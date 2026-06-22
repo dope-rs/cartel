@@ -1,3 +1,30 @@
+//! A production-grade async PostgreSQL driver for the `dope` runtime, and the
+//! officially recommended Postgres driver for the `sark` framework.
+//!
+//! A [`Session`] multiplexes queries across a pool of connections, picking the
+//! target per request via a [`PickPolicy`] ([`RoundRobin`](PickPolicy::RoundRobin)
+//! or [`LeastInflight`](PickPolicy::LeastInflight)). Statements declared through a
+//! query set (`pg_instance!` / `#[query_group]`) are prepared eagerly on every
+//! connection at startup, so dispatch reuses cached prepared statements instead of
+//! re-parsing SQL. All queries are async, returning futures driven on the runtime's
+//! executor; type-safe accessors are generated for tables deriving [`PgTable`].
+//!
+//! ```ignore
+//! use cartel_pg::{Config, Session, PgTable};
+//!
+//! #[derive(PgTable)]
+//! #[table_name("users")]
+//! struct User { #[pk] id: i64, name: String }
+//!
+//! cartel_gen::pg_instance! { Db: User }
+//!
+//! let config = Config::new("user", "password", "mydb");
+//! let session = Session::<Db>::new(config); // wired into the pool via the runtime
+//!
+//! // Generated, prepared, async accessors:
+//! let user = User::by_id(&client, 1).await?;
+//! ```
+
 mod client;
 mod decode;
 pub mod dsl;
