@@ -1,0 +1,21 @@
+[package]
+build = "build.rs"
+name = "cartel-redis"
+version.workspace = true
+edition.workspace = true
+description = "Async Redis driver for the dope runtime"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+o3.workspace = true
+dope.workspace = true
+dope-gen.workspace = true
+cartel-core.workspace = true
+
+[lib]
+
+[dev-dependencies]
+dope-extra.workspace = true
+pin-project.workspace = true

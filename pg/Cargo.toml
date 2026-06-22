@@ -1,0 +1,27 @@
+[package]
+build = "build.rs"
+name = "cartel-pg"
+version.workspace = true
+edition.workspace = true
+description = "Async PostgreSQL driver for the dope runtime"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+cartel-core.workspace = true
+o3.workspace = true
+dope.workspace = true
+dope-gen.workspace = true
+cartel-gen.workspace = true
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+stringprep = { version = "0.1" }
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+
+[lib]
+
+[dev-dependencies]
+dope-extra.workspace = true
+pin-project.workspace = true
