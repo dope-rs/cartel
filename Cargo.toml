@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["core", "gen", "pg", "redis", "sqlite"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/dope-rs/cartel"
+authors = ["inq <gofiri@gmail.com>"]
+
+[workspace.dependencies]
+dope = "0.3"
+dope-gen = "0.3"
+dope-extra = "0.3"
+o3 = "0.1"
+pin-project = "1"
+cartel-core = { path = "core", version = "0.1.0" }
+cartel-gen = { path = "gen", version = "0.1.0" }
+cartel-pg = { path = "pg", version = "0.1.0" }

@@ -1,0 +1,13 @@
+[package]
+name = "cartel-core"
+version.workspace = true
+edition.workspace = true
+description = "Shared core for cartel database drivers"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+
+[dependencies]
+dope.workspace = true

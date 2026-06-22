@@ -1,0 +1,15 @@
+[package]
+build = "build.rs"
+name = "cartel-sqlite"
+version.workspace = true
+edition.workspace = true
+description = "SQLite driver for the dope runtime"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+cartel-gen.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[lib]
