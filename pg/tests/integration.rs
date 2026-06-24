@@ -887,8 +887,9 @@ pg_instance! {
 pg_instance! { Boot: }
 
 struct Rt<I: cartel_pg::QuerySet + 'static> {
-    exec: Box<Executor>,
+    // drops before exec: socket close needs the live io_uring driver
     dispatcher: Pin<Box<PgDispatcher<I>>>,
+    exec: Box<Executor>,
     schema: String,
     drop_schema: bool,
 }
