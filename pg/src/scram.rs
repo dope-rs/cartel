@@ -1,13 +1,14 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use hmac::{Hmac, Mac};
-use rand::RngCore;
+use hmac::{Hmac, KeyInit, Mac};
+use rand::TryRng;
 use sha2::{Digest, Sha256};
 
 use crate::Error;
 
 const MECH: &str = "SCRAM-SHA-256";
 const MECH_PLUS: &str = "SCRAM-SHA-256-PLUS";
+const MAX_SCRAM_ITERATIONS: u32 = 1_000_000;
 const GS2_HEADER: &str = "n,,";
 const GS2_HEADER_B64: &str = "biws";
 
@@ -24,7 +25,9 @@ pub(super) struct Scram {
 impl Scram {
     pub(super) fn new(password: &str) -> Self {
         let mut nonce_raw = [0u8; 18];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_raw);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut nonce_raw)
+            .expect("OS RNG unavailable");
         let client_nonce = STANDARD.encode(nonce_raw);
         let client_first_bare = format!("n=,r={client_nonce}");
         Self {
@@ -75,6 +78,11 @@ impl Scram {
         }
         if nonce_b64.is_empty() || salt_b64.is_empty() || iterations == 0 {
             return Err(Error::Auth("server-first missing fields".into()));
+        }
+        if iterations > MAX_SCRAM_ITERATIONS {
+            return Err(Error::Auth(
+                "server-first: iteration count too large".into(),
+            ));
         }
         if !nonce_b64.starts_with(&self.client_nonce) {
             return Err(Error::Auth(
@@ -132,14 +140,15 @@ fn sha256(input: &[u8]) -> [u8; 32] {
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut m = <Hs as Mac>::new_from_slice(key).expect("hmac key length always valid");
+    let mut m = <Hs as KeyInit>::new_from_slice(key).expect("hmac key length always valid");
     m.update(data);
     m.finalize().into_bytes().into()
 }
 
 fn pbkdf2_sha256_32(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
     let mut u = {
-        let mut m = <Hs as Mac>::new_from_slice(password).expect("hmac key length always valid");
+        let mut m =
+            <Hs as KeyInit>::new_from_slice(password).expect("hmac key length always valid");
         m.update(salt);
         m.update(&1u32.to_be_bytes());
         m.finalize().into_bytes()
@@ -148,7 +157,7 @@ fn pbkdf2_sha256_32(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
     for _ in 1..iterations {
         u = {
             let mut m =
-                <Hs as Mac>::new_from_slice(password).expect("hmac key length always valid");
+                <Hs as KeyInit>::new_from_slice(password).expect("hmac key length always valid");
             m.update(&u);
             m.finalize().into_bytes()
         };

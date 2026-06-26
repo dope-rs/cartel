@@ -345,9 +345,20 @@ pub struct Config {
     pub database: String,
     pub application_name: String,
     pub options: String,
+    /// Server-side `statement_timeout` applied at startup, in milliseconds.
+    /// `0` omits the setting entirely, deferring to the server's own default
+    /// (which is *not* necessarily "no timeout").
+    pub statement_timeout_ms: u32,
+    /// Upper bound on rows buffered for a single non-streaming response.
+    /// Exceeding it fails the query instead of growing memory without limit.
+    /// `0` disables the bound. Use the streaming API for unbounded result sets.
+    pub max_response_rows: usize,
 }
 
 impl Config {
+    pub const DEFAULT_STATEMENT_TIMEOUT_MS: u32 = 30_000;
+    pub const DEFAULT_MAX_RESPONSE_ROWS: usize = 1_000_000;
+
     pub fn new(
         user: impl Into<String>,
         password: impl Into<String>,
@@ -359,11 +370,35 @@ impl Config {
             database: database.into(),
             application_name: "cartel-pg".into(),
             options: String::new(),
+            statement_timeout_ms: Self::DEFAULT_STATEMENT_TIMEOUT_MS,
+            max_response_rows: Self::DEFAULT_MAX_RESPONSE_ROWS,
         }
     }
 
     pub fn with_search_path(mut self, schema: &str) -> Self {
         self.options = format!("-c search_path={schema},public");
+        self
+    }
+
+    pub fn with_statement_timeout(mut self, dur: std::time::Duration) -> Self {
+        self.statement_timeout_ms = dur.as_millis().min(u32::MAX as u128) as u32;
+        self
+    }
+
+    /// Stop sending `statement_timeout` at startup, deferring to the server
+    /// default. This does not guarantee unlimited execution time.
+    pub fn without_statement_timeout(mut self) -> Self {
+        self.statement_timeout_ms = 0;
+        self
+    }
+
+    pub fn with_max_response_rows(mut self, rows: usize) -> Self {
+        self.max_response_rows = rows;
+        self
+    }
+
+    pub fn without_max_response_rows(mut self) -> Self {
+        self.max_response_rows = 0;
         self
     }
 }

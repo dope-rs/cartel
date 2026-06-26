@@ -27,6 +27,7 @@ pub(super) fn startup<S: Sink>(
     database: &str,
     application_name: &str,
     options: &str,
+    statement_timeout_ms: u32,
 ) {
     let pos = reserve_len(out);
     out.extend_from_slice(&Fe::STARTUP_PROTOCOL.to_be_bytes());
@@ -39,6 +40,10 @@ pub(super) fn startup<S: Sink>(
     write_cstr(out, application_name);
     write_cstr(out, "client_encoding");
     write_cstr(out, "UTF8");
+    if statement_timeout_ms > 0 && !options.contains("statement_timeout") {
+        write_cstr(out, "statement_timeout");
+        write_cstr(out, &statement_timeout_ms.to_string());
+    }
     if !options.is_empty() {
         write_cstr(out, "options");
         write_cstr(out, options);
@@ -46,6 +51,13 @@ pub(super) fn startup<S: Sink>(
     out.push(0);
 
     finish_len(out, pos);
+}
+
+pub(super) fn cancel_request<S: Sink>(out: &mut S, pid: i32, secret: i32) {
+    out.extend_from_slice(&16u32.to_be_bytes());
+    out.extend_from_slice(&Fe::CANCEL_REQUEST.to_be_bytes());
+    out.extend_from_slice(&pid.to_be_bytes());
+    out.extend_from_slice(&secret.to_be_bytes());
 }
 
 pub(super) fn sync<S: Sink>(out: &mut S) {

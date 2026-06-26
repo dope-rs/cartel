@@ -7,7 +7,7 @@ use dope::runtime::token::Token;
 use dope::transport::Transport;
 
 use crate::Error;
-use crate::client::{Disp, Dispatched, ExtractUnit, PgHolding, PgOps, Request};
+use crate::client::{Disp, Dispatched, DropAction, ExtractUnit, PgHolding, PgOps, Request};
 use crate::query::QuerySet;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -122,13 +122,34 @@ where
         let conn = self.conn;
         let begin = Disp::dispatch_raw::<ExtractUnit, I, S, E>(conn, None, Request::raw(&sql));
         let begin_pin = begin.resolved_conn();
+        if let Some(pin) = begin_pin {
+            Disp::acquire_exclusive(conn, pin);
+        }
         Fiber::new(async move {
-            begin.await?;
+            if let Err(e) = begin.await {
+                if let Some(pin) = begin_pin {
+                    Disp::release_exclusive(conn, pin);
+                }
+                return Err(e);
+            }
             let pin = begin_pin.ok_or(Error::NoReadyConn)?;
             if let Some(ms) = timeout_ms {
                 let sql_set = format!("SET LOCAL statement_timeout TO {}", ms);
-                Disp::dispatch_raw::<ExtractUnit, I, S, E>(conn, Some(pin), Request::raw(&sql_set))
-                    .await?;
+                if let Err(e) = Disp::dispatch_raw::<ExtractUnit, I, S, E>(
+                    conn,
+                    Some(pin),
+                    Request::raw(&sql_set),
+                )
+                .await
+                {
+                    if matches!(
+                        Disp::rollback_on_drop(conn, pin, "ROLLBACK"),
+                        DropAction::Delivered
+                    ) {
+                        Disp::release_exclusive(conn, pin);
+                    }
+                    return Err(e);
+                }
             }
             Ok(TxGuard {
                 conn,
@@ -246,9 +267,16 @@ where
 
     pub fn cancel_token(&self) -> Option<CancelToken<'d, I, S, E>> {
         let pid = self.backend_pid()?;
+        let secret_key = self
+            .conn
+            .session()
+            .shared
+            .backend_key_for(self.pin)
+            .unwrap_or(0);
         Some(CancelToken {
             conn: self.conn,
             pid,
+            secret_key,
         })
     }
 }
@@ -262,6 +290,7 @@ where
 {
     conn: PgHolding<'d, I, S, E>,
     pid: i32,
+    secret_key: i32,
 }
 
 impl<'d, I, S, E> Clone for CancelToken<'d, I, S, E>
@@ -275,6 +304,7 @@ where
         Self {
             conn: self.conn,
             pid: self.pid,
+            secret_key: self.secret_key,
         }
     }
 }
@@ -288,6 +318,22 @@ where
 {
     pub fn pid(&self) -> i32 {
         self.pid
+    }
+
+    /// Backend secret from `BackendKeyData`, paired with [`pid`](Self::pid)
+    /// to authorize an out-of-band CancelRequest.
+    pub fn secret_key(&self) -> i32 {
+        self.secret_key
+    }
+
+    /// Raw CancelRequest packet to send on a *fresh* connection to abort the
+    /// in-flight query, per the postgres cancellation protocol.
+    pub fn cancel_request_message(&self) -> [u8; 16] {
+        let mut buf = o3::buffer::Owned::with_capacity(16);
+        crate::encode::cancel_request(&mut buf, self.pid, self.secret_key);
+        let mut out = [0u8; 16];
+        out.copy_from_slice(buf.as_mut_slice());
+        out
     }
 
     pub fn cancel(&self) -> Fiber<'d, Dispatched<'d, I, S, E, ExtractUnit>> {
@@ -309,11 +355,14 @@ where
 {
     fn drop(&mut self) {
         if !self.finalised {
-            drop(Disp::dispatch_raw::<ExtractUnit, I, S, E>(
-                self.conn,
-                Some(self.pin),
-                Request::raw("ROLLBACK"),
-            ));
+            if matches!(
+                Disp::rollback_on_drop(self.conn, self.pin, "ROLLBACK"),
+                DropAction::Delivered
+            ) {
+                Disp::release_exclusive(self.conn, self.pin);
+            }
+        } else {
+            Disp::release_exclusive(self.conn, self.pin);
         }
     }
 }
@@ -421,7 +470,7 @@ where
                 "ROLLBACK TO SAVEPOINT \"{}\"",
                 self.name.replace('"', "\"\"")
             );
-            drop(self.raw_pinned(&sql));
+            Disp::rollback_on_drop(self.conn, self.pin, &sql);
         }
     }
 }
@@ -500,7 +549,7 @@ where
     fn drop(&mut self) {
         if !self.finalised {
             let sql = format!("UNLISTEN \"{}\"", self.channel.replace('"', "\"\""));
-            drop(self.raw_pinned(&sql));
+            Disp::rollback_on_drop(self.conn, self.pin, &sql);
         }
     }
 }

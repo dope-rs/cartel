@@ -19,6 +19,9 @@ use crate::{Config, Error, Notification, encode};
 pub(super) type RowItem = Result<buffer::Shared, Error>;
 
 const MAX_PG_CONNS: usize = 256;
+const MAX_FRAME_LEN: usize = 256 * 1024 * 1024;
+const OVERSIZE_FRAME: u8 = 0xff;
+const MAX_NOTIFICATIONS: usize = 1024;
 
 pub struct Frame {
     pub typ: u8,
@@ -85,6 +88,7 @@ pub(super) struct Shared {
     config: Config,
     ready_conns: Vec<Token>,
     inflight: Box<[u32]>,
+    exclusive: Box<[bool]>,
     rr_idx: Cell<usize>,
     pub(super) policy: PickPolicy,
     pub(super) ready_count: usize,
@@ -92,18 +96,23 @@ pub(super) struct Shared {
     ready_wakers: WakerSet,
     fatal: FatalSlot<Error>,
     notifications: VecDeque<Notification>,
+    notifications_dropped: u64,
     notification_wakers: WakerSet,
     pub(super) inflight_total: Inflight,
+    pub(super) max_response_rows: usize,
     pub(super) egress_drain_wakers: WakerSet,
     backend_pids: Box<[i32]>,
+    backend_keys: Box<[i32]>,
 }
 
 impl Shared {
     fn new(config: Config) -> Self {
+        let max_response_rows = config.max_response_rows;
         Self {
             config,
             ready_conns: Vec::new(),
             inflight: vec![0u32; MAX_PG_CONNS].into_boxed_slice(),
+            exclusive: vec![false; MAX_PG_CONNS].into_boxed_slice(),
             rr_idx: Cell::new(0),
             policy: PickPolicy::default(),
             ready_count: 0,
@@ -111,10 +120,13 @@ impl Shared {
             ready_wakers: WakerSet::new(),
             fatal: FatalSlot::default(),
             notifications: VecDeque::new(),
+            notifications_dropped: 0,
             notification_wakers: WakerSet::new(),
             inflight_total: Inflight::default(),
+            max_response_rows,
             egress_drain_wakers: WakerSet::new(),
             backend_pids: vec![0i32; MAX_PG_CONNS].into_boxed_slice(),
+            backend_keys: vec![0i32; MAX_PG_CONNS].into_boxed_slice(),
         }
     }
 
@@ -125,8 +137,42 @@ impl Shared {
             .filter(|&p| p != 0)
     }
 
+    pub(super) fn backend_key_for(&self, slot: Token) -> Option<i32> {
+        let i = slot.slot().raw() as usize;
+        if *self.backend_pids.get(i)? == 0 {
+            return None;
+        }
+        self.backend_keys.get(i).copied()
+    }
+
+    pub(super) fn store_backend_key_data(&mut self, slot: Token, payload: &[u8]) {
+        if payload.len() < 8 {
+            return;
+        }
+        let pid = i32::from_be_bytes(payload[0..4].try_into().unwrap());
+        let key = i32::from_be_bytes(payload[4..8].try_into().unwrap());
+        let i = slot.slot().raw() as usize;
+        if i < MAX_PG_CONNS {
+            self.backend_pids[i] = pid;
+            self.backend_keys[i] = key;
+        }
+    }
+
     pub(super) fn pop_notification(&mut self) -> Option<Notification> {
         self.notifications.pop_front()
+    }
+
+    pub(super) fn push_notification(&mut self, n: Notification) {
+        if self.notifications.len() >= MAX_NOTIFICATIONS {
+            self.notifications.pop_front();
+            self.notifications_dropped = self.notifications_dropped.saturating_add(1);
+        }
+        self.notifications.push_back(n);
+        self.notification_wakers.drain_wake();
+    }
+
+    pub(super) fn notifications_dropped(&self) -> u64 {
+        self.notifications_dropped
     }
 
     pub(super) fn register_notification_waker(&mut self, w: WakeRef) {
@@ -157,6 +203,34 @@ impl Shared {
         self.fatal.is_failed()
     }
 
+    pub(super) fn is_exclusive(&self, slot: Token) -> bool {
+        self.exclusive
+            .get(slot.slot().raw() as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn mark_exclusive(&mut self, slot: Token, on: bool) {
+        let i = slot.slot().raw() as usize;
+        if i < self.exclusive.len() {
+            self.exclusive[i] = on;
+        }
+    }
+
+    pub(super) fn acquire_exclusive(&mut self, slot: Token) {
+        self.mark_exclusive(slot, true);
+    }
+
+    pub(super) fn release_exclusive(&mut self, slot: Token) {
+        self.mark_exclusive(slot, false);
+        self.ready_wakers.drain_wake();
+        self.egress_drain_wakers.drain_wake();
+    }
+
+    pub(super) fn tx_saturated(&self) -> bool {
+        self.ready_count > 0
+    }
+
     pub(super) fn pick_conn(&self, pin: Option<Token>) -> Option<Token> {
         if let Some(p) = pin {
             return self.ready_conns.iter().copied().find(|c| *c == p);
@@ -165,30 +239,38 @@ impl Shared {
         if n == 0 {
             return None;
         }
-        let idx = match self.policy {
+        match self.policy {
             PickPolicy::RoundRobin => {
-                let i = self.rr_idx.get() % n;
-                self.rr_idx.set(i.wrapping_add(1));
-                i
+                for _ in 0..n {
+                    let i = self.rr_idx.get() % n;
+                    self.rr_idx.set(i.wrapping_add(1));
+                    let c = self.ready_conns[i];
+                    if !self.is_exclusive(c) {
+                        return Some(c);
+                    }
+                }
+                None
             }
             PickPolicy::LeastInflight => {
-                let mut best = 0usize;
+                let mut best: Option<Token> = None;
                 let mut best_v = u32::MAX;
-                for (i, c) in self.ready_conns.iter().enumerate() {
+                for c in self.ready_conns.iter().copied() {
+                    if self.is_exclusive(c) {
+                        continue;
+                    }
                     let v = self
                         .inflight
                         .get(c.slot().raw() as usize)
                         .copied()
                         .unwrap_or(0);
-                    if v < best_v {
+                    if best.is_none() || v < best_v {
                         best_v = v;
-                        best = i;
+                        best = Some(c);
                     }
                 }
                 best
             }
-        };
-        Some(self.ready_conns[idx])
+        }
     }
 
     pub(super) fn inc_inflight(&mut self, slot: Token) {
@@ -248,6 +330,15 @@ impl connector::Codec for Codec {
                 buf.len(),
             ));
         }
+        if len > MAX_FRAME_LEN {
+            return Some((
+                Frame {
+                    typ: OVERSIZE_FRAME,
+                    payload: buffer::Shared::new(),
+                },
+                5,
+            ));
+        }
         let total = 1 + len;
         if buf.len() < total {
             return None;
@@ -290,6 +381,7 @@ impl<I: QuerySet> Session<I> {
         if permanent {
             s.fatal.record(err);
         }
+        s.mark_exclusive(conn_id, false);
         if was_ready && let Some(idx) = s.ready_conns.iter().position(|c| *c == conn_id) {
             s.ready_conns.remove(idx);
             if s.ready_count > 0 {
@@ -355,13 +447,7 @@ impl<I: QuerySet> Session<I> {
             }
             Be::PARAMETER_STATUS | Be::NOTICE_RESPONSE => Ok(()),
             Be::BACKEND_KEY_DATA => {
-                if payload.len() >= 8 {
-                    let pid = i32::from_be_bytes(payload[0..4].try_into().unwrap());
-                    let sl = conn_id.slot().raw() as usize;
-                    if sl < MAX_PG_CONNS {
-                        self.shared.backend_pids[sl] = pid;
-                    }
-                }
+                self.shared.store_backend_key_data(conn_id, payload);
                 Ok(())
             }
             Be::READY_FOR_QUERY => Ok(()),
@@ -430,6 +516,7 @@ impl<I: QuerySet> Session<I> {
             Be::PARAMETER_STATUS | Be::NOTICE_RESPONSE | Be::BIND_COMPLETE => Ok(()),
             Be::READY_FOR_QUERY => {
                 conn_state.phase = Phase::Ready;
+                self.shared.mark_exclusive(conn_id, false);
                 self.shared.ready_conns.push(conn_id);
                 let sl = conn_id.slot().raw() as usize;
                 if sl < MAX_PG_CONNS {
@@ -498,19 +585,22 @@ impl<I: QuerySet> Session<I> {
                 }
             }
             Be::COPY_DATA => {
-                conn_state.responses.push(Ok(head_payload));
+                conn_state
+                    .responses
+                    .push_capped(Ok(head_payload), self.shared.max_response_rows);
                 Ok(())
             }
             Be::NOTIFICATION_RESPONSE => {
                 if let Some(n) = parse_notification(&head_payload) {
-                    self.shared.notifications.push_back(n);
-                    self.shared.notification_wakers.drain_wake();
+                    self.shared.push_notification(n);
                 }
                 Ok(())
             }
             Be::DATA_ROW => match conn_state.responses.front_kind() {
                 FrontKind::Slot(_) | FrontKind::Detached => {
-                    conn_state.responses.push(Ok(head_payload));
+                    conn_state
+                        .responses
+                        .push_capped(Ok(head_payload), self.shared.max_response_rows);
                     Ok(())
                 }
                 _ => Err(Error::Protocol("DataRow with empty pipeline")),
@@ -529,6 +619,11 @@ impl<I: QuerySet> Session<I> {
                 }
             }
             Be::READY_FOR_QUERY => {
+                let server_in_tx = matches!(head_payload.first().copied(), Some(b'T') | Some(b'E'));
+                debug_assert!(
+                    !server_in_tx || self.shared.is_exclusive(conn_id),
+                    "pg multiplex isolation desync: server reports in-transaction on a connection not exclusively checked out"
+                );
                 let skip = conn_state.error_skip;
                 loop {
                     match conn_state.responses.front_kind() {
@@ -582,6 +677,7 @@ impl<I: QuerySet> connector::Session for Session<I> {
             &self.shared.config.database,
             &self.shared.config.application_name,
             &self.shared.config.options,
+            self.shared.config.statement_timeout_ms,
         );
         out.push(buf.freeze());
         conn_state.phase = Phase::StartupSent;
@@ -613,6 +709,14 @@ impl<I: QuerySet> connector::Session for Session<I> {
         let conn_state = &mut *ctx.state;
         let out = &mut *ctx.sink;
         let typ = head.typ;
+        if typ == OVERSIZE_FRAME {
+            self.fail(
+                conn_id,
+                conn_state,
+                Error::Protocol("server frame exceeds maximum size"),
+            );
+            return;
+        }
         let prev_phase_was_awaiting_ready = matches!(conn_state.phase, Phase::AwaitingReady);
         let result = match conn_state.phase {
             Phase::StartupSent | Phase::AwaitingReady => {
@@ -666,7 +770,9 @@ impl<I: QuerySet> connector::Session for Session<I> {
         let sl = conn_id.slot().raw() as usize;
         if sl < MAX_PG_CONNS {
             s.backend_pids[sl] = 0;
+            s.backend_keys[sl] = 0;
         }
+        s.mark_exclusive(conn_id, false);
         if was_ready {
             if let Some(idx) = s.ready_conns.iter().position(|c| *c == conn_id) {
                 s.ready_conns.remove(idx);

@@ -3,6 +3,8 @@ use o3::buffer::Shared;
 use crate::Error;
 use crate::wire::Sink;
 
+const ARRAY_PREALLOC_CAP: usize = 4096;
+
 pub struct RowReader<'a> {
     buf: &'a [u8],
     payload: &'a Shared,
@@ -76,7 +78,7 @@ impl<'a> RowReader<'a> {
         decode: impl Fn([u8; N]) -> T,
     ) -> Result<Vec<T>, Error> {
         let n = self.array_header()?;
-        let mut out = Vec::with_capacity(n);
+        let mut out = Vec::with_capacity(n.min(ARRAY_PREALLOC_CAP));
         for _ in 0..n {
             let len = self.take_len()?.ok_or(Error::UnexpectedNull)?;
             if len != N {
@@ -239,7 +241,11 @@ impl<'a> RowReader<'a> {
         if dim < 0 {
             return Err(Error::Protocol("negative array dimension"));
         }
-        Ok(dim as usize)
+        let dim = dim as usize;
+        if dim > self.buf.len() / 4 {
+            return Err(Error::Protocol("array dimension exceeds payload"));
+        }
+        Ok(dim)
     }
 
     pub fn read_array_i64(&mut self) -> Result<Vec<i64>, Error> {
@@ -258,7 +264,7 @@ impl<'a> RowReader<'a> {
 
     pub fn read_array_text(&mut self) -> Result<Vec<String>, Error> {
         let n = self.array_header()?;
-        let mut out = Vec::with_capacity(n);
+        let mut out = Vec::with_capacity(n.min(ARRAY_PREALLOC_CAP));
         for _ in 0..n {
             let len = self.take_len()?.ok_or(Error::UnexpectedNull)?;
             let bytes = self.take_bytes(len)?;

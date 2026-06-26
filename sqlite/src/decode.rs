@@ -59,7 +59,7 @@ impl Decode for u32 {
 impl Decode for u64 {
     const N_COLS: usize = 1;
     fn decode_at(row: &Row<'_>, off: usize) -> Result<Self> {
-        row.get(off)
+        row.get::<_, i64>(off).map(|v| v as u64)
     }
 }
 impl Decode for f32 {

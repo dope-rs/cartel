@@ -11,6 +11,8 @@ pub struct Slot<C> {
     first: Option<C>,
     rest: VecDeque<C>,
     completed: bool,
+    capped: bool,
+    overflow: bool,
     waker: Option<WakeRef>,
 }
 
@@ -20,6 +22,8 @@ impl<C> Slot<C> {
             first: None,
             rest: VecDeque::new(),
             completed: false,
+            capped: false,
+            overflow: false,
             waker: None,
         }
     }
@@ -28,6 +32,8 @@ impl<C> Slot<C> {
         self.first = None;
         self.rest.clear();
         self.completed = false;
+        self.capped = false;
+        self.overflow = false;
         self.waker = None;
     }
 
@@ -35,8 +41,16 @@ impl<C> Slot<C> {
         self.completed
     }
 
+    pub fn overflowed(&self) -> bool {
+        self.overflow
+    }
+
     pub fn is_empty(&self) -> bool {
         self.first.is_none()
+    }
+
+    fn len(&self) -> usize {
+        self.first.is_some() as usize + self.rest.len()
     }
 
     pub fn pop(&mut self) -> Option<C> {
@@ -45,7 +59,11 @@ impl<C> Slot<C> {
         Some(head)
     }
 
-    fn push(&mut self, item: C) {
+    fn push(&mut self, item: C, max_rows: usize) {
+        if self.capped && max_rows != 0 && self.len() >= max_rows {
+            self.overflow = true;
+            return;
+        }
         if self.first.is_none() {
             self.first = Some(item);
         } else {
@@ -200,7 +218,13 @@ impl<C> Slab<C> {
 
     pub fn push(&mut self, item: C) {
         if let FrontKind::Slot(idx) = self.front_kind() {
-            self.entries[idx as usize].slot.push(item);
+            self.entries[idx as usize].slot.push(item, 0);
+        }
+    }
+
+    pub fn push_capped(&mut self, item: C, max_rows: usize) {
+        if let FrontKind::Slot(idx) = self.front_kind() {
+            self.entries[idx as usize].slot.push(item, max_rows);
         }
     }
 
@@ -219,7 +243,7 @@ impl<C> Slab<C> {
         match self.front_kind() {
             FrontKind::Slot(idx) => {
                 self.order.pop_front();
-                self.entries[idx as usize].slot.push(make());
+                self.entries[idx as usize].slot.push(make(), 0);
                 self.finish(idx);
             }
             FrontKind::Detached => self.drop_front(),
@@ -241,7 +265,7 @@ impl<C> Slab<C> {
                 }
                 FrontKind::Slot(idx) => {
                     self.order.pop_front();
-                    self.entries[idx as usize].slot.push(make());
+                    self.entries[idx as usize].slot.push(make(), 0);
                     self.finish(idx);
                     n += 1;
                 }
@@ -345,6 +369,9 @@ impl<'d, C, X: Extract<C>> Registrable<'d, C> for Reply<'d, C, X> {
     fn attach(&mut self, slab: &mut Slab<C>) {
         // SAFETY: caller invariant — Slab outlives 'd brand (thread-per-core, pinned Connector).
         unsafe { self.register_mut_raw(NonNull::from(slab)) }
+        if let Some(slot) = self.handle.slot() {
+            slot.capped = true;
+        }
     }
 }
 

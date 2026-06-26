@@ -42,6 +42,7 @@ pub(super) struct Fe;
 
 impl Fe {
     pub(super) const STARTUP_PROTOCOL: u32 = 0x0003_0000;
+    pub(super) const CANCEL_REQUEST: u32 = 80877102;
 
     pub(super) const PARSE: u8 = b'P';
     pub(super) const BIND: u8 = b'B';
