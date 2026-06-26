@@ -9,6 +9,6 @@ authors.workspace = true
 
 [dependencies]
 cartel-gen.workspace = true
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [lib]

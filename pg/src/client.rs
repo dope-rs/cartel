@@ -36,6 +36,21 @@ fn decode_row<R>(decoder: Decoder<R>, payload: &Shared) -> Result<R, Error> {
     decoder(&mut reader)
 }
 
+fn overflow_error() -> Error {
+    Error::Other("response exceeded max buffered rows".into())
+}
+
+fn no_conn_outcome(
+    shared: &protocol::Shared,
+    request: impl FnOnce() -> Request,
+) -> DispatchOutcome {
+    if shared.tx_saturated() {
+        DispatchOutcome::Failed(shared.backpressure(0))
+    } else {
+        DispatchOutcome::NoConn { request: request() }
+    }
+}
+
 pub(super) struct ExtractAll;
 
 impl Extract<RowItem> for ExtractAll {
@@ -44,6 +59,9 @@ impl Extract<RowItem> for ExtractAll {
     fn extract(slot: &mut Slot<RowItem>) -> Option<Self::Output> {
         if !slot.completed() {
             return None;
+        }
+        if slot.overflowed() {
+            return Some(Err(overflow_error()));
         }
         let mut rows = Vec::new();
         while let Some(item) = slot.pop() {
@@ -64,6 +82,9 @@ impl Extract<RowItem> for ExtractUnit {
     fn extract(slot: &mut Slot<RowItem>) -> Option<Self::Output> {
         if !slot.completed() {
             return None;
+        }
+        if slot.overflowed() {
+            return Some(Err(overflow_error()));
         }
         while let Some(item) = slot.pop() {
             if let Err(e) = item {
@@ -93,6 +114,9 @@ impl Extract<RowItem> for ExtractFirst {
     fn extract(slot: &mut Slot<RowItem>) -> Option<Self::Output> {
         if !slot.completed() {
             return None;
+        }
+        if slot.overflowed() {
+            return Some(Err(overflow_error()));
         }
         match slot.pop() {
             Some(Ok(payload)) => Some(Ok(Some(payload))),
@@ -159,6 +183,12 @@ enum DispatchOutcome {
     Throttled { throttle: Throttle },
     NoConn { request: Request },
     Failed(Error),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum DropAction {
+    Delivered,
+    Quarantined,
 }
 
 #[derive(Clone, Copy)]
@@ -285,6 +315,10 @@ where
             .shared
             .inflight_total
             .set_max(cap);
+    }
+
+    fn notifications_dropped(&self) -> u64 {
+        self.holding().session().shared.notifications_dropped()
     }
 
     fn set_pick_policy(&self, policy: protocol::PickPolicy) {
@@ -687,9 +721,9 @@ impl Disp {
                     Some(_) => {
                         DispatchOutcome::Failed(Error::Other("pinned conn no longer ready".into()))
                     }
-                    None => DispatchOutcome::NoConn {
-                        request: Request::typed::<Q>(params),
-                    },
+                    None => {
+                        no_conn_outcome(&holding.session().shared, || Request::typed::<Q>(params))
+                    }
                 };
             }
         };
@@ -741,9 +775,7 @@ impl Disp {
                     Some(_) => {
                         DispatchOutcome::Failed(Error::Other("pinned conn no longer ready".into()))
                     }
-                    None => DispatchOutcome::NoConn {
-                        request: req.clone(),
-                    },
+                    None => no_conn_outcome(&holding.session().shared, || req.clone()),
                 };
             }
         };
@@ -944,6 +976,50 @@ impl Disp {
         channel.conn_state_mut().push_batch_boundary();
         pool.request_flush(pin);
         Ok(())
+    }
+
+    pub(super) fn rollback_on_drop<'d, I, S, E>(
+        holding: PgHolding<'d, I, S, E>,
+        pin: Token,
+        sql: &str,
+    ) -> DropAction
+    where
+        I: QuerySet,
+        S: Dialer<E::Transport>,
+        E: Env,
+        E::Transport: Transport<Addr: Clone>,
+    {
+        let req = Request::raw(sql);
+        let mut reply = Reply::<RowItem, ExtractUnit>::new();
+        let outcome = Self::try_dispatch_reply(holding, Some(pin), &mut reply, &req);
+        if matches!(outcome, DispatchOutcome::Enqueued { .. }) {
+            return DropAction::Delivered;
+        }
+        let mut h = holding.hold();
+        h.as_mut().request_close(pin);
+        DropAction::Quarantined
+    }
+
+    pub(super) fn acquire_exclusive<'d, I, S, E>(holding: PgHolding<'d, I, S, E>, pin: Token)
+    where
+        I: QuerySet,
+        S: Dialer<E::Transport>,
+        E: Env,
+        E::Transport: Transport<Addr: Clone>,
+    {
+        let mut h = holding.hold();
+        h.as_mut().session_mut().shared.acquire_exclusive(pin);
+    }
+
+    pub(super) fn release_exclusive<'d, I, S, E>(holding: PgHolding<'d, I, S, E>, pin: Token)
+    where
+        I: QuerySet,
+        S: Dialer<E::Transport>,
+        E: Env,
+        E::Transport: Transport<Addr: Clone>,
+    {
+        let mut h = holding.hold();
+        h.as_mut().session_mut().shared.release_exclusive(pin);
     }
 
     fn check_can_dispatch<'d, I, S, E>(holding: PgHolding<'d, I, S, E>) -> Result<(), Error>
