@@ -220,9 +220,9 @@ impl SqliteBackend {
         let mut field_decodes = Vec::new();
         let mut n_cols_acc = quote! { 0usize };
         let mut col_names: Vec<String> = Vec::new();
-        for f in fields {
-            let fname = f.ident.as_ref().expect("named field");
-            let fty = &f.ty;
+        for f in &fields {
+            let fname = f.name;
+            let fty = f.ty;
             field_decodes.push(quote! {
                 #fname: <#fty as ::cartel_sqlite::Decode>::decode_at(__r, __off + (#n_cols_acc))?,
             });

@@ -18,12 +18,17 @@ pub struct LaneBudget {
 
 #[derive(Clone, Copy)]
 pub struct LaneBudgetRef<'d> {
-    credits: NonNull<FairCredits>,
+    credits: NonNull<UnsafeCell<FairCredits>>,
     lane: usize,
     lifetime: PhantomData<&'d LaneBudget>,
 }
 
 impl LaneBudget {
+    fn with_credits<R>(&self, operation: impl for<'a> FnOnce(&'a mut FairCredits) -> R) -> R {
+        // SAFETY: the budget is single-threaded, and `R` cannot borrow the scoped credits.
+        unsafe { operation(&mut *self.credits.get()) }
+    }
+
     pub fn with_capacity(capacity: usize, lanes: usize) -> Self {
         Self {
             credits: Box::new(UnsafeCell::new(FairCredits::balanced(capacity, lanes))),
@@ -31,9 +36,9 @@ impl LaneBudget {
     }
 
     pub fn handle(&self, lane: usize) -> LaneBudgetRef<'_> {
-        assert!(lane < unsafe { &*self.credits.get() }.lanes());
+        assert!(lane < self.with_credits(|credits| credits.lanes()));
         LaneBudgetRef {
-            credits: NonNull::from(unsafe { &mut *self.credits.get() }),
+            credits: NonNull::from(self.credits.as_ref()),
             lane,
             lifetime: PhantomData,
         }
@@ -51,12 +56,17 @@ impl LaneBudgetRef<'_> {
         }
     }
 
+    fn with_credits<R>(self, operation: impl for<'a> FnOnce(&'a mut FairCredits) -> R) -> R {
+        // SAFETY: the handle keeps the budget alive; the higher-ranked borrow cannot escape.
+        unsafe { operation(&mut *self.credits.as_ref().get()) }
+    }
+
     fn try_acquire(self, amount: usize) -> bool {
-        unsafe { &mut *self.credits.as_ptr() }.try_acquire(self.lane, amount)
+        self.with_credits(|credits| credits.try_acquire(self.lane, amount))
     }
 
     fn release(self, amount: usize) {
-        unsafe { &mut *self.credits.as_ptr() }.release(self.lane, amount);
+        self.with_credits(|credits| credits.release(self.lane, amount));
     }
 }
 
@@ -236,13 +246,19 @@ impl<'d, C> Slot<'d, C> {
         item_credits: usize,
         max_credits: usize,
     ) -> Result<(), C> {
-        let next_bytes = self.budget.amount().checked_add(item_bytes);
-        let next_credits = self.credits.checked_add(item_credits);
+        let Some(next_bytes) = self.budget.amount().checked_add(item_bytes) else {
+            self.overflow = true;
+            return Err(item);
+        };
+        let Some(next_credits) = self.credits.checked_add(item_credits) else {
+            self.overflow = true;
+            return Err(item);
+        };
         if self.completed
             || self.overflow
             || self.len() >= max_items
-            || next_bytes.is_none_or(|bytes| bytes > max_bytes)
-            || next_credits.is_none_or(|credits| credits > max_credits)
+            || next_bytes > max_bytes
+            || next_credits > max_credits
             || !self.nodes.can_acquire(self.first.is_some(), item_credits)
         {
             self.overflow = true;
@@ -266,7 +282,7 @@ impl<'d, C> Slot<'d, C> {
             self.rest_tail = index;
             self.rest_len += 1;
         }
-        self.credits = next_credits.expect("reply credits checked before reservation");
+        self.credits = next_credits;
         Ok(())
     }
 
@@ -379,14 +395,14 @@ impl<T> NodePool<T> {
 
     pub fn restore(&mut self, index: u32, next: u32, item: T) {
         let node = &mut self.nodes[index as usize];
-        debug_assert!(node.item.is_none());
+        assert!(node.item.is_none(), "restored node must be vacant");
         node.next = next;
         node.item = Some(item);
     }
 
     pub fn release(&mut self, index: u32) {
         let node = &mut self.nodes[index as usize];
-        debug_assert!(node.item.is_none());
+        assert!(node.item.is_none(), "released node must be vacant");
         node.next = self.free;
         self.free = index;
         self.available += 1;
@@ -409,13 +425,13 @@ pub struct ItemPool<C> {
 }
 
 pub struct ItemPoolRef<'d, C> {
-    state: NonNull<ItemPoolState<C>>,
+    state: NonNull<UnsafeCell<ItemPoolState<C>>>,
     lane: usize,
     lifetime: PhantomData<&'d ItemPool<C>>,
 }
 
 struct RawItemPool<C> {
-    state: NonNull<ItemPoolState<C>>,
+    state: NonNull<UnsafeCell<ItemPoolState<C>>>,
     lane: usize,
 }
 
@@ -436,6 +452,11 @@ impl<C> Clone for ItemPoolRef<'_, C> {
 impl<C> Copy for ItemPoolRef<'_, C> {}
 
 impl<C> ItemPool<C> {
+    fn with_state<R>(&self, operation: impl for<'a> FnOnce(&'a mut ItemPoolState<C>) -> R) -> R {
+        // SAFETY: the pool is single-threaded, and `R` cannot borrow the scoped state reference.
+        unsafe { operation(&mut *self.state.get()) }
+    }
+
     pub fn with_capacity(capacity: usize) -> Self {
         Self::with_credit_capacity(capacity, capacity, 1)
     }
@@ -462,9 +483,9 @@ impl<C> ItemPool<C> {
     }
 
     pub fn handle_for(&self, lane: usize) -> ItemPoolRef<'_, C> {
-        assert!(lane < unsafe { &*self.state.get() }.rows.lanes());
+        assert!(lane < self.with_state(|state| state.rows.lanes()));
         ItemPoolRef {
-            state: NonNull::from(unsafe { &mut *self.state.get() }),
+            state: NonNull::from(self.state.as_ref()),
             lane,
             lifetime: PhantomData,
         }
@@ -491,35 +512,35 @@ impl<C> ItemPoolRef<'_, C> {
 }
 
 impl<C> RawItemPool<C> {
+    fn with_state<R>(self, operation: impl for<'a> FnOnce(&'a mut ItemPoolState<C>) -> R) -> R {
+        // SAFETY: the owner outlives this handle; the higher-ranked borrow cannot escape.
+        unsafe { operation(&mut *self.state.as_ref().get()) }
+    }
+
     fn can_acquire(self, needs_node: bool, credits: usize) -> bool {
-        let state = unsafe { &mut *self.state.as_ptr() };
-        (!needs_node || !state.nodes.is_full()) && state.rows.can_acquire(self.lane, credits)
+        self.with_state(|state| {
+            (!needs_node || !state.nodes.is_full()) && state.rows.can_acquire(self.lane, credits)
+        })
     }
 
     fn acquire_reserved(self, credits: usize) {
-        let state = unsafe { &mut *self.state.as_ptr() };
-        state.rows.acquire_reserved(self.lane, credits);
+        self.with_state(|state| state.rows.acquire_reserved(self.lane, credits));
     }
 
     fn release(self, rows: usize) {
-        unsafe { &mut *self.state.as_ptr() }
-            .rows
-            .release(self.lane, rows);
+        self.with_state(|state| state.rows.release(self.lane, rows));
     }
 
     fn insert_reserved(self, item: (C, usize, usize)) -> u32 {
-        let state = unsafe { &mut *self.state.as_ptr() };
-        state.nodes.insert_reserved(item)
+        self.with_state(|state| state.nodes.insert_reserved(item))
     }
 
     fn set_next(self, index: u32, next: u32) {
-        unsafe { &mut *self.state.as_ptr() }
-            .nodes
-            .set_next(index, next);
+        self.with_state(|state| state.nodes.set_next(index, next));
     }
 
     fn take(self, index: u32) -> (u32, (C, usize, usize)) {
-        unsafe { &mut *self.state.as_ptr() }.nodes.remove(index)
+        self.with_state(|state| state.nodes.remove(index))
     }
 }
 
@@ -738,7 +759,7 @@ pub struct ArenaPool {
 }
 
 pub struct ArenaPoolRef<'d> {
-    state: NonNull<ArenaPoolState>,
+    state: NonNull<UnsafeCell<ArenaPoolState>>,
     lifetime: PhantomData<&'d ArenaPool>,
 }
 
@@ -751,6 +772,11 @@ impl Clone for ArenaPoolRef<'_> {
 impl Copy for ArenaPoolRef<'_> {}
 
 impl ArenaPool {
+    fn with_state<R>(&self, operation: impl for<'a> FnOnce(&'a mut ArenaPoolState) -> R) -> R {
+        // SAFETY: the pool is single-threaded, and `R` cannot borrow the scoped state reference.
+        unsafe { operation(&mut *self.state.get()) }
+    }
+
     pub fn with_capacity(capacity: usize, lanes: usize) -> Self {
         Self {
             state: Box::new(UnsafeCell::new(ArenaPoolState::with_capacity(
@@ -761,25 +787,25 @@ impl ArenaPool {
 
     pub fn handle(&self) -> ArenaPoolRef<'_> {
         ArenaPoolRef {
-            state: NonNull::from(unsafe { &mut *self.state.get() }),
+            state: NonNull::from(self.state.as_ref()),
             lifetime: PhantomData,
         }
     }
 
     pub fn activate(&self, lane: usize) {
-        unsafe { &mut *self.state.get() }.activate(lane);
+        self.with_state(|state| state.activate(lane));
     }
 
     pub fn deactivate(&self, lane: usize) {
-        unsafe { &mut *self.state.get() }.deactivate(lane);
+        self.with_state(|state| state.deactivate(lane));
     }
 
     pub fn pick_active(&self) -> Option<usize> {
-        unsafe { &mut *self.state.get() }.pick_active()
+        self.with_state(|state| state.pick_active())
     }
 
     pub fn len(&self) -> usize {
-        unsafe { &*self.state.get() }.entries.used()
+        self.with_state(|state| state.entries.used())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -797,8 +823,9 @@ impl ArenaPoolRef<'_> {
         }
     }
 
-    fn get(self) -> &'static mut ArenaPoolState {
-        unsafe { &mut *self.state.as_ptr() }
+    fn with_state<R>(self, operation: impl for<'a> FnOnce(&'a mut ArenaPoolState) -> R) -> R {
+        // SAFETY: the handle keeps the pool alive; the higher-ranked borrow cannot escape.
+        unsafe { operation(&mut *self.state.as_ref().get()) }
     }
 }
 
@@ -842,9 +869,7 @@ impl<'d, C> ArenaState<'d, C> {
         limits: Limits,
     ) -> Self {
         let reserve = metadata
-            .get()
-            .entries
-            .reserve(lane)
+            .with_state(|state| state.entries.reserve(lane))
             .expect("reply metadata lane out of range");
         Self {
             entries: Vec::with_capacity(reserve),
@@ -871,22 +896,25 @@ impl<'d, C> ArenaState<'d, C> {
     }
 
     fn can_mark_boundary(&self) -> bool {
-        self.accepting.get() && self.metadata.get().can_reserve(self.lane, 1, false)
+        self.accepting.get()
+            && self
+                .metadata
+                .with_state(|state| state.can_reserve(self.lane, 1, false))
     }
 
     fn can_register(&self, trailing_boundary: bool) -> bool {
         self.accepting.get()
-            && self
-                .metadata
-                .get()
-                .can_reserve(self.lane, 1 + trailing_boundary as usize, true)
+            && self.metadata.with_state(|state| {
+                state.can_reserve(self.lane, 1 + trailing_boundary as usize, true)
+            })
     }
 
     fn append_order(&mut self, index: u32) {
         if self.order_tail == NONE {
             self.order_head = index;
         } else {
-            self.metadata.get().set_next(self.order_tail, index);
+            self.metadata
+                .with_state(|state| state.set_next(self.order_tail, index));
         }
         self.order_tail = index;
         self.order_len += 1;
@@ -902,8 +930,7 @@ impl<'d, C> ArenaState<'d, C> {
         let count = 1 + trailing_boundary as usize;
         let reserved = self
             .metadata
-            .get()
-            .reserve(self.lane, &items[..count], true)?;
+            .with_state(|state| state.reserve(self.lane, &items[..count], true))?;
         if self.free.last() == Some(&idx) {
             self.free.pop();
             let entry = &mut self.entries[idx as usize];
@@ -938,7 +965,8 @@ impl<'d, C> ArenaState<'d, C> {
         }
         entry.held = false;
         self.free.push(idx);
-        self.metadata.get().release_entry(self.lane);
+        self.metadata
+            .with_state(|state| state.release_entry(self.lane));
     }
 
     fn begin_retire(&mut self, idx: u32, epoch: u32) -> bool {
@@ -982,7 +1010,10 @@ impl<'d, C> ArenaState<'d, C> {
         if self.order_head == NONE {
             return FrontKind::Empty;
         }
-        match self.metadata.get().item(self.order_head) {
+        match self
+            .metadata
+            .with_state(|state| state.item(self.order_head))
+        {
             OrderItem::Boundary => FrontKind::Boundary,
             OrderItem::Slot { idx, epoch } => {
                 let e = &self.entries[idx as usize];
@@ -1032,8 +1063,7 @@ impl<'d, C> ArenaState<'d, C> {
         }
         let Some(reserved) = self
             .metadata
-            .get()
-            .reserve(self.lane, &[OrderItem::Boundary], false)
+            .with_state(|state| state.reserve(self.lane, &[OrderItem::Boundary], false))
         else {
             return false;
         };
@@ -1052,7 +1082,9 @@ impl<'d, C> ArenaState<'d, C> {
         if index == NONE {
             return None;
         }
-        let (next, item) = self.metadata.get().take(self.lane, index);
+        let (next, item) = self
+            .metadata
+            .with_state(|state| state.take(self.lane, index));
         self.order_head = next;
         if next == NONE {
             self.order_tail = NONE;
@@ -1080,7 +1112,8 @@ impl<'d, C> ArenaState<'d, C> {
             entry.retiring = false;
             entry.ordered = false;
             entry.held = false;
-            self.metadata.get().release_entry(self.lane);
+            self.metadata
+                .with_state(|state| state.release_entry(self.lane));
         }
         self.live = 0;
         for entry in &mut self.entries {
@@ -1221,6 +1254,11 @@ pub struct ArenaFactory<C> {
 }
 
 impl<'d, C> Arena<'d, C> {
+    fn with_state<R>(&self, operation: impl for<'a> FnOnce(&'a mut ArenaState<'d, C>) -> R) -> R {
+        // SAFETY: safe operations run user code only after this scoped state borrow ends.
+        unsafe { operation(&mut *self.slab.get()) }
+    }
+
     pub fn factory(capacity: usize, limits: Limits) -> ArenaFactory<C> {
         ArenaFactory {
             capacity,
@@ -1361,36 +1399,36 @@ impl<'d, C> Arena<'d, C> {
     }
 
     pub fn len(&self) -> usize {
-        unsafe { &*self.slab.get() }.len()
+        self.with_state(|state| state.len())
     }
 
     pub fn is_empty(&self) -> bool {
-        unsafe { &*self.slab.get() }.is_empty()
+        self.with_state(|state| state.is_empty())
     }
 
     pub fn can_register(&self) -> bool {
-        unsafe { &*self.slab.get() }.can_register(false)
+        self.with_state(|state| state.can_register(false))
     }
 
     pub fn can_mark_boundary(&self) -> bool {
-        unsafe { &*self.slab.get() }.can_mark_boundary()
+        self.with_state(|state| state.can_mark_boundary())
     }
 
     pub fn front_kind(&self) -> FrontKind {
-        unsafe { &mut *self.slab.get() }.front_kind()
+        self.with_state(|state| state.front_kind())
     }
 
     pub fn mark_boundary(&self) -> bool {
-        unsafe { &mut *self.slab.get() }.mark_boundary()
+        self.with_state(|state| state.mark_boundary())
     }
 
     pub fn pop_boundary(&self) {
-        unsafe { &mut *self.slab.get() }.pop_boundary();
+        self.with_state(|state| state.pop_boundary());
     }
 
     pub fn try_push(&self, item: C, item_bytes: usize, item_credits: usize) -> bool {
         let (pushed, waker) =
-            unsafe { &mut *self.slab.get() }.try_push(item, item_bytes, item_credits);
+            self.with_state(|state| state.try_push(item, item_bytes, item_credits));
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -1398,7 +1436,7 @@ impl<'d, C> Arena<'d, C> {
     }
 
     pub fn complete(&self) {
-        let waker = unsafe { &mut *self.slab.get() }.complete();
+        let waker = self.with_state(|state| state.complete());
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -1406,7 +1444,7 @@ impl<'d, C> Arena<'d, C> {
 
     pub fn fail_one(&self, make: impl FnOnce() -> C) {
         let item = make();
-        let (rejected, waker) = unsafe { &mut *self.slab.get() }.fail_one(item);
+        let (rejected, waker) = self.with_state(|state| state.fail_one(item));
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -1420,8 +1458,7 @@ impl<'d, C> Arena<'d, C> {
                 return failed;
             }
             let item = make();
-            let (done, counted, rejected, waker) =
-                unsafe { &mut *self.slab.get() }.fail_front(item);
+            let (done, counted, rejected, waker) = self.with_state(|state| state.fail_front(item));
             if let Some(waker) = waker {
                 waker.wake();
             }
@@ -1434,22 +1471,21 @@ impl<'d, C> Arena<'d, C> {
     }
 
     fn register(&self, trailing_boundary: bool) -> Option<(u32, u32)> {
-        let slab = unsafe { &mut *self.slab.get() };
-        slab.register(trailing_boundary)
+        self.with_state(|state| state.register(trailing_boundary))
     }
 
     fn retire(&self, idx: u32, epoch: u32) {
-        if !unsafe { &mut *self.slab.get() }.begin_retire(idx, epoch) {
+        if !self.with_state(|state| state.begin_retire(idx, epoch)) {
             return;
         }
         loop {
-            let item = unsafe { &mut *self.slab.get() }.pop_retired(idx, epoch);
+            let item = self.with_state(|state| state.pop_retired(idx, epoch));
             let Some(item) = item else {
                 break;
             };
             drop(item);
         }
-        unsafe { &mut *self.slab.get() }.finish_retire(idx, epoch);
+        self.with_state(|state| state.finish_retire(idx, epoch));
     }
 
     unsafe fn with_slot<R>(
@@ -1458,15 +1494,16 @@ impl<'d, C> Arena<'d, C> {
         epoch: u32,
         f: impl FnOnce(&mut Slot<'d, C>) -> R,
     ) -> Option<R> {
-        let slab = unsafe { &mut *self.slab.get() };
-        let entry = slab.entries.get_mut(idx as usize)?;
-        (entry.epoch == epoch && entry.live).then(|| f(&mut entry.slot))
+        self.with_state(|state| {
+            let entry = state.entries.get_mut(idx as usize)?;
+            (entry.epoch == epoch && entry.live).then(|| f(&mut entry.slot))
+        })
     }
 }
 
 impl<C> Drop for Arena<'_, C> {
     fn drop(&mut self) {
-        unsafe { &mut *self.slab.get() }.drain();
+        self.with_state(|state| state.drain());
     }
 }
 

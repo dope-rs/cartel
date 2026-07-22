@@ -222,20 +222,13 @@ pub(super) struct AggCol {
 }
 
 impl AggregateKind {
-    pub(super) fn fn_name(&self) -> Option<&'static str> {
+    pub(super) fn function(&self) -> Option<(&'static str, &AggCol)> {
         match self {
             Self::Count => None,
-            Self::Sum(_) => Some("SUM"),
-            Self::Avg(_) => Some("AVG"),
-            Self::Min(_) => Some("MIN"),
-            Self::Max(_) => Some("MAX"),
-        }
-    }
-
-    pub(super) fn agg_col(&self) -> Option<&AggCol> {
-        match self {
-            Self::Count => None,
-            Self::Sum(c) | Self::Avg(c) | Self::Min(c) | Self::Max(c) => Some(c),
+            Self::Sum(column) => Some(("SUM", column)),
+            Self::Avg(column) => Some(("AVG", column)),
+            Self::Min(column) => Some(("MIN", column)),
+            Self::Max(column) => Some(("MAX", column)),
         }
     }
 }

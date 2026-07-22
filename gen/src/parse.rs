@@ -345,17 +345,15 @@ impl QueryShape {
                     ));
                 }
                 let (idents, body) = mc.args[0].as_closure_any_arity("having")?;
-                if idents.is_empty() {
+                let Some((agg_arg, row_args)) = idents.split_last() else {
                     return Err(syn::Error::new(
                         mc.args[0].span(),
                         "`.having(...)` closure must take at least 2 args (row vars + agg handle)",
                     ));
-                }
-                let agg_arg = idents.last().expect("non-empty").clone();
-                let row_args = idents[..idents.len() - 1].to_vec();
+                };
                 having = Some(HavingClause {
-                    row_args,
-                    agg_arg,
+                    row_args: row_args.to_vec(),
+                    agg_arg: agg_arg.clone(),
                     pred: body,
                 });
                 current = (*mc.receiver).clone();
@@ -397,7 +395,7 @@ impl QueryShape {
                     ),
                 ));
             }
-            if let Some(c) = kind.agg_col()
+            if let Some((_, c)) = kind.function()
                 && c.args.len() != n
             {
                 return Err(syn::Error::new(

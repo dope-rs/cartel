@@ -415,10 +415,9 @@ impl<'a> PlanBuilder<'a> {
             sql_parts.extend(parts.iter().cloned());
             sql_parts.push(self.dialect.kw("COMMA"));
         }
-        match kind.fn_name() {
+        match kind.function() {
             None => sql_parts.push(self.dialect.kw("COUNT_STAR")),
-            Some(fn_name) => {
-                let agg = kind.agg_col().expect("non-Count agg has AggCol");
+            Some((fn_name, agg)) => {
                 let agg_scope = RowScope::for_source(source, &agg.args);
                 let inner = agg_scope
                     .parse_side_expr(

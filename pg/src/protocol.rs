@@ -94,7 +94,6 @@ pub(super) struct Shared {
     transactions: Box<[Cell<Option<TransactionState>>]>,
     transaction_generations: Box<[Cell<u64>]>,
     transaction_waiters: Pin<Box<[WaitQueue]>>,
-    held_transactions: Cell<usize>,
     ready_next: Box<[Cell<u32>]>,
     ready_prev: Box<[Cell<u32>]>,
     ready_linked: Box<[Cell<bool>]>,
@@ -136,7 +135,6 @@ impl Shared {
                     .map(|_| WaitQueue::with_capacity(1))
                     .collect(),
             ),
-            held_transactions: Cell::new(0),
             ready_next: (0..max_connections).map(|_| Cell::new(NONE)).collect(),
             ready_prev: (0..max_connections).map(|_| Cell::new(NONE)).collect(),
             ready_linked: (0..max_connections).map(|_| Cell::new(false)).collect(),
@@ -309,12 +307,6 @@ impl Shared {
         self.unlink_ready(index);
         self.unlink_bucket(index);
         self.transactions[index].set(Some(TransactionState::Held(id)));
-        self.held_transactions.set(
-            self.held_transactions
-                .get()
-                .checked_add(1)
-                .expect("held transaction count overflow"),
-        );
         Some((slot, generation))
     }
 
@@ -362,12 +354,6 @@ impl Shared {
             return false;
         }
         state.set(Some(TransactionState::Finalizing(id)));
-        self.held_transactions.set(
-            self.held_transactions
-                .get()
-                .checked_sub(1)
-                .expect("held transaction count underflow"),
-        );
         true
     }
 
@@ -383,12 +369,6 @@ impl Shared {
             return false;
         }
         state.set(Some(TransactionState::Quarantined(id)));
-        self.held_transactions.set(
-            self.held_transactions
-                .get()
-                .checked_sub(1)
-                .expect("held transaction count underflow"),
-        );
         true
     }
 
@@ -420,14 +400,6 @@ impl Shared {
             .is_some_and(|transaction| transaction.id().conn == slot)
         {
             return;
-        }
-        if matches!(state.get(), Some(TransactionState::Held(_))) {
-            self.held_transactions.set(
-                self.held_transactions
-                    .get()
-                    .checked_sub(1)
-                    .expect("held transaction count underflow"),
-            );
         }
         state.set(None);
         if available && self.ready_tokens[index].get() == Some(slot) {
@@ -462,7 +434,9 @@ impl Shared {
     }
 
     pub(super) fn tx_saturated(&self) -> bool {
-        self.held_transactions.get() != 0
+        self.transactions
+            .iter()
+            .any(|state| matches!(state.get(), Some(TransactionState::Held(_))))
     }
 
     pub(super) fn pick_conn(&self, target: Option<(Token, u64)>) -> Option<Token> {

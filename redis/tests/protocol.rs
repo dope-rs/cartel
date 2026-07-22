@@ -1,5 +1,5 @@
-use cartel_redis::Value;
 use cartel_redis::protocol::{Codec, Head};
+use cartel_redis::{FromValue, GeoCoord, Value};
 use dope::manifold::connector::Codec as _;
 use o3::buffer::Shared;
 
@@ -59,4 +59,24 @@ fn parser_accepts_i64_minimum() {
         frame.into_value().expect("integer"),
         Value::Integer(i64::MIN)
     ));
+}
+
+#[test]
+fn coordinates_use_the_shared_value_decoder() {
+    let coordinates = Vec::<Option<GeoCoord>>::from_value(Value::Array(vec![
+        Value::Array(vec![
+            Value::Bulk(Shared::copy_from_slice(b"127.5")),
+            Value::Bulk(Shared::copy_from_slice(b"37.25")),
+        ]),
+        Value::Nil,
+    ]))
+    .expect("coordinates");
+
+    assert_eq!(coordinates, vec![Some(GeoCoord::new(127.5, 37.25)), None]);
+    assert!(
+        GeoCoord::from_value(Value::Array(vec![Value::Bulk(Shared::copy_from_slice(
+            b"127.5",
+        ))]))
+        .is_err()
+    );
 }

@@ -86,7 +86,7 @@ impl FairCredits {
 
     pub fn release(&mut self, lane: usize, amount: usize) {
         let held = self.held[lane];
-        debug_assert!(held >= amount);
+        assert!(held >= amount, "cannot release credits that are not held");
         self.held[lane] -= amount;
         self.available += amount;
         self.protected += self.reserve[lane]

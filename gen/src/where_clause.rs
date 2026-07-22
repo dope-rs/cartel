@@ -735,13 +735,12 @@ impl RowScope {
             && path.segments.len() == 1
         {
             let id = &path.segments[0].ident;
-            if let Some((fn_params, _)) = &bind_ctx
+            if let Some((fn_params, captures)) = bind_ctx.as_mut()
                 && fn_params.iter().any(|p| p == id)
             {
-                let (fn_params, captures) = bind_ctx.take().expect("just borrowed Some(_) above");
                 let idx = captures.intern(id.clone());
                 let ctx = ParamCtx {
-                    captures: &*captures,
+                    captures,
                     param_ids: fn_params,
                     param_tys,
                 };
@@ -1188,10 +1187,9 @@ impl RowScope {
         }
 
         let mut sql: Vec<proc_macro2::TokenStream> = vec![dialect.kw("SUBQUERY_OPEN")];
-        match agg_kind.fn_name() {
+        match agg_kind.function() {
             None => sql.push(dialect.kw("COUNT_STAR")),
-            Some(fn_name) => {
-                let agg = agg_kind.agg_col().expect("non-Count agg has AggCol");
+            Some((fn_name, agg)) => {
                 let agg_inner_scope = Self::for_source(&inner_source, &agg.args)
                     .with_outer(self.clone().force_qualified())
                     .force_qualified();

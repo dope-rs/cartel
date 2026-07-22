@@ -137,7 +137,7 @@ unsafe impl Extract<RowItem> for ExtractFirst {
 }
 
 pub(super) struct Throttle<'d> {
-    request: Option<Pending<'d>>,
+    request: Pending<'d>,
     conn: Token,
 }
 
@@ -260,6 +260,33 @@ where
     Failed(Error),
 }
 
+enum DispatchRetry<'d> {
+    Pending(Pending<'d>),
+    Enqueued { conn: Token },
+    Throttled { throttle: Throttle<'d> },
+    Failed(Error),
+}
+
+enum TransactionDispatchRetry<'d, I>
+where
+    I: QuerySet + 'd,
+{
+    Pending(Pending<'d>),
+    Enqueued {
+        lease: TransactionLease<'d, I>,
+    },
+    Throttled {
+        lease: TransactionLease<'d, I>,
+        throttle: Throttle<'d>,
+    },
+    Failed(Error),
+}
+
+enum ThrottleRetry<'d> {
+    Pending(Throttle<'d>),
+    Ready(Result<(), Error>),
+}
+
 pub(super) enum DispatchedStream<'d, I, X>
 where
     I: QuerySet + 'd,
@@ -277,9 +304,10 @@ where
         client: Client<'d, I>,
         target: Option<(Token, u64)>,
         reply: ReplyStream<'d, RowItem, X>,
-        request: Option<Pending<'d>>,
+        request: Pending<'d>,
     },
-    Failed(Option<Error>),
+    Failed(Error),
+    Done,
 }
 
 impl<'d, I, X> DispatchedStream<'d, I, X>
@@ -292,53 +320,78 @@ where
         mut cx: Pin<&mut Context<'_, 'd>>,
         waiter: Pin<&Waiter<'d>>,
     ) -> Poll<()> {
-        if let DispatchedStream::Connecting {
-            client,
-            target,
-            reply,
-            request,
-        } = self
-        {
-            match Disp::retry_connecting(*client, *target, cx.as_mut(), waiter, reply, request) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(DispatchOutcome::Enqueued { .. }) => {
-                    let reply = std::mem::replace(reply, ReplyStream::new());
+        loop {
+            match std::mem::replace(self, DispatchedStream::Done) {
+                DispatchedStream::Pending { reply } => {
                     *self = DispatchedStream::Pending { reply };
+                    return Poll::Ready(());
                 }
-                Poll::Ready(DispatchOutcome::Throttled { throttle }) => {
-                    let reply = std::mem::replace(reply, ReplyStream::new());
-                    *self = DispatchedStream::Throttled {
-                        client: *client,
-                        reply,
-                        throttle,
-                    };
+                DispatchedStream::Connecting {
+                    client,
+                    target,
+                    mut reply,
+                    request,
+                } => match Disp::retry_connecting(
+                    client,
+                    target,
+                    cx.as_mut(),
+                    waiter,
+                    &mut reply,
+                    request,
+                ) {
+                    DispatchRetry::Pending(request) => {
+                        *self = DispatchedStream::Connecting {
+                            client,
+                            target,
+                            reply,
+                            request,
+                        };
+                        return Poll::Pending;
+                    }
+                    DispatchRetry::Enqueued { .. } => {
+                        *self = DispatchedStream::Pending { reply };
+                    }
+                    DispatchRetry::Throttled { throttle } => {
+                        *self = DispatchedStream::Throttled {
+                            client,
+                            reply,
+                            throttle,
+                        };
+                    }
+                    DispatchRetry::Failed(error) => {
+                        *self = DispatchedStream::Failed(error);
+                    }
+                },
+                DispatchedStream::Throttled {
+                    client,
+                    mut reply,
+                    throttle,
+                } => match Disp::retry_throttled(client, cx.as_mut(), waiter, &mut reply, throttle)
+                {
+                    ThrottleRetry::Pending(throttle) => {
+                        *self = DispatchedStream::Throttled {
+                            client,
+                            reply,
+                            throttle,
+                        };
+                        return Poll::Pending;
+                    }
+                    ThrottleRetry::Ready(Ok(())) => {
+                        *self = DispatchedStream::Pending { reply };
+                    }
+                    ThrottleRetry::Ready(Err(error)) => {
+                        *self = DispatchedStream::Failed(error);
+                    }
+                },
+                DispatchedStream::Failed(error) => {
+                    *self = DispatchedStream::Failed(error);
+                    return Poll::Ready(());
                 }
-                Poll::Ready(DispatchOutcome::NoConn { .. }) => {
-                    unreachable!("retry_connecting maps NoConn to Pending/Failed")
-                }
-                Poll::Ready(DispatchOutcome::Failed(e)) => {
-                    *self = DispatchedStream::Failed(Some(e));
+                DispatchedStream::Done => {
+                    return Poll::Ready(());
                 }
             }
         }
-        if let DispatchedStream::Throttled {
-            client,
-            reply,
-            throttle,
-        } = self
-        {
-            match Disp::retry_throttled(*client, cx.as_mut(), waiter, reply, throttle) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(())) => {
-                    let reply = std::mem::replace(reply, ReplyStream::new());
-                    *self = DispatchedStream::Pending { reply };
-                }
-                Poll::Ready(Err(e)) => {
-                    *self = DispatchedStream::Failed(Some(e));
-                }
-            }
-        }
-        Poll::Ready(())
     }
 }
 
@@ -646,9 +699,9 @@ impl Disp {
             DispatchOutcome::NoConn { request } => DispatchState::Connecting {
                 client,
                 target,
-                request: Some(request),
+                request,
             },
-            DispatchOutcome::Failed(e) => DispatchState::Failed(Some(e)),
+            DispatchOutcome::Failed(e) => DispatchState::Failed(e),
         };
         Dispatched::new(reply, state)
     }
@@ -710,9 +763,9 @@ impl Disp {
                 client,
                 target,
                 reply,
-                request: Some(request),
+                request,
             },
-            DispatchOutcome::Failed(e) => DispatchedStream::Failed(Some(e)),
+            DispatchOutcome::Failed(e) => DispatchedStream::Failed(e),
         }
     }
 
@@ -778,7 +831,7 @@ impl Disp {
             Ok(()) => DispatchOutcome::Enqueued { conn: conn_id },
             Err((Error::Backpressure { .. }, request)) => DispatchOutcome::Throttled {
                 throttle: Throttle {
-                    request: Some(request),
+                    request,
                     conn: conn_id,
                 },
             },
@@ -812,10 +865,7 @@ impl Disp {
             Ok(()) => TransactionDispatchOutcome::Enqueued { lease },
             Err((Error::Backpressure { .. }, request)) => TransactionDispatchOutcome::Throttled {
                 lease,
-                throttle: Throttle {
-                    request: Some(request),
-                    conn,
-                },
+                throttle: Throttle { request, conn },
             },
             Err((error, _)) => TransactionDispatchOutcome::Failed(error),
         }
@@ -846,32 +896,37 @@ impl Disp {
         cx: Pin<&mut Context<'_, 'd>>,
         waiter: Pin<&Waiter<'d>>,
         reply: &mut impl Registrable<'d, RowItem>,
-        request: &mut Option<Pending<'d>>,
-    ) -> Poll<DispatchOutcome<'d>>
+        request: Pending<'d>,
+    ) -> DispatchRetry<'d>
     where
         I: QuerySet,
     {
-        let outcome = Self::try_dispatch_reply(
-            client,
-            target,
-            reply,
-            request.take().expect("missing pending request"),
-        );
-        if let DispatchOutcome::NoConn { request: pending } = outcome {
-            *request = Some(pending);
-            let shared = &client.port.shared;
-            if shared.is_failed() {
-                waiter.unregister();
-                return Poll::Ready(DispatchOutcome::Failed(Error::Closed));
+        match Self::try_dispatch_reply(client, target, reply, request) {
+            DispatchOutcome::NoConn { request } => {
+                let shared = &client.port.shared;
+                if shared.is_failed() {
+                    waiter.unregister();
+                    return DispatchRetry::Failed(Error::Closed);
+                }
+                if shared.try_register_ready(waiter, cx.as_ref()) {
+                    DispatchRetry::Pending(request)
+                } else {
+                    DispatchRetry::Failed(Error::WaiterCapacity)
+                }
             }
-            return if shared.try_register_ready(waiter, cx.as_ref()) {
-                Poll::Pending
-            } else {
-                Poll::Ready(DispatchOutcome::Failed(Error::WaiterCapacity))
-            };
+            DispatchOutcome::Enqueued { conn } => {
+                waiter.unregister();
+                DispatchRetry::Enqueued { conn }
+            }
+            DispatchOutcome::Throttled { throttle } => {
+                waiter.unregister();
+                DispatchRetry::Throttled { throttle }
+            }
+            DispatchOutcome::Failed(error) => {
+                waiter.unregister();
+                DispatchRetry::Failed(error)
+            }
         }
-        waiter.unregister();
-        Poll::Ready(outcome)
     }
 
     fn retry_transaction_connecting<'d, I>(
@@ -879,31 +934,37 @@ impl Disp {
         cx: Pin<&mut Context<'_, 'd>>,
         waiter: Pin<&Waiter<'d>>,
         reply: &mut impl Registrable<'d, RowItem>,
-        request: &mut Option<Pending<'d>>,
-    ) -> Poll<TransactionDispatchOutcome<'d, I>>
+        request: Pending<'d>,
+    ) -> TransactionDispatchRetry<'d, I>
     where
         I: QuerySet,
     {
-        let outcome = Self::try_dispatch_transaction(
-            client,
-            reply,
-            request.take().expect("missing pending transaction request"),
-        );
-        if let TransactionDispatchOutcome::NoConn { request: pending } = outcome {
-            *request = Some(pending);
-            let shared = &client.port.shared;
-            if shared.is_failed() {
-                waiter.unregister();
-                return Poll::Ready(TransactionDispatchOutcome::Failed(Error::Closed));
+        match Self::try_dispatch_transaction(client, reply, request) {
+            TransactionDispatchOutcome::NoConn { request } => {
+                let shared = &client.port.shared;
+                if shared.is_failed() {
+                    waiter.unregister();
+                    return TransactionDispatchRetry::Failed(Error::Closed);
+                }
+                if shared.try_register_ready(waiter, cx.as_ref()) {
+                    TransactionDispatchRetry::Pending(request)
+                } else {
+                    TransactionDispatchRetry::Failed(Error::WaiterCapacity)
+                }
             }
-            return if shared.try_register_ready(waiter, cx.as_ref()) {
-                Poll::Pending
-            } else {
-                Poll::Ready(TransactionDispatchOutcome::Failed(Error::WaiterCapacity))
-            };
+            TransactionDispatchOutcome::Enqueued { lease } => {
+                waiter.unregister();
+                TransactionDispatchRetry::Enqueued { lease }
+            }
+            TransactionDispatchOutcome::Throttled { lease, throttle } => {
+                waiter.unregister();
+                TransactionDispatchRetry::Throttled { lease, throttle }
+            }
+            TransactionDispatchOutcome::Failed(error) => {
+                waiter.unregister();
+                TransactionDispatchRetry::Failed(error)
+            }
         }
-        waiter.unregister();
-        Poll::Ready(outcome)
     }
 
     fn retry_throttled<'d, I>(
@@ -911,32 +972,33 @@ impl Disp {
         cx: Pin<&mut Context<'_, 'd>>,
         waiter: Pin<&Waiter<'d>>,
         reply: &mut impl Registrable<'d, RowItem>,
-        throttle: &mut Throttle<'d>,
-    ) -> Poll<Result<(), Error>>
+        throttle: Throttle<'d>,
+    ) -> ThrottleRetry<'d>
     where
         I: QuerySet,
     {
         let shared = &client.port.shared;
         if shared.is_failed() {
             waiter.unregister();
-            return Poll::Ready(Err(Error::Closed));
+            return ThrottleRetry::Ready(Err(Error::Closed));
         }
-        let request = throttle.request.take().expect("missing throttled request");
-        match Self::stage_request(client, throttle.conn, reply, request) {
+        let Throttle { request, conn } = throttle;
+        match Self::stage_request(client, conn, reply, request) {
             Ok(()) => {
                 waiter.unregister();
-                return Poll::Ready(Ok(()));
+                ThrottleRetry::Ready(Ok(()))
             }
-            Err((Error::Backpressure { .. }, request)) => throttle.request = Some(request),
+            Err((Error::Backpressure { .. }, request)) => {
+                if shared.try_register_egress(waiter, cx.as_ref()) {
+                    ThrottleRetry::Pending(Throttle { request, conn })
+                } else {
+                    ThrottleRetry::Ready(Err(Error::WaiterCapacity))
+                }
+            }
             Err((error, _)) => {
                 waiter.unregister();
-                return Poll::Ready(Err(error));
+                ThrottleRetry::Ready(Err(error))
             }
-        }
-        if shared.try_register_egress(waiter, cx.as_ref()) {
-            Poll::Pending
-        } else {
-            Poll::Ready(Err(Error::WaiterCapacity))
         }
     }
 
@@ -1035,16 +1097,28 @@ where
     Connecting {
         client: Client<'d, I>,
         target: Option<(Token, u64)>,
-        request: Option<Pending<'d>>,
+        request: Pending<'d>,
     },
-    Failed(Option<Error>),
+    Failed(Error),
+    Done,
 }
 
-enum TransactionDispatchState<'d> {
-    Pending,
-    Throttled(Throttle<'d>),
-    Connecting(Option<Pending<'d>>),
-    Failed(Option<Error>),
+enum TransactionDispatchState<'d, I>
+where
+    I: QuerySet + 'd,
+{
+    Pending {
+        lease: TransactionLease<'d, I>,
+    },
+    Throttled {
+        lease: TransactionLease<'d, I>,
+        throttle: Throttle<'d>,
+    },
+    Connecting {
+        request: Pending<'d>,
+    },
+    Failed(Error),
+    Done,
 }
 
 #[pin_project]
@@ -1054,8 +1128,7 @@ where
 {
     client: Client<'d, I>,
     reply: Reply<'d, RowItem, ExtractUnit>,
-    lease: Option<TransactionLease<'d, I>>,
-    state: TransactionDispatchState<'d>,
+    state: TransactionDispatchState<'d, I>,
     #[pin]
     waiter: Waiter<'d>,
 }
@@ -1066,24 +1139,21 @@ impl<'d, I: QuerySet + 'd> TransactionDispatched<'d, I> {
         reply: Reply<'d, RowItem, ExtractUnit>,
         outcome: TransactionDispatchOutcome<'d, I>,
     ) -> Self {
-        let (lease, state) = match outcome {
+        let state = match outcome {
             TransactionDispatchOutcome::Enqueued { lease } => {
-                (Some(lease), TransactionDispatchState::Pending)
+                TransactionDispatchState::Pending { lease }
             }
             TransactionDispatchOutcome::Throttled { lease, throttle } => {
-                (Some(lease), TransactionDispatchState::Throttled(throttle))
+                TransactionDispatchState::Throttled { lease, throttle }
             }
             TransactionDispatchOutcome::NoConn { request } => {
-                (None, TransactionDispatchState::Connecting(Some(request)))
+                TransactionDispatchState::Connecting { request }
             }
-            TransactionDispatchOutcome::Failed(error) => {
-                (None, TransactionDispatchState::Failed(Some(error)))
-            }
+            TransactionDispatchOutcome::Failed(error) => TransactionDispatchState::Failed(error),
         };
         Self {
             client,
             reply,
-            lease,
             state,
             waiter: Waiter::new(),
         }
@@ -1096,57 +1166,65 @@ impl<'d, I: QuerySet + 'd> Fiber<'d> for TransactionDispatched<'d, I> {
         let me = self.project();
         let client = *me.client;
         let waiter = me.waiter.as_ref();
-        if let TransactionDispatchState::Connecting(request) = &mut *me.state {
-            match Disp::retry_transaction_connecting(client, cx.as_mut(), waiter, me.reply, request)
-            {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(TransactionDispatchOutcome::Enqueued { lease }) => {
-                    *me.lease = Some(lease);
-                    *me.state = TransactionDispatchState::Pending;
+        loop {
+            match std::mem::replace(me.state, TransactionDispatchState::Done) {
+                TransactionDispatchState::Connecting { request } => {
+                    match Disp::retry_transaction_connecting(
+                        client,
+                        cx.as_mut(),
+                        waiter,
+                        me.reply,
+                        request,
+                    ) {
+                        TransactionDispatchRetry::Pending(request) => {
+                            *me.state = TransactionDispatchState::Connecting { request };
+                            return Poll::Pending;
+                        }
+                        TransactionDispatchRetry::Enqueued { lease } => {
+                            *me.state = TransactionDispatchState::Pending { lease };
+                        }
+                        TransactionDispatchRetry::Throttled { lease, throttle } => {
+                            *me.state = TransactionDispatchState::Throttled { lease, throttle };
+                        }
+                        TransactionDispatchRetry::Failed(error) => {
+                            return Poll::Ready(Err(error));
+                        }
+                    }
                 }
-                Poll::Ready(TransactionDispatchOutcome::Throttled { lease, throttle }) => {
-                    *me.lease = Some(lease);
-                    *me.state = TransactionDispatchState::Throttled(throttle);
+                TransactionDispatchState::Throttled { lease, throttle } => {
+                    match Disp::retry_throttled(client, cx.as_mut(), waiter, me.reply, throttle) {
+                        ThrottleRetry::Pending(throttle) => {
+                            *me.state = TransactionDispatchState::Throttled { lease, throttle };
+                            return Poll::Pending;
+                        }
+                        ThrottleRetry::Ready(Ok(())) => {
+                            *me.state = TransactionDispatchState::Pending { lease };
+                        }
+                        ThrottleRetry::Ready(Err(error)) => {
+                            drop(lease);
+                            return Poll::Ready(Err(error));
+                        }
+                    }
                 }
-                Poll::Ready(TransactionDispatchOutcome::NoConn { .. }) => {
-                    unreachable!("transaction retry maps NoConn to Pending/Failed")
+                TransactionDispatchState::Pending { lease } => {
+                    match Fiber::poll(Pin::new(me.reply), cx.as_mut()) {
+                        Poll::Pending => {
+                            *me.state = TransactionDispatchState::Pending { lease };
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(())) => return Poll::Ready(Ok(lease)),
+                        Poll::Ready(Err(error)) => {
+                            drop(lease);
+                            return Poll::Ready(Err(error));
+                        }
+                    }
                 }
-                Poll::Ready(TransactionDispatchOutcome::Failed(error)) => {
-                    *me.state = TransactionDispatchState::Failed(None);
+                TransactionDispatchState::Failed(error) => {
                     return Poll::Ready(Err(error));
                 }
-            }
-        }
-        if let TransactionDispatchState::Throttled(throttle) = &mut *me.state {
-            match Disp::retry_throttled(client, cx.as_mut(), waiter, me.reply, throttle) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(())) => *me.state = TransactionDispatchState::Pending,
-                Poll::Ready(Err(error)) => {
-                    drop(me.lease.take());
-                    *me.state = TransactionDispatchState::Failed(None);
-                    return Poll::Ready(Err(error));
+                TransactionDispatchState::Done => {
+                    return Poll::Ready(Err(Error::Closed));
                 }
-            }
-        }
-        match &mut *me.state {
-            TransactionDispatchState::Pending => match Fiber::poll(Pin::new(me.reply), cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Ok(())) => {
-                    Poll::Ready(Ok(me.lease.take().expect("transaction lease missing")))
-                }
-                Poll::Ready(Err(error)) => {
-                    drop(me.lease.take());
-                    Poll::Ready(Err(error))
-                }
-            },
-            TransactionDispatchState::Failed(error) => Poll::Ready(Err(error
-                .take()
-                .expect("transaction dispatch polled after failure"))),
-            TransactionDispatchState::Throttled(_) => {
-                unreachable!("transaction throttle resolved above")
-            }
-            TransactionDispatchState::Connecting(_) => {
-                unreachable!("transaction connection resolved above")
             }
         }
     }
@@ -1181,7 +1259,9 @@ where
         match &self.state {
             DispatchState::Pending { conn } => Some(*conn),
             DispatchState::Throttled { throttle, .. } => Some(throttle.conn),
-            DispatchState::Connecting { .. } | DispatchState::Failed(_) => None,
+            DispatchState::Connecting { .. } | DispatchState::Failed(_) | DispatchState::Done => {
+                None
+            }
         }
     }
 
@@ -1199,51 +1279,59 @@ where
     fn poll(self: Pin<&mut Self>, mut cx: Pin<&mut Context<'_, 'd>>) -> Poll<Self::Output> {
         let me = self.project();
         let waiter = me.waiter.as_ref();
-        if let DispatchState::Connecting {
-            client,
-            target,
-            request,
-        } = &mut *me.state
-        {
-            match Disp::retry_connecting(*client, *target, cx.as_mut(), waiter, me.reply, request) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(DispatchOutcome::Enqueued { conn: target }) => {
-                    *me.state = DispatchState::Pending { conn: target };
+        loop {
+            match std::mem::replace(me.state, DispatchState::Done) {
+                DispatchState::Connecting {
+                    client,
+                    target,
+                    request,
+                } => match Disp::retry_connecting(
+                    client,
+                    target,
+                    cx.as_mut(),
+                    waiter,
+                    me.reply,
+                    request,
+                ) {
+                    DispatchRetry::Pending(request) => {
+                        *me.state = DispatchState::Connecting {
+                            client,
+                            target,
+                            request,
+                        };
+                        return Poll::Pending;
+                    }
+                    DispatchRetry::Enqueued { conn } => {
+                        *me.state = DispatchState::Pending { conn };
+                    }
+                    DispatchRetry::Throttled { throttle } => {
+                        *me.state = DispatchState::Throttled { client, throttle };
+                    }
+                    DispatchRetry::Failed(error) => return Poll::Ready(Err(error)),
+                },
+                DispatchState::Throttled { client, throttle } => {
+                    let conn = throttle.conn;
+                    match Disp::retry_throttled(client, cx.as_mut(), waiter, me.reply, throttle) {
+                        ThrottleRetry::Pending(throttle) => {
+                            *me.state = DispatchState::Throttled { client, throttle };
+                            return Poll::Pending;
+                        }
+                        ThrottleRetry::Ready(Ok(())) => {
+                            *me.state = DispatchState::Pending { conn };
+                        }
+                        ThrottleRetry::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    }
                 }
-                Poll::Ready(DispatchOutcome::Throttled { throttle }) => {
-                    *me.state = DispatchState::Throttled {
-                        client: *client,
-                        throttle,
-                    };
+                DispatchState::Pending { conn } => {
+                    let outcome = Fiber::poll(Pin::new(me.reply), cx.as_mut());
+                    if outcome.is_pending() {
+                        *me.state = DispatchState::Pending { conn };
+                    }
+                    return outcome;
                 }
-                Poll::Ready(DispatchOutcome::NoConn { .. }) => {
-                    unreachable!("retry_connecting maps NoConn to Pending/Failed")
-                }
-                Poll::Ready(DispatchOutcome::Failed(e)) => {
-                    return Poll::Ready(Err(e));
-                }
+                DispatchState::Failed(error) => return Poll::Ready(Err(error)),
+                DispatchState::Done => return Poll::Ready(Err(Error::Closed)),
             }
-        }
-        if let DispatchState::Throttled {
-            client, throttle, ..
-        } = &mut *me.state
-        {
-            match Disp::retry_throttled(*client, cx.as_mut(), waiter, me.reply, throttle) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(())) => {
-                    let target = throttle.conn;
-                    *me.state = DispatchState::Pending { conn: target };
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            }
-        }
-        match &mut *me.state {
-            DispatchState::Connecting { .. } => unreachable!("Connecting resolved above"),
-            DispatchState::Throttled { .. } => unreachable!("Throttled resolved above"),
-            DispatchState::Failed(e) => Poll::Ready(Err(e
-                .take()
-                .expect("dispatch future polled after failure delivered"))),
-            DispatchState::Pending { .. } => Fiber::poll(Pin::new(me.reply), cx),
         }
     }
 }
@@ -1317,20 +1405,23 @@ where
         if stream.state.poll_settle(cx.as_mut(), waiter).is_pending() {
             return Poll::Pending;
         }
-        match &mut stream.state {
-            DispatchedStream::Throttled { .. } => unreachable!("poll_settle drains Throttled"),
-            DispatchedStream::Connecting { .. } => unreachable!("poll_settle drains Connecting"),
-            DispatchedStream::Failed(error) => Poll::Ready(Err(error
-                .take()
-                .expect("stream fiber polled after failure delivered"))),
-            DispatchedStream::Pending { reply } => match Pin::new(reply).poll_next(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(None) => Poll::Ready(Ok(None)),
-                Poll::Ready(Some(Ok(payload))) => {
-                    Poll::Ready(decode_row(stream.decoder, &payload).map(Some))
+        match std::mem::replace(&mut stream.state, DispatchedStream::Done) {
+            DispatchedStream::Failed(error) => Poll::Ready(Err(error)),
+            DispatchedStream::Pending { mut reply } => {
+                let outcome = Pin::new(&mut reply).poll_next(cx);
+                stream.state = DispatchedStream::Pending { reply };
+                match outcome {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(None) => Poll::Ready(Ok(None)),
+                    Poll::Ready(Some(Ok(payload))) => {
+                        Poll::Ready(decode_row(stream.decoder, &payload).map(Some))
+                    }
+                    Poll::Ready(Some(Err(error))) => Poll::Ready(Err(error)),
                 }
-                Poll::Ready(Some(Err(error))) => Poll::Ready(Err(error)),
-            },
+            }
+            DispatchedStream::Throttled { .. }
+            | DispatchedStream::Connecting { .. }
+            | DispatchedStream::Done => Poll::Ready(Err(Error::Closed)),
         }
     }
 }
@@ -1354,7 +1445,7 @@ impl<'d, I: QuerySet + 'd> CopyInGuard<'d, I> {
             Ok(()) => DispatchState::Pending {
                 conn: self.target.0,
             },
-            Err(e) => DispatchState::Failed(Some(e)),
+            Err(e) => DispatchState::Failed(e),
         };
         Dispatched::new(self.reply, state)
     }
@@ -1398,18 +1489,21 @@ where
         if state.poll_settle(cx.as_mut(), waiter).is_pending() {
             return Poll::Pending;
         }
-        match state {
-            DispatchedStream::Throttled { .. } => unreachable!("poll_settle drains Throttled"),
-            DispatchedStream::Connecting { .. } => unreachable!("poll_settle drains Connecting"),
-            DispatchedStream::Failed(error) => Poll::Ready(Err(error
-                .take()
-                .expect("copy out fiber polled after failure delivered"))),
-            DispatchedStream::Pending { reply } => match Pin::new(reply).poll_next(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(None) => Poll::Ready(Ok(None)),
-                Poll::Ready(Some(Ok(payload))) => Poll::Ready(Ok(Some(payload.to_vec()))),
-                Poll::Ready(Some(Err(error))) => Poll::Ready(Err(error)),
-            },
+        match std::mem::replace(state, DispatchedStream::Done) {
+            DispatchedStream::Failed(error) => Poll::Ready(Err(error)),
+            DispatchedStream::Pending { mut reply } => {
+                let outcome = Pin::new(&mut reply).poll_next(cx);
+                *state = DispatchedStream::Pending { reply };
+                match outcome {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(None) => Poll::Ready(Ok(None)),
+                    Poll::Ready(Some(Ok(payload))) => Poll::Ready(Ok(Some(payload.to_vec()))),
+                    Poll::Ready(Some(Err(error))) => Poll::Ready(Err(error)),
+                }
+            }
+            DispatchedStream::Throttled { .. }
+            | DispatchedStream::Connecting { .. }
+            | DispatchedStream::Done => Poll::Ready(Err(Error::Closed)),
         }
     }
 }

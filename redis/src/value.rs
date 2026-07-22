@@ -1,6 +1,7 @@
 use o3::buffer::Shared;
 
 use crate::Error;
+use crate::client::GeoCoord;
 
 pub enum Value {
     Nil,
@@ -187,6 +188,32 @@ impl FromValue for Option<f64> {
             Value::Nil => Ok(None),
             other => Ok(Some(f64::from_value(other)?)),
         }
+    }
+}
+
+impl FromValue for GeoCoord {
+    fn from_value(v: Value) -> Result<Self, Error> {
+        let values = v.into_array()?;
+        let length = values.len();
+        let [longitude, latitude] = values.try_into().map_err(|_| {
+            Error::Redis(format!("expected 2-element coordinate array, got {length}"))
+        })?;
+        Ok(Self::new(
+            f64::from_value(longitude)?,
+            f64::from_value(latitude)?,
+        ))
+    }
+}
+
+impl FromValue for Vec<Option<GeoCoord>> {
+    fn from_value(v: Value) -> Result<Self, Error> {
+        v.into_array()?
+            .into_iter()
+            .map(|value| match value.into_result()? {
+                Value::Nil => Ok(None),
+                coordinate => GeoCoord::from_value(coordinate).map(Some),
+            })
+            .collect()
     }
 }
 

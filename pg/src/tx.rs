@@ -240,9 +240,7 @@ impl<'d, I: QuerySet + 'd> TxGuard<'d, I> {
         TransactionFinalizer {
             client,
             target,
-            lease: Some(self.lease),
-            dispatched: None,
-            outcome: None,
+            state: TransactionFinalizerState::Holding(self.lease),
             sql,
             waiter: Waiter::new(),
         }
@@ -279,6 +277,19 @@ impl<'d, I: QuerySet + 'd> TxGuard<'d, I> {
     }
 }
 
+enum TransactionFinalizerState<'d, I>
+where
+    I: QuerySet + 'd,
+{
+    Holding(TransactionLease<'d, I>),
+    Dispatching {
+        lease: Option<TransactionLease<'d, I>>,
+        dispatched: Pin<Box<Dispatched<'d, I, ExtractUnit>>>,
+    },
+    Settling(Result<(), Error>),
+    Done,
+}
+
 #[pin_project]
 struct TransactionFinalizer<'d, I>
 where
@@ -286,9 +297,7 @@ where
 {
     client: Client<'d, I>,
     target: (Token, u64),
-    lease: Option<TransactionLease<'d, I>>,
-    dispatched: Option<Pin<Box<Dispatched<'d, I, ExtractUnit>>>>,
-    outcome: Option<Result<(), Error>>,
+    state: TransactionFinalizerState<'d, I>,
     sql: &'static str,
     #[pin]
     waiter: Waiter<'d>,
@@ -296,13 +305,10 @@ where
 
 impl<'d, I: QuerySet + 'd> TransactionFinalizer<'d, I> {
     fn transfer(
-        dispatched: &Option<Pin<Box<Dispatched<'d, I, ExtractUnit>>>>,
+        dispatched: &Pin<Box<Dispatched<'d, I, ExtractUnit>>>,
         lease: &mut Option<TransactionLease<'d, I>>,
     ) -> Result<(), Error> {
-        if !dispatched
-            .as_ref()
-            .is_some_and(|future| future.as_ref().get_ref().is_enqueued())
-        {
+        if !dispatched.as_ref().get_ref().is_enqueued() {
             return Ok(());
         }
         let Some(mut lease) = lease.take() else {
@@ -312,6 +318,22 @@ impl<'d, I: QuerySet + 'd> TransactionFinalizer<'d, I> {
             Ok(())
         } else {
             Err(Error::Closed)
+        }
+    }
+
+    fn finish(state: &mut TransactionFinalizerState<'d, I>, settled: bool) -> Result<(), Error> {
+        let TransactionFinalizerState::Settling(outcome) =
+            std::mem::replace(state, TransactionFinalizerState::Done)
+        else {
+            return Err(Error::Closed);
+        };
+        if settled {
+            outcome
+        } else {
+            match outcome {
+                Err(error) => Err(error),
+                Ok(()) => Err(Error::Closed),
+            }
         }
     }
 }
@@ -324,87 +346,82 @@ impl<'d, I: QuerySet + 'd> Fiber<'d> for TransactionFinalizer<'d, I> {
         let target = *this.target;
         let sql = *this.sql;
         let waiter = this.waiter.as_ref();
-        if this.outcome.is_none() && this.dispatched.is_none() {
-            let lease = this.lease.as_ref().expect("transaction lease missing");
-            let lease_client = lease.client();
-            let lease_target = lease.target();
-            if !lease_client.port.shared.is_transaction_held(lease_target) {
-                drop(this.lease.take());
-                waiter.unregister();
-                return Poll::Ready(Err(Error::Closed));
-            }
-            if lease_client.port.response_len(lease_target.0) != 0 {
-                if !lease_client.port.shared.try_register_transaction(
-                    lease_target,
-                    waiter,
-                    cx.as_ref(),
-                ) {
-                    drop(this.lease.take());
+        loop {
+            match this.state {
+                TransactionFinalizerState::Holding(lease) => {
+                    let lease_client = lease.client();
+                    let lease_target = lease.target();
+                    if !lease_client.port.shared.is_transaction_held(lease_target) {
+                        *this.state = TransactionFinalizerState::Done;
+                        waiter.unregister();
+                        return Poll::Ready(Err(Error::Closed));
+                    }
+                    if lease_client.port.response_len(lease_target.0) != 0 {
+                        if !lease_client.port.shared.try_register_transaction(
+                            lease_target,
+                            waiter,
+                            cx.as_ref(),
+                        ) {
+                            *this.state = TransactionFinalizerState::Done;
+                            waiter.unregister();
+                            return Poll::Ready(Err(Error::Closed));
+                        }
+                        if lease_client.port.response_len(lease_target.0) != 0 {
+                            return Poll::Pending;
+                        }
+                        waiter.unregister();
+                    }
+                    let TransactionFinalizerState::Holding(lease) =
+                        std::mem::replace(this.state, TransactionFinalizerState::Done)
+                    else {
+                        return Poll::Ready(Err(Error::Closed));
+                    };
+                    let mut lease = Some(lease);
+                    let dispatched = Box::pin(Disp::dispatch_raw::<ExtractUnit, I>(
+                        lease_client,
+                        Some(lease_target),
+                        Request::raw(sql),
+                    ));
+                    if let Err(error) = Self::transfer(&dispatched, &mut lease) {
+                        drop(lease);
+                        waiter.unregister();
+                        return Poll::Ready(Err(error));
+                    }
+                    *this.state = TransactionFinalizerState::Dispatching { lease, dispatched };
+                }
+                TransactionFinalizerState::Dispatching { lease, dispatched } => {
+                    let outcome = Fiber::poll(dispatched.as_mut(), cx.as_mut());
+                    if let Err(error) = Self::transfer(dispatched, lease) {
+                        *this.state = TransactionFinalizerState::Done;
+                        waiter.unregister();
+                        return Poll::Ready(Err(error));
+                    }
+                    let Poll::Ready(outcome) = outcome else {
+                        return Poll::Pending;
+                    };
+                    drop(lease.take());
+                    *this.state = TransactionFinalizerState::Settling(outcome);
+                }
+                TransactionFinalizerState::Settling(_) => loop {
+                    if let Some(settled) = client.port.shared.transaction_settled(target) {
+                        waiter.unregister();
+                        return Poll::Ready(Self::finish(this.state, settled));
+                    }
+                    if !client
+                        .port
+                        .shared
+                        .try_register_transaction(target, waiter, cx.as_ref())
+                    {
+                        continue;
+                    }
+                    if client.port.shared.transaction_settled(target).is_none() {
+                        return Poll::Pending;
+                    }
+                },
+                TransactionFinalizerState::Done => {
                     waiter.unregister();
                     return Poll::Ready(Err(Error::Closed));
                 }
-                if lease_client.port.response_len(lease_target.0) != 0 {
-                    return Poll::Pending;
-                }
-                waiter.unregister();
-            }
-            *this.dispatched = Some(Box::pin(Disp::dispatch_raw::<ExtractUnit, I>(
-                lease_client,
-                Some(lease_target),
-                Request::raw(sql),
-            )));
-            if let Err(error) = Self::transfer(this.dispatched, this.lease) {
-                drop(this.lease.take());
-                waiter.unregister();
-                return Poll::Ready(Err(error));
-            }
-        }
-        if this.outcome.is_none() {
-            let outcome = Fiber::poll(
-                this.dispatched
-                    .as_mut()
-                    .expect("transaction finalizer missing")
-                    .as_mut(),
-                cx.as_mut(),
-            );
-            if let Err(error) = Self::transfer(this.dispatched, this.lease) {
-                drop(this.lease.take());
-                waiter.unregister();
-                return Poll::Ready(Err(error));
-            }
-            let Poll::Ready(outcome) = outcome else {
-                return Poll::Pending;
-            };
-            if this.lease.is_some() {
-                drop(this.lease.take());
-            }
-            *this.outcome = Some(outcome);
-            *this.dispatched = None;
-        }
-        loop {
-            match client.port.shared.transaction_settled(target) {
-                Some(true) => {
-                    waiter.unregister();
-                    return Poll::Ready(this.outcome.take().expect("transaction outcome missing"));
-                }
-                Some(false) => {
-                    waiter.unregister();
-                    return Poll::Ready(match this.outcome.take() {
-                        Some(Err(error)) => Err(error),
-                        Some(Ok(())) | None => Err(Error::Closed),
-                    });
-                }
-                None => {}
-            }
-            if !client
-                .port
-                .shared
-                .try_register_transaction(target, waiter, cx.as_ref())
-            {
-                continue;
-            }
-            if client.port.shared.transaction_settled(target).is_none() {
-                return Poll::Pending;
             }
         }
     }

@@ -20,7 +20,20 @@ use crate::protocol::{Outcome, Session};
 use crate::value::FromValue;
 use crate::{Error, encode};
 
-pub type GeoCoord = (f64, f64);
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GeoCoord {
+    pub longitude: f64,
+    pub latitude: f64,
+}
+
+impl GeoCoord {
+    pub fn new(longitude: f64, latitude: f64) -> Self {
+        Self {
+            longitude,
+            latitude,
+        }
+    }
+}
 
 pub const DEFAULT_BACKOFF: Duration = Duration::from_millis(500);
 
@@ -1128,21 +1141,8 @@ impl<'d> Ops<'d> for Redis<'d> {
         member2: &[u8],
         unit: Option<&[u8]>,
     ) -> impl Fiber<'d, Output = Result<Option<f64>, Error>> {
-        let fut = Redis::submit::<Option<Shared>>(
-            self,
-            Redis::frame(self, |out| {
-                encode::cmd_geodist(out, key, member1, member2, unit)
-            }),
-        );
-        dope_fiber::fiber!('d => async move {
-            match fut.await? {
-                None => Ok(None),
-                Some(b) => std::str::from_utf8(b.as_slice())
-                    .ok()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .map(Some)
-                    .ok_or_else(|| Error::Redis("GEODIST: invalid float".into())),
-            }
+        Redis::dispatch::<Option<f64>>(self, move |out| {
+            encode::cmd_geodist(out, key, member1, member2, unit)
         })
     }
 
@@ -1150,34 +1150,9 @@ impl<'d> Ops<'d> for Redis<'d> {
         self,
         key: &[u8],
         members: &[&[u8]],
-    ) -> impl Fiber<'d, Output = Result<Vec<Option<(f64, f64)>>, Error>> {
-        let fut = Redis::submit::<crate::value::Value>(
-            self,
-            Redis::frame(self, |out| encode::cmd_geopos(out, key, members)),
-        );
-        dope_fiber::fiber!('d => async move {
-            let arr = fut.await?.into_array()?;
-            let mut out = Vec::with_capacity(arr.len());
-            for entry in arr {
-                match entry {
-                    crate::value::Value::Nil => out.push(None),
-                    crate::value::Value::Array(items) if items.len() == 2 => {
-                        let mut it = items.into_iter();
-                        let parse_f = |v: crate::value::Value| -> Result<f64, Error> {
-                            let b = v.into_bulk()?;
-                            std::str::from_utf8(b.as_slice())
-                                .ok()
-                                .and_then(|s| s.parse::<f64>().ok())
-                                .ok_or_else(|| Error::Redis("GEOPOS: invalid float".into()))
-                        };
-                        let lng = parse_f(it.next().unwrap())?;
-                        let lat = parse_f(it.next().unwrap())?;
-                        out.push(Some((lng, lat)));
-                    }
-                    _ => return Err(Error::Redis("GEOPOS: unexpected entry shape".into())),
-                }
-            }
-            Ok(out)
+    ) -> impl Fiber<'d, Output = Result<Vec<Option<GeoCoord>>, Error>> {
+        Redis::dispatch::<Vec<Option<GeoCoord>>>(self, move |out| {
+            encode::cmd_geopos(out, key, members)
         })
     }
 

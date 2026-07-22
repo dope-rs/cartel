@@ -10,8 +10,8 @@ pub mod protocol;
 mod value;
 
 pub use client::{
-    Capacities, Config, ConfigError, Connect, DEFAULT_BACKOFF, Factory, MAX_FRAME_CAPACITY, Ops,
-    Redis, Store,
+    Capacities, Config, ConfigError, Connect, DEFAULT_BACKOFF, Factory, GeoCoord,
+    MAX_FRAME_CAPACITY, Ops, Redis, Store,
 };
 pub use protocol::Error as ProtocolError;
 pub use value::{FromValue, Value};

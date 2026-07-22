@@ -336,8 +336,8 @@ impl PgBackend {
         let mut col_names: Vec<String> = Vec::new();
         let mut result_format_codes: Vec<u16> = Vec::new();
         let mut any_text_col = false;
-        for f in fields {
-            let fname = f.ident.as_ref().expect("named field");
+        for f in &fields {
+            let fname = f.name;
             let read_call = f.ty.row_read()?;
             field_inits.push(quote! { #fname: #read_call, });
             col_names.push(fname.to_string());
@@ -376,8 +376,8 @@ impl PgBackend {
         let slices_ident = format_ident!("{name}__Slices");
         let mut slice_field_decls = Vec::new();
         let mut all_slices_supported = true;
-        for f in fields {
-            let fname = f.ident.as_ref().expect("named field");
+        for f in &fields {
+            let fname = f.name;
             match f.ty.slice_field_type() {
                 Ok(ty) => slice_field_decls.push(quote! { pub #fname: #ty }),
                 Err(_) => {

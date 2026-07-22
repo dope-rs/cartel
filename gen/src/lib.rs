@@ -62,8 +62,12 @@ pub fn dispatcher(attr: TokenStream, item: TokenStream) -> TokenStream {
     let constructor_fields = fields
         .iter()
         .map(|field| {
-            (
-                field.ident.clone().expect("named field"),
+            let name = field
+                .ident
+                .clone()
+                .ok_or_else(|| syn::Error::new_spanned(field, "expected a named field"))?;
+            Ok((
+                name,
                 field.ty.clone(),
                 field
                     .attrs
@@ -71,9 +75,13 @@ pub fn dispatcher(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .filter(|attr| attr.path().is_ident("cfg"))
                     .cloned()
                     .collect::<Vec<_>>(),
-            )
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<syn::Result<Vec<_>>>();
+    let constructor_fields = match constructor_fields {
+        Ok(fields) => fields,
+        Err(error) => return error.to_compile_error().into(),
+    };
     let has_manifold_fields = fields.iter().any(|field| {
         field
             .attrs

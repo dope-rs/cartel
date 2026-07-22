@@ -155,10 +155,15 @@ impl Compiled {
     }
 }
 
+pub(super) struct TableField<'a> {
+    pub(super) name: &'a Ident,
+    pub(super) ty: &'a Type,
+}
+
 pub(super) struct TableSpec<'a> {
     pub(super) input: &'a syn::DeriveInput,
     pub(super) table_name: String,
-    pub(super) fields: &'a syn::punctuated::Punctuated<syn::Field, syn::Token![,]>,
+    pub(super) fields: Vec<TableField<'a>>,
     pub(super) pk_cols: Vec<String>,
 }
 

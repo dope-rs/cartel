@@ -17,7 +17,7 @@ pub struct QueuePool<T> {
 }
 
 pub struct QueuePoolRef<'d, T> {
-    state: NonNull<QueuePoolState<T>>,
+    state: NonNull<UnsafeCell<QueuePoolState<T>>>,
     lane: usize,
     lifetime: PhantomData<&'d QueuePool<T>>,
 }
@@ -31,6 +31,11 @@ impl<T> Clone for QueuePoolRef<'_, T> {
 impl<T> Copy for QueuePoolRef<'_, T> {}
 
 impl<T> QueuePool<T> {
+    fn with_state<R>(&self, operation: impl for<'a> FnOnce(&'a mut QueuePoolState<T>) -> R) -> R {
+        // SAFETY: the pool is single-threaded, and `R` cannot borrow the scoped state reference.
+        unsafe { operation(&mut *self.state.get()) }
+    }
+
     pub fn with_capacity(capacity: usize, lanes: usize) -> Self {
         Self {
             state: Box::new(UnsafeCell::new(QueuePoolState {
@@ -41,9 +46,9 @@ impl<T> QueuePool<T> {
     }
 
     pub fn handle(&self, lane: usize) -> QueuePoolRef<'_, T> {
-        assert!(lane < unsafe { &*self.state.get() }.credits.lanes());
+        assert!(lane < self.with_state(|state| state.credits.lanes()));
         QueuePoolRef {
-            state: NonNull::from(unsafe { &mut *self.state.get() }),
+            state: NonNull::from(self.state.as_ref()),
             lane,
             lifetime: PhantomData,
         }
@@ -59,6 +64,11 @@ impl<T> QueuePoolRef<'_, T> {
             lane: self.lane,
             lifetime: PhantomData,
         }
+    }
+
+    fn with_state<R>(self, operation: impl for<'a> FnOnce(&'a mut QueuePoolState<T>) -> R) -> R {
+        // SAFETY: the handle keeps the pool alive; the higher-ranked borrow cannot escape.
+        unsafe { operation(&mut *self.state.as_ref().get()) }
     }
 }
 
@@ -94,13 +104,13 @@ impl<'d, T> BoundedQueue<'d, T> {
     }
 
     pub fn has_capacity(&self) -> bool {
-        let state = unsafe { self.pool.state.as_ref() };
-        !state.nodes.is_full() && state.credits.can_acquire(self.pool.lane, 1)
+        self.pool.with_state(|state| {
+            !state.nodes.is_full() && state.credits.can_acquire(self.pool.lane, 1)
+        })
     }
 
     pub fn try_push(&self, item: T, weight: usize) -> Result<(), T> {
-        let state = unsafe { &mut *self.pool.state.as_ptr() };
-        if state.nodes.is_full() || !state.credits.can_acquire(self.pool.lane, 1) {
+        if !self.has_capacity() {
             return Err(item);
         }
         self.push_reserved(item, weight);
@@ -108,19 +118,20 @@ impl<'d, T> BoundedQueue<'d, T> {
     }
 
     pub fn push_reserved(&self, item: T, weight: usize) {
-        let state = unsafe { &mut *self.pool.state.as_ptr() };
-        assert!(
-            !state.nodes.is_full() && state.credits.can_acquire(self.pool.lane, 1),
-            "queue reservation must be checked before insertion"
-        );
-        state.credits.acquire_reserved(self.pool.lane, 1);
-        let index = state.nodes.insert_reserved((item, weight));
-        let tail = self.tail.replace(index);
-        if tail == NONE {
-            self.head.set(index);
-        } else {
-            state.nodes.set_next(tail, index);
-        }
+        self.pool.with_state(|state| {
+            assert!(
+                !state.nodes.is_full() && state.credits.can_acquire(self.pool.lane, 1),
+                "queue reservation must be checked before insertion"
+            );
+            state.credits.acquire_reserved(self.pool.lane, 1);
+            let index = state.nodes.insert_reserved((item, weight));
+            let tail = self.tail.replace(index);
+            if tail == NONE {
+                self.head.set(index);
+            } else {
+                state.nodes.set_next(tail, index);
+            }
+        });
         self.len.set(self.len.get() + 1);
         self.weight.set(self.weight.get().saturating_add(weight));
     }
@@ -158,8 +169,7 @@ impl<'d, T> BoundedQueue<'d, T> {
         if index == NONE {
             return None;
         }
-        let state = unsafe { &mut *self.pool.state.as_ptr() };
-        let (next, (item, weight)) = state.nodes.take(index);
+        let (next, (item, weight)) = self.pool.with_state(|state| state.nodes.take(index));
         self.head.set(next);
         if next == NONE {
             self.tail.set(NONE);
@@ -170,9 +180,8 @@ impl<'d, T> BoundedQueue<'d, T> {
 
     fn restore_front(&self, index: u32, _next: u32, item: T, weight: usize) {
         let head = self.head.replace(index);
-        unsafe { &mut *self.pool.state.as_ptr() }
-            .nodes
-            .restore(index, head, (item, weight));
+        self.pool
+            .with_state(|state| state.nodes.restore(index, head, (item, weight)));
         if head == NONE {
             self.tail.set(index);
         }
@@ -180,9 +189,10 @@ impl<'d, T> BoundedQueue<'d, T> {
     }
 
     fn release(&self, index: u32) {
-        let state = unsafe { &mut *self.pool.state.as_ptr() };
-        state.nodes.release(index);
-        state.credits.release(self.pool.lane, 1);
+        self.pool.with_state(|state| {
+            state.nodes.release(index);
+            state.credits.release(self.pool.lane, 1);
+        });
     }
 }
 
