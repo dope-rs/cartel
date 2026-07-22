@@ -1269,7 +1269,7 @@ impl Redis<'_> {
         redis: Redis<'d>,
         encode: impl FnOnce(&mut crate::port::Frame<'_>),
     ) -> Result<crate::port::Frame<'d>, Error> {
-        redis.port.encode(encode).map(crate::port::Frame::cast)
+        redis.port.encode(encode)
     }
 
     fn dispatch<'d, R>(

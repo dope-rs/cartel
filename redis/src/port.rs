@@ -22,13 +22,6 @@ pub(super) struct Frame<'d> {
 }
 
 impl Frame<'_> {
-    pub(super) fn cast<'a>(self) -> Frame<'a> {
-        Frame {
-            buffer: unsafe { std::mem::transmute::<Lease<'_>, Lease<'a>>(self.buffer) },
-            overflowed: self.overflowed,
-        }
-    }
-
     fn overflowed(&self) -> bool {
         self.overflowed
     }
@@ -54,7 +47,7 @@ struct Conn<'d> {
     driver: DriverRef<'d>,
     token: Cell<Option<Token>>,
     ready: Cell<Option<ReadyKey<'d>>>,
-    requests: BoundedQueue<'d, Frame<'static>>,
+    requests: BoundedQueue<'d, Frame<'d>>,
     responses: Arena<'d, Outcome>,
 }
 
@@ -77,8 +70,8 @@ pub(super) struct Port<'d> {
     fatal: RefCell<FatalSlot<Error>>,
     max_frame_capacity: usize,
     response_value_capacity: usize,
+    _request_queue: QueuePool<Frame<'d>>,
     requests: Pin<Box<Pool>>,
-    _request_queue: QueuePool<Frame<'static>>,
     inflight_capacity: usize,
     response_metadata: ArenaPool,
     _response_budget: LaneBudget,
@@ -202,7 +195,7 @@ impl<'d> Port<'d> {
         Some(&self.conn(token)?.responses)
     }
 
-    pub(super) fn frame(&self) -> Result<Frame<'_>, Error> {
+    pub(super) fn frame(&'d self) -> Result<Frame<'d>, Error> {
         let buffer = self
             .requests
             .as_ref()
@@ -214,7 +207,10 @@ impl<'d> Port<'d> {
         })
     }
 
-    pub(super) fn encode(&self, encode: impl FnOnce(&mut Frame<'_>)) -> Result<Frame<'_>, Error> {
+    pub(super) fn encode(
+        &'d self,
+        encode: impl FnOnce(&mut Frame<'_>),
+    ) -> Result<Frame<'d>, Error> {
         let mut frame = self.frame()?;
         encode(&mut frame);
         if frame.overflowed() {
@@ -248,7 +244,7 @@ impl<'d> Port<'d> {
                 frame,
             ));
         }
-        conn.requests.push_reserved(frame.cast(), 0);
+        conn.requests.push_reserved(frame, 0);
         conn.wake();
         Ok(())
     }
@@ -256,13 +252,12 @@ impl<'d> Port<'d> {
     pub(super) fn drain_requests(
         &'d self,
         token: Token,
-        mut push: impl FnMut(Frame<'d>) -> Result<(), Frame<'d>>,
+        push: impl FnMut(Frame<'d>) -> Result<(), Frame<'d>>,
     ) -> connector::Requests {
         let Some(conn) = self.conn(token) else {
             return connector::Requests::default();
         };
-        conn.requests
-            .drain(|frame| push(frame.cast()).map_err(Frame::cast));
+        conn.requests.drain(push);
         connector::Requests::default()
     }
 

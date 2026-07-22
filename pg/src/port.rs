@@ -172,13 +172,6 @@ pub struct Frame<'d> {
 }
 
 impl Frame<'_> {
-    fn cast<'a>(self) -> Frame<'a> {
-        Frame {
-            buffer: unsafe { std::mem::transmute::<Lease<'_>, Lease<'a>>(self.buffer) },
-            overflowed: self.overflowed,
-        }
-    }
-
     pub(super) fn overflowed(&self) -> bool {
         self.overflowed
     }
@@ -219,7 +212,7 @@ struct Conn<'d> {
     driver: DriverRef<'d>,
     token: Cell<Option<Token>>,
     ready: Cell<Option<ReadyKey<'d>>>,
-    requests: BoundedQueue<'d, Frame<'static>>,
+    requests: BoundedQueue<'d, Frame<'d>>,
     close: Cell<bool>,
     responses: Arena<'d, RowItem>,
     unsynced: Cell<u32>,
@@ -229,7 +222,7 @@ struct Conn<'d> {
 impl<'d> Conn<'d> {
     fn new(
         lane: usize,
-        requests: QueuePoolRef<'d, Frame<'static>>,
+        requests: QueuePoolRef<'d, Frame<'d>>,
         limits: Limits,
         budget: LaneBudgetRef<'d>,
         responses: ItemPoolRef<'d, RowItem>,
@@ -262,8 +255,8 @@ impl<'d> Conn<'d> {
 pub struct Port<'d, I: QuerySet> {
     pub(super) shared: PoolState,
     conns: Box<[Conn<'d>]>,
+    _request_queue: QueuePool<Frame<'d>>,
     requests: Pin<Box<Pool>>,
-    _request_queue: QueuePool<Frame<'static>>,
     _response_metadata: ArenaPool,
     _response_budget: LaneBudget,
     _response_rows: ItemPool<RowItem>,
@@ -376,7 +369,7 @@ impl<'d, I: QuerySet> Port<'d, I> {
         conn.requests.clear();
     }
 
-    pub(super) fn frame(&self) -> Result<Frame<'_>, Error> {
+    pub(super) fn frame(&'d self) -> Result<Frame<'d>, Error> {
         self.requests
             .as_ref()
             .try_acquire()
@@ -387,7 +380,7 @@ impl<'d, I: QuerySet> Port<'d, I> {
             .ok_or(Error::RequestCapacity)
     }
 
-    pub(super) fn encode(&self, f: impl FnOnce(&mut Frame<'_>)) -> Result<Frame<'_>, Error> {
+    pub(super) fn encode(&'d self, f: impl FnOnce(&mut Frame<'_>)) -> Result<Frame<'d>, Error> {
         let mut frame = self.frame()?;
         f(&mut frame);
         if frame.overflowed() {
@@ -396,18 +389,12 @@ impl<'d, I: QuerySet> Port<'d, I> {
         Ok(frame)
     }
 
-    fn enqueue_request<'a>(&self, conn: &Conn<'d>, frame: Frame<'a>) -> Result<(), Frame<'a>> {
+    fn enqueue_request(&self, conn: &Conn<'d>, frame: Frame<'d>) -> Result<(), Frame<'d>> {
         let len = frame.as_ref().len();
-        conn.requests
-            .try_push(frame.cast(), len)
-            .map_err(Frame::cast)
+        conn.requests.try_push(frame, len)
     }
 
-    fn try_enqueue_conn<'a>(
-        &self,
-        token: Token,
-        bytes: Frame<'a>,
-    ) -> Result<(), (Error, Frame<'a>)> {
+    fn try_enqueue_conn(&self, token: Token, bytes: Frame<'d>) -> Result<(), (Error, Frame<'d>)> {
         let Some(conn) = self.conn(token) else {
             return Err((Error::Closed, bytes));
         };
@@ -455,24 +442,23 @@ impl<'d, I: QuerySet> Port<'d, I> {
         Ok(())
     }
 
-    pub(super) fn try_enqueue<'a>(
+    pub(super) fn try_enqueue(
         &self,
         token: Token,
-        bytes: Frame<'a>,
-    ) -> Result<(), (Error, Frame<'a>)> {
+        bytes: Frame<'d>,
+    ) -> Result<(), (Error, Frame<'d>)> {
         self.try_enqueue_conn(token, bytes)
     }
 
     pub(super) fn drain_requests(
         &'d self,
         token: Token,
-        mut push: impl FnMut(Frame<'d>) -> Result<(), Frame<'d>>,
+        push: impl FnMut(Frame<'d>) -> Result<(), Frame<'d>>,
     ) -> dope::manifold::connector::Requests {
         let Some(conn) = self.conn(token) else {
             return dope::manifold::connector::Requests::default();
         };
-        conn.requests
-            .drain(|send| push(send.cast()).map_err(Frame::cast));
+        conn.requests.drain(push);
         dope::manifold::connector::Requests {
             shutdown: None,
             close: conn
