@@ -220,39 +220,8 @@ fn write_float_bulk(out: &mut impl Sink, v: f64) {
         write_bulk(out, if v > 0.0 { b"inf" } else { b"-inf" });
         return;
     }
-    let mut formatted = StackFloat::new();
-    write!(&mut formatted, "{v}").expect("f64 formatting exceeds stack buffer");
-    write_bulk(out, formatted.as_bytes());
-}
-
-struct StackFloat {
-    bytes: [u8; 32],
-    len: usize,
-}
-
-impl StackFloat {
-    fn new() -> Self {
-        Self {
-            bytes: [0; 32],
-            len: 0,
-        }
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-}
-
-impl fmt::Write for StackFloat {
-    fn write_str(&mut self, value: &str) -> fmt::Result {
-        let end = self.len.checked_add(value.len()).ok_or(fmt::Error)?;
-        if end > self.bytes.len() {
-            return Err(fmt::Error);
-        }
-        self.bytes[self.len..end].copy_from_slice(value.as_bytes());
-        self.len = end;
-        Ok(())
-    }
+    let mut formatted = ryu::Buffer::new();
+    write_bulk(out, formatted.format_finite(v).as_bytes());
 }
 
 pub(super) fn cmd_hget(out: &mut impl Sink, key: &[u8], field: &[u8]) {
@@ -655,5 +624,3 @@ pub(super) fn cmd_geopos(out: &mut impl Sink, key: &[u8], members: &[&[u8]]) {
         write_bulk(out, m);
     }
 }
-
-use std::fmt::{self, Write};

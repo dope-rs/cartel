@@ -319,7 +319,7 @@ impl<'d> Redis<'d> {
 
 struct ExtractValue;
 
-unsafe impl Extract<Outcome> for ExtractValue {
+impl Extract<Outcome> for ExtractValue {
     type Output = Result<crate::value::Value, Error>;
 
     fn extract(slot: &mut Slot<'_, Outcome>) -> Option<Self::Output> {
@@ -1290,7 +1290,7 @@ impl Redis<'_> {
         R: FromValue,
     {
         dope_fiber::fiber!('d => async move {
-            let reply = Self::enqueue(redis, frame?)?;
+            let reply = Self::enqueue(redis, frame?).await?;
             let value = reply.await;
             value.and_then(R::from_value)
         })
@@ -1299,12 +1299,20 @@ impl Redis<'_> {
     fn enqueue<'d>(
         redis: Redis<'d>,
         frame: crate::port::Frame<'d>,
-    ) -> Result<Reply<'d, Outcome, ExtractValue>, Error> {
-        let mut reply = Reply::new();
-        redis
-            .port
-            .try_enqueue_reply(frame, &mut reply)
-            .map_err(|(error, _)| error)?;
-        Ok(reply)
+    ) -> impl Fiber<'d, Output = Result<Reply<'d, Outcome, ExtractValue>, Error>> {
+        let mut pending = Some((frame, Reply::new()));
+        dope_fiber::poll_fn(move |mut cx| {
+            let Some((frame, mut reply)) = pending.take() else {
+                return std::task::Poll::Ready(Err(Error::Closed));
+            };
+            let region = cx.as_mut().region_token();
+            std::task::Poll::Ready(
+                redis
+                    .port
+                    .try_enqueue_reply(frame, &mut reply, region)
+                    .map(|()| reply)
+                    .map_err(|(error, _)| error),
+            )
+        })
     }
 }

@@ -1069,10 +1069,7 @@ fn with_rt<I: cartel_pg::QuerySet + 'static>(
         .with_storage_factory(Port::<I>::factory(cfg.search_path(&schema), port_config));
     exec.enter(|mut session| {
         let backoff = session.seed().derive(dope::hash::domain::BACKOFF).state();
-        let port = session.storage() as *const Port<'_, I>;
-        // The port is executor-owned and every handle/resource below is
-        // destroyed before this session closure returns.
-        let port = unsafe { &*port };
+        let port = session.storage();
         let client = port.client();
         let upstreams = Static::<Tcp>::new(
             ::std::vec![addr; max_connections.max(1)],
@@ -2264,7 +2261,7 @@ fn copy_in_stream_chunks() {
             header.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
             header.extend_from_slice(&0i32.to_be_bytes());
             header.extend_from_slice(&0i32.to_be_bytes());
-            guard.write(&header).unwrap();
+            guard.write(&header).await.unwrap();
             for (id, label) in [(50i64, "p"), (51, "q")] {
                 let mut row = Vec::new();
                 row.extend_from_slice(&2i16.to_be_bytes());
@@ -2272,11 +2269,11 @@ fn copy_in_stream_chunks() {
                 row.extend_from_slice(&id.to_be_bytes());
                 row.extend_from_slice(&(label.len() as i32).to_be_bytes());
                 row.extend_from_slice(label.as_bytes());
-                guard.write(&row).unwrap();
+                guard.write(&row).await.unwrap();
             }
             let mut trailer = Vec::new();
             trailer.extend_from_slice(&(-1i16).to_be_bytes());
-            guard.write(&trailer).unwrap();
+            guard.write(&trailer).await.unwrap();
             guard.finish().await.unwrap();
         });
     });

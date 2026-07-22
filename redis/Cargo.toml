@@ -13,6 +13,7 @@ dope.workspace = true
 dope-fiber.workspace = true
 dope-net.workspace = true
 cartel-core.workspace = true
+ryu.workspace = true
 
 [lib]
 

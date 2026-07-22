@@ -1,6 +1,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use hmac::{Hmac, KeyInit, Mac};
+use pbkdf2::pbkdf2_hmac_array;
 use rand::TryRng;
 use sha2::{Digest, Sha256};
 
@@ -93,10 +94,10 @@ impl Scram {
             .decode(salt_b64.as_bytes())
             .map_err(|_| Error::Auth("server-first: bad base64 salt".into()))?;
 
-        let salted = pbkdf2_sha256_32(&self.password, &salt, iterations);
-        let client_key = hmac_sha256(&salted, b"Client Key");
+        let salted = pbkdf2_hmac_array::<Sha256, 32>(&self.password, &salt, iterations);
+        let client_key = hmac_sha256(&salted, b"Client Key")?;
         let stored_key = sha256(&client_key);
-        let server_key = hmac_sha256(&salted, b"Server Key");
+        let server_key = hmac_sha256(&salted, b"Server Key")?;
 
         let client_final_no_proof = format!("c={GS2_HEADER_B64},r={nonce_b64}");
         self.auth_message = format!(
@@ -104,13 +105,13 @@ impl Scram {
             self.client_first_bare, server_first_str, client_final_no_proof
         );
 
-        let client_signature = hmac_sha256(&stored_key, self.auth_message.as_bytes());
+        let client_signature = hmac_sha256(&stored_key, self.auth_message.as_bytes())?;
         let mut client_proof = client_key;
         for (a, b) in client_proof.iter_mut().zip(client_signature.iter()) {
             *a ^= *b;
         }
         let client_proof_b64 = STANDARD.encode(client_proof);
-        let server_signature_v = hmac_sha256(&server_key, self.auth_message.as_bytes());
+        let server_signature_v = hmac_sha256(&server_key, self.auth_message.as_bytes())?;
         self.server_signature = server_signature_v;
 
         Ok(format!("{client_final_no_proof},p={client_proof_b64}"))
@@ -139,31 +140,9 @@ fn sha256(input: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut m = <Hs as KeyInit>::new_from_slice(key).expect("hmac key length always valid");
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<[u8; 32], Error> {
+    let mut m = <Hs as KeyInit>::new_from_slice(key)
+        .map_err(|_| Error::Protocol("HMAC-SHA-256 rejected key length"))?;
     m.update(data);
-    m.finalize().into_bytes().into()
-}
-
-fn pbkdf2_sha256_32(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
-    let mut u = {
-        let mut m =
-            <Hs as KeyInit>::new_from_slice(password).expect("hmac key length always valid");
-        m.update(salt);
-        m.update(&1u32.to_be_bytes());
-        m.finalize().into_bytes()
-    };
-    let mut t = u;
-    for _ in 1..iterations {
-        u = {
-            let mut m =
-                <Hs as KeyInit>::new_from_slice(password).expect("hmac key length always valid");
-            m.update(&u);
-            m.finalize().into_bytes()
-        };
-        for (a, b) in t.iter_mut().zip(u.iter()) {
-            *a ^= *b;
-        }
-    }
-    t.into()
+    Ok(m.finalize().into_bytes().into())
 }

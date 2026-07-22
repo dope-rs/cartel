@@ -1,15 +1,14 @@
 use std::cell::{Cell, RefCell};
 use std::pin::Pin;
 
-use cartel_core::{
-    Arena, ArenaPool, BoundedQueue, FatalSlot, ItemPool, LaneBudget, Limits, QueuePool, Registrable,
-};
+use cartel_core::{Arena, ArenaConfig, ArenaLane, FatalSlot, Limits, QueueArena, Registrable};
 use dope::DriverRef;
 use dope::driver::ready::ReadyKey;
 use dope::driver::token::Token;
 use dope::manifold::connector;
 use dope_fiber::WaitQueue;
 use o3::buffer::{Lease, Pool};
+use o3::cell::RegionToken;
 
 use crate::Error;
 use crate::client::Config;
@@ -47,8 +46,6 @@ struct Conn<'d> {
     driver: DriverRef<'d>,
     token: Cell<Option<Token>>,
     ready: Cell<Option<ReadyKey<'d>>>,
-    requests: BoundedQueue<'d, Frame<'d>>,
-    responses: Arena<'d, Outcome>,
 }
 
 impl<'d> Conn<'d> {
@@ -70,45 +67,34 @@ pub(super) struct Port<'d> {
     fatal: RefCell<FatalSlot<Error>>,
     max_frame_capacity: usize,
     response_value_capacity: usize,
-    _request_queue: QueuePool<Frame<'d>>,
     requests: Pin<Box<Pool>>,
+    request_queue: QueueArena<'d, Frame<'d>>,
     inflight_capacity: usize,
-    response_metadata: ArenaPool,
-    _response_budget: LaneBudget,
-    _response_items: ItemPool<Outcome>,
+    responses: Arena<'d, Outcome>,
 }
 
 impl<'d> Port<'d> {
     pub(super) fn new(config: Config, driver: DriverRef<'d>) -> Self {
         let connection_count = config.connection_capacity();
-        let response_metadata =
-            ArenaPool::with_capacity(config.inflight_capacity(), connection_count);
-        let response_budget =
-            LaneBudget::with_capacity(config.response_byte_capacity(), connection_count);
-        let response_items = ItemPool::with_credit_capacity(
-            config.inflight_capacity(),
-            config.response_value_capacity(),
-            connection_count,
-        );
-        let request_queue = QueuePool::with_capacity(config.request_capacity(), connection_count);
+        let request_queue = QueueArena::with_capacity(config.request_capacity(), connection_count);
         let limits = Limits::new(
             1,
             config.max_frame_capacity(),
             config.response_value_capacity(),
         );
-        let metadata = unsafe { response_metadata.handle().assume_lifetime() };
+        let responses = Arena::new(ArenaConfig::new(
+            connection_count,
+            config.inflight_capacity(),
+            config.inflight_capacity(),
+            config.response_byte_capacity(),
+            config.response_value_capacity(),
+            limits,
+        ));
         let conns = (0..connection_count)
-            .map(|lane| {
-                let requests = unsafe { request_queue.handle(lane).assume_lifetime() };
-                let budget = unsafe { response_budget.handle(lane).assume_lifetime() };
-                let items = unsafe { response_items.handle_for(lane).assume_lifetime() };
-                Conn {
-                    driver,
-                    token: Cell::new(None),
-                    ready: Cell::new(None),
-                    requests: BoundedQueue::new(requests),
-                    responses: Arena::with_fair_shared_pools(metadata, lane, limits, budget, items),
-                }
+            .map(|_| Conn {
+                driver,
+                token: Cell::new(None),
+                ready: Cell::new(None),
             })
             .collect();
         Self {
@@ -119,11 +105,9 @@ impl<'d> Port<'d> {
             max_frame_capacity: config.max_frame_capacity(),
             response_value_capacity: config.response_value_capacity(),
             requests: Box::pin(Pool::new(config.request_pool())),
-            _request_queue: request_queue,
+            request_queue,
             inflight_capacity: config.inflight_capacity(),
-            response_metadata,
-            _response_budget: response_budget,
-            _response_items: response_items,
+            responses,
         }
     }
 
@@ -167,32 +151,40 @@ impl<'d> Port<'d> {
         self.active_waiters.as_ref().wake();
     }
 
-    pub(super) fn activate(&self, token: Token, ready: ReadyKey<'d>) -> bool {
+    pub(super) fn activate(
+        &self,
+        token: Token,
+        ready: ReadyKey<'d>,
+        region: &mut RegionToken<'d>,
+    ) -> bool {
         let Some(conn) = self.conns.get(token.slot().raw() as usize) else {
             return false;
         };
         if conn.token.replace(Some(token)).is_none() {
             self.active.set(self.active.get() + 1);
-            self.response_metadata.activate(token.slot().raw() as usize);
+            self.responses.activate(region, token.slot().raw() as usize);
         }
         conn.ready.set(Some(ready));
         true
     }
 
-    pub(super) fn deactivate(&self, token: Token) {
+    pub(super) fn deactivate(&'d self, token: Token, region: &mut RegionToken<'d>) {
         let Some(conn) = self.conn(token) else {
             return;
         };
         conn.token.set(None);
         conn.ready.set(None);
         self.active.set(self.active.get() - 1);
-        self.response_metadata
-            .deactivate(token.slot().raw() as usize);
-        conn.requests.clear();
+        self.responses
+            .deactivate(region, token.slot().raw() as usize);
+        self.request_queue
+            .lane(token.slot().raw() as usize)
+            .clear(region);
     }
 
-    pub(super) fn responses(&self, token: Token) -> Option<&Arena<'d, Outcome>> {
-        Some(&self.conn(token)?.responses)
+    pub(super) fn responses(&'d self, token: Token) -> Option<ArenaLane<'d, Outcome>> {
+        self.conn(token)?;
+        Some(self.responses.lane(token.slot().raw() as usize))
     }
 
     pub(super) fn frame(&'d self) -> Result<Frame<'d>, Error> {
@@ -223,11 +215,12 @@ impl<'d> Port<'d> {
         &'d self,
         frame: Frame<'d>,
         reply: &mut impl Registrable<'d, Outcome>,
+        region: &mut RegionToken<'d>,
     ) -> Result<(), (Error, Frame<'d>)> {
-        let Some(conn) = self.pick_conn() else {
+        let Some((token, conn)) = self.pick_conn(region) else {
             let error = if self.active() {
                 Error::Backpressure {
-                    inflight: self.inflight(),
+                    inflight: self.inflight(region),
                     capacity: self.response_capacity(),
                 }
             } else {
@@ -235,16 +228,19 @@ impl<'d> Port<'d> {
             };
             return Err((error, frame));
         };
-        if !reply.try_attach(&conn.responses) {
+        let lane = token.slot().raw() as usize;
+        if !reply.try_attach(region, self.responses.lane(lane)) {
             return Err((
                 Error::Backpressure {
-                    inflight: self.inflight(),
+                    inflight: self.inflight(region),
                     capacity: self.response_capacity(),
                 },
                 frame,
             ));
         }
-        conn.requests.push_reserved(frame, 0);
+        self.request_queue
+            .lane(lane)
+            .push_reserved(region, frame, 0);
         conn.wake();
         Ok(())
     }
@@ -253,11 +249,14 @@ impl<'d> Port<'d> {
         &'d self,
         token: Token,
         push: impl FnMut(Frame<'d>) -> Result<(), Frame<'d>>,
+        region: &mut RegionToken<'d>,
     ) -> connector::Requests {
-        let Some(conn) = self.conn(token) else {
+        if self.conn(token).is_none() {
             return connector::Requests::default();
-        };
-        conn.requests.drain(push);
+        }
+        self.request_queue
+            .lane(token.slot().raw() as usize)
+            .drain(region, push);
         connector::Requests::default()
     }
 
@@ -266,17 +265,17 @@ impl<'d> Port<'d> {
         conn.matches(token).then_some(conn)
     }
 
-    fn pick_conn(&self) -> Option<&Conn<'d>> {
-        let lane = self.response_metadata.pick_active()?;
+    fn pick_conn(&'d self, region: &mut RegionToken<'d>) -> Option<(Token, &'d Conn<'d>)> {
+        let lane = self.responses.pick_active(region)?;
         let conn = &self.conns[lane];
-        debug_assert!(conn.token.get().is_some());
-        debug_assert!(conn.responses.can_register());
-        debug_assert!(conn.requests.has_capacity());
-        Some(conn)
+        let token = conn.token.get()?;
+        debug_assert!(self.responses.can_register(region, lane));
+        debug_assert!(self.request_queue.lane(lane).has_capacity(region));
+        Some((token, conn))
     }
 
-    fn inflight(&self) -> usize {
-        self.response_metadata.len()
+    fn inflight(&self, region: &mut RegionToken<'d>) -> usize {
+        self.responses.inflight(region)
     }
 
     fn response_capacity(&self) -> usize {

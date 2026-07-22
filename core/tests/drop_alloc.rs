@@ -1,13 +1,18 @@
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use cartel_core::{Arena, Extract, Limits, Registrable, Reply, Slot};
+use dope::runtime::profile::Throughput;
+use dope::runtime::{Executor, StorageFactory};
+use dope::{DriverContext, driver};
 
 struct CountingAllocator;
 
 static TRACKING: AtomicBool = AtomicBool::new(false);
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static DROPS: AtomicUsize = AtomicUsize::new(0);
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -49,7 +54,7 @@ impl Drop for Counted {
 
 struct Never;
 
-unsafe impl Extract<Counted> for Never {
+impl Extract<Counted> for Never {
     type Output = ();
 
     fn extract(_slot: &mut Slot<'_, Counted>) -> Option<Self::Output> {
@@ -57,21 +62,63 @@ unsafe impl Extract<Counted> for Never {
     }
 }
 
+struct Factory;
+
+impl StorageFactory for Factory {
+    type Output<'d> = Arena<'d, Counted>;
+
+    fn build<'d>(self, _driver: &mut DriverContext<'_, 'd>) -> Self::Output<'d> {
+        Arena::with_limits(4, Limits::new(4, 1, 4))
+    }
+}
+
+#[test]
+fn reply_registration_does_not_allocate_after_arena_construction() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    let cfg = driver::Config::for_tcp_profile::<Throughput>(1);
+    Executor::new(cfg)
+        .expect("executor")
+        .with_storage_factory(Factory)
+        .enter(|mut session| {
+            let arena = session.storage();
+            let lane = arena.lane(0);
+            let mut first = Reply::<_, Never>::new();
+            let mut second = Reply::<_, Never>::new();
+            let mut third = Reply::<_, Never>::new();
+            let mut fourth = Reply::<_, Never>::new();
+            TRACKING.store(true, Ordering::Relaxed);
+            assert!(first.try_attach(session.driver_access().region_token(), lane));
+            assert!(second.try_attach(session.driver_access().region_token(), lane));
+            assert!(third.try_attach(session.driver_access().region_token(), lane));
+            assert!(fourth.try_attach(session.driver_access().region_token(), lane));
+            drop((first, second, third, fourth));
+            TRACKING.store(false, Ordering::Relaxed);
+        });
+
+    assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+}
+
 #[test]
 fn arena_drop_does_not_allocate() {
-    let arena = Arena::with_limits(1, Limits::new(4, 1, 4));
-    let arena_ref = unsafe { &*(&arena as *const Arena<'_, Counted>) };
-    let mut reply = Reply::<_, Never>::new();
-    assert!(reply.try_attach(arena_ref));
-    for _ in 0..4 {
-        assert!(arena.try_push(Counted, 0, 1));
-    }
-    std::mem::forget(reply);
-
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     ALLOCATIONS.store(0, Ordering::Relaxed);
     DROPS.store(0, Ordering::Relaxed);
-    TRACKING.store(true, Ordering::Relaxed);
-    drop(arena);
+    let cfg = driver::Config::for_tcp_profile::<Throughput>(1);
+    Executor::new(cfg)
+        .expect("executor")
+        .with_storage_factory(Factory)
+        .enter(|mut session| {
+            let arena = session.storage();
+            let lane = arena.lane(0);
+            let mut reply = Reply::<_, Never>::new();
+            assert!(reply.try_attach(session.driver_access().region_token(), lane));
+            for _ in 0..4 {
+                assert!(lane.try_push(session.driver_access().region_token(), Counted, 0, 1));
+            }
+            std::mem::forget(reply);
+            TRACKING.store(true, Ordering::Relaxed);
+        });
     TRACKING.store(false, Ordering::Relaxed);
 
     assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);

@@ -6,6 +6,7 @@ use cartel_core::{Extract, Registrable, Reply, ReplyStream, Slot};
 use dope::driver::token::Token;
 use dope_fiber::{Context, Fiber, Waiter};
 use o3::buffer::Shared;
+use o3::cell::RegionToken;
 use pin_project::pin_project;
 
 use crate::port::{Boundary, Frame, Port};
@@ -56,7 +57,7 @@ fn no_conn_outcome<'d>(shared: &protocol::Shared, request: Pending<'d>) -> Dispa
 
 pub(super) struct ExtractAll<Q>(PhantomData<fn() -> Q>);
 
-unsafe impl<Q: TypedQuery> Extract<RowItem> for ExtractAll<Q> {
+impl<Q: TypedQuery> Extract<RowItem> for ExtractAll<Q> {
     type Output = Result<Vec<Q::Row>, Error>;
 
     fn extract(slot: &mut Slot<'_, RowItem>) -> Option<Self::Output> {
@@ -82,7 +83,7 @@ unsafe impl<Q: TypedQuery> Extract<RowItem> for ExtractAll<Q> {
 
 pub struct ExtractUnit;
 
-unsafe impl Extract<RowItem> for ExtractUnit {
+impl Extract<RowItem> for ExtractUnit {
     type Output = Result<(), Error>;
 
     fn extract(slot: &mut Slot<'_, RowItem>) -> Option<Self::Output> {
@@ -103,7 +104,7 @@ unsafe impl Extract<RowItem> for ExtractUnit {
 
 pub(super) struct ExtractOne;
 
-unsafe impl Extract<RowItem> for ExtractOne {
+impl Extract<RowItem> for ExtractOne {
     type Output = Result<Shared, Error>;
     const SYNC_AFTER: bool = true;
 
@@ -118,7 +119,7 @@ unsafe impl Extract<RowItem> for ExtractOne {
 
 pub(super) struct ExtractFirst;
 
-unsafe impl Extract<RowItem> for ExtractFirst {
+impl Extract<RowItem> for ExtractFirst {
     type Output = Result<Option<Shared>, Error>;
 
     fn extract(slot: &mut Slot<'_, RowItem>) -> Option<Self::Output> {
@@ -513,22 +514,14 @@ where
     fn copy_in_stream(&self, sql: &str) -> Result<CopyInGuard<'d, I>, Error> {
         let client = self.client();
         let target = self.target();
-        let req = Request::raw_extra(sql, Extra::CopyInOpen);
-        let mut reply = Reply::<RowItem, ExtractUnit>::new();
-        let outcome = match Disp::raw(client, req) {
-            Ok(request) => Disp::try_dispatch_reply(client, target, &mut reply, request),
-            Err(error) => DispatchOutcome::Failed(error),
-        };
-        match outcome {
-            DispatchOutcome::Enqueued { conn } => Ok(CopyInGuard {
+        Ok(CopyInGuard {
+            client,
+            dispatched: Box::pin(Disp::dispatch_raw::<ExtractUnit, I>(
                 client,
-                target: target.unwrap_or((conn, 0)),
-                reply,
-            }),
-            DispatchOutcome::Throttled { .. } => Err(client.port.shared.backpressure(0)),
-            DispatchOutcome::NoConn { .. } => Err(Error::NoReadyConn),
-            DispatchOutcome::Failed(e) => Err(e),
-        }
+                target,
+                Request::raw_extra(sql, Extra::CopyInOpen),
+            )),
+        })
     }
 
     fn copy_out(&self, sql: &str) -> CopyOutStream<'d, I> {
@@ -641,9 +634,9 @@ impl Disp {
         I: QuerySet + HasGroup<Q::Group>,
         Q::Group: crate::query::QueryGroup,
     {
-        let mut reply = Reply::<RowItem, X>::new();
+        let reply = Reply::<RowItem, X>::new();
         let outcome = match Self::typed::<Q, I>(client, params, X::SYNC_AFTER) {
-            Ok(request) => Self::try_dispatch_reply(client, target, &mut reply, request),
+            Ok(request) => DispatchOutcome::NoConn { request },
             Err(error) => DispatchOutcome::Failed(error),
         };
         Self::reply_state(client, target, reply, outcome)
@@ -658,9 +651,9 @@ impl Disp {
         X: Extract<RowItem>,
         I: QuerySet,
     {
-        let mut reply = Reply::<RowItem, X>::new();
+        let reply = Reply::<RowItem, X>::new();
         let outcome = match Self::raw(client, req) {
-            Ok(request) => Self::try_dispatch_reply(client, target, &mut reply, request),
+            Ok(request) => DispatchOutcome::NoConn { request },
             Err(error) => DispatchOutcome::Failed(error),
         };
         Self::reply_state(client, target, reply, outcome)
@@ -673,9 +666,9 @@ impl Disp {
     where
         I: QuerySet,
     {
-        let mut reply = Reply::<RowItem, ExtractUnit>::new();
+        let reply = Reply::<RowItem, ExtractUnit>::new();
         let outcome = match Self::raw(client, req) {
-            Ok(request) => Self::try_dispatch_transaction(client, &mut reply, request),
+            Ok(request) => TransactionDispatchOutcome::NoConn { request },
             Err(error) => TransactionDispatchOutcome::Failed(error),
         };
         TransactionDispatched::new(client, reply, outcome)
@@ -717,9 +710,9 @@ impl Disp {
         I: QuerySet + HasGroup<Q::Group>,
         Q::Group: crate::query::QueryGroup,
     {
-        let mut reply = ReplyStream::<RowItem, X>::new();
+        let reply = ReplyStream::<RowItem, X>::new();
         let outcome = match Self::typed::<Q, I>(client, params, X::SYNC_AFTER) {
-            Ok(request) => Self::try_dispatch_reply(client, target, &mut reply, request),
+            Ok(request) => DispatchOutcome::NoConn { request },
             Err(error) => DispatchOutcome::Failed(error),
         };
         Self::stream_state(client, target, reply, outcome)
@@ -734,9 +727,9 @@ impl Disp {
         X: Extract<RowItem>,
         I: QuerySet,
     {
-        let mut reply = ReplyStream::<RowItem, X>::new();
+        let reply = ReplyStream::<RowItem, X>::new();
         let outcome = match Self::raw(client, req) {
-            Ok(request) => Self::try_dispatch_reply(client, target, &mut reply, request),
+            Ok(request) => DispatchOutcome::NoConn { request },
             Err(error) => DispatchOutcome::Failed(error),
         };
         Self::stream_state(client, target, reply, outcome)
@@ -808,6 +801,7 @@ impl Disp {
         target: Option<(Token, u64)>,
         reply: &mut impl Registrable<'d, RowItem>,
         request: Pending<'d>,
+        region: &mut RegionToken<'d>,
     ) -> DispatchOutcome<'d>
     where
         I: QuerySet,
@@ -827,7 +821,7 @@ impl Disp {
                 };
             }
         };
-        match Self::stage_request(client, conn_id, reply, request) {
+        match Self::stage_request(client, conn_id, reply, request, region) {
             Ok(()) => DispatchOutcome::Enqueued { conn: conn_id },
             Err((Error::Backpressure { .. }, request)) => DispatchOutcome::Throttled {
                 throttle: Throttle {
@@ -843,6 +837,7 @@ impl Disp {
         client: Client<'d, I>,
         reply: &mut impl Registrable<'d, RowItem>,
         request: Pending<'d>,
+        region: &mut RegionToken<'d>,
     ) -> TransactionDispatchOutcome<'d, I>
     where
         I: QuerySet,
@@ -861,7 +856,7 @@ impl Disp {
         let Some(lease) = TransactionLease::acquire(client, conn) else {
             return TransactionDispatchOutcome::NoConn { request };
         };
-        match Self::stage_request(client, conn, reply, request) {
+        match Self::stage_request(client, conn, reply, request, region) {
             Ok(()) => TransactionDispatchOutcome::Enqueued { lease },
             Err((Error::Backpressure { .. }, request)) => TransactionDispatchOutcome::Throttled {
                 lease,
@@ -876,6 +871,7 @@ impl Disp {
         conn_id: Token,
         reply: &mut impl Registrable<'d, RowItem>,
         request: Pending<'d>,
+        region: &mut RegionToken<'d>,
     ) -> Result<(), (Error, Pending<'d>)>
     where
         I: QuerySet,
@@ -883,7 +879,7 @@ impl Disp {
         let Pending { frame, boundary } = request;
         match client
             .port
-            .try_enqueue_reply(conn_id, frame, reply, boundary)
+            .try_enqueue_reply(conn_id, frame, reply, boundary, region)
         {
             Ok(()) => Ok(()),
             Err((error, frame)) => Err((error, Pending { frame, boundary })),
@@ -893,7 +889,7 @@ impl Disp {
     fn retry_connecting<'d, I>(
         client: Client<'d, I>,
         target: Option<(Token, u64)>,
-        cx: Pin<&mut Context<'_, 'd>>,
+        mut cx: Pin<&mut Context<'_, 'd>>,
         waiter: Pin<&Waiter<'d>>,
         reply: &mut impl Registrable<'d, RowItem>,
         request: Pending<'d>,
@@ -901,7 +897,11 @@ impl Disp {
     where
         I: QuerySet,
     {
-        match Self::try_dispatch_reply(client, target, reply, request) {
+        let outcome = {
+            let region = cx.as_mut().region_token();
+            Self::try_dispatch_reply(client, target, reply, request, region)
+        };
+        match outcome {
             DispatchOutcome::NoConn { request } => {
                 let shared = &client.port.shared;
                 if shared.is_failed() {
@@ -931,7 +931,7 @@ impl Disp {
 
     fn retry_transaction_connecting<'d, I>(
         client: Client<'d, I>,
-        cx: Pin<&mut Context<'_, 'd>>,
+        mut cx: Pin<&mut Context<'_, 'd>>,
         waiter: Pin<&Waiter<'d>>,
         reply: &mut impl Registrable<'d, RowItem>,
         request: Pending<'d>,
@@ -939,7 +939,11 @@ impl Disp {
     where
         I: QuerySet,
     {
-        match Self::try_dispatch_transaction(client, reply, request) {
+        let outcome = {
+            let region = cx.as_mut().region_token();
+            Self::try_dispatch_transaction(client, reply, request, region)
+        };
+        match outcome {
             TransactionDispatchOutcome::NoConn { request } => {
                 let shared = &client.port.shared;
                 if shared.is_failed() {
@@ -969,7 +973,7 @@ impl Disp {
 
     fn retry_throttled<'d, I>(
         client: Client<'d, I>,
-        cx: Pin<&mut Context<'_, 'd>>,
+        mut cx: Pin<&mut Context<'_, 'd>>,
         waiter: Pin<&Waiter<'d>>,
         reply: &mut impl Registrable<'d, RowItem>,
         throttle: Throttle<'d>,
@@ -983,7 +987,11 @@ impl Disp {
             return ThrottleRetry::Ready(Err(Error::Closed));
         }
         let Throttle { request, conn } = throttle;
-        match Self::stage_request(client, conn, reply, request) {
+        let staged = {
+            let region = cx.as_mut().region_token();
+            Self::stage_request(client, conn, reply, request, region)
+        };
+        match staged {
             Ok(()) => {
                 waiter.unregister();
                 ThrottleRetry::Ready(Ok(()))
@@ -1002,35 +1010,27 @@ impl Disp {
         }
     }
 
-    fn dispatch_copy_data<I: QuerySet>(
-        client: Client<'_, I>,
-        target: (Token, u64),
+    fn dispatch_copy_data<'d, I: QuerySet>(
+        client: Client<'d, I>,
+        target: Token,
         data: &[u8],
+        region: &mut RegionToken<'d>,
     ) -> Result<(), Error> {
         Self::check_can_dispatch(client)?;
-        let pin = client
-            .port
-            .shared
-            .pick_conn(Some(target))
-            .ok_or(Error::Closed)?;
         let frame = client.port.encode(|frame| encode::copy_data(frame, data))?;
         client
             .port
-            .try_enqueue(pin, frame)
+            .try_enqueue(target, frame, region)
             .map_err(|(error, _)| error)
     }
 
-    fn dispatch_copy_finish<I: QuerySet>(
-        client: Client<'_, I>,
-        target: (Token, u64),
+    fn dispatch_copy_finish<'d, I: QuerySet>(
+        client: Client<'d, I>,
+        target: Token,
+        region: &mut RegionToken<'d>,
     ) -> Result<(), Error> {
         Self::check_can_dispatch(client)?;
-        let pin = client
-            .port
-            .shared
-            .pick_conn(Some(target))
-            .ok_or(Error::Closed)?;
-        if !client.port.can_push_boundary(pin) {
+        if !client.port.can_push_boundary(target, region) {
             return Err(Error::ResponseCapacity);
         }
         let frame = client.port.encode(|frame| {
@@ -1039,9 +1039,9 @@ impl Disp {
         })?;
         client
             .port
-            .try_enqueue(pin, frame)
+            .try_enqueue(target, frame, region)
             .map_err(|(error, _)| error)?;
-        let marked = client.port.push_boundary(pin);
+        let marked = client.port.push_boundary(target, region);
         debug_assert!(marked);
         Ok(())
     }
@@ -1049,27 +1049,16 @@ impl Disp {
     pub(super) fn rollback_on_drop<I: QuerySet>(
         client: Client<'_, I>,
         target: (Token, u64),
-        sql: &str,
+        _sql: &str,
     ) {
-        let req = Request::raw(sql);
-        let mut reply = Reply::<RowItem, ExtractUnit>::new();
-        let outcome = match Self::raw(client, req) {
-            Ok(request) => Self::try_dispatch_reply(client, Some(target), &mut reply, request),
-            Err(error) => DispatchOutcome::Failed(error),
-        };
-        if matches!(outcome, DispatchOutcome::Enqueued { .. }) {
-            return;
-        }
+        // Drop has no runtime state permission. Closing quarantines the
+        // connection and lets normal async recovery perform rollback safely.
         client.port.close(target.0);
     }
 
     fn quarantine_transaction<I: QuerySet>(client: Client<'_, I>, target: (Token, u64)) {
         if !client.port.shared.quarantine_transaction(target) {
             return;
-        }
-        if let Ok(request) = Self::raw(client, Request::raw("ROLLBACK")) {
-            let mut reply = Reply::<RowItem, ExtractUnit>::new();
-            let _ = Self::stage_request(client, target.0, &mut reply, request);
         }
         client.port.close(target.0);
     }
@@ -1431,23 +1420,60 @@ where
     I: QuerySet + 'd,
 {
     client: Client<'d, I>,
-    target: (Token, u64),
-    reply: Reply<'d, RowItem, ExtractUnit>,
+    dispatched: Pin<Box<Dispatched<'d, I, ExtractUnit>>>,
 }
 
 impl<'d, I: QuerySet + 'd> CopyInGuard<'d, I> {
-    pub fn write(&mut self, chunk: &[u8]) -> Result<(), Error> {
-        Disp::dispatch_copy_data(self.client, self.target, chunk)
+    pub fn write<'a>(
+        &'a mut self,
+        chunk: &'a [u8],
+    ) -> impl Fiber<'d, Output = Result<(), Error>> + 'a {
+        let client = self.client;
+        let mut completed = false;
+        dope_fiber::poll_fn(move |mut cx| {
+            if completed {
+                return Poll::Ready(Err(Error::Closed));
+            }
+            match Fiber::poll(self.dispatched.as_mut(), cx.as_mut()) {
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => Poll::Ready(Err(Error::Closed)),
+                Poll::Pending => {
+                    let Some(target) = self.dispatched.as_ref().get_ref().resolved_conn() else {
+                        return Poll::Pending;
+                    };
+                    completed = true;
+                    let region = cx.as_mut().region_token();
+                    Poll::Ready(Disp::dispatch_copy_data(client, target, chunk, region))
+                }
+            }
+        })
     }
 
-    pub fn finish(self) -> Dispatched<'d, I, ExtractUnit> {
-        let state = match Disp::dispatch_copy_finish(self.client, self.target) {
-            Ok(()) => DispatchState::Pending {
-                conn: self.target.0,
-            },
-            Err(e) => DispatchState::Failed(e),
-        };
-        Dispatched::new(self.reply, state)
+    pub fn finish(self) -> impl Fiber<'d, Output = Result<(), Error>> {
+        let client = self.client;
+        let mut dispatched = self.dispatched;
+        let mut finished = false;
+        dope_fiber::poll_fn(move |mut cx| {
+            if !finished {
+                match Fiber::poll(dispatched.as_mut(), cx.as_mut()) {
+                    Poll::Ready(output) => return Poll::Ready(output),
+                    Poll::Pending => {
+                        let Some(target) = dispatched.as_ref().get_ref().resolved_conn() else {
+                            return Poll::Pending;
+                        };
+                        let result = {
+                            let region = cx.as_mut().region_token();
+                            Disp::dispatch_copy_finish(client, target, region)
+                        };
+                        if let Err(error) = result {
+                            return Poll::Ready(Err(error));
+                        }
+                        finished = true;
+                    }
+                }
+            }
+            Fiber::poll(dispatched.as_mut(), cx)
+        })
     }
 }
 

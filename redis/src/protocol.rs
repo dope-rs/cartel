@@ -4,6 +4,7 @@ use dope::driver::token::Token;
 use dope::manifold::connector;
 use dope::manifold::connector::{Close, Ctx};
 use o3::buffer;
+use o3::cell::RegionToken;
 
 use crate::decode::{ParseState, Scan, Scanned, scan};
 use crate::port::{Frame as SendFrame, Port};
@@ -125,11 +126,11 @@ impl<'d> Session<'d> {
         }
     }
 
-    fn fail(&self, token: Token, error: crate::Error) {
+    fn fail(&self, token: Token, error: crate::Error, region: &mut RegionToken<'d>) {
         let message = error.to_string();
         self.port.record_fatal(error);
         if let Some(responses) = self.port.responses(token) {
-            responses.fail_all(|| Err(crate::Error::Redis(message.clone())));
+            responses.fail_all(region, || Err(crate::Error::Redis(message.clone())));
         }
         self.port.wake_active();
     }
@@ -144,8 +145,13 @@ impl<'d> connector::Session<'d> for Session<'d> {
         &self.codec
     }
 
-    fn activate(&self, token: Token, ready: dope::driver::ready::ReadyKey<'d>) {
-        assert!(self.port.activate(token, ready));
+    fn activate(
+        &self,
+        token: Token,
+        ready: dope::driver::ready::ReadyKey<'d>,
+        region: &mut RegionToken<'d>,
+    ) {
+        assert!(self.port.activate(token, ready, region));
     }
 
     fn connect(&mut self, ctx: &mut Ctx<'_, 'd, Self>) {
@@ -162,12 +168,12 @@ impl<'d> connector::Session<'d> for Session<'d> {
                 let Some(responses) = self.port.responses(ctx.conn_id) else {
                     return;
                 };
-                responses.try_push(Ok(value), bytes, credits);
-                responses.complete();
+                responses.try_push(ctx.region, Ok(value), bytes, credits);
+                responses.complete(ctx.region);
             }
             Head::Fatal(error) => {
                 ctx.state.poisoned = true;
-                self.fail(ctx.conn_id, error);
+                self.fail(ctx.conn_id, error, ctx.region);
             }
         }
     }
@@ -178,9 +184,9 @@ impl<'d> connector::Session<'d> for Session<'d> {
             .fatal_message()
             .unwrap_or_else(|| "connection closed".to_string());
         if let Some(responses) = self.port.responses(ctx.conn_id) {
-            responses.fail_all(|| Err(crate::Error::Redis(message.clone())));
+            responses.fail_all(ctx.region, || Err(crate::Error::Redis(message.clone())));
         }
-        self.port.deactivate(ctx.conn_id);
+        self.port.deactivate(ctx.conn_id, ctx.region);
         self.port.wake_active();
     }
 
@@ -188,19 +194,30 @@ impl<'d> connector::Session<'d> for Session<'d> {
         &self,
         token: Token,
         push: impl FnMut(Self::Send) -> Result<(), Self::Send>,
+        region: &mut RegionToken<'d>,
     ) -> connector::Requests {
-        self.port.drain_requests(token, push)
+        self.port.drain_requests(token, push, region)
     }
 
-    fn defer_close(&self, token: Token, _state: &Self::ConnState) -> bool {
+    fn defer_close(
+        &self,
+        token: Token,
+        _state: &Self::ConnState,
+        region: &mut RegionToken<'d>,
+    ) -> bool {
         self.port
             .responses(token)
-            .is_some_and(|responses| !responses.is_empty())
+            .is_some_and(|responses| !responses.is_empty(region))
     }
 
-    fn is_drained(&self, token: Token, _state: &Self::ConnState) -> bool {
+    fn is_drained(
+        &self,
+        token: Token,
+        _state: &Self::ConnState,
+        region: &mut RegionToken<'d>,
+    ) -> bool {
         self.port
             .responses(token)
-            .is_none_or(cartel_core::Arena::is_empty)
+            .is_none_or(|responses| responses.is_empty(region))
     }
 }

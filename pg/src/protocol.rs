@@ -10,6 +10,7 @@ use dope::manifold::connector::{Close, Ctx};
 use dope_fiber::WaitQueue;
 use dope_fiber::{Context, Waiter};
 use o3::buffer;
+use o3::cell::RegionToken;
 use o3::collections::FixedQueue;
 
 use crate::decode::{AuthRequest, parse_auth, parse_db_error, parse_notification};
@@ -386,8 +387,7 @@ impl Shared {
     }
 
     fn transaction_waiter(&self, index: usize) -> Option<Pin<&WaitQueue>> {
-        let queue = self.transaction_waiters.as_ref().get_ref().get(index)?;
-        Some(unsafe { Pin::new_unchecked(queue) })
+        WaitQueue::get_pinned(self.transaction_waiters.as_ref(), index)
     }
 
     fn clear_transaction(&self, slot: Token, available: bool) {
@@ -709,7 +709,13 @@ impl<'d, I: QuerySet> Session<'d, I> {
         out.try_enqueue(frame).map_err(|_| Error::RequestCapacity)
     }
 
-    fn fail(&mut self, conn_id: Token, conn_state: &mut ConnState, err: Error) {
+    fn fail(
+        &mut self,
+        conn_id: Token,
+        conn_state: &mut ConnState,
+        err: Error,
+        region: &mut RegionToken<'d>,
+    ) {
         let msg = err.to_string();
         let was_ready = matches!(conn_state.phase, Phase::Ready);
         let permanent = !was_ready
@@ -722,7 +728,7 @@ impl<'d, I: QuerySet> Session<'d, I> {
         conn_state.pending_close = true;
         conn_state.close_permanent = permanent;
         let n = self.port.responses(conn_id).map_or(0, |responses| {
-            responses.fail_all(|| Err(Error::Other(msg.clone())))
+            responses.fail_all(region, || Err(Error::Other(msg.clone())))
         });
         self.port.set_batch_open(conn_id, false);
         let s = &self.port.shared;
@@ -888,6 +894,7 @@ impl<'d, I: QuerySet> Session<'d, I> {
         typ: u8,
         head_payload: buffer::Shared,
         conn_state: &mut ConnState,
+        region: &mut RegionToken<'d>,
     ) -> Result<(), Error> {
         if matches!(
             typ,
@@ -922,14 +929,14 @@ impl<'d, I: QuerySet> Session<'d, I> {
                     .port
                     .responses(conn_id)
                     .ok_or(Error::Protocol("CommandComplete with unknown connection"))?;
-                let front = responses.front_kind();
+                let front = responses.front_kind(region);
                 match front {
                     FrontKind::Empty => Err(Error::Protocol("CommandComplete with empty pipeline")),
                     FrontKind::Boundary => Err(Error::Protocol(
                         "CommandComplete past pipeline batch boundary",
                     )),
                     FrontKind::Slot(_) | FrontKind::Detached => {
-                        responses.complete();
+                        responses.complete(region);
                         self.port.shared.inflight_total.dec();
                         self.port.shared.dec_inflight(conn_id);
                         Ok(())
@@ -941,7 +948,7 @@ impl<'d, I: QuerySet> Session<'d, I> {
                 self.port
                     .responses(conn_id)
                     .ok_or(Error::Protocol("CopyData with unknown connection"))?
-                    .try_push(Ok(head_payload), bytes, 1);
+                    .try_push(region, Ok(head_payload), bytes, 1);
                 Ok(())
             }
             Be::NOTIFICATION_RESPONSE => {
@@ -955,11 +962,11 @@ impl<'d, I: QuerySet> Session<'d, I> {
                     .port
                     .responses(conn_id)
                     .ok_or(Error::Protocol("DataRow with unknown connection"))?;
-                let front = responses.front_kind();
+                let front = responses.front_kind(region);
                 match front {
                     FrontKind::Slot(_) | FrontKind::Detached => {
                         let bytes = head_payload.len();
-                        responses.try_push(Ok(head_payload), bytes, 1);
+                        responses.try_push(region, Ok(head_payload), bytes, 1);
                         Ok(())
                     }
                     _ => Err(Error::Protocol("DataRow with empty pipeline")),
@@ -971,11 +978,11 @@ impl<'d, I: QuerySet> Session<'d, I> {
                     .port
                     .responses(conn_id)
                     .ok_or(Error::Protocol("ErrorResponse with unknown connection"))?;
-                let front = responses.front_kind();
+                let front = responses.front_kind(region);
                 match front {
                     FrontKind::Empty | FrontKind::Boundary => Err(Error::Db(db)),
                     FrontKind::Slot(_) | FrontKind::Detached => {
-                        responses.fail_one(|| Err(Error::Db(db)));
+                        responses.fail_one(region, || Err(Error::Db(db)));
                         self.port.shared.inflight_total.dec();
                         self.port.shared.dec_inflight(conn_id);
                         conn_state.error_skip = true;
@@ -996,22 +1003,22 @@ impl<'d, I: QuerySet> Session<'d, I> {
                         .port
                         .responses(conn_id)
                         .ok_or(Error::Protocol("ReadyForQuery with unknown connection"))?;
-                    let front = responses.front_kind();
+                    let front = responses.front_kind(region);
                     match front {
                         FrontKind::Empty => break,
                         FrontKind::Boundary => {
-                            responses.pop_boundary();
+                            responses.pop_boundary(region);
                             break;
                         }
                         FrontKind::Slot(_) | FrontKind::Detached => {
                             if skip {
-                                responses.fail_one(|| {
+                                responses.fail_one(region, || {
                                     Err(Error::Other(
                                         "query skipped: earlier error in pipeline batch".into(),
                                     ))
                                 });
                             } else {
-                                responses.complete();
+                                responses.complete(region);
                             }
                             self.port.shared.inflight_total.dec();
                             self.port.shared.dec_inflight(conn_id);
@@ -1044,7 +1051,12 @@ impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
         &self.codec
     }
 
-    fn activate(&self, token: Token, ready: dope::driver::ready::ReadyKey<'d>) {
+    fn activate(
+        &self,
+        token: Token,
+        ready: dope::driver::ready::ReadyKey<'d>,
+        _region: &mut RegionToken<'d>,
+    ) {
         self.port.activate(token, ready);
     }
 
@@ -1066,7 +1078,7 @@ impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
             Ok(()) => {
                 conn_state.phase = Phase::StartupSent;
             }
-            Err(error) => self.fail(ctx.conn_id, conn_state, error),
+            Err(error) => self.fail(ctx.conn_id, conn_state, error, ctx.region),
         }
     }
 
@@ -1081,7 +1093,7 @@ impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
         if self.port.unsynced(conn_id) == 0 || !self.port.batch_open(conn_id) {
             return;
         }
-        if !self.port.can_push_boundary(conn_id) {
+        if !self.port.can_push_boundary(conn_id, ctx.region) {
             self.port.close(conn_id);
             return;
         }
@@ -1091,7 +1103,7 @@ impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
             stage.commit()
         };
         if committed != 0 {
-            let marked = self.port.push_boundary(conn_id);
+            let marked = self.port.push_boundary(conn_id, ctx.region);
             debug_assert!(marked);
         }
     }
@@ -1106,6 +1118,7 @@ impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
                 conn_id,
                 conn_state,
                 Error::Protocol("server frame exceeds maximum size"),
+                ctx.region,
             );
             return;
         }
@@ -1121,7 +1134,7 @@ impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
                 self.handle_preparing(conn_id, typ, &head.payload, conn_state, remaining)
             }
             Phase::Ready | Phase::CopyInActive | Phase::CopyOutActive => {
-                let r = self.handle_ready(conn_id, typ, head.payload, conn_state);
+                let r = self.handle_ready(conn_id, typ, head.payload, conn_state, ctx.region);
                 if matches!(
                     typ,
                     Be::COMMAND_COMPLETE | Be::READY_FOR_QUERY | Be::ERROR_RESPONSE
@@ -1138,11 +1151,11 @@ impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
         {
             match self.send_prepare(out) {
                 Ok(count) => conn_state.phase = Phase::Preparing { remaining: count },
-                Err(error) => self.fail(conn_id, conn_state, error),
+                Err(error) => self.fail(conn_id, conn_state, error, ctx.region),
             }
         }
         if let Err(e) = result {
-            self.fail(conn_id, conn_state, e);
+            self.fail(conn_id, conn_state, e, ctx.region);
         }
     }
 
@@ -1157,7 +1170,7 @@ impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
         let was_ready = matches!(conn_state.phase, Phase::Ready);
         conn_state.pending_close = false;
         let n = self.port.responses(conn_id).map_or(0, |responses| {
-            responses.fail_all(|| Err(Error::Other(msg.clone())))
+            responses.fail_all(ctx.region, || Err(Error::Other(msg.clone())))
         });
         self.port.set_batch_open(conn_id, false);
         let s = &self.port.shared;
@@ -1168,26 +1181,27 @@ impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
         }
         s.clear_transaction(conn_id, false);
         s.wake_all();
-        self.port.deactivate(conn_id);
+        self.port.deactivate(conn_id, ctx.region);
     }
 
     fn drain_requests(
         &self,
         token: Token,
         push: impl FnMut(Self::Send) -> Result<(), Self::Send>,
+        region: &mut RegionToken<'d>,
     ) -> connector::Requests {
-        self.port.drain_requests(token, push)
+        self.port.drain_requests(token, push, region)
     }
 
     fn sent(&self, _token: Token, _sent: usize) {
         self.port.shared.egress_waiters.as_ref().wake();
     }
 
-    fn defer_close(&self, token: Token, _state: &ConnState) -> bool {
-        self.port.response_len(token) != 0
+    fn defer_close(&self, token: Token, _state: &ConnState, region: &mut RegionToken<'d>) -> bool {
+        self.port.response_len(token, region) != 0
     }
 
-    fn is_drained(&self, token: Token, _state: &ConnState) -> bool {
-        self.port.responses_empty(token)
+    fn is_drained(&self, token: Token, _state: &ConnState, region: &mut RegionToken<'d>) -> bool {
+        self.port.responses_empty(token, region)
     }
 }

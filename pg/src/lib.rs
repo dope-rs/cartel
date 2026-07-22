@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod client;
 mod decode;
 pub mod dsl;
@@ -75,21 +77,19 @@ impl std::fmt::Display for Ltree {
 }
 
 #[derive(Clone)]
-pub struct Text(o3::buffer::Shared);
+pub struct Text(o3::buffer::SharedStr);
 
 impl Text {
     pub fn from_static(s: &'static str) -> Self {
-        Self(o3::buffer::Shared::from_static(s.as_bytes()))
+        Self(o3::buffer::SharedStr::from_static(s))
     }
 
     pub(crate) fn from_shared(bytes: o3::buffer::Shared) -> Result<Self, std::str::Utf8Error> {
-        std::str::from_utf8(&bytes)?;
-        Ok(Self(bytes))
+        o3::buffer::SharedStr::from_utf8(bytes).map(Self)
     }
 
     pub fn as_str(&self) -> &str {
-        // SAFETY: every Text constructor accepts UTF-8 input or validates the shared bytes.
-        unsafe { std::str::from_utf8_unchecked(&self.0) }
+        self.0.as_str()
     }
 }
 
@@ -127,29 +127,27 @@ impl PartialEq<&str> for Text {
 impl Eq for Text {}
 
 #[derive(Clone)]
-pub struct Jsonb(o3::buffer::Shared);
+pub struct Jsonb(o3::buffer::SharedStr);
 
 impl Jsonb {
     pub fn from_static_json(s: &'static str) -> Self {
-        Self(o3::buffer::Shared::from_static(s.as_bytes()))
+        Self(o3::buffer::SharedStr::from_static(s))
     }
 
     pub fn from_string(s: String) -> Self {
-        Self(o3::buffer::Shared::from(s))
+        Self(o3::buffer::SharedStr::from(s))
     }
 
     pub(crate) fn from_shared(bytes: o3::buffer::Shared) -> Result<Self, std::str::Utf8Error> {
-        std::str::from_utf8(&bytes)?;
-        Ok(Self(bytes))
+        o3::buffer::SharedStr::from_utf8(bytes).map(Self)
     }
 
     pub fn as_str(&self) -> &str {
-        // SAFETY: every Jsonb constructor accepts UTF-8 input or validates the shared bytes.
-        unsafe { std::str::from_utf8_unchecked(&self.0) }
+        self.0.as_str()
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        self.0.as_bytes()
     }
 }
 

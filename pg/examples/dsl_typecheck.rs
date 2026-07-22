@@ -103,10 +103,7 @@ fn main() -> Result<(), ExampleError> {
     let server_version = executor
         .enter(|mut session| {
             let backoff = session.seed().derive(dope::hash::domain::BACKOFF).state();
-            let port = session.storage() as *const Port<'_, ExampleDatabase>;
-            // The port is pinned in executor storage until after the connector
-            // runtime and all database fibers have been dropped.
-            let port = unsafe { &*port };
+            let port = session.storage();
             let client: Client<'_, ExampleDatabase> = port.client();
             let upstreams = Static::<Tcp>::new(vec![address], RECONNECT_DELAY, backoff);
             let connector = {

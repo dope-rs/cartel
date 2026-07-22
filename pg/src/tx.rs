@@ -356,7 +356,11 @@ impl<'d, I: QuerySet + 'd> Fiber<'d> for TransactionFinalizer<'d, I> {
                         waiter.unregister();
                         return Poll::Ready(Err(Error::Closed));
                     }
-                    if lease_client.port.response_len(lease_target.0) != 0 {
+                    if lease_client
+                        .port
+                        .response_len(lease_target.0, cx.as_mut().region_token())
+                        != 0
+                    {
                         if !lease_client.port.shared.try_register_transaction(
                             lease_target,
                             waiter,
@@ -366,7 +370,11 @@ impl<'d, I: QuerySet + 'd> Fiber<'d> for TransactionFinalizer<'d, I> {
                             waiter.unregister();
                             return Poll::Ready(Err(Error::Closed));
                         }
-                        if lease_client.port.response_len(lease_target.0) != 0 {
+                        if lease_client
+                            .port
+                            .response_len(lease_target.0, cx.as_mut().region_token())
+                            != 0
+                        {
                             return Poll::Pending;
                         }
                         waiter.unregister();

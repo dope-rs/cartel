@@ -53,11 +53,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .seed()
             .derive(dope::hash::domain::BACKOFF ^ 1)
             .state();
-        let stores = session.storage() as *const (cartel_redis::Store<'_>, cartel_redis::Store<'_>);
+        let (a_store, b_store) = session.storage();
         let mut driver = session.driver_access();
-        // Both stores stay pinned until the combined dispatcher and all fibers
-        // have been dropped at the end of this session closure.
-        let (a_store, b_store) = unsafe { &*stores };
         let a = a_store.redis();
         let b = b_store.redis();
         let (a_connector, b_connector) = {

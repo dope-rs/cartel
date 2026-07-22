@@ -31,7 +31,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "cartel-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "dope",
  "dope-fiber",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "cartel-gen"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "cartel-core",
  "dope",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "cartel-pg"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64",
  "cartel-core",
@@ -65,6 +65,7 @@ dependencies = [
  "dope-net",
  "hmac",
  "o3",
+ "pbkdf2",
  "pin-project",
  "rand",
  "sha2",
@@ -73,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "cartel-redis"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "cartel-core",
  "cartel-gen",
@@ -83,11 +84,12 @@ dependencies = [
  "dope-net",
  "o3",
  "pin-project",
+ "ryu",
 ]
 
 [[package]]
 name = "cartel-sqlite"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "cartel-gen",
  "rusqlite",
@@ -155,9 +157,7 @@ dependencies = [
 
 [[package]]
 name = "dope"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3b0c8b462cac75b59a828f81fc466fa305f75064c90b13d14caf50b2f2c5e00"
+version = "0.9.0"
 dependencies = [
  "dope-core",
  "dope-net",
@@ -170,9 +170,7 @@ dependencies = [
 
 [[package]]
 name = "dope-core"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a15556546d983231b0a14dccc0f2627b0538aaf34c9a2401a63baef927445d04"
+version = "0.9.0"
 dependencies = [
  "io-uring",
  "libc",
@@ -181,9 +179,7 @@ dependencies = [
 
 [[package]]
 name = "dope-extra"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e658d73098c4522c3f9873ec58b2f588348d3e08f6d605f1c5964ade0416e66"
+version = "0.9.0"
 dependencies = [
  "dope",
  "dope-fiber",
@@ -194,9 +190,7 @@ dependencies = [
 
 [[package]]
 name = "dope-fiber"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7ae8c3a40898d0cb5ef462b368fd25687bc87d55aa289720d66c4145bc9d8f8"
+version = "0.9.0"
 dependencies = [
  "dope",
  "dope-core",
@@ -209,21 +203,17 @@ dependencies = [
 
 [[package]]
 name = "dope-gen"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2e0b920aa5a6e74b390629968c14c768caf25b6e27992571672e4ed89659f33"
+version = "0.9.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "dope-net"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db1c4c88362d10c4f6c97aa2462b87d909980eb434c1709c7423e479fe0b8d4a"
+version = "0.9.0"
 dependencies = [
  "dope-core",
  "libc",
@@ -373,15 +363,25 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "o3"
-version = "0.4.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c7fd543e6031241339bf65d9e2a3a95b68aecf085a466e8f71bf9d35d5c6136"
+checksum = "23c2a062002b291cd840b32784f65718f1ae559708ebe82de5f9a92e0960a3ae"
 
 [[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "pbkdf2"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
+dependencies = [
+ "digest",
+ "hmac",
+]
 
 [[package]]
 name = "pin-project"
@@ -488,6 +488,12 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "serde_core"

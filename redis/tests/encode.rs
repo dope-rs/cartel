@@ -84,6 +84,25 @@ fn sorted_set_and_list_commands_preserve_numeric_arguments() {
 }
 
 #[test]
+fn floating_arguments_cover_finite_and_non_finite_boundaries() {
+    for (value, encoded) in [
+        (-0.0, "0"),
+        (f64::NAN, "nan"),
+        (f64::INFINITY, "inf"),
+        (f64::NEG_INFINITY, "-inf"),
+        (f64::MAX, "1.7976931348623157e308"),
+        (f64::from_bits(1), "5e-324"),
+    ] {
+        let frame = encode_frame(|buffer| encode::cmd_incrbyfloat(buffer, b"k", value));
+        let expected = format!(
+            "*3\r\n$11\r\nINCRBYFLOAT\r\n$1\r\nk\r\n${}\r\n{encoded}\r\n",
+            encoded.len()
+        );
+        assert_eq!(frame, expected.as_bytes());
+    }
+}
+
+#[test]
 fn scan_and_key_commands_cover_optional_shapes() {
     assert_eq!(
         encode_frame(|buffer| encode::cmd_scan(buffer, 0, Some(b"user:*"), Some(100))),

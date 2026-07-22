@@ -34,10 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let exec = Executor::new(driver)?.with_storage_factory(redis_config()?.factory());
     exec.enter(|mut session| -> Result<(), Box<dyn std::error::Error>> {
         let backoff = session.seed().derive(dope::hash::domain::BACKOFF).state();
-        let store = session.storage() as *const cartel_redis::Store<'_>;
-        // The store is pinned in executor storage until after the connector
-        // runtime and probe fiber are destroyed.
-        let redis = unsafe { (&*store).redis() };
+        let redis = session.storage().redis();
         let connector = {
             let mut driver = session.driver_access();
             redis

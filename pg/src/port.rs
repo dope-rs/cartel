@@ -2,10 +2,7 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::pin::Pin;
 
-use cartel_core::{
-    Arena, ArenaPool, ArenaPoolRef, BoundedQueue, ItemPool, ItemPoolRef, LaneBudget, LaneBudgetRef,
-    Limits, QueuePool, QueuePoolRef, Registrable,
-};
+use cartel_core::{Arena, ArenaConfig, ArenaLane, Limits, QueueArena, QueueLane, Registrable};
 use dope::driver::ready::ReadyKey;
 use dope::driver::token::Token;
 use dope::manifold::connector::Connector;
@@ -15,6 +12,7 @@ use dope::runtime::StorageFactory;
 use dope::{DriverContext, DriverRef};
 use dope_net::Transport;
 use o3::buffer::{Lease, Pool, PoolLayout};
+use o3::cell::RegionToken;
 
 use crate::protocol::{RowItem, Session, Shared as PoolState};
 use crate::query::QuerySet;
@@ -212,30 +210,18 @@ struct Conn<'d> {
     driver: DriverRef<'d>,
     token: Cell<Option<Token>>,
     ready: Cell<Option<ReadyKey<'d>>>,
-    requests: BoundedQueue<'d, Frame<'d>>,
     close: Cell<bool>,
-    responses: Arena<'d, RowItem>,
     unsynced: Cell<u32>,
     batch_open: Cell<bool>,
 }
 
 impl<'d> Conn<'d> {
-    fn new(
-        lane: usize,
-        requests: QueuePoolRef<'d, Frame<'d>>,
-        limits: Limits,
-        budget: LaneBudgetRef<'d>,
-        responses: ItemPoolRef<'d, RowItem>,
-        metadata: ArenaPoolRef<'d>,
-        driver: DriverRef<'d>,
-    ) -> Self {
+    fn new(driver: DriverRef<'d>) -> Self {
         Self {
             driver,
             token: Cell::new(None),
             ready: Cell::new(None),
-            requests: BoundedQueue::new(requests),
             close: Cell::new(false),
-            responses: Arena::with_fair_shared_pools(metadata, lane, limits, budget, responses),
             unsynced: Cell::new(0),
             batch_open: Cell::new(false),
         }
@@ -255,11 +241,9 @@ impl<'d> Conn<'d> {
 pub struct Port<'d, I: QuerySet> {
     pub(super) shared: PoolState,
     conns: Box<[Conn<'d>]>,
-    _request_queue: QueuePool<Frame<'d>>,
     requests: Pin<Box<Pool>>,
-    _response_metadata: ArenaPool,
-    _response_budget: LaneBudget,
-    _response_rows: ItemPool<RowItem>,
+    request_queue: QueueArena<'d, Frame<'d>>,
+    responses: Arena<'d, RowItem>,
     _instance: PhantomData<fn() -> I>,
 }
 
@@ -292,27 +276,21 @@ impl<'d, I: QuerySet> Port<'d, I> {
             config.response_byte_capacity(),
             config.response_capacity(),
         );
-        let request_queue = QueuePool::with_capacity(request_entries, connections);
-        let response_budget =
-            LaneBudget::with_capacity(config.response_byte_capacity(), connections);
-        let response_rows = ItemPool::with_lanes(config.response_capacity(), connections);
-        let response_metadata = ArenaPool::with_capacity(config.inflight_capacity(), connections);
-        let metadata = unsafe { response_metadata.handle().assume_lifetime() };
+        let request_queue = QueueArena::with_capacity(request_entries, connections);
+        let responses = Arena::new(ArenaConfig::new(
+            connections,
+            config.inflight_capacity(),
+            config.response_capacity(),
+            config.response_byte_capacity(),
+            config.response_capacity(),
+            limits,
+        ));
         Self {
             shared: PoolState::new(database, config),
-            conns: (0..connections)
-                .map(|lane| {
-                    let requests = unsafe { request_queue.handle(lane).assume_lifetime() };
-                    let budget = unsafe { response_budget.handle(lane).assume_lifetime() };
-                    let rows = unsafe { response_rows.handle_for(lane).assume_lifetime() };
-                    Conn::new(lane, requests, limits, budget, rows, metadata, driver)
-                })
-                .collect(),
+            conns: (0..connections).map(|_| Conn::new(driver)).collect(),
             requests: Box::pin(Pool::new(config.request_pool())),
-            _request_queue: request_queue,
-            _response_metadata: response_metadata,
-            _response_budget: response_budget,
-            _response_rows: response_rows,
+            request_queue,
+            responses,
             _instance: PhantomData,
         }
     }
@@ -357,16 +335,17 @@ impl<'d, I: QuerySet> Port<'d, I> {
         conn.batch_open.set(false);
     }
 
-    pub(super) fn deactivate(&self, token: Token) {
+    pub(super) fn deactivate(&'d self, token: Token, region: &mut RegionToken<'d>) {
         let Some(conn) = self.conn(token) else {
             return;
         };
+        let lane = token.slot().raw() as usize;
         conn.token.set(None);
         conn.ready.set(None);
         conn.close.set(false);
         conn.unsynced.set(0);
         conn.batch_open.set(false);
-        conn.requests.clear();
+        self.request_queue.lane(lane).clear(region);
     }
 
     pub(super) fn frame(&'d self) -> Result<Frame<'d>, Error> {
@@ -389,20 +368,35 @@ impl<'d, I: QuerySet> Port<'d, I> {
         Ok(frame)
     }
 
-    fn enqueue_request(&self, conn: &Conn<'d>, frame: Frame<'d>) -> Result<(), Frame<'d>> {
-        let len = frame.as_ref().len();
-        conn.requests.try_push(frame, len)
+    fn request_lane(&self, token: Token) -> QueueLane<'_, 'd, Frame<'d>> {
+        self.request_queue.lane(token.slot().raw() as usize)
     }
 
-    fn try_enqueue_conn(&self, token: Token, bytes: Frame<'d>) -> Result<(), (Error, Frame<'d>)> {
+    fn enqueue_request(
+        &'d self,
+        token: Token,
+        frame: Frame<'d>,
+        region: &mut RegionToken<'d>,
+    ) -> Result<(), Frame<'d>> {
+        let len = frame.as_ref().len();
+        self.request_lane(token).try_push(region, frame, len)
+    }
+
+    fn try_enqueue_conn(
+        &'d self,
+        token: Token,
+        bytes: Frame<'d>,
+        region: &mut RegionToken<'d>,
+    ) -> Result<(), (Error, Frame<'d>)> {
         let Some(conn) = self.conn(token) else {
             return Err((Error::Closed, bytes));
         };
-        let queued = conn.requests.weight();
-        if !conn.requests.has_capacity() {
+        let requests = self.request_lane(token);
+        let queued = requests.weight(region);
+        if !requests.has_capacity(region) {
             return Err((self.shared.backpressure(queued), bytes));
         }
-        self.enqueue_request(conn, bytes)
+        self.enqueue_request(token, bytes, region)
             .map_err(|bytes| (self.shared.backpressure(queued), bytes))?;
         conn.wake();
         Ok(())
@@ -414,18 +408,25 @@ impl<'d, I: QuerySet> Port<'d, I> {
         bytes: Frame<'d>,
         reply: &mut impl Registrable<'d, RowItem>,
         boundary: Boundary,
+        region: &mut RegionToken<'d>,
     ) -> Result<(), (Error, Frame<'d>)> {
         let Some(conn) = self.conn(token) else {
             return Err((Error::Closed, bytes));
         };
-        let queued = conn.requests.weight();
-        if !conn.requests.has_capacity() {
+        let requests = self.request_lane(token);
+        let queued = requests.weight(region);
+        if !requests.has_capacity(region) {
             return Err((self.shared.backpressure(queued), bytes));
         }
-        if !reply.try_attach_with_boundary(&conn.responses, matches!(boundary, Boundary::Close)) {
+        let lane = token.slot().raw() as usize;
+        if !reply.try_attach_with_boundary(
+            region,
+            self.responses.lane(lane),
+            matches!(boundary, Boundary::Close),
+        ) {
             return Err((self.shared.backpressure(queued), bytes));
         }
-        self.enqueue_request(conn, bytes)
+        self.enqueue_request(token, bytes, region)
             .map_err(|bytes| (self.shared.backpressure(queued), bytes))?;
         conn.unsynced.set(conn.unsynced.get().saturating_add(1));
         match boundary {
@@ -443,22 +444,24 @@ impl<'d, I: QuerySet> Port<'d, I> {
     }
 
     pub(super) fn try_enqueue(
-        &self,
+        &'d self,
         token: Token,
         bytes: Frame<'d>,
+        region: &mut RegionToken<'d>,
     ) -> Result<(), (Error, Frame<'d>)> {
-        self.try_enqueue_conn(token, bytes)
+        self.try_enqueue_conn(token, bytes, region)
     }
 
     pub(super) fn drain_requests(
         &'d self,
         token: Token,
         push: impl FnMut(Frame<'d>) -> Result<(), Frame<'d>>,
+        region: &mut RegionToken<'d>,
     ) -> dope::manifold::connector::Requests {
         let Some(conn) = self.conn(token) else {
             return dope::manifold::connector::Requests::default();
         };
-        conn.requests.drain(push);
+        self.request_lane(token).drain(region, push);
         dope::manifold::connector::Requests {
             shutdown: None,
             close: conn
@@ -490,16 +493,23 @@ impl<'d, I: QuerySet> Port<'d, I> {
         }
     }
 
-    pub(super) fn can_push_boundary(&self, token: Token) -> bool {
-        self.conn(token)
-            .is_some_and(|conn| conn.responses.can_mark_boundary())
+    pub(super) fn can_push_boundary(&'d self, token: Token, region: &mut RegionToken<'d>) -> bool {
+        self.conn(token).is_some()
+            && self
+                .responses
+                .lane(token.slot().raw() as usize)
+                .can_mark_boundary(region)
     }
 
-    pub(super) fn push_boundary(&self, token: Token) -> bool {
+    pub(super) fn push_boundary(&'d self, token: Token, region: &mut RegionToken<'d>) -> bool {
         let Some(conn) = self.conn(token) else {
             return false;
         };
-        if !conn.responses.mark_boundary() {
+        if !self
+            .responses
+            .lane(token.slot().raw() as usize)
+            .mark_boundary(region)
+        {
             return false;
         }
         conn.unsynced.set(0);
@@ -507,16 +517,19 @@ impl<'d, I: QuerySet> Port<'d, I> {
         true
     }
 
-    pub(super) fn responses(&self, token: Token) -> Option<&Arena<'d, RowItem>> {
-        Some(&self.conn(token)?.responses)
+    pub(super) fn responses(&'d self, token: Token) -> Option<ArenaLane<'d, RowItem>> {
+        self.conn(token)?;
+        Some(self.responses.lane(token.slot().raw() as usize))
     }
 
-    pub(super) fn response_len(&self, token: Token) -> usize {
-        self.responses(token).map_or(0, Arena::len)
+    pub(super) fn response_len(&'d self, token: Token, region: &mut RegionToken<'d>) -> usize {
+        self.responses(token)
+            .map_or(0, |responses| responses.len(region))
     }
 
-    pub(super) fn responses_empty(&self, token: Token) -> bool {
-        self.responses(token).is_none_or(Arena::is_empty)
+    pub(super) fn responses_empty(&'d self, token: Token, region: &mut RegionToken<'d>) -> bool {
+        self.responses(token)
+            .is_none_or(|responses| responses.is_empty(region))
     }
 }
 

@@ -10,7 +10,7 @@ use dope::manifold::connector::Connector;
 use dope::manifold::connector::source::Static;
 use dope::manifold::env::Bundle;
 use dope::runtime::profile::Throughput;
-use dope::{Completion as _, Cqe, driver};
+use dope::{Completion as _, driver};
 use dope_net::tcp::Tcp;
 use dope_net::wire::identity::Identity;
 use o3::cell::BrandCell as Branded;
@@ -63,10 +63,8 @@ fn probe_step_by_step() {
         .with_storage_factory(cartel_pg::Port::<Probe>::factory(cfg, port_config));
     exec.enter(|mut sess| {
         let backoff = sess.seed().derive(dope::hash::domain::BACKOFF).state();
-        let port = sess.storage() as *const cartel_pg::Port<'_, Probe>;
+        let port = sess.storage();
         let (token, mut driver) = sess.token_and_driver();
-        // The port and connector remain inside this executor session.
-        let port = unsafe { &*port };
         let upstreams = Static::<Tcp>::new(vec![addr], Duration::from_millis(500), backoff);
         let connector: PgConn<'_> = port
             .connect::<0, _, Bundle<Tcp, Identity, Throughput>>(upstreams, &mut driver)
@@ -77,13 +75,13 @@ fn probe_step_by_step() {
 
         pg.borrow_pin_mut(token).pre_park(&mut driver);
 
-        let mut buf = [Cqe::ZERO; 64];
+        let mut buf = [const { None }; 64];
         let mut wake_buf: Vec<Token> = Vec::with_capacity(64);
         for _ in 0..200 {
             let n = driver.drain(&mut buf);
             if n > 0 {
-                for cqe in &buf[..n] {
-                    let Ok(ev) = dope::Event::decode(*cqe) else {
+                for event in &mut buf[..n] {
+                    let Some(ev) = event.take() else {
                         continue;
                     };
                     if ev.route() == ROUTE {
@@ -97,8 +95,8 @@ fn probe_step_by_step() {
                 .drain_ready(|target| wake_buf.push(target));
             for t in &wake_buf {
                 if t.route() == ROUTE {
-                    let __typed =
-                        unsafe { dope::manifold::TypedToken::<PgConn>::new_unchecked(*t) };
+                    let __typed = dope::manifold::TypedToken::<PgConn>::try_new(*t)
+                        .expect("ready target route was checked");
                     Manifold::activate(pg.borrow_pin_mut(token), __typed, &mut driver);
                 }
             }
