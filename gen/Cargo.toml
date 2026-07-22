@@ -13,4 +13,9 @@ proc-macro = true
 [dependencies]
 proc-macro2 = "1"
 quote = "1"
-syn = { version = "2", features = ["full", "extra-traits", "visit", "visit-mut"] }
+syn = { version = "3", features = ["full", "extra-traits", "visit", "visit-mut"] }
+
+[dev-dependencies]
+cartel-core.workspace = true
+dope.workspace = true
+pin-project.workspace = true

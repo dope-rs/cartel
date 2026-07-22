@@ -1,244 +1,383 @@
 use o3::buffer::Shared;
 
+use crate::Error;
+use crate::protocol;
 use crate::value::Value;
-use crate::{Error, protocol};
 
-const MAX_DEPTH: usize = 64;
+pub const MAX_DEPTH: usize = 64;
 
-pub(super) fn parse_one_bytes(buf: &Shared) -> Result<Option<(Value, usize)>, Error> {
-    parse(buf, 0, 0)
+#[derive(Clone, Copy, Default)]
+enum Mode {
+    #[default]
+    Marker,
+    Line(LineKind),
+    Bulk {
+        payload_end: usize,
+        end: usize,
+    },
 }
 
-fn parse(buf: &Shared, off: usize, depth: usize) -> Result<Option<(Value, usize)>, Error> {
-    if depth > MAX_DEPTH {
-        return Err(Error::Redis("RESP nesting too deep".into()));
-    }
-    let view = &buf.as_slice()[off..];
-    if view.is_empty() {
-        return Ok(None);
-    }
-    match view[0] {
-        b'+' => parse_simple(buf, off + 1),
-        b'-' => parse_error(buf, off + 1),
-        b':' => parse_integer(buf, off + 1),
-        b'$' => parse_bulk(buf, off + 1),
-        b'*' => parse_array(buf, off + 1, depth),
-        other => Err(Error::Redis(format!(
-            "unknown RESP marker: {:?}",
-            other as char
-        ))),
+#[derive(Clone, Copy)]
+enum LineKind {
+    Status,
+    Error,
+    Integer,
+    Bulk,
+    Array,
+}
+
+pub struct ParseState {
+    cursor: usize,
+    scan: usize,
+    values: usize,
+    depth: usize,
+    remaining: [usize; MAX_DEPTH],
+    mode: Mode,
+}
+
+impl Default for ParseState {
+    fn default() -> Self {
+        Self {
+            cursor: 0,
+            scan: 0,
+            values: 0,
+            depth: 0,
+            remaining: [0; MAX_DEPTH],
+            mode: Mode::Marker,
+        }
     }
 }
 
-fn parse_simple(buf: &Shared, off: usize) -> Result<Option<(Value, usize)>, Error> {
-    let view = &buf.as_slice()[off..];
-    let Some(line_len) = find_crlf(view) else {
-        return Ok(None);
-    };
-    let value = if view[..line_len] == *b"OK" {
-        Value::Ok
-    } else {
-        Value::Status(buf.slice(off..off + line_len))
-    };
-    Ok(Some((value, off + line_len + 2)))
+impl ParseState {
+    fn reset(&mut self) {
+        self.cursor = 0;
+        self.scan = 0;
+        self.values = 0;
+        self.depth = 0;
+        self.mode = Mode::Marker;
+    }
+
+    fn finish_value(&mut self) -> bool {
+        loop {
+            if self.depth == 0 {
+                return true;
+            }
+            let remaining = &mut self.remaining[self.depth - 1];
+            *remaining -= 1;
+            if *remaining != 0 {
+                self.mode = Mode::Marker;
+                return false;
+            }
+            self.depth -= 1;
+        }
+    }
 }
 
-fn parse_error(buf: &Shared, off: usize) -> Result<Option<(Value, usize)>, Error> {
-    let view = &buf.as_slice()[off..];
-    let Some(line_len) = find_crlf(view) else {
-        return Ok(None);
-    };
-    Ok(Some((
-        Value::Error(buf.slice(off..off + line_len)),
-        off + line_len + 2,
-    )))
+pub struct Scanned {
+    frame: Shared,
+    value_count: usize,
 }
 
-fn parse_integer(buf: &Shared, off: usize) -> Result<Option<(Value, usize)>, Error> {
-    let view = &buf.as_slice()[off..];
-    let Some(line_len) = find_crlf(view) else {
-        return Ok(None);
-    };
-    let n = parse_signed(&view[..line_len])?;
-    Ok(Some((Value::Integer(n), off + line_len + 2)))
+impl Scanned {
+    pub fn frame_len(&self) -> usize {
+        self.frame.len()
+    }
+
+    pub fn value_count(&self) -> usize {
+        self.value_count
+    }
+
+    pub fn into_value(self) -> Result<Value, Error> {
+        build_value(&self.frame)
+    }
 }
 
-fn parse_bulk(buf: &Shared, off: usize) -> Result<Option<(Value, usize)>, Error> {
-    let view = &buf.as_slice()[off..];
-    let Some(header_len) = find_crlf(view) else {
-        return Ok(None);
-    };
-    let len = parse_signed(&view[..header_len])?;
-    if len < 0 {
-        return Ok(Some((Value::Nil, off + header_len + 2)));
-    }
-    let data_len = len as usize;
-    let total = header_len + 2 + data_len + 2;
-    if view.len() < total {
-        return Ok(None);
-    }
-    let payload_off = off + header_len + 2;
-    let trailer_idx = header_len + 2 + data_len;
-    let trailer_ok = view[trailer_idx] == b'\r' && view[trailer_idx + 1] == b'\n';
-    if !trailer_ok {
-        return Err(Error::Redis("missing CRLF after bulk payload".into()));
-    }
-    Ok(Some((
-        Value::Bulk(buf.slice(payload_off..payload_off + data_len)),
-        off + total,
-    )))
+pub enum Scan {
+    Pending,
+    Complete(Scanned, usize),
+    Invalid(protocol::Error, usize),
+    FrameCapacity(usize),
+    ValueCapacity(usize),
 }
 
-fn parse_array(buf: &Shared, off: usize, depth: usize) -> Result<Option<(Value, usize)>, Error> {
-    let view = &buf.as_slice()[off..];
-    let Some(header_len) = find_crlf(view) else {
-        return Ok(None);
-    };
-    let count = parse_signed(&view[..header_len])?;
-    if count < 0 {
-        return Ok(Some((Value::Nil, off + header_len + 2)));
+pub fn scan(
+    state: &mut ParseState,
+    buf: &Shared,
+    frame_capacity: usize,
+    value_capacity: usize,
+) -> Scan {
+    let bytes = buf.as_slice();
+    if state.cursor > bytes.len() || state.scan > bytes.len() {
+        state.reset();
     }
-    let n = count as usize;
-    let mut items = Vec::with_capacity(n.min(64));
-    let mut cursor = off + header_len + 2;
-    for _ in 0..n {
-        match parse(buf, cursor, depth + 1)? {
-            None => return Ok(None),
-            Some((value, used_total)) => {
-                items.push(value);
-                cursor = used_total;
+    loop {
+        match state.mode {
+            Mode::Marker => {
+                if state.cursor == bytes.len() {
+                    return Scan::Pending;
+                }
+                if state.cursor >= frame_capacity {
+                    return Scan::FrameCapacity(state.cursor.max(1).min(bytes.len()));
+                }
+                state.values = match state.values.checked_add(1) {
+                    Some(values) if values <= value_capacity => values,
+                    _ => return Scan::ValueCapacity((state.cursor + 1).min(bytes.len())),
+                };
+                let marker = bytes[state.cursor];
+                state.cursor += 1;
+                state.scan = state.cursor;
+                state.mode = match marker {
+                    b'+' => Mode::Line(LineKind::Status),
+                    b'-' => Mode::Line(LineKind::Error),
+                    b':' => Mode::Line(LineKind::Integer),
+                    b'$' => Mode::Line(LineKind::Bulk),
+                    b'*' => Mode::Line(LineKind::Array),
+                    _ => {
+                        return Scan::Invalid(
+                            protocol::Error::UnknownMarker,
+                            state.cursor.min(bytes.len()),
+                        );
+                    }
+                };
+            }
+            Mode::Line(kind) => {
+                let Some(line_end) = find_crlf_from(bytes, state.scan) else {
+                    state.scan = bytes.len().saturating_sub(1).max(state.cursor);
+                    if bytes.len() > frame_capacity {
+                        return Scan::FrameCapacity(frame_capacity.max(1));
+                    }
+                    return Scan::Pending;
+                };
+                let end = line_end + 2;
+                if end > frame_capacity {
+                    return Scan::FrameCapacity(end.min(bytes.len()).max(1));
+                }
+                let line = &bytes[state.cursor..line_end];
+                match kind {
+                    LineKind::Status | LineKind::Error => {
+                        state.cursor = end;
+                        if state.finish_value() {
+                            return complete(state, buf);
+                        }
+                    }
+                    LineKind::Integer => {
+                        if parse_signed(line).is_err() {
+                            return Scan::Invalid(protocol::Error::InvalidInteger, end);
+                        }
+                        state.cursor = end;
+                        if state.finish_value() {
+                            return complete(state, buf);
+                        }
+                    }
+                    LineKind::Bulk => {
+                        let length = match parse_length(line) {
+                            Ok(length) => length,
+                            Err(error) => return Scan::Invalid(error, end),
+                        };
+                        if length == -1 {
+                            state.cursor = end;
+                            if state.finish_value() {
+                                return complete(state, buf);
+                            }
+                            continue;
+                        }
+                        let Ok(length) = usize::try_from(length) else {
+                            return Scan::FrameCapacity(end);
+                        };
+                        let Some(payload_end) = end.checked_add(length) else {
+                            return Scan::FrameCapacity(end);
+                        };
+                        let Some(frame_end) = payload_end.checked_add(2) else {
+                            return Scan::FrameCapacity(end);
+                        };
+                        if frame_end > frame_capacity {
+                            return Scan::FrameCapacity(end);
+                        }
+                        state.mode = Mode::Bulk {
+                            payload_end,
+                            end: frame_end,
+                        };
+                    }
+                    LineKind::Array => {
+                        let count = match parse_length(line) {
+                            Ok(count) => count,
+                            Err(error) => return Scan::Invalid(error, end),
+                        };
+                        state.cursor = end;
+                        if count == -1 || count == 0 {
+                            if state.finish_value() {
+                                return complete(state, buf);
+                            }
+                            continue;
+                        }
+                        let Ok(count) = usize::try_from(count) else {
+                            return Scan::ValueCapacity(end);
+                        };
+                        if state
+                            .values
+                            .checked_add(count)
+                            .is_none_or(|minimum| minimum > value_capacity)
+                        {
+                            return Scan::ValueCapacity(end);
+                        }
+                        if state.depth == MAX_DEPTH {
+                            return Scan::Invalid(protocol::Error::NestingDepth, end);
+                        }
+                        state.remaining[state.depth] = count;
+                        state.depth += 1;
+                        state.mode = Mode::Marker;
+                    }
+                }
+            }
+            Mode::Bulk { payload_end, end } => {
+                if bytes.len() < end {
+                    return Scan::Pending;
+                }
+                if bytes[payload_end] != b'\r' || bytes[payload_end + 1] != b'\n' {
+                    return Scan::Invalid(protocol::Error::BulkTerminator, end);
+                }
+                state.cursor = end;
+                if state.finish_value() {
+                    return complete(state, buf);
+                }
             }
         }
     }
-    Ok(Some((Value::Array(items), cursor)))
 }
 
-fn find_crlf(buf: &[u8]) -> Option<usize> {
-    let mut i = 0;
-    while i + 1 < buf.len() {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
-            return Some(i);
+fn complete(state: &mut ParseState, buf: &Shared) -> Scan {
+    let consumed = state.cursor;
+    let value_count = state.values;
+    let frame = buf.slice(..consumed);
+    state.reset();
+    Scan::Complete(Scanned { frame, value_count }, consumed)
+}
+
+fn find_crlf_from(bytes: &[u8], mut cursor: usize) -> Option<usize> {
+    while cursor + 1 < bytes.len() {
+        if bytes[cursor] == b'\r' && bytes[cursor + 1] == b'\n' {
+            return Some(cursor);
         }
-        i += 1;
+        cursor += 1;
     }
     None
 }
 
-fn parse_signed(buf: &[u8]) -> Result<i64, Error> {
-    std::str::from_utf8(buf)
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .ok_or(Error::Protocol(protocol::Error::InvalidInteger))
+fn parse_length(bytes: &[u8]) -> Result<i64, protocol::Error> {
+    let value = parse_signed(bytes).map_err(|_| protocol::Error::InvalidInteger)?;
+    if value < -1 {
+        return Err(protocol::Error::InvalidLength);
+    }
+    Ok(value)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn decode(s: &[u8]) -> Result<Option<Value>, Error> {
-        let buf = Shared::copy_from_slice(s);
-        Ok(parse_one_bytes(&buf)?.map(|(v, _)| v))
+fn parse_signed(bytes: &[u8]) -> Result<i64, protocol::Error> {
+    if bytes.is_empty() {
+        return Err(protocol::Error::InvalidInteger);
     }
-
-    #[test]
-    fn parses_ok() {
-        let v = decode(b"+OK\r\n").unwrap().unwrap();
-        assert!(matches!(v, Value::Ok));
-    }
-
-    #[test]
-    fn parses_integer() {
-        let v = decode(b":-42\r\n").unwrap().unwrap();
-        assert!(matches!(v, Value::Integer(-42)));
-    }
-
-    #[test]
-    fn parses_bulk() {
-        let v = decode(b"$5\r\nhello\r\n").unwrap().unwrap();
-        match v {
-            Value::Bulk(bytes) => assert_eq!(bytes.as_slice(), b"hello"),
-            _ => panic!("expected bulk"),
+    let mut cursor = 0;
+    let negative = bytes[0] == b'-';
+    if negative {
+        cursor = 1;
+        if cursor == bytes.len() {
+            return Err(protocol::Error::InvalidInteger);
         }
     }
-
-    #[test]
-    fn parses_null_bulk() {
-        let v = decode(b"$-1\r\n").unwrap().unwrap();
-        assert!(matches!(v, Value::Nil));
+    let mut value = 0i64;
+    while cursor < bytes.len() {
+        let digit = bytes[cursor].wrapping_sub(b'0');
+        if digit > 9 {
+            return Err(protocol::Error::InvalidInteger);
+        }
+        value = if negative {
+            value
+                .checked_mul(10)
+                .and_then(|value| value.checked_sub(i64::from(digit)))
+        } else {
+            value
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(i64::from(digit)))
+        }
+        .ok_or(protocol::Error::InvalidInteger)?;
+        cursor += 1;
     }
+    Ok(value)
+}
 
-    #[test]
-    fn parses_array() {
-        let v = decode(b"*2\r\n$3\r\nfoo\r\n:7\r\n").unwrap().unwrap();
-        match v {
-            Value::Array(items) => {
-                assert_eq!(items.len(), 2);
-                assert!(matches!(&items[0], Value::Bulk(b) if b.as_slice() == b"foo"));
-                assert!(matches!(items[1], Value::Integer(7)));
+fn build_value(frame: &Shared) -> Result<Value, Error> {
+    let (value, consumed) = build_at(frame, 0, 0)?;
+    if consumed != frame.len() {
+        return Err(Error::Protocol(protocol::Error::TrailingBytes));
+    }
+    Ok(value)
+}
+
+fn build_at(frame: &Shared, offset: usize, depth: usize) -> Result<(Value, usize), Error> {
+    if depth > MAX_DEPTH || offset >= frame.len() {
+        return Err(Error::Protocol(protocol::Error::NestingDepth));
+    }
+    let bytes = frame.as_slice();
+    match bytes[offset] {
+        b'+' => {
+            let start = offset + 1;
+            let line_end = find_crlf_from(bytes, start)
+                .ok_or(Error::Protocol(protocol::Error::TrailingBytes))?;
+            let value = if bytes[start..line_end] == *b"OK" {
+                Value::Ok
+            } else {
+                Value::Status(frame.slice(start..line_end))
+            };
+            Ok((value, line_end + 2))
+        }
+        b'-' => {
+            let start = offset + 1;
+            let line_end = find_crlf_from(bytes, start)
+                .ok_or(Error::Protocol(protocol::Error::TrailingBytes))?;
+            Ok((Value::Error(frame.slice(start..line_end)), line_end + 2))
+        }
+        b':' => {
+            let start = offset + 1;
+            let line_end = find_crlf_from(bytes, start)
+                .ok_or(Error::Protocol(protocol::Error::TrailingBytes))?;
+            let value = parse_signed(&bytes[start..line_end]).map_err(Error::Protocol)?;
+            Ok((Value::Integer(value), line_end + 2))
+        }
+        b'$' => {
+            let start = offset + 1;
+            let line_end = find_crlf_from(bytes, start)
+                .ok_or(Error::Protocol(protocol::Error::TrailingBytes))?;
+            let length = parse_length(&bytes[start..line_end]).map_err(Error::Protocol)?;
+            if length == -1 {
+                return Ok((Value::Nil, line_end + 2));
             }
-            _ => panic!("expected array"),
+            let payload_start = line_end + 2;
+            let length = usize::try_from(length)
+                .map_err(|_| Error::Protocol(protocol::Error::InvalidLength))?;
+            let payload_end = payload_start + length;
+            Ok((
+                Value::Bulk(frame.slice(payload_start..payload_end)),
+                payload_end + 2,
+            ))
         }
-    }
-
-    #[test]
-    fn returns_none_on_partial() {
-        assert!(decode(b"$5\r\nhel").unwrap().is_none());
-    }
-
-    #[test]
-    fn error_response_parses_to_value_error() {
-        let v = decode(b"-ERR bad cmd\r\n").unwrap().unwrap();
-        match v {
-            Value::Error(msg) => assert_eq!(msg.as_slice(), b"ERR bad cmd"),
-            _ => panic!("expected error variant"),
+        b'*' => {
+            let start = offset + 1;
+            let line_end = find_crlf_from(bytes, start)
+                .ok_or(Error::Protocol(protocol::Error::TrailingBytes))?;
+            let count = parse_length(&bytes[start..line_end]).map_err(Error::Protocol)?;
+            if count == -1 {
+                return Ok((Value::Nil, line_end + 2));
+            }
+            let count = usize::try_from(count)
+                .map_err(|_| Error::Protocol(protocol::Error::InvalidLength))?;
+            let mut values = Vec::with_capacity(count);
+            let mut cursor = line_end + 2;
+            for _ in 0..count {
+                let (value, next) = build_at(frame, cursor, depth + 1)?;
+                values.push(value);
+                cursor = next;
+            }
+            Ok((Value::Array(values), cursor))
         }
-    }
-
-    #[test]
-    fn unknown_marker_is_hard_error() {
-        assert!(matches!(decode(b"?garbage\r\n"), Err(Error::Redis(_))));
-    }
-
-    #[test]
-    fn invalid_integer_is_hard_error() {
-        assert!(decode(b":notanint\r\n").is_err());
-    }
-
-    #[test]
-    fn missing_bulk_trailer_is_hard_error() {
-        assert!(matches!(decode(b"$3\r\nfooXX"), Err(Error::Redis(_))));
-    }
-
-    #[test]
-    fn deep_nesting_is_rejected() {
-        let mut s = Vec::new();
-        for _ in 0..(MAX_DEPTH + 5) {
-            s.extend_from_slice(b"*1\r\n");
-        }
-        s.extend_from_slice(b":1\r\n");
-        let buf = Shared::copy_from_slice(&s);
-        assert!(matches!(parse_one_bytes(&buf), Err(Error::Redis(_))));
-    }
-
-    #[test]
-    fn huge_array_count_does_not_preallocate() {
-        let buf = Shared::copy_from_slice(b"*1000000000\r\n");
-        assert!(parse_one_bytes(&buf).unwrap().is_none());
-    }
-
-    #[test]
-    fn bulk_view_is_zero_copy() {
-        let buf = Shared::copy_from_slice(b"$5\r\nhello\r\n");
-        let (v, _) = parse_one_bytes(&buf).unwrap().unwrap();
-        let Value::Bulk(view) = v else {
-            panic!("expected Bulk");
-        };
-        let buf_ptr = buf.as_slice().as_ptr() as usize;
-        let view_ptr = view.as_slice().as_ptr() as usize;
-        let buf_end = buf_ptr + buf.as_slice().len();
-        assert!(
-            view_ptr >= buf_ptr && view_ptr < buf_end,
-            "Bulk view ({view_ptr:#x}) must point inside parent buffer ({buf_ptr:#x}..{buf_end:#x})"
-        );
+        _ => Err(Error::Protocol(protocol::Error::UnknownMarker)),
     }
 }

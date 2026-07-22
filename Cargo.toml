@@ -4,18 +4,19 @@ members = ["core", "gen", "pg", "redis", "sqlite"]
 
 [workspace.package]
 edition = "2024"
-version = "0.3.0"
+version = "0.5.0"
 license = "MIT"
 repository = "https://github.com/dope-rs/cartel"
 authors = ["inq <gofiri@gmail.com>"]
 
 [workspace.dependencies]
-dope = "0.5"
-dope-gen = "0.5"
-dope-extra = "0.5"
-o3 = "0.2"
+dope = "0.8"
+dope-fiber = "0.8"
+dope-gen = "0.8"
+dope-extra = "0.8"
+dope-net = "0.8"
+o3 = "0.4"
 pin-project = "1"
-cartel-core = { path = "core", version = "0.3" }
-cartel-gen = { path = "gen", version = "0.3" }
-cartel-pg = { path = "pg", version = "0.3" }
-
+cartel-core = { path = "core", version = "0.5.0" }
+cartel-gen = { path = "gen", version = "0.5.0" }
+cartel-pg = { path = "pg", version = "0.5.0" }

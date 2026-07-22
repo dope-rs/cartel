@@ -133,27 +133,27 @@ impl PgBackend {
 
         let (wrapper_ret, dispatch_call, each_elem_out) = match &plan.dispatch {
             DispatchKind::One(t) => (
-                quote! { ::cartel_pg::Fiber<'__d, impl ::core::future::Future<Output = ::core::result::Result<#t, ::cartel_pg::Error>> + use<'__d, __R, __I, __S, __E>> },
+                quote! { impl ::cartel_pg::Fiber<'__d, Output = ::core::result::Result<#t, ::cartel_pg::Error>> + use<'__d, __R, __I> },
                 quote! { __client.run_one::<#q_struct>(#params_construct) },
                 quote! { ::core::result::Result<#t, ::cartel_pg::Error> },
             ),
             DispatchKind::First(t) => (
-                quote! { ::cartel_pg::Fiber<'__d, impl ::core::future::Future<Output = ::core::result::Result<::core::option::Option<#t>, ::cartel_pg::Error>> + use<'__d, __R, __I, __S, __E>> },
+                quote! { impl ::cartel_pg::Fiber<'__d, Output = ::core::result::Result<::core::option::Option<#t>, ::cartel_pg::Error>> + use<'__d, __R, __I> },
                 quote! { __client.run_first::<#q_struct>(#params_construct) },
                 quote! { ::core::result::Result<::core::option::Option<#t>, ::cartel_pg::Error> },
             ),
             DispatchKind::All(t) => (
-                quote! { ::cartel_pg::Fiber<'__d, impl ::core::future::Future<Output = ::core::result::Result<::std::vec::Vec<#t>, ::cartel_pg::Error>> + use<'__d, __R, __I, __S, __E>> },
+                quote! { impl ::cartel_pg::Fiber<'__d, Output = ::core::result::Result<::std::vec::Vec<#t>, ::cartel_pg::Error>> + use<'__d, __R, __I> },
                 quote! { __client.run_all::<#q_struct>(#params_construct) },
                 quote! { ::core::result::Result<::std::vec::Vec<#t>, ::cartel_pg::Error> },
             ),
             DispatchKind::Stream(t) => (
-                quote! { ::cartel_pg::RunStream<'__d, __I, __S, __E, #t> },
+                quote! { ::cartel_pg::RunStream<'__d, __I, #t> },
                 quote! { __client.run_stream::<#q_struct>(#params_construct) },
-                quote! { ::cartel_pg::RunStream<'__d, __I, __S, __E, #t> },
+                quote! { ::cartel_pg::RunStream<'__d, __I, #t> },
             ),
             DispatchKind::NoRows => (
-                quote! { ::cartel_pg::Fiber<'__d, ::cartel_pg::Dispatched<'__d, __I, __S, __E, ::cartel_pg::ExtractUnit>> },
+                quote! { ::cartel_pg::Dispatched<'__d, __I, ::cartel_pg::ExtractUnit> },
                 quote! { __client.run_no_rows::<#q_struct>(#params_construct) },
                 quote! { ::core::result::Result<(), ::cartel_pg::Error> },
             ),
@@ -176,14 +176,14 @@ impl PgBackend {
             _ => {
                 let each_fn_name = format_ident!("{}_each", fn_name);
                 let (each_arg_ty, each_arg_pat) = if n_fn_params == 1 {
-                    let ty = &param_tys[0];
+                    let ty = param_tys[0].rewrite_to_p();
                     let id = &param_ids[0];
-                    (quote! { &[#ty] }, quote! { #id })
+                    (quote! { &'p [#ty; __N] }, quote! { #id })
                 } else {
-                    let tuple_elems = param_tys.iter().map(|t| quote! { #t });
+                    let tuple_elems = param_tys.iter().map(TypeExt::rewrite_to_p);
                     let pat_elems = param_ids.iter().map(|id| quote! { #id });
                     (
-                        quote! { &[( #( #tuple_elems, )* )] },
+                        quote! { &'p [( #( #tuple_elems, )* ); __N] },
                         quote! { ( #( #pat_elems, )* ) },
                     )
                 };
@@ -199,33 +199,36 @@ impl PgBackend {
                     .iter()
                     .map(|id| quote! { ::core::clone::Clone::clone(#id) });
                 quote! {
-                    #fn_vis fn #each_fn_name<'__d, __R, __I, __S, __E>(
+                    #fn_vis fn #each_fn_name<'p, '__d, __R, __I, const __N: usize>(
                         __client: &__R,
                         __args: #each_arg_ty,
-                    ) -> ::cartel_pg::Batch<
-                        impl ::core::future::Future<Output = #each_elem_out>,
-                    >
+                    ) -> impl ::cartel_pg::Fiber<
+                        '__d,
+                        Output = impl ::core::iter::ExactSizeIterator<Item = #each_elem_out>
+                            + use<'p, '__d, __R, __I, __N>,
+                    > + use<'p, '__d, __R, __I, __N>
                     where
-                        __R: ::cartel_pg::PgOps<'__d, __I, __S, __E>,
+                        __R: ::cartel_pg::PgOps<'__d, __I>,
                         __I: ::cartel_pg::QuerySet + ::cartel_pg::HasGroup<#group_ty> + '__d,
-                        __S: ::dope::manifold::connector::source::Dialer<__E::Transport> + '__d,
-                        __E: ::dope::manifold::env::Env + '__d,
-                        __E::Transport: ::dope::transport::Transport<Addr: ::core::clone::Clone>,
                     {
-                        let __holding = __client.holding();
+                        let __pg = __client.client();
                         let __pin = __client.batch_pin();
-                        ::cartel_pg::Batch::new(
-                            __args
-                                .iter()
-                                .map(|#each_arg_pat| {
-                                    let __captured = ( #( #each_capture, )* );
-                                    let __runner = ::cartel_pg::Runner::new(__holding.clone(), __pin);
-                                    ::cartel_pg::Lazy::new(move || {
-                                        <#group_ty>::#fn_name(&__runner, #( #each_call_args, )*)
-                                    })
-                                })
-                                .collect::<::std::vec::Vec<_>>(),
-                        )
+                        let mut __batch = ::cartel_pg::Batch::<
+                            _,
+                            #each_elem_out,
+                            __N,
+                        >::new();
+                        for #each_arg_pat in __args.iter() {
+                            let __captured = ( #( #each_capture, )* );
+                            let __runner = ::cartel_pg::Runner::new(__pg, __pin);
+                            let __fiber = ::cartel_pg::Lazy::new(move || {
+                                <#group_ty>::#fn_name(&__runner, #( #each_call_args, )*)
+                            });
+                            if __batch.try_push(__fiber).is_err() {
+                                ::core::unreachable!()
+                            }
+                        }
+                        __batch
                     }
                 }
             }
@@ -297,16 +300,13 @@ impl PgBackend {
             }
 
             impl #group_ty {
-                #fn_vis fn #fn_name<'__d, __R, __I, __S, __E>(
+                #fn_vis fn #fn_name<'__d, __R, __I>(
                     __client: &__R,
                     #( #arg_decls, )*
                 ) -> #wrapper_ret
                 where
-                    __R: ::cartel_pg::PgOps<'__d, __I, __S, __E>,
+                    __R: ::cartel_pg::PgOps<'__d, __I>,
                     __I: ::cartel_pg::QuerySet + ::cartel_pg::HasGroup<#group_ty> + '__d,
-                    __S: ::dope::manifold::connector::source::Dialer<__E::Transport> + '__d,
-                    __E: ::dope::manifold::env::Env + '__d,
-                    __E::Transport: ::dope::transport::Transport<Addr: ::core::clone::Clone>,
                 {
                     #dispatch_call
                 }

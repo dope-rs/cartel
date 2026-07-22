@@ -1,27 +1,26 @@
 use std::net::SocketAddr;
-use std::pin::Pin;
+use std::pin::pin;
 use std::time::Duration;
 
 use cartel_gen::pg_instance;
-use cartel_pg::PgOps;
-use dope::fiber::Holding;
+use cartel_pg::{PgOps, port};
+use dope::driver::token::Token;
 use dope::manifold::Manifold;
 use dope::manifold::connector::Connector;
 use dope::manifold::connector::source::Static;
 use dope::manifold::env::Bundle;
-use dope::runtime::park::Parker;
 use dope::runtime::profile::Throughput;
-use dope::runtime::token::Token;
-use dope::transport::Tcp;
-use dope::wire::Identity;
-use dope::{Cqe, Drive, Driver, DriverCfg, DriverConfig};
+use dope::{Completion as _, Cqe, driver};
+use dope_net::tcp::Tcp;
+use dope_net::wire::identity::Identity;
+use o3::cell::BrandCell as Branded;
 
 const ROUTE: u8 = 0;
 
 pg_instance! { Probe: }
 
-type PgConn =
-    Connector<0, cartel_pg::Session<Probe>, Static<Tcp>, Bundle<Tcp, Identity, Throughput>>;
+type PgConn<'d> =
+    Connector<'d, 0, cartel_pg::Session<'d, Probe>, Static<Tcp>, Bundle<Tcp, Identity, Throughput>>;
 
 fn pg_addr() -> SocketAddr {
     let host = std::env::var("PG_HOST").unwrap_or_else(|_| "127.0.0.1".into());
@@ -42,67 +41,74 @@ fn pg_cfg() -> cartel_pg::Config {
 
 #[test]
 fn probe_step_by_step() {
+    if std::env::var_os("CARTEL_PG_TEST").is_none() {
+        return;
+    }
     let addr = pg_addr();
     let cfg = pg_cfg();
+    let port_config = port::Config::new(port::Capacities {
+        connections: 1,
+        request_entries: 16,
+        request_bytes: 4 * 1024,
+        response_entries: 65_536,
+        response_bytes: 256 * 1024 * 1024,
+        inflight: 16,
+        waiters: 16,
+        notifications: 1024,
+    })
+    .expect("port config");
 
-    let mut driver = Driver::new(DriverCfg::for_tcp_profile::<Throughput>(8)).expect("driver");
-    let upstreams = Static::<Tcp>::new(vec![addr], Duration::from_millis(500));
-    let pg = PgConn::new(cartel_pg::Session::new(cfg), upstreams, 1, &mut driver);
-    let mut pg = Box::pin(pg);
-    // SAFETY: single-threaded test; `Connector` stays boxed and unmoved for the whole test.
-    let pg_ptr = ::std::ptr::NonNull::from(unsafe { pg.as_mut().get_unchecked_mut() });
-    // SAFETY: same `Box`; `Holding` keeps only a `NonNull` into the pinned connector.
-    let pg_ref = Holding::of(unsafe { Pin::new_unchecked(&mut *pg_ptr.as_ptr()) });
+    let exec = dope::runtime::Executor::new(driver::Config::for_tcp_profile::<Throughput>(8))
+        .expect("driver")
+        .with_storage_factory(cartel_pg::Port::<Probe>::factory(cfg, port_config));
+    exec.enter(|mut sess| {
+        let backoff = sess.seed().derive(dope::hash::domain::BACKOFF).state();
+        let port = sess.storage() as *const cartel_pg::Port<'_, Probe>;
+        let (token, mut driver) = sess.token_and_driver();
+        // The port and connector remain inside this executor session.
+        let port = unsafe { &*port };
+        let upstreams = Static::<Tcp>::new(vec![addr], Duration::from_millis(500), backoff);
+        let connector: PgConn<'_> = port
+            .connect::<0, _, Bundle<Tcp, Identity, Throughput>>(upstreams, &mut driver)
+            .expect("connector");
+        let pg = pin!(Branded::new(connector));
+        let pg = pg.as_ref();
+        let client = port.client();
 
-    eprintln!("[probe] addr={}", addr);
-    eprintln!("[probe] connector created");
+        pg.borrow_pin_mut(token).pre_park(&mut driver);
 
-    eprintln!("[probe] -- first tick --");
-    pg.as_mut().pre_park(&mut driver);
-
-    let mut buf = [Cqe::ZERO; 64];
-    let mut wake_buf: Vec<Token> = Vec::with_capacity(64);
-    for i in 0..200 {
-        let pending_before = matches!(pg.as_ref().idle(), dope::Idle::Busy);
-        let n = Drive::drain(&mut driver, &mut buf);
-        if n > 0 {
-            for cqe in &buf[..n] {
-                let r = cqe.route();
-                let k = cqe.kind();
-                eprintln!(
-                    "[probe] iter {} CQE route={} kind={} result={}",
-                    i, r, k, cqe.result
-                );
-                if r == ROUTE {
-                    let Ok(ev) = dope::Event::try_from(*cqe) else {
+        let mut buf = [Cqe::ZERO; 64];
+        let mut wake_buf: Vec<Token> = Vec::with_capacity(64);
+        for _ in 0..200 {
+            let n = driver.drain(&mut buf);
+            if n > 0 {
+                for cqe in &buf[..n] {
+                    let Ok(ev) = dope::Event::decode(*cqe) else {
                         continue;
                     };
-                    Manifold::dispatch(pg.as_mut(), ev, &mut driver);
+                    if ev.route() == ROUTE {
+                        Manifold::dispatch(pg.borrow_pin_mut(token), ev, &mut driver);
+                    }
                 }
             }
-        }
-        wake_buf.clear();
-        Parker::drain(&driver, &mut wake_buf);
-        for t in &wake_buf {
-            if t.route() == ROUTE {
-                // SAFETY: gate `t.route() == ROUTE` verified token bits encode <PgConn as Manifold>::ID.
-                let __typed =
-                    unsafe { dope::manifold::route::TypedToken::<PgConn>::from_raw_token(*t) };
-                Manifold::on_wake(pg.as_mut(), __typed, &mut driver);
+            wake_buf.clear();
+            driver
+                .driver_ref()
+                .drain_ready(|target| wake_buf.push(target));
+            for t in &wake_buf {
+                if t.route() == ROUTE {
+                    let __typed =
+                        unsafe { dope::manifold::TypedToken::<PgConn>::new_unchecked(*t) };
+                    Manifold::activate(pg.borrow_pin_mut(token), __typed, &mut driver);
+                }
             }
+            pg.borrow_pin_mut(token).pre_park(&mut driver);
+            let live = client.live_count();
+            if live >= 1 {
+                return;
+            }
+            let _ = driver.wait(Some(Duration::from_millis(100)));
         }
-        pg.as_mut().pre_park(&mut driver);
-        let live = pg_ref.live_count();
-        let pending = matches!(pg.as_ref().idle(), dope::Idle::Busy);
-        eprintln!(
-            "[probe] iter {} n={} pending_before={} pending_after={} live={}",
-            i, n, pending_before, pending, live
-        );
-        if live >= 1 {
-            eprintln!("[probe] READY at iter {}", i);
-            return;
-        }
-        let _ = driver.park(Duration::from_millis(100));
-    }
-    panic!("never reached live=1 after 200 iters (20s)");
+        panic!("never reached live=1 after 200 iters (20s)");
+    });
 }

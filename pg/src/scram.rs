@@ -23,20 +23,20 @@ pub(super) struct Scram {
 }
 
 impl Scram {
-    pub(super) fn new(password: &str) -> Self {
+    pub(super) fn new(password: &str) -> Result<Self, Error> {
         let mut nonce_raw = [0u8; 18];
         rand::rngs::SysRng
             .try_fill_bytes(&mut nonce_raw)
-            .expect("OS RNG unavailable");
+            .map_err(|error| Error::Auth(format!("OS RNG unavailable: {error}")))?;
         let client_nonce = STANDARD.encode(nonce_raw);
         let client_first_bare = format!("n=,r={client_nonce}");
-        Self {
+        Ok(Self {
             password: password.as_bytes().to_vec(),
             client_nonce,
             client_first_bare,
             auth_message: String::new(),
             server_signature: [0u8; 32],
-        }
+        })
     }
 
     pub(super) fn pick_mechanism(&self, offered: &[&str]) -> Result<&'static str, Error> {

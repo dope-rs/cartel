@@ -1,46 +1,32 @@
-use std::future::Future;
+use dope_fiber::Fiber;
 
-use dope::manifold::connector::source::Dialer;
-use dope::manifold::env::Env;
-use dope::transport::Transport;
+use crate::{Dispatched, Error, ExtractUnit, PgOps, QuerySet};
 
-use crate::{Dispatched, Error, ExtractUnit, Fiber, PgHolding, PgOps, QuerySet};
-
-pub trait PgRawExt<'d, I, S, E>: PgOps<'d, I, S, E>
+pub trait PgRawExt<'d, I>: PgOps<'d, I>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
 {
-    fn execute_raw(
-        &self,
-        sql: &str,
-    ) -> Fiber<'d, impl Future<Output = Result<(), Error>> + use<'d, Self, I, S, E>> {
-        let dispatched: Dispatched<'d, I, S, E, ExtractUnit> = self.dispatch_sql(sql);
-        Fiber::new(dispatched)
+    fn execute_raw(&self, sql: &str) -> Dispatched<'d, I, ExtractUnit> {
+        self.dispatch_sql(sql)
     }
 
     fn migrate(
         &self,
         stmts: &'static [&'static str],
-    ) -> Fiber<'d, impl Future<Output = Result<(), Error>> + use<'d, Self, I, S, E>> {
-        let holding: PgHolding<'d, I, S, E> = self.holding();
-        Fiber::new(async move {
-            for sql in stmts {
-                holding.dispatch_sql(sql).await?;
+    ) -> impl Fiber<'d, Output = Result<(), Error>> + use<'d, Self, I> {
+        let client = self.client();
+        dope_fiber::fiber!('d => async move {
+            for statement in stmts {
+                client.dispatch_sql(statement).await?;
             }
             Ok(())
         })
     }
 }
 
-impl<'d, I, S, E, T> PgRawExt<'d, I, S, E> for T
+impl<'d, I, T> PgRawExt<'d, I> for T
 where
-    T: PgOps<'d, I, S, E>,
+    T: PgOps<'d, I>,
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
 {
 }

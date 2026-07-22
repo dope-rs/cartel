@@ -379,7 +379,9 @@ pub(super) enum ReturnShape {
 
 impl ReturnShape {
     pub(super) fn parse(ty: &Type) -> Self {
-        if let Type::Path(syn::TypePath { path, qself: None }) = ty
+        if let Type::Path(syn::TypePath {
+            path, qself: None, ..
+        }) = ty
             && let Some(seg) = path.segments.last()
             && (seg.ident == "Option" || seg.ident == "Vec" || seg.ident == "Stream")
             && let syn::PathArguments::AngleBracketed(args) = &seg.arguments

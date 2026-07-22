@@ -8,33 +8,33 @@ pub trait Sink {
     fn as_mut_slice(&mut self) -> &mut [u8];
 }
 
-impl Sink for o3::buffer::Owned {
+impl Sink for Vec<u8> {
     fn push(&mut self, byte: u8) {
-        o3::buffer::Owned::push(self, byte);
+        Vec::push(self, byte);
     }
     fn extend_from_slice(&mut self, src: &[u8]) {
-        o3::buffer::Owned::extend_from_slice(self, src);
+        Vec::extend_from_slice(self, src);
     }
     fn len(&self) -> usize {
-        o3::buffer::Owned::len(self)
+        Vec::len(self)
     }
     fn as_mut_slice(&mut self) -> &mut [u8] {
-        o3::buffer::Owned::as_mut_slice(self)
+        Vec::as_mut_slice(self)
     }
 }
 
-impl Sink for dope::manifold::connector::session::Stage<'_> {
+impl<B> Sink for dope::manifold::connector::state::Stage<'_, B> {
     fn push(&mut self, byte: u8) {
-        dope::manifold::connector::session::Stage::push(self, byte);
+        dope::manifold::connector::state::Stage::push(self, byte);
     }
     fn extend_from_slice(&mut self, src: &[u8]) {
-        dope::manifold::connector::session::Stage::extend_from_slice(self, src);
+        dope::manifold::connector::state::Stage::extend_from_slice(self, src);
     }
     fn len(&self) -> usize {
-        dope::manifold::connector::session::Stage::len(self)
+        dope::manifold::connector::state::Stage::len(self)
     }
     fn as_mut_slice(&mut self) -> &mut [u8] {
-        dope::manifold::connector::session::Stage::as_mut_slice(self)
+        dope::manifold::connector::state::Stage::as_mut_slice(self)
     }
 }
 

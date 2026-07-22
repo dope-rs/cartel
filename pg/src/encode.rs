@@ -53,11 +53,13 @@ pub(super) fn startup<S: Sink>(
     finish_len(out, pos);
 }
 
-pub(super) fn cancel_request<S: Sink>(out: &mut S, pid: i32, secret: i32) {
-    out.extend_from_slice(&16u32.to_be_bytes());
-    out.extend_from_slice(&Fe::CANCEL_REQUEST.to_be_bytes());
-    out.extend_from_slice(&pid.to_be_bytes());
-    out.extend_from_slice(&secret.to_be_bytes());
+pub(super) fn cancel_request_message(pid: i32, secret: i32) -> [u8; 16] {
+    let mut out = [0; 16];
+    out[..4].copy_from_slice(&16u32.to_be_bytes());
+    out[4..8].copy_from_slice(&Fe::CANCEL_REQUEST.to_be_bytes());
+    out[8..12].copy_from_slice(&pid.to_be_bytes());
+    out[12..].copy_from_slice(&secret.to_be_bytes());
+    out
 }
 
 pub(super) fn sync<S: Sink>(out: &mut S) {

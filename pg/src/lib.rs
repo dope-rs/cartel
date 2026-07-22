@@ -1,34 +1,8 @@
-//! A production-grade async PostgreSQL driver for the `dope` runtime, and the
-//! officially recommended Postgres driver for the `sark` framework.
-//!
-//! A [`Session`] multiplexes queries across a pool of connections, picking the
-//! target per request via a [`PickPolicy`] ([`RoundRobin`](PickPolicy::RoundRobin)
-//! or [`LeastInflight`](PickPolicy::LeastInflight)). Statements declared through a
-//! query set (`pg_instance!` / `#[query_group]`) are prepared eagerly on every
-//! connection at startup, so dispatch reuses cached prepared statements instead of
-//! re-parsing SQL. All queries are async, returning futures driven on the runtime's
-//! executor; type-safe accessors are generated for tables deriving [`PgTable`].
-//!
-//! ```ignore
-//! use cartel_pg::{Config, Session, PgTable};
-//!
-//! #[derive(PgTable)]
-//! #[table_name("users")]
-//! struct User { #[pk] id: i64, name: String }
-//!
-//! cartel_gen::pg_instance! { Db: User }
-//!
-//! let config = Config::new("user", "password", "mydb");
-//! let session = Session::<Db>::new(config); // wired into the pool via the runtime
-//!
-//! // Generated, prepared, async accessors:
-//! let user = User::by_id(&client, 1).await?;
-//! ```
-
 mod client;
 mod decode;
 pub mod dsl;
 mod encode;
+pub mod port;
 mod protocol;
 mod query;
 mod raw;
@@ -40,10 +14,12 @@ mod wire;
 
 pub use cartel_gen::PgTable;
 pub use client::{
-    CopyInGuard, CopyOutStream, Dispatched, ExtractUnit, NextNotification, PgHolding, PgOps,
-    PgTransport, RunStream, Runner,
+    Client, CopyInGuard, CopyOutStream, Dispatched, ExtractUnit, NextNotification, PgOps,
+    RunStream, Runner,
 };
-pub use dope::fiber::{Batch, Fiber, Lazy};
+pub use dope_extra::runtime::AppRuntime;
+pub use dope_fiber::{Batch, Fiber, Lazy};
+
 pub use dsl::{
     AggBuilder, AggHandle, ConflictTarget, Cte, DeleteBuilder, EachClosure, EachCols,
     FilterBuilder, InsertBuilder, JoinBuilder, JoinBuilder2, JoinBuilder3, JoinBuilder4,
@@ -55,11 +31,12 @@ pub use dsl::{
     regexp_match, regexp_replace, replace, round, row_number, sqrt, substring, sum, to_tsquery,
     to_tsvector, trim, ts_rank, upper, websearch_to_tsquery,
 };
+pub use port::{Port, PortFactory};
 pub use protocol::{PickPolicy, Session};
 pub use query::{HasGroup, QueryGroup, QueryMeta, QuerySet, Row, TypedQuery};
 pub use raw::PgRawExt;
 pub use tx::{
-    AccessMode, CancelToken, IsolationLevel, ListenGuard, PgPool, SavepointGuard, TxBuilder,
+    AccessMode, CancelToken, IsolationLevel, ListenGuard, PgPool, SavepointGuard, Tx, TxBuilder,
     TxGuard,
 };
 pub use value::{BindWriter, RowReader};
@@ -105,12 +82,13 @@ impl Text {
         Self(o3::buffer::Shared::from_static(s.as_bytes()))
     }
 
-    pub(crate) fn from_shared_unchecked(bytes: o3::buffer::Shared) -> Self {
-        Self(bytes)
+    pub(crate) fn from_shared(bytes: o3::buffer::Shared) -> Result<Self, std::str::Utf8Error> {
+        std::str::from_utf8(&bytes)?;
+        Ok(Self(bytes))
     }
 
     pub fn as_str(&self) -> &str {
-        // SAFETY: Text is only constructed from UTF-8-validated bytes.
+        // SAFETY: every Text constructor accepts UTF-8 input or validates the shared bytes.
         unsafe { std::str::from_utf8_unchecked(&self.0) }
     }
 }
@@ -157,15 +135,16 @@ impl Jsonb {
     }
 
     pub fn from_string(s: String) -> Self {
-        Self(o3::buffer::Shared::copy_from_slice(s.as_bytes()))
+        Self(o3::buffer::Shared::from(s))
     }
 
-    pub(crate) fn from_shared_unchecked(bytes: o3::buffer::Shared) -> Self {
-        Self(bytes)
+    pub(crate) fn from_shared(bytes: o3::buffer::Shared) -> Result<Self, std::str::Utf8Error> {
+        std::str::from_utf8(&bytes)?;
+        Ok(Self(bytes))
     }
 
     pub fn as_str(&self) -> &str {
-        // SAFETY: Jsonb is only constructed from UTF-8-validated bytes (PG jsonb wire stores valid UTF-8).
+        // SAFETY: every Jsonb constructor accepts UTF-8 input or validates the shared bytes.
         unsafe { std::str::from_utf8_unchecked(&self.0) }
     }
 
@@ -275,7 +254,8 @@ impl std::fmt::Display for Uuid {
             buf[bi] = HEX[(b & 0xf) as usize];
             bi += 1;
         }
-        f.write_str(std::str::from_utf8(&buf).unwrap())
+        let text = std::str::from_utf8(&buf).map_err(|_| std::fmt::Error)?;
+        f.write_str(text)
     }
 }
 
@@ -340,24 +320,16 @@ pub mod __internal {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub user: String,
-    pub password: String,
-    pub database: String,
-    pub application_name: String,
-    pub options: String,
-    /// Server-side `statement_timeout` applied at startup, in milliseconds.
-    /// `0` omits the setting entirely, deferring to the server's own default
-    /// (which is *not* necessarily "no timeout").
-    pub statement_timeout_ms: u32,
-    /// Upper bound on rows buffered for a single non-streaming response.
-    /// Exceeding it fails the query instead of growing memory without limit.
-    /// `0` disables the bound. Use the streaming API for unbounded result sets.
-    pub max_response_rows: usize,
+    user: String,
+    password: String,
+    database: String,
+    application_name: String,
+    options: String,
+    statement_timeout_ms: u32,
 }
 
 impl Config {
     pub const DEFAULT_STATEMENT_TIMEOUT_MS: u32 = 30_000;
-    pub const DEFAULT_MAX_RESPONSE_ROWS: usize = 1_000_000;
 
     pub fn new(
         user: impl Into<String>,
@@ -371,35 +343,41 @@ impl Config {
             application_name: "cartel-pg".into(),
             options: String::new(),
             statement_timeout_ms: Self::DEFAULT_STATEMENT_TIMEOUT_MS,
-            max_response_rows: Self::DEFAULT_MAX_RESPONSE_ROWS,
         }
     }
 
-    pub fn with_search_path(mut self, schema: &str) -> Self {
+    pub fn search_path(mut self, schema: &str) -> Self {
         self.options = format!("-c search_path={schema},public");
         self
     }
 
-    pub fn with_statement_timeout(mut self, dur: std::time::Duration) -> Self {
+    pub fn statement_timeout(mut self, dur: std::time::Duration) -> Self {
         self.statement_timeout_ms = dur.as_millis().min(u32::MAX as u128) as u32;
         self
     }
 
-    /// Stop sending `statement_timeout` at startup, deferring to the server
-    /// default. This does not guarantee unlimited execution time.
-    pub fn without_statement_timeout(mut self) -> Self {
-        self.statement_timeout_ms = 0;
-        self
+    pub(crate) fn user(&self) -> &str {
+        &self.user
     }
 
-    pub fn with_max_response_rows(mut self, rows: usize) -> Self {
-        self.max_response_rows = rows;
-        self
+    pub(crate) fn password(&self) -> &str {
+        &self.password
     }
 
-    pub fn without_max_response_rows(mut self) -> Self {
-        self.max_response_rows = 0;
-        self
+    pub(crate) fn database(&self) -> &str {
+        &self.database
+    }
+
+    pub(crate) fn application_name(&self) -> &str {
+        &self.application_name
+    }
+
+    pub(crate) fn options(&self) -> &str {
+        &self.options
+    }
+
+    pub(crate) fn statement_timeout_ms(&self) -> u32 {
+        self.statement_timeout_ms
     }
 }
 
@@ -451,6 +429,10 @@ pub enum Error {
     NotFound,
     UnexpectedNull,
     NoReadyConn,
+    WaiterCapacity,
+    RequestCapacity,
+    RequestTooLarge,
+    ResponseCapacity,
     Backpressure {
         inflight: usize,
         queued: usize,
@@ -475,6 +457,12 @@ impl From<cartel_core::Error> for Error {
     }
 }
 
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 impl Error {
     pub fn db(&self) -> Option<&DbError> {
         match self {
@@ -496,6 +484,10 @@ impl std::fmt::Display for Error {
             Self::NotFound => f.write_str("query returned no rows"),
             Self::UnexpectedNull => f.write_str("unexpected NULL in non-nullable column"),
             Self::NoReadyConn => f.write_str("no ready connection (saturated or connecting)"),
+            Self::WaiterCapacity => f.write_str("waiter capacity exhausted"),
+            Self::RequestCapacity => f.write_str("request capacity exhausted"),
+            Self::RequestTooLarge => f.write_str("request exceeds configured byte capacity"),
+            Self::ResponseCapacity => f.write_str("response capacity exceeded"),
             Self::Backpressure {
                 inflight,
                 queued,

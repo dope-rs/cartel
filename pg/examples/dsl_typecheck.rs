@@ -1,134 +1,135 @@
-use cartel_pg::dsl::*;
-use cartel_pg::{PgTable, Uuid};
+use std::io;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::time::Duration;
+
+use cartel_gen::{pg_instance, query_group};
+use cartel_pg::{Client, PgTable, Port, Stream, port};
+use dope::driver;
+use dope::manifold::connector::source::Static;
+use dope::manifold::env::Bundle;
+use dope::runtime::Executor;
+use dope::runtime::profile::Throughput;
+use dope_net::tcp::Tcp;
+use dope_net::wire::identity::Identity;
+
+const DEFAULT_HOST: &str = "127.0.0.1";
+const DEFAULT_PORT: u16 = 5432;
+const DEFAULT_USER: &str = "bench";
+const DEFAULT_PASSWORD: &str = "bench";
+const DEFAULT_DATABASE: &str = "bench";
+const CONNECTION_COUNT: usize = 1;
+const REQUEST_ENTRIES: usize = 16;
+const REQUEST_BYTES: usize = 4 * 1024;
+const RESPONSE_ENTRIES: usize = 65_536;
+const RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+const INFLIGHT: usize = 16;
+const WAITERS: usize = 16;
+const NOTIFICATIONS: usize = 1024;
+const DRIVER_CAPACITY: usize = 8;
+const RECONNECT_DELAY: Duration = Duration::from_millis(500);
+const SERVER_VERSION_SETTING: &str = "server_version";
+
+type ExampleError = Box<dyn std::error::Error>;
+type PgEnvironment = Bundle<Tcp, Identity, Throughput>;
 
 #[derive(PgTable)]
-#[allow(dead_code)]
-struct User {
+#[table_name("pg_catalog.pg_settings")]
+struct Setting {
     #[pk]
-    id: i64,
     name: String,
-    age: i32,
+    setting: String,
 }
 
-#[derive(PgTable)]
-#[allow(dead_code)]
-struct Post {
-    #[pk]
-    id: i64,
-    author_id: i64,
-    title: String,
+#[query_group]
+impl Setting {
+    fn by_name(name: String) -> Stream<Setting> {
+        Setting::filter(|setting| setting.name == name).stream()
+    }
 }
 
-#[derive(PgTable)]
-#[allow(dead_code)]
-struct Doc {
-    #[pk]
-    id: i64,
-    payload: Vec<u8>,
+pg_instance! { ExampleDatabase: Setting }
+
+struct ExampleConfig {
+    address: SocketAddr,
+    credentials: cartel_pg::Config,
 }
 
-#[allow(dead_code, unreachable_code, clippy::let_unit_value)]
-fn typecheck_basic() {
-    let _: User = User::filter(|u| u.id == 1).one();
-    let _: Option<User> = User::filter(|u| u.id == 1).first();
-    let _: Vec<User> = User::filter(|u| u.id >= 1).all();
-    let _: i64 = User::filter(|u| u.age >= 18).count();
-    let _: Option<i32> = User::filter(|u| u.age >= 18).max(|u| u.age);
-    let _: Option<f64> = User::filter(|u| u.age >= 18).avg(|u| u.age);
-
-    let _: Vec<User> = User::filter(|u| u.id >= 1)
-        .order_by_desc(|u| u.id)
-        .limit(10)
-        .offset(5)
-        .all();
-    let _: Vec<User> = User::filter(|u| u.id >= 1).distinct().all();
-    let _: User = User::filter(|u| u.id == 1).for_update().one();
-
-    let pat = String::from("a%");
-    let _: Vec<User> = User::filter(|u| u.name.like(&pat)).all();
-
-    let ids = vec![1i64, 2, 3];
-    let _: Vec<User> = User::filter(|u| u.id.in_(&ids)).all();
-}
-
-#[allow(dead_code, unreachable_code)]
-fn typecheck_join() {
-    let _: Vec<Post> = Post::join::<User>(|p, u| p.author_id == u.id)
-        .filter(|_p, u| u.id >= 1)
-        .all();
-    let _: Vec<(Post, User)> = Post::join::<User>(|p, u| p.author_id == u.id)
-        .filter(|p, u| p.id >= 1 && u.id >= 1)
-        .all();
-}
-
-#[allow(dead_code, unreachable_code)]
-fn typecheck_aggregate() {
-    let _: Vec<(i32, i64)> = User::filter(|u| u.age >= 18).group_by(|u| u.age).count();
-    let _: Vec<(i32, i64)> = User::filter(|u| u.age >= 18)
-        .group_by(|u| u.age)
-        .having(|_u, agg| agg.count() > 10)
-        .count();
-}
-
-#[allow(dead_code, unreachable_code)]
-fn typecheck_mutations() {
-    User::filter(|u| u.id == 1).update(|u| {
-        u.name = String::new();
-    });
-    let _: User = User::filter(|u| u.id == 1)
-        .update(|u| {
-            u.name = String::new();
+impl ExampleConfig {
+    fn from_environment() -> Result<Self, ExampleError> {
+        let host = environment_value("PG_HOST", DEFAULT_HOST);
+        let port = environment_value("PG_PORT", &DEFAULT_PORT.to_string()).parse::<u16>()?;
+        let address = (host.as_str(), port)
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::AddrNotAvailable, "PG_HOST resolved empty")
+            })?;
+        let credentials = cartel_pg::Config::new(
+            environment_value("PG_USER", DEFAULT_USER),
+            environment_value("PG_PASSWORD", DEFAULT_PASSWORD),
+            environment_value("PG_DATABASE", DEFAULT_DATABASE),
+        );
+        Ok(Self {
+            address,
+            credentials,
         })
-        .returning_one();
-    User::filter(|u| u.id == 1).delete();
-
-    User::insert(|u| {
-        u.id = 1;
-    });
-    User::insert(|u| {
-        u.id = 1;
-    })
-    .on_conflict_do_nothing();
-    User::insert(|u| {
-        u.id = 1;
-    })
-    .on_conflict(|u| u.id)
-    .do_nothing();
+    }
 }
 
-#[allow(dead_code, unreachable_code)]
-fn typecheck_setops() {
-    let _: Vec<User> = User::filter(|u| u.age < 30)
-        .union(User::filter(|u| u.age > 60))
-        .all();
+fn environment_value(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_owned())
 }
 
-#[allow(dead_code, unreachable_code)]
-fn typecheck_subquery() {
-    let _: Vec<User> = User::filter(|u| exists(Post::filter(|p| p.author_id == u.id))).all();
-    let _: Vec<User> = User::filter(|u| not_exists(Post::filter(|p| p.author_id == u.id))).all();
-}
+fn main() -> Result<(), ExampleError> {
+    let ExampleConfig {
+        address,
+        credentials,
+    } = ExampleConfig::from_environment()?;
+    let port_config = port::Config::new(port::Capacities {
+        connections: CONNECTION_COUNT,
+        request_entries: REQUEST_ENTRIES,
+        request_bytes: REQUEST_BYTES,
+        response_entries: RESPONSE_ENTRIES,
+        response_bytes: RESPONSE_BYTES,
+        inflight: INFLIGHT,
+        waiters: WAITERS,
+        notifications: NOTIFICATIONS,
+    })?;
+    let executor = Executor::new(driver::Config::for_tcp_profile::<Throughput>(
+        DRIVER_CAPACITY,
+    ))?
+    .with_storage_factory(Port::<ExampleDatabase>::factory(credentials, port_config));
 
-#[allow(dead_code, unreachable_code)]
-fn typecheck_cte() {
-    let young = User::filter(|u| u.age < 30).cte();
-    let old = User::filter(|u| u.age > 60).cte();
-    let _: Vec<User> = young.union(old).all();
-}
-
-#[allow(dead_code, unreachable_code)]
-fn typecheck_window() {
-    let _: Vec<i64> = User::filter(|u| u.age >= 18).select(|u| u.id).all();
-    let _: Vec<(i64, i64)> = User::filter(|u| u.age >= 18)
-        .select(|u| {
-            (
-                u.id,
-                row_number().over(|w| w.partition_by(u.age).order_by(u.id)),
-            )
+    let server_version = executor
+        .enter(|mut session| {
+            let backoff = session.seed().derive(dope::hash::domain::BACKOFF).state();
+            let port = session.storage() as *const Port<'_, ExampleDatabase>;
+            // The port is pinned in executor storage until after the connector
+            // runtime and all database fibers have been dropped.
+            let port = unsafe { &*port };
+            let client: Client<'_, ExampleDatabase> = port.client();
+            let upstreams = Static::<Tcp>::new(vec![address], RECONNECT_DELAY, backoff);
+            let connector = {
+                let mut driver = session.driver_access();
+                port.connect::<0, _, PgEnvironment>(upstreams, &mut driver)?
+            };
+            cartel_pg::AppRuntime::enter(&mut session, connector, |mut runtime| {
+                let mut matching_settings =
+                    Setting::by_name(&client, SERVER_VERSION_SETTING.to_owned());
+                let server_version = runtime
+                    .block_on(matching_settings.next_row())??
+                    .ok_or(cartel_pg::Error::NotFound)?;
+                let duplicate = runtime.block_on(matching_settings.next_row())??;
+                if duplicate.is_some() {
+                    return Err(cartel_pg::Error::Other(
+                        "server_version setting is not unique".to_owned(),
+                    ));
+                }
+                Ok(server_version)
+            })
         })
-        .all();
-}
+        .map_err(|error| io::Error::other(error.to_string()))?;
 
-fn main() {
-    let _ = Uuid::NIL;
+    println!("{}={}", server_version.name, server_version.setting);
+    Ok(())
 }

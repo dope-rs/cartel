@@ -10,11 +10,13 @@ authors.workspace = true
 [dependencies]
 o3.workspace = true
 dope.workspace = true
-dope-gen.workspace = true
+dope-fiber.workspace = true
+dope-net.workspace = true
 cartel-core.workspace = true
 
 [lib]
 
 [dev-dependencies]
+cartel-gen.workspace = true
 dope-extra.workspace = true
 pin-project.workspace = true

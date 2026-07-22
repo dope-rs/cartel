@@ -1,102 +1,87 @@
-use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::time::Instant;
 
-use cartel_redis::{DEFAULT_BACKOFF, Ops};
-use dope::fiber::Holding;
-use dope::manifold::connector::Connector;
+use cartel_redis::{Capacities, Config, ConfigError, Connect, DEFAULT_BACKOFF, Ops};
+use dope::driver;
 use dope::manifold::connector::source::Static;
 use dope::manifold::env::Bundle;
+use dope::runtime::Executor;
 use dope::runtime::profile::Throughput;
-use dope::transport::Tcp;
-use dope::wire::Identity;
-use dope::{DriverCfg, DriverConfig, Executor};
+use dope_net::tcp::Tcp;
+use dope_net::wire::identity::Identity;
 
-type RedisConn =
-    Connector<0, cartel_redis::Session, Static<Tcp>, Bundle<Tcp, Identity, Throughput>>;
+type Env = Bundle<Tcp, Identity, Throughput>;
 
-#[pin_project::pin_project]
-#[derive(dope_gen::Dispatcher)]
-struct RedisDispatcher {
-    #[pin]
-    #[manifold]
-    redis: RedisConn,
+fn redis_config() -> Result<Config, ConfigError> {
+    Config::new(Capacities {
+        connection: 1,
+        waiters: 16,
+        inflight: 256,
+        request_entries: 256,
+        request_bytes: 64 * 1024,
+        response_bytes: 64 * 1024 * 1024,
+        response_values: 65_536,
+        max_frame_bytes: 16 * 1024 * 1024,
+    })
 }
 
-struct ProductionDemo {
-    exec: Box<Executor>,
-    dispatcher: Pin<Box<RedisDispatcher>>,
-}
-
-impl ProductionDemo {
-    fn new(addr: SocketAddr) -> std::io::Result<Self> {
-        let cfg = DriverCfg::for_tcp_profile::<Throughput>(16);
-        let mut exec = Box::new(Executor::new(cfg)?);
-
-        let driver = exec.driver_mut();
-        let dispatcher = Box::pin(RedisDispatcher {
-            redis: RedisConn::new(
-                cartel_redis::Session::new(),
-                Static::<Tcp>::new(vec![addr], DEFAULT_BACKOFF),
-                1,
-                driver,
-            ),
-        });
-        Ok(Self { exec, dispatcher })
-    }
-
-    fn block_on<F: Future>(&mut self, fut: F) -> F::Output {
-        dope_extra::block_on(
-            &mut self.exec,
-            self.dispatcher.as_mut(),
-            dope::fiber::Fiber::new(fut),
-        )
-    }
-
-    fn client<'a>(&mut self) -> Holding<'a, RedisConn> {
-        self.dispatcher.as_mut().redis_handle()
-    }
-}
-
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = std::env::var("REDIS_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:6379".to_string())
-        .parse()
-        .expect("invalid REDIS_ADDR");
+        .parse()?;
 
-    let mut demo = ProductionDemo::new(addr).expect("driver init");
-    let client = demo.client();
+    let driver = driver::Config::for_tcp_profile::<Throughput>(16);
+    let exec = Executor::new(driver)?.with_storage_factory(redis_config()?.factory());
+    exec.enter(|mut session| -> Result<(), Box<dyn std::error::Error>> {
+        let backoff = session.seed().derive(dope::hash::domain::BACKOFF).state();
+        let store = session.storage() as *const cartel_redis::Store<'_>;
+        // The store is pinned in executor storage until after the connector
+        // runtime and probe fiber are destroyed.
+        let redis = unsafe { (&*store).redis() };
+        let connector = {
+            let mut driver = session.driver_access();
+            redis
+                .connect::<0, _, Env>(
+                    Connect {
+                        topology: Static::<Tcp>::new(vec![addr], DEFAULT_BACKOFF, backoff),
+                    },
+                    &mut driver,
+                )?
+        };
 
-    demo.block_on(async {
-        client.wait_active().await.expect("redis connect");
-        let started = Instant::now();
-        let probes = 64;
-        let mut hits = 0u64;
-        for _ in 0..probes {
-            client.ping().await.expect("ping");
-            hits += 1;
-        }
-        let elapsed = started.elapsed();
-
-        let id = client.client_id().await.expect("client id");
-        let info = client
-            .info(Some(b"server"))
-            .await
-            .expect("info server");
+        let probe = dope_fiber::fiber!('_ => async move {
+            redis.wait_active().await?;
+            for _ in 0..16 {
+                redis.ping().await?;
+            }
+            let started = Instant::now();
+            let mut hits = 0u64;
+            for _ in 0..64 {
+                redis.ping().await?;
+                hits += 1;
+            }
+            let elapsed = started.elapsed();
+            let id = redis.client_id().await?;
+            let info = redis.info(Some(b"server")).await?;
+            Ok::<_, cartel_redis::Error>((hits, elapsed, id, info))
+        });
+        let (hits, elapsed, id, info) =
+            dope_extra::runtime::AppRuntime::enter(&mut session, connector, |mut runtime| {
+                runtime.block_on(probe)
+            })??;
         let info_summary = std::str::from_utf8(info.as_slice())
             .ok()
-            .and_then(|s| {
-                s.lines()
+            .and_then(|text| {
+                text.lines()
                     .find(|line| line.starts_with("redis_version:"))
-                    .map(|line| line.to_string())
+                    .map(str::to_owned)
             })
             .unwrap_or_else(|| String::from("redis_version: unknown"));
-
         println!(
-            "production demo: client_id={id} pings={hits} elapsed_ms={} per_op_us={:.1} {info_summary}",
+            "production probe: client_id={id} pings={hits} elapsed_ms={} per_op_us={:.1} {info_summary}",
             elapsed.as_millis(),
             elapsed.as_micros() as f64 / hits as f64,
         );
-    });
+        Ok(())
+    })
 }

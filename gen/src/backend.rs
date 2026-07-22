@@ -55,10 +55,11 @@ impl Compiled {
         let synthetic = syn::ItemFn {
             attrs: Vec::new(),
             vis: syn::Visibility::Inherited,
+            modifiers: Default::default(),
             sig: syn::Signature {
                 constness: None,
                 asyncness: None,
-                unsafety: None,
+                safety: Default::default(),
                 abi: None,
                 fn_token: syn::Token![fn](span),
                 ident: Ident::new("__cartel_query", span),

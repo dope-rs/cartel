@@ -1,30 +1,40 @@
 use std::fmt;
 
-use cartel_core::{FatalSlot, Slab};
-use dope::WakerSet;
+use dope::driver::token::Token;
 use dope::manifold::connector;
 use dope::manifold::connector::{Close, Ctx};
-use dope::runtime::token::Token;
 use o3::buffer;
 
-use crate::decode::parse_one_bytes;
-use crate::value::Value;
+use crate::decode::{ParseState, Scan, Scanned, scan};
+use crate::port::{Frame as SendFrame, Port};
 
 #[derive(Debug)]
 pub enum Error {
     InvalidInteger,
+    InvalidLength,
+    UnknownMarker,
+    NestingDepth,
+    BulkTerminator,
+    TrailingBytes,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidInteger => f.write_str("invalid integer"),
+            Self::InvalidLength => f.write_str("invalid length"),
+            Self::UnknownMarker => f.write_str("unknown RESP marker"),
+            Self::NestingDepth => f.write_str("RESP nesting capacity exceeded"),
+            Self::BulkTerminator => f.write_str("missing CRLF after bulk payload"),
+            Self::TrailingBytes => f.write_str("RESP frame has trailing bytes"),
         }
     }
 }
 
+impl std::error::Error for Error {}
+
 pub enum Head {
-    Reply(Value),
+    Reply(Scanned),
     Fatal(crate::Error),
 }
 
@@ -51,140 +61,146 @@ impl connector::Lifecycle for ConnState {
     }
 }
 
-pub(super) type Outcome = Result<Value, crate::Error>;
+pub(super) type Outcome = Result<Scanned, crate::Error>;
 
-pub(super) struct Shared {
-    pub(super) slab: Slab<Outcome>,
-    pub(super) conn_id: Option<Token>,
-    pub(super) max_inflight: usize,
-    pub(super) active_wakers: WakerSet,
-    pub(super) fatal: FatalSlot<crate::Error>,
+pub struct Codec {
+    max_frame_capacity: usize,
+    response_value_capacity: usize,
 }
 
-impl Shared {
-    fn new() -> Self {
+impl Codec {
+    pub fn new(max_frame_capacity: usize, response_value_capacity: usize) -> Self {
         Self {
-            slab: Slab::new(),
-            conn_id: None,
-            max_inflight: usize::MAX,
-            active_wakers: WakerSet::new(),
-            fatal: FatalSlot::default(),
+            max_frame_capacity,
+            response_value_capacity,
         }
     }
 }
-
-pub struct Codec;
 
 impl connector::Codec for Codec {
     type Head = Head;
-    type ParseState = ();
+    type ParseState = ParseState;
 
-    fn parse(&self, _state: &mut (), buf: &buffer::Shared) -> Option<(Head, usize)> {
-        match parse_one_bytes(buf) {
-            Ok(Some((value, consumed))) => Some((Head::Reply(value), consumed)),
-            Ok(None) => None,
-            Err(e) => Some((Head::Fatal(e), buf.as_slice().len().max(1))),
+    fn parse(&self, state: &mut ParseState, buf: &buffer::Shared) -> Option<(Head, usize)> {
+        match scan(
+            state,
+            buf,
+            self.max_frame_capacity,
+            self.response_value_capacity,
+        ) {
+            Scan::Pending => None,
+            Scan::Complete(frame, consumed) => Some((Head::Reply(frame), consumed)),
+            Scan::Invalid(error, consumed) => {
+                *state = ParseState::default();
+                Some((Head::Fatal(crate::Error::Protocol(error)), consumed.max(1)))
+            }
+            Scan::FrameCapacity(consumed) => {
+                *state = ParseState::default();
+                Some((
+                    Head::Fatal(crate::Error::ResponseFrameCapacity),
+                    consumed.max(1),
+                ))
+            }
+            Scan::ValueCapacity(consumed) => {
+                *state = ParseState::default();
+                Some((
+                    Head::Fatal(crate::Error::ResponseValueCapacity),
+                    consumed.max(1),
+                ))
+            }
         }
     }
 }
 
-pub struct Session {
+pub(super) struct Session<'d> {
     codec: Codec,
-    pub(super) shared: Shared,
+    port: &'d Port<'d>,
 }
 
-impl Session {
-    pub fn new() -> Self {
+impl<'d> Session<'d> {
+    pub(super) fn new(port: &'d Port<'d>) -> Self {
         Self {
-            codec: Codec,
-            shared: Shared::new(),
+            codec: Codec::new(port.max_frame_capacity(), port.response_value_capacity()),
+            port,
         }
     }
-}
 
-impl Default for Session {
-    fn default() -> Self {
-        Self::new()
+    fn fail(&self, token: Token, error: crate::Error) {
+        let message = error.to_string();
+        self.port.record_fatal(error);
+        if let Some(responses) = self.port.responses(token) {
+            responses.fail_all(|| Err(crate::Error::Redis(message.clone())));
+        }
+        self.port.wake_active();
     }
 }
 
-impl connector::Session for Session {
+impl<'d> connector::Session<'d> for Session<'d> {
     type Codec = Codec;
     type ConnState = ConnState;
+    type Send = SendFrame<'d>;
 
-    fn codec(&self) -> &Codec {
+    fn codec(&self) -> &Self::Codec {
         &self.codec
     }
 
-    fn connect(&mut self, ctx: &mut Ctx<'_, Self>) {
-        ctx.state.poisoned = false;
-        self.shared.conn_id = Some(ctx.conn_id);
-        self.shared.fatal.clear();
-        self.shared.active_wakers.drain_wake();
+    fn activate(&self, token: Token, ready: dope::driver::ready::ReadyKey<'d>) {
+        assert!(self.port.activate(token, ready));
     }
 
-    fn response(&mut self, head: Head, ctx: &mut Ctx<'_, Self>) {
+    fn connect(&mut self, ctx: &mut Ctx<'_, 'd, Self>) {
+        ctx.state.poisoned = false;
+        self.port.clear_fatal();
+        self.port.wake_active();
+    }
+
+    fn response(&mut self, head: Head, ctx: &mut Ctx<'_, 'd, Self>) {
         match head {
             Head::Reply(value) => {
-                self.shared.slab.push(Ok(value));
-                self.shared.slab.complete();
+                let bytes = value.frame_len();
+                let credits = value.value_count();
+                let Some(responses) = self.port.responses(ctx.conn_id) else {
+                    return;
+                };
+                responses.try_push(Ok(value), bytes, credits);
+                responses.complete();
             }
-            Head::Fatal(err) => {
-                let msg = err.to_string();
-                self.shared.fatal.record(err);
+            Head::Fatal(error) => {
                 ctx.state.poisoned = true;
-                self.shared.conn_id = None;
-                self.shared
-                    .slab
-                    .fail_all(|| Err(crate::Error::Redis(msg.clone())));
-                self.shared.active_wakers.drain_wake();
+                self.fail(ctx.conn_id, error);
             }
         }
     }
 
-    fn disconnect(&mut self, ctx: &mut Ctx<'_, Self>) {
-        let _ = ctx;
-        self.shared.conn_id = None;
-        let msg = self
-            .shared
-            .fatal
-            .as_ref()
-            .map(|e| e.to_string())
+    fn disconnect(&mut self, ctx: &mut Ctx<'_, 'd, Self>) {
+        let message = self
+            .port
+            .fatal_message()
             .unwrap_or_else(|| "connection closed".to_string());
-        self.shared
-            .slab
-            .fail_all(|| Err(crate::Error::Redis(msg.clone())));
-        self.shared.active_wakers.drain_wake();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use dope::manifold::connector::Codec as _;
-
-    use super::*;
-
-    #[test]
-    fn malformed_frame_maps_to_fatal_not_reply() {
-        let codec = Codec;
-        let buf = buffer::Shared::copy_from_slice(b"?bogus\r\n");
-        let (head, consumed) = codec.parse(&mut (), &buf).expect("decoder yields head");
-        assert!(matches!(head, Head::Fatal(_)));
-        assert_eq!(consumed, buf.as_slice().len());
+        if let Some(responses) = self.port.responses(ctx.conn_id) {
+            responses.fail_all(|| Err(crate::Error::Redis(message.clone())));
+        }
+        self.port.deactivate(ctx.conn_id);
+        self.port.wake_active();
     }
 
-    #[test]
-    fn valid_frame_maps_to_reply() {
-        let codec = Codec;
-        let buf = buffer::Shared::copy_from_slice(b"+OK\r\n");
-        let (head, _) = codec.parse(&mut (), &buf).expect("decoder yields head");
-        assert!(matches!(head, Head::Reply(Value::Ok)));
+    fn drain_requests(
+        &self,
+        token: Token,
+        push: impl FnMut(Self::Send) -> Result<(), Self::Send>,
+    ) -> connector::Requests {
+        self.port.drain_requests(token, push)
     }
 
-    #[test]
-    fn partial_frame_yields_none() {
-        let codec = Codec;
-        let buf = buffer::Shared::copy_from_slice(b"$5\r\nhel");
-        assert!(codec.parse(&mut (), &buf).is_none());
+    fn defer_close(&self, token: Token, _state: &Self::ConnState) -> bool {
+        self.port
+            .responses(token)
+            .is_some_and(|responses| !responses.is_empty())
+    }
+
+    fn is_drained(&self, token: Token, _state: &Self::ConnState) -> bool {
+        self.port
+            .responses(token)
+            .is_none_or(cartel_core::Arena::is_empty)
     }
 }

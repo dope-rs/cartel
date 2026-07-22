@@ -47,6 +47,13 @@ impl Backend for SqliteBackend {
 
 impl SqliteBackend {
     pub(super) fn query_free(f: ItemFn, no_probe: bool) -> syn::Result<proc_macro2::TokenStream> {
+        f.modifiers.require_empty()?;
+        if let syn::Safety::Unsafe(unsafe_token) = &f.sig.safety {
+            return Err(syn::Error::new_spanned(
+                unsafe_token,
+                "#[query] functions must not be unsafe",
+            ));
+        }
         if f.sig.asyncness.is_some() {
             return Err(syn::Error::new(
                 f.sig.span(),

@@ -33,7 +33,7 @@ pub trait QueryGroup {
 
 pub trait HasGroup<G: QueryGroup> {}
 
-pub trait QuerySet {
+pub trait QuerySet: 'static {
     const GROUPS: &'static [&'static [QueryMeta]];
 }
 

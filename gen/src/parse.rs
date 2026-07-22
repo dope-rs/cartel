@@ -1121,7 +1121,10 @@ impl JoinSpec {
                 "`.join` turbofish argument must be a type",
             ));
         };
-        let Type::Path(syn::TypePath { path, qself: None }) = joined_ty else {
+        let Type::Path(syn::TypePath {
+            path, qself: None, ..
+        }) = joined_ty
+        else {
             return Err(syn::Error::new(
                 joined_ty.span(),
                 "`.join` turbofish argument must be a plain Table path",
@@ -1178,6 +1181,7 @@ impl JoinSpec {
         let Type::Path(syn::TypePath {
             path: joined_path,
             qself: None,
+            ..
         }) = joined_ty
         else {
             return Err(syn::Error::new(

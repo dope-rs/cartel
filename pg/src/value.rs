@@ -22,7 +22,7 @@ impl<'a> RowReader<'a> {
         if self.buf.len() < 4 {
             return Err(Error::Protocol("row column len truncated"));
         }
-        let len = i32::from_be_bytes(self.buf[0..4].try_into().unwrap());
+        let len = i32::from_be_bytes(Self::fixed_bytes(&self.buf[0..4])?);
         self.buf = &self.buf[4..];
         if len == -1 {
             return Ok(None);
@@ -43,19 +43,14 @@ impl<'a> RowReader<'a> {
     }
 
     fn read_fixed<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        if self.buf.len() < 4 + N {
-            return Err(Error::Protocol("row column truncated"));
-        }
-        let len = i32::from_be_bytes(self.buf[0..4].try_into().unwrap());
-        if len == -1 {
+        let Some(len) = self.take_len()? else {
             return Err(Error::UnexpectedNull);
-        }
-        if len as usize != N {
+        };
+        if len != N {
             return Err(Error::Protocol("unexpected column width"));
         }
-        let out: [u8; N] = self.buf[4..4 + N].try_into().unwrap();
-        self.buf = &self.buf[4 + N..];
-        Ok(out)
+        let bytes = self.take_bytes(N)?;
+        Self::fixed_bytes(bytes)
     }
 
     fn read_opt_fixed<const N: usize, T>(
@@ -69,7 +64,7 @@ impl<'a> RowReader<'a> {
             return Err(Error::Protocol("unexpected column width"));
         }
         let bytes = self.take_bytes(N)?;
-        Ok(Some(decode(bytes.try_into().unwrap())))
+        Ok(Some(decode(Self::fixed_bytes(bytes)?)))
     }
 
     fn read_array_fixed<const N: usize, T>(
@@ -85,7 +80,7 @@ impl<'a> RowReader<'a> {
                 return Err(Error::Protocol(width_err));
             }
             let bytes = self.take_bytes(N)?;
-            out.push(decode(bytes.try_into().unwrap()));
+            out.push(decode(Self::fixed_bytes(bytes)?));
         }
         Ok(out)
     }
@@ -148,11 +143,9 @@ impl<'a> RowReader<'a> {
     pub fn read_text_shared(&mut self) -> Result<crate::Text, Error> {
         let len = self.take_len()?.ok_or(Error::UnexpectedNull)?;
         let start = self.payload.len() - self.buf.len();
-        let bytes = self.take_bytes(len)?;
-        std::str::from_utf8(bytes).map_err(|_| Error::Protocol("invalid utf-8 in text column"))?;
-        Ok(crate::Text::from_shared_unchecked(
-            self.payload.slice(start..start + len),
-        ))
+        self.take_bytes(len)?;
+        crate::Text::from_shared(self.payload.slice(start..start + len))
+            .map_err(|_| Error::Protocol("invalid utf-8 in text column"))
     }
 
     pub fn read_jsonb(&mut self) -> Result<crate::Jsonb, Error> {
@@ -165,11 +158,8 @@ impl<'a> RowReader<'a> {
         if bytes[0] != 0x01 {
             return Err(Error::Protocol("unsupported jsonb wire version"));
         }
-        std::str::from_utf8(&bytes[1..])
-            .map_err(|_| Error::Protocol("invalid utf-8 in jsonb column"))?;
-        Ok(crate::Jsonb::from_shared_unchecked(
-            self.payload.slice(start + 1..start + len),
-        ))
+        crate::Jsonb::from_shared(self.payload.slice(start + 1..start + len))
+            .map_err(|_| Error::Protocol("invalid utf-8 in jsonb column"))
     }
 
     pub fn read_opt_bool(&mut self) -> Result<Option<bool>, Error> {
@@ -220,8 +210,8 @@ impl<'a> RowReader<'a> {
     fn array_header(&mut self) -> Result<usize, Error> {
         let payload_len = self.take_len()?.ok_or(Error::UnexpectedNull)?;
         let head = self.take_bytes(12)?;
-        let ndim = i32::from_be_bytes(head[0..4].try_into().unwrap());
-        let has_nulls = i32::from_be_bytes(head[4..8].try_into().unwrap());
+        let ndim = i32::from_be_bytes(Self::fixed_bytes(&head[0..4])?);
+        let has_nulls = i32::from_be_bytes(Self::fixed_bytes(&head[4..8])?);
         if ndim == 0 {
             if payload_len != 12 {
                 return Err(Error::Protocol("empty array payload length mismatch"));
@@ -237,7 +227,7 @@ impl<'a> RowReader<'a> {
             ));
         }
         let dim_head = self.take_bytes(8)?;
-        let dim = i32::from_be_bytes(dim_head[0..4].try_into().unwrap());
+        let dim = i32::from_be_bytes(Self::fixed_bytes(&dim_head[0..4])?);
         if dim < 0 {
             return Err(Error::Protocol("negative array dimension"));
         }
@@ -297,8 +287,12 @@ impl<'a> RowReader<'a> {
             if cur.len() < 4 {
                 return Err(Error::Protocol("range bound length truncated"));
             }
-            let n = i32::from_be_bytes(cur[0..4].try_into().unwrap()) as usize;
+            let n = i32::from_be_bytes(Self::fixed_bytes(&cur[0..4])?);
             *cur = &cur[4..];
+            if n < 0 {
+                return Err(Error::Protocol("negative range bound length"));
+            }
+            let n = n as usize;
             if cur.len() < n {
                 return Err(Error::Protocol("range bound bytes truncated"));
             }
@@ -338,7 +332,7 @@ impl<'a> RowReader<'a> {
             if b.len() != 4 {
                 return Err(Error::Protocol("int4 range bound width != 4"));
             }
-            Ok(i32::from_be_bytes(b.try_into().unwrap()))
+            Ok(i32::from_be_bytes(Self::fixed_bytes(b)?))
         })
     }
 
@@ -347,8 +341,14 @@ impl<'a> RowReader<'a> {
             if b.len() != 8 {
                 return Err(Error::Protocol("int8 range bound width != 8"));
             }
-            Ok(i64::from_be_bytes(b.try_into().unwrap()))
+            Ok(i64::from_be_bytes(Self::fixed_bytes(b)?))
         })
+    }
+
+    fn fixed_bytes<const N: usize>(bytes: &[u8]) -> Result<[u8; N], Error> {
+        bytes
+            .try_into()
+            .map_err(|_| Error::Protocol("unexpected column width"))
     }
 }
 

@@ -167,7 +167,10 @@ impl TypeExt for Type {
 
     fn result_format_codes(&self) -> Option<proc_macro2::TokenStream> {
         let row_ty = self;
-        let Type::Path(TypePath { path, qself: None }) = row_ty else {
+        let Type::Path(TypePath {
+            path, qself: None, ..
+        }) = row_ty
+        else {
             return None;
         };
         let last = path.segments.last()?;

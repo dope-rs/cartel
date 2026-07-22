@@ -1,16 +1,19 @@
-use std::cell::Cell;
-use std::collections::VecDeque;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
+use std::pin::Pin;
 
-use cartel_core::{FatalSlot, FrontKind, Inflight, Slab};
+use cartel_core::{FrontKind, Inflight};
+use dope::driver::token::Token;
 use dope::manifold::connector;
-use dope::manifold::connector::session::{IOV_CAP, Queue};
+use dope::manifold::connector::state::{IOV_CAP, Queue};
 use dope::manifold::connector::{Close, Ctx};
-use dope::runtime::token::Token;
-use dope::{WakeRef, WakerSet};
-use o3::buffer::{self, Owned};
+use dope_fiber::WaitQueue;
+use dope_fiber::{Context, Waiter};
+use o3::buffer;
+use o3::collections::FixedQueue;
 
 use crate::decode::{AuthRequest, parse_auth, parse_db_error, parse_notification};
+use crate::port::{self, Frame as SendFrame, Port};
 use crate::query::QuerySet;
 use crate::scram::Scram;
 use crate::wire::Be;
@@ -18,10 +21,30 @@ use crate::{Config, Error, Notification, encode};
 
 pub(super) type RowItem = Result<buffer::Shared, Error>;
 
-const MAX_PG_CONNS: usize = 256;
-const MAX_FRAME_LEN: usize = 256 * 1024 * 1024;
 const OVERSIZE_FRAME: u8 = 0xff;
-const MAX_NOTIFICATIONS: usize = 1024;
+const NONE: u32 = u32::MAX;
+const BUCKET_NONE: u32 = u32::MAX;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TransactionId {
+    conn: Token,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransactionState {
+    Held(TransactionId),
+    Finalizing(TransactionId),
+    Quarantined(TransactionId),
+}
+
+impl TransactionState {
+    fn id(self) -> TransactionId {
+        match self {
+            Self::Held(id) | Self::Finalizing(id) | Self::Quarantined(id) => id,
+        }
+    }
+}
 
 pub struct Frame {
     pub typ: u8,
@@ -31,30 +54,9 @@ pub struct Frame {
 #[derive(Default)]
 pub struct ConnState {
     phase: Phase,
-    pub(super) responses: Slab<RowItem>,
-    pub(super) unsynced: u32,
-    pub(super) batch_open: bool,
     error_skip: bool,
     pending_close: bool,
     close_permanent: bool,
-}
-
-impl ConnState {
-    fn fail_all_in_flight(&mut self, msg: &str) -> usize {
-        let n = self
-            .responses
-            .fail_all(|| Err(Error::Other(msg.to_string())));
-        self.unsynced = 0;
-        self.error_skip = false;
-        self.batch_open = false;
-        n
-    }
-
-    pub(super) fn push_batch_boundary(&mut self) {
-        self.responses.mark_boundary();
-        self.unsynced = 0;
-        self.batch_open = false;
-    }
 }
 
 impl connector::Lifecycle for ConnState {
@@ -69,11 +71,11 @@ impl connector::Lifecycle for ConnState {
     }
 
     fn defer_close(&self) -> bool {
-        self.responses.depth() != 0
+        false
     }
 
     fn is_drained(&self) -> bool {
-        self.responses.is_drained()
+        true
     }
 }
 
@@ -85,206 +87,566 @@ pub enum PickPolicy {
 }
 
 pub(super) struct Shared {
-    config: Config,
-    ready_conns: Vec<Token>,
-    inflight: Box<[u32]>,
-    exclusive: Box<[bool]>,
-    rr_idx: Cell<usize>,
-    pub(super) policy: PickPolicy,
-    pub(super) ready_count: usize,
-    ready: bool,
-    ready_wakers: WakerSet,
-    fatal: FatalSlot<Error>,
-    notifications: VecDeque<Notification>,
-    notifications_dropped: u64,
-    notification_wakers: WakerSet,
+    database: Config,
+    pub(super) config: port::Config,
+    ready_tokens: Box<[Cell<Option<Token>>]>,
+    inflight: Box<[Cell<u32>]>,
+    transactions: Box<[Cell<Option<TransactionState>>]>,
+    transaction_generations: Box<[Cell<u64>]>,
+    transaction_waiters: Pin<Box<[WaitQueue]>>,
+    held_transactions: Cell<usize>,
+    ready_next: Box<[Cell<u32>]>,
+    ready_prev: Box<[Cell<u32>]>,
+    ready_linked: Box<[Cell<bool>]>,
+    ready_head: Cell<u32>,
+    bucket_next: Box<[Cell<u32>]>,
+    bucket_prev: Box<[Cell<u32>]>,
+    bucket_of: Box<[Cell<u32>]>,
+    bucket_heads: Box<[Cell<u32>]>,
+    bucket_bits: Box<[Cell<u64>]>,
+    pub(super) policy: Cell<PickPolicy>,
+    pub(super) ready_count: Cell<usize>,
+    ready: Cell<bool>,
+    ready_waiters: Pin<Box<WaitQueue>>,
+    fatal: Cell<Option<Error>>,
+    notifications: RefCell<FixedQueue<Notification>>,
+    notifications_dropped: Cell<u64>,
+    notification_waiters: Pin<Box<WaitQueue>>,
     pub(super) inflight_total: Inflight,
-    pub(super) max_response_rows: usize,
-    pub(super) egress_drain_wakers: WakerSet,
-    backend_pids: Box<[i32]>,
-    backend_keys: Box<[i32]>,
+    egress_waiters: Pin<Box<WaitQueue>>,
+    backend_pids: Box<[Cell<i32>]>,
+    backend_keys: Box<[Cell<i32>]>,
 }
 
 impl Shared {
-    fn new(config: Config) -> Self {
-        let max_response_rows = config.max_response_rows;
+    pub(super) fn new(database: Config, config: port::Config) -> Self {
+        let max_connections = config.connection_capacity();
+        let waiter_capacity = config.waiter_capacity();
+        let max_pending_per_conn = config.request_capacity().div_ceil(max_connections);
+        let inflight_total = Inflight::with_capacity(config.inflight_capacity());
         Self {
+            database,
             config,
-            ready_conns: Vec::new(),
-            inflight: vec![0u32; MAX_PG_CONNS].into_boxed_slice(),
-            exclusive: vec![false; MAX_PG_CONNS].into_boxed_slice(),
-            rr_idx: Cell::new(0),
-            policy: PickPolicy::default(),
-            ready_count: 0,
-            ready: false,
-            ready_wakers: WakerSet::new(),
-            fatal: FatalSlot::default(),
-            notifications: VecDeque::new(),
-            notifications_dropped: 0,
-            notification_wakers: WakerSet::new(),
-            inflight_total: Inflight::default(),
-            max_response_rows,
-            egress_drain_wakers: WakerSet::new(),
-            backend_pids: vec![0i32; MAX_PG_CONNS].into_boxed_slice(),
-            backend_keys: vec![0i32; MAX_PG_CONNS].into_boxed_slice(),
+            ready_tokens: (0..max_connections).map(|_| Cell::new(None)).collect(),
+            inflight: (0..max_connections).map(|_| Cell::new(0u32)).collect(),
+            transactions: (0..max_connections).map(|_| Cell::new(None)).collect(),
+            transaction_generations: (0..max_connections).map(|_| Cell::new(0u64)).collect(),
+            transaction_waiters: Box::into_pin(
+                (0..max_connections)
+                    .map(|_| WaitQueue::with_capacity(1))
+                    .collect(),
+            ),
+            held_transactions: Cell::new(0),
+            ready_next: (0..max_connections).map(|_| Cell::new(NONE)).collect(),
+            ready_prev: (0..max_connections).map(|_| Cell::new(NONE)).collect(),
+            ready_linked: (0..max_connections).map(|_| Cell::new(false)).collect(),
+            ready_head: Cell::new(NONE),
+            bucket_next: (0..max_connections).map(|_| Cell::new(NONE)).collect(),
+            bucket_prev: (0..max_connections).map(|_| Cell::new(NONE)).collect(),
+            bucket_of: (0..max_connections)
+                .map(|_| Cell::new(BUCKET_NONE))
+                .collect(),
+            bucket_heads: (0..=max_pending_per_conn)
+                .map(|_| Cell::new(NONE))
+                .collect(),
+            bucket_bits: (0..=(max_pending_per_conn / 64))
+                .map(|_| Cell::new(0))
+                .collect(),
+            policy: Cell::new(PickPolicy::default()),
+            ready_count: Cell::new(0),
+            ready: Cell::new(false),
+            ready_waiters: Box::pin(WaitQueue::with_capacity(waiter_capacity)),
+            fatal: Cell::new(None),
+            notifications: RefCell::new(FixedQueue::with_capacity(config.notification_capacity())),
+            notifications_dropped: Cell::new(0),
+            notification_waiters: Box::pin(WaitQueue::with_capacity(waiter_capacity)),
+            inflight_total,
+            egress_waiters: Box::pin(WaitQueue::with_capacity(waiter_capacity)),
+            backend_pids: (0..max_connections).map(|_| Cell::new(0)).collect(),
+            backend_keys: (0..max_connections).map(|_| Cell::new(0)).collect(),
         }
     }
 
     pub(super) fn backend_pid_for(&self, slot: Token) -> Option<i32> {
         self.backend_pids
             .get(slot.slot().raw() as usize)
-            .copied()
+            .map(Cell::get)
             .filter(|&p| p != 0)
     }
 
     pub(super) fn backend_key_for(&self, slot: Token) -> Option<i32> {
         let i = slot.slot().raw() as usize;
-        if *self.backend_pids.get(i)? == 0 {
+        if self.backend_pids.get(i)?.get() == 0 {
             return None;
         }
-        self.backend_keys.get(i).copied()
+        self.backend_keys.get(i).map(Cell::get)
     }
 
-    pub(super) fn store_backend_key_data(&mut self, slot: Token, payload: &[u8]) {
+    pub(super) fn store_backend_key_data(&self, slot: Token, payload: &[u8]) {
         if payload.len() < 8 {
             return;
         }
-        let pid = i32::from_be_bytes(payload[0..4].try_into().unwrap());
-        let key = i32::from_be_bytes(payload[4..8].try_into().unwrap());
-        let i = slot.slot().raw() as usize;
-        if i < MAX_PG_CONNS {
-            self.backend_pids[i] = pid;
-            self.backend_keys[i] = key;
+        let Ok(pid) = payload[0..4].try_into() else {
+            return;
+        };
+        let Ok(key) = payload[4..8].try_into() else {
+            return;
+        };
+        let pid = i32::from_be_bytes(pid);
+        let key = i32::from_be_bytes(key);
+        let index = slot.slot().raw() as usize;
+        if let (Some(stored_pid), Some(stored_key)) =
+            (self.backend_pids.get(index), self.backend_keys.get(index))
+        {
+            stored_pid.set(pid);
+            stored_key.set(key);
         }
     }
 
-    pub(super) fn pop_notification(&mut self) -> Option<Notification> {
-        self.notifications.pop_front()
+    pub(super) fn pop_notification(&self) -> Option<Notification> {
+        self.notifications.borrow_mut().pop_front()
     }
 
-    pub(super) fn push_notification(&mut self, n: Notification) {
-        if self.notifications.len() >= MAX_NOTIFICATIONS {
-            self.notifications.pop_front();
-            self.notifications_dropped = self.notifications_dropped.saturating_add(1);
+    pub(super) fn push_notification(&self, n: Notification) {
+        let mut q = self.notifications.borrow_mut();
+        if q.len() >= self.config.notification_capacity() {
+            q.pop_front();
+            self.notifications_dropped
+                .set(self.notifications_dropped.get().saturating_add(1));
         }
-        self.notifications.push_back(n);
-        self.notification_wakers.drain_wake();
+        let Some(entry) = q.vacant_entry() else {
+            unreachable!()
+        };
+        entry.push_back(n);
+        self.notification_waiters.as_ref().wake();
     }
 
     pub(super) fn notifications_dropped(&self) -> u64 {
-        self.notifications_dropped
+        self.notifications_dropped.get()
     }
 
-    pub(super) fn register_notification_waker(&mut self, w: WakeRef) {
-        self.notification_wakers.register(w);
+    pub(super) fn try_register_notification<'d>(
+        &self,
+        waiter: Pin<&Waiter<'d>>,
+        context: Pin<&Context<'_, 'd>>,
+    ) -> bool {
+        self.notification_waiters
+            .as_ref()
+            .try_register(waiter, context)
     }
 
-    pub(super) fn register_egress_drain_waker(&mut self, w: WakeRef) {
-        self.egress_drain_wakers.register(w);
+    pub(super) fn try_register_egress<'d>(
+        &self,
+        waiter: Pin<&Waiter<'d>>,
+        context: Pin<&Context<'_, 'd>>,
+    ) -> bool {
+        self.egress_waiters.as_ref().try_register(waiter, context)
     }
 
-    pub(super) fn register_ready_waker(&mut self, w: WakeRef) {
-        self.ready_wakers.register(w);
+    pub(super) fn try_register_ready<'d>(
+        &self,
+        waiter: Pin<&Waiter<'d>>,
+        context: Pin<&Context<'_, 'd>>,
+    ) -> bool {
+        self.ready_waiters.as_ref().try_register(waiter, context)
     }
 
     pub(super) fn backpressure(&self, queued: usize) -> Error {
         Error::Backpressure {
-            inflight: self.inflight_total.total,
+            inflight: self.inflight_total.len(),
             queued,
-            cap: self.inflight_total.max,
+            cap: self.inflight_total.capacity(),
         }
     }
 
     pub(super) fn is_ready(&self) -> bool {
-        self.ready
+        self.ready.get()
     }
 
     pub(super) fn is_failed(&self) -> bool {
-        self.fatal.is_failed()
+        let error = self.fatal.take();
+        let failed = error.is_some();
+        self.fatal.set(error);
+        failed
+    }
+
+    pub(super) fn fatal_message(&self) -> Option<String> {
+        let error = self.fatal.take();
+        let message = error.as_ref().map(ToString::to_string);
+        self.fatal.set(error);
+        message
+    }
+
+    fn clear_fatal(&self) {
+        self.fatal.set(None);
+    }
+
+    fn record_fatal(&self, error: Error) {
+        let current = self.fatal.take();
+        self.fatal.set(current.or(Some(error)));
     }
 
     pub(super) fn is_exclusive(&self, slot: Token) -> bool {
-        self.exclusive
+        self.transactions
             .get(slot.slot().raw() as usize)
-            .copied()
-            .unwrap_or(false)
+            .and_then(Cell::get)
+            .is_some_and(|state| state.id().conn == slot)
     }
 
-    fn mark_exclusive(&mut self, slot: Token, on: bool) {
-        let i = slot.slot().raw() as usize;
-        if i < self.exclusive.len() {
-            self.exclusive[i] = on;
+    pub(super) fn try_acquire_transaction(&self, slot: Token) -> Option<(Token, u64)> {
+        let index = slot.slot().raw() as usize;
+        if self.ready_tokens.get(index).map(Cell::get) != Some(Some(slot))
+            || self.transactions.get(index)?.get().is_some()
+        {
+            return None;
         }
+        let generation = self.transaction_generations[index].get().checked_add(1)?;
+        self.transaction_generations[index].set(generation);
+        let id = TransactionId {
+            conn: slot,
+            generation,
+        };
+        self.unlink_ready(index);
+        self.unlink_bucket(index);
+        self.transactions[index].set(Some(TransactionState::Held(id)));
+        self.held_transactions.set(
+            self.held_transactions
+                .get()
+                .checked_add(1)
+                .expect("held transaction count overflow"),
+        );
+        Some((slot, generation))
     }
 
-    pub(super) fn acquire_exclusive(&mut self, slot: Token) {
-        self.mark_exclusive(slot, true);
+    pub(super) fn is_transaction_held(&self, target: (Token, u64)) -> bool {
+        let id = TransactionId {
+            conn: target.0,
+            generation: target.1,
+        };
+        self.transactions
+            .get(id.conn.slot().raw() as usize)
+            .is_some_and(|state| state.get() == Some(TransactionState::Held(id)))
     }
 
-    pub(super) fn release_exclusive(&mut self, slot: Token) {
-        self.mark_exclusive(slot, false);
-        self.ready_wakers.drain_wake();
-        self.egress_drain_wakers.drain_wake();
+    fn is_transaction(&self, target: (Token, u64)) -> bool {
+        let id = TransactionId {
+            conn: target.0,
+            generation: target.1,
+        };
+        self.transactions
+            .get(id.conn.slot().raw() as usize)
+            .and_then(Cell::get)
+            .is_some_and(|state| state.id() == id)
+    }
+
+    pub(super) fn transaction_settled(&self, target: (Token, u64)) -> Option<bool> {
+        if self.is_transaction(target) {
+            return None;
+        }
+        Some(
+            self.ready_tokens
+                .get(target.0.slot().raw() as usize)
+                .is_some_and(|token| token.get() == Some(target.0)),
+        )
+    }
+
+    pub(super) fn begin_transaction_finalization(&self, target: (Token, u64)) -> bool {
+        let id = TransactionId {
+            conn: target.0,
+            generation: target.1,
+        };
+        let Some(state) = self.transactions.get(id.conn.slot().raw() as usize) else {
+            return false;
+        };
+        if state.get() != Some(TransactionState::Held(id)) {
+            return false;
+        }
+        state.set(Some(TransactionState::Finalizing(id)));
+        self.held_transactions.set(
+            self.held_transactions
+                .get()
+                .checked_sub(1)
+                .expect("held transaction count underflow"),
+        );
+        true
+    }
+
+    pub(super) fn quarantine_transaction(&self, target: (Token, u64)) -> bool {
+        let id = TransactionId {
+            conn: target.0,
+            generation: target.1,
+        };
+        let Some(state) = self.transactions.get(id.conn.slot().raw() as usize) else {
+            return false;
+        };
+        if state.get() != Some(TransactionState::Held(id)) {
+            return false;
+        }
+        state.set(Some(TransactionState::Quarantined(id)));
+        self.held_transactions.set(
+            self.held_transactions
+                .get()
+                .checked_sub(1)
+                .expect("held transaction count underflow"),
+        );
+        true
+    }
+
+    pub(super) fn try_register_transaction<'d>(
+        &self,
+        target: (Token, u64),
+        waiter: Pin<&Waiter<'d>>,
+        context: Pin<&Context<'_, 'd>>,
+    ) -> bool {
+        if !self.is_transaction(target) {
+            return false;
+        }
+        self.transaction_waiter(target.0.slot().raw() as usize)
+            .is_some_and(|queue| queue.try_register(waiter, context))
+    }
+
+    fn transaction_waiter(&self, index: usize) -> Option<Pin<&WaitQueue>> {
+        let queue = self.transaction_waiters.as_ref().get_ref().get(index)?;
+        Some(unsafe { Pin::new_unchecked(queue) })
+    }
+
+    fn clear_transaction(&self, slot: Token, available: bool) {
+        let index = slot.slot().raw() as usize;
+        let Some(state) = self.transactions.get(index) else {
+            return;
+        };
+        if !state
+            .get()
+            .is_some_and(|transaction| transaction.id().conn == slot)
+        {
+            return;
+        }
+        if matches!(state.get(), Some(TransactionState::Held(_))) {
+            self.held_transactions.set(
+                self.held_transactions
+                    .get()
+                    .checked_sub(1)
+                    .expect("held transaction count underflow"),
+            );
+        }
+        state.set(None);
+        if available && self.ready_tokens[index].get() == Some(slot) {
+            self.link_ready(index);
+            self.link_bucket(index, self.inflight[index].get() as usize);
+        }
+        if let Some(waiters) = self.transaction_waiter(index) {
+            waiters.wake();
+        }
+        self.ready_waiters.as_ref().wake();
+        self.egress_waiters.as_ref().wake();
+    }
+
+    fn transaction_ready(&self, slot: Token, idle: bool) -> bool {
+        let index = slot.slot().raw() as usize;
+        match self.transactions[index].get() {
+            Some(TransactionState::Finalizing(id)) if id.conn == slot => {
+                if idle {
+                    self.clear_transaction(slot, true);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => {
+                if let Some(waiters) = self.transaction_waiter(index) {
+                    waiters.wake();
+                }
+                true
+            }
+        }
     }
 
     pub(super) fn tx_saturated(&self) -> bool {
-        self.ready_count > 0
+        self.held_transactions.get() != 0
     }
 
-    pub(super) fn pick_conn(&self, pin: Option<Token>) -> Option<Token> {
-        if let Some(p) = pin {
-            return self.ready_conns.iter().copied().find(|c| *c == p);
+    pub(super) fn pick_conn(&self, target: Option<(Token, u64)>) -> Option<Token> {
+        if let Some((conn, generation)) = target {
+            let index = conn.slot().raw() as usize;
+            if self.ready_tokens.get(index)?.get() != Some(conn) {
+                return None;
+            }
+            let transaction = self.transactions[index].get();
+            return if generation == 0 {
+                transaction.is_none().then_some(conn)
+            } else {
+                (transaction == Some(TransactionState::Held(TransactionId { conn, generation })))
+                    .then_some(conn)
+            };
         }
-        let n = self.ready_conns.len();
-        if n == 0 {
-            return None;
-        }
-        match self.policy {
+        let index = match self.policy.get() {
             PickPolicy::RoundRobin => {
-                for _ in 0..n {
-                    let i = self.rr_idx.get() % n;
-                    self.rr_idx.set(i.wrapping_add(1));
-                    let c = self.ready_conns[i];
-                    if !self.is_exclusive(c) {
-                        return Some(c);
-                    }
+                let index = self.ready_head.get();
+                if index == NONE {
+                    return None;
                 }
-                None
+                self.ready_head.set(self.ready_next[index as usize].get());
+                index as usize
             }
-            PickPolicy::LeastInflight => {
-                let mut best: Option<Token> = None;
-                let mut best_v = u32::MAX;
-                for c in self.ready_conns.iter().copied() {
-                    if self.is_exclusive(c) {
-                        continue;
-                    }
-                    let v = self
-                        .inflight
-                        .get(c.slot().raw() as usize)
-                        .copied()
-                        .unwrap_or(0);
-                    if best.is_none() || v < best_v {
-                        best_v = v;
-                        best = Some(c);
-                    }
-                }
-                best
+            PickPolicy::LeastInflight => self.first_bucket_index()?,
+        };
+        self.ready_tokens[index].get()
+    }
+
+    pub(super) fn inc_inflight(&self, slot: Token) {
+        let index = slot.slot().raw() as usize;
+        if let Some(inflight) = self.inflight.get(index) {
+            self.unlink_bucket(index);
+            inflight.set(inflight.get().saturating_add(1));
+            if self.ready_tokens[index].get() == Some(slot)
+                && self.transactions[index].get().is_none()
+            {
+                self.link_bucket(index, inflight.get() as usize);
             }
         }
     }
 
-    pub(super) fn inc_inflight(&mut self, slot: Token) {
-        let i = slot.slot().raw() as usize;
-        if i < self.inflight.len() {
-            self.inflight[i] = self.inflight[i].saturating_add(1);
+    pub(super) fn dec_inflight(&self, slot: Token) {
+        let index = slot.slot().raw() as usize;
+        if let Some(inflight) = self.inflight.get(index) {
+            self.unlink_bucket(index);
+            inflight.set(inflight.get().saturating_sub(1));
+            if self.ready_tokens[index].get() == Some(slot)
+                && self.transactions[index].get().is_none()
+            {
+                self.link_bucket(index, inflight.get() as usize);
+            }
         }
     }
 
-    fn dec_inflight(&mut self, slot: Token) {
-        let i = slot.slot().raw() as usize;
-        if i < self.inflight.len() {
-            self.inflight[i] = self.inflight[i].saturating_sub(1);
+    fn add_ready(&self, conn: Token) {
+        let index = conn.slot().raw() as usize;
+        self.ready_tokens[index].set(Some(conn));
+        if self.transactions[index].get().is_none() {
+            self.link_ready(index);
+            self.link_bucket(index, self.inflight[index].get() as usize);
         }
+        self.ready_count.set(self.ready_count.get() + 1);
+        self.ready.set(true);
+        self.ready_waiters.as_ref().wake();
+    }
+
+    fn remove_ready(&self, conn: Token) {
+        let index = conn.slot().raw() as usize;
+        let removed = self.ready_tokens[index].get() == Some(conn);
+        if removed {
+            self.unlink_ready(index);
+            self.unlink_bucket(index);
+            self.ready_tokens[index].set(None);
+            self.ready_count
+                .set(self.ready_count.get().saturating_sub(1));
+        }
+        if self.ready_count.get() == 0 {
+            self.ready.set(false);
+        }
+    }
+
+    fn link_ready(&self, index: usize) {
+        if self.ready_linked[index].replace(true) {
+            return;
+        }
+        let head = self.ready_head.get();
+        if head == NONE {
+            self.ready_next[index].set(index as u32);
+            self.ready_prev[index].set(index as u32);
+            self.ready_head.set(index as u32);
+            return;
+        }
+        let tail = self.ready_prev[head as usize].get();
+        self.ready_next[index].set(head);
+        self.ready_prev[index].set(tail);
+        self.ready_next[tail as usize].set(index as u32);
+        self.ready_prev[head as usize].set(index as u32);
+    }
+
+    fn unlink_ready(&self, index: usize) {
+        if !self.ready_linked[index].replace(false) {
+            return;
+        }
+        let next = self.ready_next[index].get();
+        let prev = self.ready_prev[index].get();
+        if next == index as u32 {
+            self.ready_head.set(NONE);
+        } else {
+            self.ready_next[prev as usize].set(next);
+            self.ready_prev[next as usize].set(prev);
+            if self.ready_head.get() == index as u32 {
+                self.ready_head.set(next);
+            }
+        }
+        self.ready_next[index].set(NONE);
+        self.ready_prev[index].set(NONE);
+    }
+
+    fn link_bucket(&self, index: usize, depth: usize) {
+        let depth = depth.min(self.bucket_heads.len() - 1);
+        if self.bucket_of[index].get() != BUCKET_NONE {
+            return;
+        }
+        let head = self.bucket_heads[depth].get();
+        self.bucket_prev[index].set(NONE);
+        self.bucket_next[index].set(head);
+        if head != NONE {
+            self.bucket_prev[head as usize].set(index as u32);
+        }
+        self.bucket_heads[depth].set(index as u32);
+        self.bucket_of[index].set(depth as u32);
+        let word = depth / 64;
+        self.bucket_bits[word].set(self.bucket_bits[word].get() | 1 << (depth % 64));
+    }
+
+    fn unlink_bucket(&self, index: usize) {
+        let depth = self.bucket_of[index].replace(BUCKET_NONE);
+        if depth == BUCKET_NONE {
+            return;
+        }
+        let depth = depth as usize;
+        let next = self.bucket_next[index].replace(NONE);
+        let prev = self.bucket_prev[index].replace(NONE);
+        if prev == NONE {
+            self.bucket_heads[depth].set(next);
+        } else {
+            self.bucket_next[prev as usize].set(next);
+        }
+        if next != NONE {
+            self.bucket_prev[next as usize].set(prev);
+        }
+        if self.bucket_heads[depth].get() == NONE {
+            let word = depth / 64;
+            self.bucket_bits[word].set(self.bucket_bits[word].get() & !(1 << (depth % 64)));
+        }
+    }
+
+    fn first_bucket_index(&self) -> Option<usize> {
+        for (word_index, word) in self.bucket_bits.iter().enumerate() {
+            let bits = word.get();
+            if bits != 0 {
+                let depth = word_index * 64 + bits.trailing_zeros() as usize;
+                return Some(self.bucket_heads[depth].get() as usize);
+            }
+        }
+        None
+    }
+
+    fn clear_backend(&self, conn: Token) {
+        let index = conn.slot().raw() as usize;
+        if let Some(pid) = self.backend_pids.get(index) {
+            pid.set(0);
+        }
+        if let Some(key) = self.backend_keys.get(index) {
+            key.set(0);
+        }
+    }
+
+    fn wake_all(&self) {
+        self.ready_waiters.as_ref().wake();
+        self.notification_waiters.as_ref().wake();
+        self.egress_waiters.as_ref().wake();
     }
 }
 
@@ -309,7 +671,9 @@ enum Phase {
     Failed,
 }
 
-pub struct Codec;
+pub struct Codec {
+    max_response_bytes: usize,
+}
 
 impl connector::Codec for Codec {
     type Head = Frame;
@@ -320,7 +684,8 @@ impl connector::Codec for Codec {
             return None;
         }
         let typ = buf[0];
-        let len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+        let len_bytes = buf[1..5].try_into().ok()?;
+        let len = u32::from_be_bytes(len_bytes) as usize;
         if len < 4 {
             return Some((
                 Frame {
@@ -330,7 +695,8 @@ impl connector::Codec for Codec {
                 buf.len(),
             ));
         }
-        if len > MAX_FRAME_LEN {
+        let response_len = len - 4;
+        if response_len > self.max_response_bytes {
             return Some((
                 Frame {
                     typ: OVERSIZE_FRAME,
@@ -348,19 +714,25 @@ impl connector::Codec for Codec {
     }
 }
 
-pub struct Session<I: QuerySet> {
+pub struct Session<'d, I: QuerySet> {
     codec: Codec,
-    pub(super) shared: Shared,
+    port: &'d Port<'d, I>,
     _instance: PhantomData<fn() -> I>,
 }
 
-impl<I: QuerySet> Session<I> {
-    pub fn new(config: Config) -> Self {
+impl<'d, I: QuerySet> Session<'d, I> {
+    pub(super) fn new(port: &'d Port<'d, I>) -> Self {
         Self {
-            codec: Codec,
-            shared: Shared::new(config),
+            codec: Codec {
+                max_response_bytes: port.shared.config.response_byte_capacity(),
+            },
+            port,
             _instance: PhantomData,
         }
+    }
+
+    fn enqueue(out: &Queue<IOV_CAP, SendFrame<'d>>, frame: SendFrame<'d>) -> Result<(), Error> {
+        out.try_enqueue(frame).map_err(|_| Error::RequestCapacity)
     }
 
     fn fail(&mut self, conn_id: Token, conn_state: &mut ConnState, err: Error) {
@@ -375,38 +747,40 @@ impl<I: QuerySet> Session<I> {
         conn_state.phase = Phase::Failed;
         conn_state.pending_close = true;
         conn_state.close_permanent = permanent;
-        let n = conn_state.fail_all_in_flight(&msg);
-        let s = &mut self.shared;
+        let n = self.port.responses(conn_id).map_or(0, |responses| {
+            responses.fail_all(|| Err(Error::Other(msg.clone())))
+        });
+        self.port.set_batch_open(conn_id, false);
+        let s = &self.port.shared;
         s.inflight_total.dec_n(n);
         if permanent {
-            s.fatal.record(err);
+            s.record_fatal(err);
         }
-        s.mark_exclusive(conn_id, false);
-        if was_ready && let Some(idx) = s.ready_conns.iter().position(|c| *c == conn_id) {
-            s.ready_conns.remove(idx);
-            if s.ready_count > 0 {
-                s.ready_count -= 1;
-            }
+        if was_ready {
+            s.remove_ready(conn_id);
         }
-        if s.ready_count == 0 {
-            s.ready = false;
-        }
-        s.ready_wakers.drain_wake();
-        s.egress_drain_wakers.drain_wake();
+        s.clear_transaction(conn_id, false);
+        s.ready_waiters.as_ref().wake();
+        s.egress_waiters.as_ref().wake();
     }
 
-    fn send_prepare(&self, out: &mut Queue<IOV_CAP>) -> u32 {
+    fn send_prepare(&self, out: &mut Queue<IOV_CAP, SendFrame<'d>>) -> Result<u32, Error> {
         let mut count = 0u32;
-        let mut buf = Owned::with_capacity(256);
-        for group in I::GROUPS {
-            for meta in *group {
-                encode::parse(&mut buf, meta.name, meta.sql, meta.param_oids);
-                count += 1;
-            }
+        let mut queries = I::GROUPS.iter().flat_map(|group| group.iter()).peekable();
+        while let Some(meta) = queries.next() {
+            let frame = self.port.encode(|frame| {
+                encode::parse(frame, meta.name, meta.sql, meta.param_oids);
+                if queries.peek().is_none() {
+                    encode::sync(frame);
+                }
+            })?;
+            Self::enqueue(out, frame)?;
+            count += 1;
         }
-        encode::sync(&mut buf);
-        out.push(buf.freeze());
-        count
+        if count == 0 {
+            Self::enqueue(out, self.port.encode(|frame| encode::sync(frame))?)?;
+        }
+        Ok(count)
     }
 
     fn handle_startup(
@@ -415,7 +789,7 @@ impl<I: QuerySet> Session<I> {
         conn_state: &mut ConnState,
         typ: u8,
         payload: &[u8],
-        out: &mut Queue<IOV_CAP>,
+        out: &mut Queue<IOV_CAP, SendFrame<'d>>,
     ) -> Result<(), Error> {
         match typ {
             Be::AUTH => {
@@ -426,12 +800,13 @@ impl<I: QuerySet> Session<I> {
                         Ok(())
                     }
                     AuthRequest::Sasl { mechanisms } => {
-                        let scram = Scram::new(&self.shared.config.password);
+                        let scram = Scram::new(self.port.shared.database.password())?;
                         let mech = scram.pick_mechanism(&mechanisms)?;
                         let client_first = scram.client_first();
-                        let mut buf = Owned::with_capacity(128);
-                        encode::sasl_initial_response(&mut buf, mech, client_first.as_bytes());
-                        out.push(buf.freeze());
+                        let frame = self.port.encode(|frame| {
+                            encode::sasl_initial_response(frame, mech, client_first.as_bytes());
+                        })?;
+                        Self::enqueue(out, frame)?;
                         conn_state.phase = Phase::AwaitingSaslContinue {
                             scram: Box::new(scram),
                         };
@@ -447,7 +822,7 @@ impl<I: QuerySet> Session<I> {
             }
             Be::PARAMETER_STATUS | Be::NOTICE_RESPONSE => Ok(()),
             Be::BACKEND_KEY_DATA => {
-                self.shared.store_backend_key_data(conn_id, payload);
+                self.port.shared.store_backend_key_data(conn_id, payload);
                 Ok(())
             }
             Be::READY_FOR_QUERY => Ok(()),
@@ -464,7 +839,7 @@ impl<I: QuerySet> Session<I> {
         conn_state: &mut ConnState,
         typ: u8,
         payload: &[u8],
-        out: &mut Queue<IOV_CAP>,
+        out: &mut Queue<IOV_CAP, SendFrame<'d>>,
     ) -> Result<(), Error> {
         if typ == Be::ERROR_RESPONSE {
             return Err(Error::Db(Box::new(parse_db_error(payload))));
@@ -480,9 +855,10 @@ impl<I: QuerySet> Session<I> {
         match (phase, req) {
             (Phase::AwaitingSaslContinue { mut scram }, AuthRequest::SaslContinue { data }) => {
                 let client_final = scram.client_final(data)?;
-                let mut buf = Owned::with_capacity(128);
-                encode::sasl_response(&mut buf, client_final.as_bytes());
-                out.push(buf.freeze());
+                let frame = self
+                    .port
+                    .encode(|frame| encode::sasl_response(frame, client_final.as_bytes()))?;
+                Self::enqueue(out, frame)?;
                 conn_state.phase = Phase::AwaitingSaslFinal { scram };
                 Ok(())
             }
@@ -516,15 +892,12 @@ impl<I: QuerySet> Session<I> {
             Be::PARAMETER_STATUS | Be::NOTICE_RESPONSE | Be::BIND_COMPLETE => Ok(()),
             Be::READY_FOR_QUERY => {
                 conn_state.phase = Phase::Ready;
-                self.shared.mark_exclusive(conn_id, false);
-                self.shared.ready_conns.push(conn_id);
-                let sl = conn_id.slot().raw() as usize;
-                if sl < MAX_PG_CONNS {
-                    self.shared.inflight[sl] = 0;
+                self.port.shared.clear_transaction(conn_id, false);
+                let index = conn_id.slot().raw() as usize;
+                if let Some(inflight) = self.port.shared.inflight.get(index) {
+                    inflight.set(0);
                 }
-                self.shared.ready_count += 1;
-                self.shared.ready = true;
-                self.shared.ready_wakers.drain_wake();
+                self.port.shared.add_ready(conn_id);
                 Ok(())
             }
             Be::ERROR_RESPONSE => Err(Error::Db(Box::new(parse_db_error(payload)))),
@@ -571,48 +944,66 @@ impl<I: QuerySet> Session<I> {
                 Ok(())
             }
             Be::COMMAND_COMPLETE | Be::EMPTY_QUERY_RESPONSE => {
-                match conn_state.responses.front_kind() {
+                let responses = self
+                    .port
+                    .responses(conn_id)
+                    .ok_or(Error::Protocol("CommandComplete with unknown connection"))?;
+                let front = responses.front_kind();
+                match front {
                     FrontKind::Empty => Err(Error::Protocol("CommandComplete with empty pipeline")),
                     FrontKind::Boundary => Err(Error::Protocol(
                         "CommandComplete past pipeline batch boundary",
                     )),
                     FrontKind::Slot(_) | FrontKind::Detached => {
-                        conn_state.responses.complete();
-                        self.shared.inflight_total.dec();
-                        self.shared.dec_inflight(conn_id);
+                        responses.complete();
+                        self.port.shared.inflight_total.dec();
+                        self.port.shared.dec_inflight(conn_id);
                         Ok(())
                     }
                 }
             }
             Be::COPY_DATA => {
-                conn_state
-                    .responses
-                    .push_capped(Ok(head_payload), self.shared.max_response_rows);
+                let bytes = head_payload.len();
+                self.port
+                    .responses(conn_id)
+                    .ok_or(Error::Protocol("CopyData with unknown connection"))?
+                    .try_push(Ok(head_payload), bytes, 1);
                 Ok(())
             }
             Be::NOTIFICATION_RESPONSE => {
                 if let Some(n) = parse_notification(&head_payload) {
-                    self.shared.push_notification(n);
+                    self.port.shared.push_notification(n);
                 }
                 Ok(())
             }
-            Be::DATA_ROW => match conn_state.responses.front_kind() {
-                FrontKind::Slot(_) | FrontKind::Detached => {
-                    conn_state
-                        .responses
-                        .push_capped(Ok(head_payload), self.shared.max_response_rows);
-                    Ok(())
+            Be::DATA_ROW => {
+                let responses = self
+                    .port
+                    .responses(conn_id)
+                    .ok_or(Error::Protocol("DataRow with unknown connection"))?;
+                let front = responses.front_kind();
+                match front {
+                    FrontKind::Slot(_) | FrontKind::Detached => {
+                        let bytes = head_payload.len();
+                        responses.try_push(Ok(head_payload), bytes, 1);
+                        Ok(())
+                    }
+                    _ => Err(Error::Protocol("DataRow with empty pipeline")),
                 }
-                _ => Err(Error::Protocol("DataRow with empty pipeline")),
-            },
+            }
             Be::ERROR_RESPONSE => {
                 let db = Box::new(parse_db_error(&head_payload));
-                match conn_state.responses.front_kind() {
+                let responses = self
+                    .port
+                    .responses(conn_id)
+                    .ok_or(Error::Protocol("ErrorResponse with unknown connection"))?;
+                let front = responses.front_kind();
+                match front {
                     FrontKind::Empty | FrontKind::Boundary => Err(Error::Db(db)),
                     FrontKind::Slot(_) | FrontKind::Detached => {
-                        conn_state.responses.fail_one(|| Err(Error::Db(db)));
-                        self.shared.inflight_total.dec();
-                        self.shared.dec_inflight(conn_id);
+                        responses.fail_one(|| Err(Error::Db(db)));
+                        self.port.shared.inflight_total.dec();
+                        self.port.shared.dec_inflight(conn_id);
                         conn_state.error_skip = true;
                         Ok(())
                     }
@@ -620,35 +1011,47 @@ impl<I: QuerySet> Session<I> {
             }
             Be::READY_FOR_QUERY => {
                 let server_in_tx = matches!(head_payload.first().copied(), Some(b'T') | Some(b'E'));
-                debug_assert!(
-                    !server_in_tx || self.shared.is_exclusive(conn_id),
-                    "pg multiplex isolation desync: server reports in-transaction on a connection not exclusively checked out"
-                );
+                if server_in_tx && !self.port.shared.is_exclusive(conn_id) {
+                    return Err(Error::Protocol(
+                        "server transaction escaped its client lease",
+                    ));
+                }
                 let skip = conn_state.error_skip;
                 loop {
-                    match conn_state.responses.front_kind() {
+                    let responses = self
+                        .port
+                        .responses(conn_id)
+                        .ok_or(Error::Protocol("ReadyForQuery with unknown connection"))?;
+                    let front = responses.front_kind();
+                    match front {
                         FrontKind::Empty => break,
                         FrontKind::Boundary => {
-                            conn_state.responses.pop_boundary();
+                            responses.pop_boundary();
                             break;
                         }
                         FrontKind::Slot(_) | FrontKind::Detached => {
                             if skip {
-                                conn_state.responses.fail_one(|| {
+                                responses.fail_one(|| {
                                     Err(Error::Other(
                                         "query skipped: earlier error in pipeline batch".into(),
                                     ))
                                 });
                             } else {
-                                conn_state.responses.complete();
+                                responses.complete();
                             }
-                            self.shared.inflight_total.dec();
-                            self.shared.dec_inflight(conn_id);
+                            self.port.shared.inflight_total.dec();
+                            self.port.shared.dec_inflight(conn_id);
                         }
                     }
                 }
                 conn_state.error_skip = false;
-                Ok(())
+                if self.port.shared.transaction_ready(conn_id, !server_in_tx) {
+                    Ok(())
+                } else {
+                    Err(Error::Protocol(
+                        "transaction finalizer left the connection in a transaction",
+                    ))
+                }
             }
             other => Err(Error::ProtocolOwned(format!(
                 "unexpected message {} in ready phase",
@@ -658,53 +1061,68 @@ impl<I: QuerySet> Session<I> {
     }
 }
 
-impl<I: QuerySet> connector::Session for Session<I> {
+impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
     type Codec = Codec;
     type ConnState = ConnState;
+    type Send = SendFrame<'d>;
 
     fn codec(&self) -> &Codec {
         &self.codec
     }
 
-    fn connect(&mut self, ctx: &mut Ctx<'_, Self>) {
-        let conn_state = &mut *ctx.state;
-        let out = &mut *ctx.sink;
-        self.shared.fatal.clear();
-        let mut buf = Owned::with_capacity(64);
-        encode::startup(
-            &mut buf,
-            &self.shared.config.user,
-            &self.shared.config.database,
-            &self.shared.config.application_name,
-            &self.shared.config.options,
-            self.shared.config.statement_timeout_ms,
-        );
-        out.push(buf.freeze());
-        conn_state.phase = Phase::StartupSent;
+    fn activate(&self, token: Token, ready: dope::driver::ready::ReadyKey<'d>) {
+        self.port.activate(token, ready);
     }
 
-    fn flush_trailer(&mut self, ctx: &mut Ctx<'_, Self>) {
-        if !self.shared.egress_drain_wakers.is_empty() {
-            self.shared.egress_drain_wakers.drain_wake();
+    fn connect(&mut self, ctx: &mut Ctx<'_, 'd, Self>) {
+        let conn_state = &mut *ctx.state;
+        let out = &mut *ctx.sink;
+        self.port.shared.clear_fatal();
+        let frame = self.port.encode(|frame| {
+            encode::startup(
+                frame,
+                self.port.shared.database.user(),
+                self.port.shared.database.database(),
+                self.port.shared.database.application_name(),
+                self.port.shared.database.options(),
+                self.port.shared.database.statement_timeout_ms(),
+            );
+        });
+        match frame.and_then(|frame| Self::enqueue(out, frame)) {
+            Ok(()) => {
+                conn_state.phase = Phase::StartupSent;
+            }
+            Err(error) => self.fail(ctx.conn_id, conn_state, error),
         }
+    }
+
+    fn flush_trailer(&mut self, ctx: &mut Ctx<'_, 'd, Self>) {
+        self.port.shared.egress_waiters.as_ref().wake();
+        let conn_id = ctx.conn_id;
         let conn_state = &mut *ctx.state;
         let out = &mut *ctx.sink;
         if !matches!(conn_state.phase, Phase::Ready) {
             return;
         }
-        if conn_state.unsynced == 0 || !conn_state.batch_open {
+        if self.port.unsynced(conn_id) == 0 || !self.port.batch_open(conn_id) {
             return;
         }
-        let n = {
+        if !self.port.can_push_boundary(conn_id) {
+            self.port.close(conn_id);
+            return;
+        }
+        let committed = {
             let mut stage = out.wire_stage();
             encode::sync(&mut stage);
-            stage.len()
+            stage.commit()
         };
-        out.wire_commit(n);
-        conn_state.push_batch_boundary();
+        if committed != 0 {
+            let marked = self.port.push_boundary(conn_id);
+            debug_assert!(marked);
+        }
     }
 
-    fn response(&mut self, head: Frame, ctx: &mut Ctx<'_, Self>) {
+    fn response(&mut self, head: Frame, ctx: &mut Ctx<'_, 'd, Self>) {
         let conn_id = ctx.conn_id;
         let conn_state = &mut *ctx.state;
         let out = &mut *ctx.sink;
@@ -733,9 +1151,8 @@ impl<I: QuerySet> connector::Session for Session<I> {
                 if matches!(
                     typ,
                     Be::COMMAND_COMPLETE | Be::READY_FOR_QUERY | Be::ERROR_RESPONSE
-                ) && !self.shared.egress_drain_wakers.is_empty()
-                {
-                    self.shared.egress_drain_wakers.drain_wake();
+                ) {
+                    self.port.shared.egress_waiters.as_ref().wake();
                 }
                 r
             }
@@ -745,47 +1162,58 @@ impl<I: QuerySet> connector::Session for Session<I> {
             && typ == Be::READY_FOR_QUERY
             && matches!(conn_state.phase, Phase::AwaitingReady)
         {
-            let count = self.send_prepare(out);
-            conn_state.phase = Phase::Preparing { remaining: count };
+            match self.send_prepare(out) {
+                Ok(count) => conn_state.phase = Phase::Preparing { remaining: count },
+                Err(error) => self.fail(conn_id, conn_state, error),
+            }
         }
         if let Err(e) = result {
             self.fail(conn_id, conn_state, e);
         }
     }
 
-    fn disconnect(&mut self, ctx: &mut Ctx<'_, Self>) {
+    fn disconnect(&mut self, ctx: &mut Ctx<'_, 'd, Self>) {
         let conn_id = ctx.conn_id;
         let conn_state = &mut *ctx.state;
         let msg = self
+            .port
             .shared
-            .fatal
-            .as_ref()
-            .map(|e| e.to_string())
+            .fatal_message()
             .unwrap_or_else(|| "connection closed".into());
         let was_ready = matches!(conn_state.phase, Phase::Ready);
         conn_state.pending_close = false;
-        let n = conn_state.fail_all_in_flight(&msg);
-        let s = &mut self.shared;
+        let n = self.port.responses(conn_id).map_or(0, |responses| {
+            responses.fail_all(|| Err(Error::Other(msg.clone())))
+        });
+        self.port.set_batch_open(conn_id, false);
+        let s = &self.port.shared;
         s.inflight_total.dec_n(n);
-        let sl = conn_id.slot().raw() as usize;
-        if sl < MAX_PG_CONNS {
-            s.backend_pids[sl] = 0;
-            s.backend_keys[sl] = 0;
-        }
-        s.mark_exclusive(conn_id, false);
+        s.clear_backend(conn_id);
         if was_ready {
-            if let Some(idx) = s.ready_conns.iter().position(|c| *c == conn_id) {
-                s.ready_conns.remove(idx);
-            }
-            if s.ready_count > 0 {
-                s.ready_count -= 1;
-            }
+            s.remove_ready(conn_id);
         }
-        if s.ready_count == 0 {
-            s.ready = false;
-        }
-        s.ready_wakers.drain_wake();
-        s.notification_wakers.drain_wake();
-        s.egress_drain_wakers.drain_wake();
+        s.clear_transaction(conn_id, false);
+        s.wake_all();
+        self.port.deactivate(conn_id);
+    }
+
+    fn drain_requests(
+        &self,
+        token: Token,
+        push: impl FnMut(Self::Send) -> Result<(), Self::Send>,
+    ) -> connector::Requests {
+        self.port.drain_requests(token, push)
+    }
+
+    fn sent(&self, _token: Token, _sent: usize) {
+        self.port.shared.egress_waiters.as_ref().wake();
+    }
+
+    fn defer_close(&self, token: Token, _state: &ConnState) -> bool {
+        self.port.response_len(token) != 0
+    }
+
+    fn is_drained(&self, token: Token, _state: &ConnState) -> bool {
+        self.port.responses_empty(token)
     }
 }

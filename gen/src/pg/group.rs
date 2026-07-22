@@ -25,6 +25,13 @@ impl QueryGroupItem {
     ];
 
     pub(super) fn expand(block: ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
+        block.modifiers.require_empty()?;
+        if let Some(unsafe_token) = &block.unsafety {
+            return Err(syn::Error::new_spanned(
+                unsafe_token,
+                "#[query_group] does not support unsafe impl blocks",
+            ));
+        }
         if block.trait_.is_some() {
             return Err(syn::Error::new(
                 block.span(),
@@ -62,6 +69,13 @@ impl QueryGroupItem {
                     "#[query_group] impl block may only contain query methods",
                 ));
             };
+            method.modifiers.require_empty()?;
+            if let syn::Safety::Unsafe(unsafe_token) = &method.sig.safety {
+                return Err(syn::Error::new_spanned(
+                    unsafe_token,
+                    "#[query_group] methods must not be unsafe",
+                ));
+            }
             if method.sig.asyncness.is_some() {
                 return Err(syn::Error::new(
                     method.sig.span(),

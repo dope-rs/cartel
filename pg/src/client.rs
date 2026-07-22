@@ -1,30 +1,36 @@
-use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::Poll;
 
 use cartel_core::{Extract, Registrable, Reply, ReplyStream, Slot};
-use dope::WakeRef;
-use dope::fiber::{Fiber, Holding};
-use dope::manifold::connector::Connector;
-use dope::manifold::connector::session::Stage;
-use dope::manifold::connector::source::{Dialer, Static};
-use dope::manifold::env::{Bundle, Env};
-use dope::runtime::profile::Production;
-use dope::runtime::token::Token;
-use dope::transport::{Tcp, Transport};
-use dope::wire::Identity;
-use o3::buffer::{Owned, Shared};
+use dope::driver::token::Token;
+use dope_fiber::{Context, Fiber, Waiter};
+use o3::buffer::Shared;
+use pin_project::pin_project;
 
-use crate::protocol::{RowItem, Session};
+use crate::port::{Boundary, Frame, Port};
+use crate::protocol::RowItem;
 use crate::query::{HasGroup, QuerySet, TypedQuery};
 use crate::value::{BindWriter, RowReader};
 use crate::{Error, encode, protocol};
 
-pub trait PgTransport: Transport<Addr: Clone> {}
+pub struct Client<'d, I: QuerySet> {
+    pub(super) port: &'d Port<'d, I>,
+}
 
-impl<T: Transport<Addr: Clone>> PgTransport for T {}
+impl<I: QuerySet> Copy for Client<'_, I> {}
 
-pub type PgHolding<'d, I, S, E> = Holding<'d, Connector<0, Session<I>, S, E>>;
+impl<I: QuerySet> Clone for Client<'_, I> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'d, I: QuerySet> Port<'d, I> {
+    pub fn client(&'d self) -> Client<'d, I> {
+        Client { port: self }
+    }
+}
 
 type Decoder<R> = fn(&mut RowReader<'_>) -> Result<R, Error>;
 
@@ -37,36 +43,36 @@ fn decode_row<R>(decoder: Decoder<R>, payload: &Shared) -> Result<R, Error> {
 }
 
 fn overflow_error() -> Error {
-    Error::Other("response exceeded max buffered rows".into())
+    Error::ResponseCapacity
 }
 
-fn no_conn_outcome(
-    shared: &protocol::Shared,
-    request: impl FnOnce() -> Request,
-) -> DispatchOutcome {
+fn no_conn_outcome<'d>(shared: &protocol::Shared, request: Pending<'d>) -> DispatchOutcome<'d> {
     if shared.tx_saturated() {
         DispatchOutcome::Failed(shared.backpressure(0))
     } else {
-        DispatchOutcome::NoConn { request: request() }
+        DispatchOutcome::NoConn { request }
     }
 }
 
-pub(super) struct ExtractAll;
+pub(super) struct ExtractAll<Q>(PhantomData<fn() -> Q>);
 
-impl Extract<RowItem> for ExtractAll {
-    type Output = Result<Vec<Shared>, Error>;
+unsafe impl<Q: TypedQuery> Extract<RowItem> for ExtractAll<Q> {
+    type Output = Result<Vec<Q::Row>, Error>;
 
-    fn extract(slot: &mut Slot<RowItem>) -> Option<Self::Output> {
+    fn extract(slot: &mut Slot<'_, RowItem>) -> Option<Self::Output> {
         if !slot.completed() {
             return None;
         }
         if slot.overflowed() {
             return Some(Err(overflow_error()));
         }
-        let mut rows = Vec::new();
+        let mut rows = Vec::with_capacity(slot.len());
         while let Some(item) = slot.pop() {
             match item {
-                Ok(payload) => rows.push(payload),
+                Ok(payload) => match decode_row(Q::decode_row, &payload) {
+                    Ok(row) => rows.push(row),
+                    Err(error) => return Some(Err(error)),
+                },
                 Err(e) => return Some(Err(e)),
             }
         }
@@ -76,10 +82,10 @@ impl Extract<RowItem> for ExtractAll {
 
 pub struct ExtractUnit;
 
-impl Extract<RowItem> for ExtractUnit {
+unsafe impl Extract<RowItem> for ExtractUnit {
     type Output = Result<(), Error>;
 
-    fn extract(slot: &mut Slot<RowItem>) -> Option<Self::Output> {
+    fn extract(slot: &mut Slot<'_, RowItem>) -> Option<Self::Output> {
         if !slot.completed() {
             return None;
         }
@@ -97,21 +103,25 @@ impl Extract<RowItem> for ExtractUnit {
 
 pub(super) struct ExtractOne;
 
-impl Extract<RowItem> for ExtractOne {
+unsafe impl Extract<RowItem> for ExtractOne {
     type Output = Result<Shared, Error>;
     const SYNC_AFTER: bool = true;
 
-    fn extract(slot: &mut Slot<RowItem>) -> Option<Self::Output> {
-        slot.pop()
+    fn extract(slot: &mut Slot<'_, RowItem>) -> Option<Self::Output> {
+        match slot.pop() {
+            Some(item) => Some(item),
+            None if slot.take_overflow() => Some(Err(overflow_error())),
+            None => None,
+        }
     }
 }
 
 pub(super) struct ExtractFirst;
 
-impl Extract<RowItem> for ExtractFirst {
+unsafe impl Extract<RowItem> for ExtractFirst {
     type Output = Result<Option<Shared>, Error>;
 
-    fn extract(slot: &mut Slot<RowItem>) -> Option<Self::Output> {
+    fn extract(slot: &mut Slot<'_, RowItem>) -> Option<Self::Output> {
         if !slot.completed() {
             return None;
         }
@@ -126,120 +136,170 @@ impl Extract<RowItem> for ExtractFirst {
     }
 }
 
-pub(super) struct Throttle {
-    request: Request,
+pub(super) struct Throttle<'d> {
+    request: Option<Pending<'d>>,
     conn: Token,
 }
 
 struct Emit;
 
 impl Emit {
-    fn frame_typed<Q: TypedQuery, X: Extract<RowItem>>(
-        stage: &mut Stage<'_>,
-        params: Q::Params<'_>,
-    ) -> bool {
+    fn typed<Q: TypedQuery>(out: &mut Frame<'_>, params: Q::Params<'_>, sync: bool) {
         let pos = encode::bind_header(
-            stage,
+            out,
             "",
             Q::STATEMENT_NAME,
             Q::PARAM_FORMAT_CODES,
             Q::N_PARAMS,
         );
-        {
-            let mut bw = BindWriter::new(stage);
-            Q::encode_params(params, &mut bw);
+        Q::encode_params(params, &mut BindWriter::new(out));
+        encode::bind_trailer(out, pos, Q::RESULT_FORMAT_CODES);
+        encode::execute(out);
+        if sync {
+            encode::sync(out);
         }
-        encode::bind_trailer(stage, pos, Q::RESULT_FORMAT_CODES);
-        encode::execute(stage);
-        if X::SYNC_AFTER {
-            encode::sync(stage);
-        }
-        !stage.overflowed()
     }
 
-    fn frame_request(stage: &mut Stage<'_>, req: &Request) -> bool {
-        encode::parse(stage, "", &req.sql, req.param_oids);
-        let pos = encode::bind_header(stage, "", "", req.param_formats, req.n_params);
-        stage.extend_from_slice(&req.param_buf);
-        encode::bind_trailer(stage, pos, req.result_formats);
-        encode::execute(stage);
-        match &req.extra {
+    fn raw(out: &mut Frame<'_>, req: Request<'_>) {
+        encode::parse(out, "", req.sql, &[]);
+        let pos = encode::bind_header(out, "", "", &[1], 0);
+        encode::bind_trailer(out, pos, &[1]);
+        encode::execute(out);
+        match req.extra {
             Extra::Plain => {
-                encode::sync(stage);
+                encode::sync(out);
             }
             Extra::CopyIn { data } => {
-                encode::copy_data(stage, data);
-                encode::copy_done(stage);
-                encode::sync(stage);
+                encode::copy_data(out, data);
+                encode::copy_done(out);
+                encode::sync(out);
             }
             Extra::CopyInOpen => {}
         }
-        !stage.overflowed()
     }
 }
 
-enum DispatchOutcome {
+pub(super) struct Pending<'d> {
+    frame: Frame<'d>,
+    boundary: Boundary,
+}
+
+pub(super) struct TransactionLease<'d, I>
+where
+    I: QuerySet + 'd,
+{
+    client: Client<'d, I>,
+    target: (Token, u64),
+    armed: bool,
+}
+
+impl<'d, I: QuerySet + 'd> TransactionLease<'d, I> {
+    fn acquire(client: Client<'d, I>, conn: Token) -> Option<Self> {
+        let target = client.port.shared.try_acquire_transaction(conn)?;
+        Some(Self {
+            client,
+            target,
+            armed: true,
+        })
+    }
+
+    pub(super) fn client(&self) -> Client<'d, I> {
+        self.client
+    }
+
+    pub(super) fn target(&self) -> (Token, u64) {
+        self.target
+    }
+
+    pub(super) fn transfer(&mut self) -> bool {
+        if !self.armed {
+            return false;
+        }
+        if !self
+            .client
+            .port
+            .shared
+            .begin_transaction_finalization(self.target)
+        {
+            return false;
+        }
+        self.armed = false;
+        true
+    }
+}
+
+impl<I: QuerySet> Drop for TransactionLease<'_, I> {
+    fn drop(&mut self) {
+        if self.armed {
+            Disp::quarantine_transaction(self.client, self.target);
+        }
+    }
+}
+
+enum DispatchOutcome<'d> {
     Enqueued { conn: Token },
-    Throttled { throttle: Throttle },
-    NoConn { request: Request },
+    Throttled { throttle: Throttle<'d> },
+    NoConn { request: Pending<'d> },
     Failed(Error),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum DropAction {
-    Delivered,
-    Quarantined,
-}
-
-#[derive(Clone, Copy)]
-enum BoundaryAction {
-    Close,
-    Open,
-    External,
-}
-
-pub(super) enum DispatchedStream<'d, I, S, E, X>
+enum TransactionDispatchOutcome<'d, I>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
+{
+    Enqueued {
+        lease: TransactionLease<'d, I>,
+    },
+    Throttled {
+        lease: TransactionLease<'d, I>,
+        throttle: Throttle<'d>,
+    },
+    NoConn {
+        request: Pending<'d>,
+    },
+    Failed(Error),
+}
+
+pub(super) enum DispatchedStream<'d, I, X>
+where
+    I: QuerySet + 'd,
     X: Extract<RowItem>,
 {
     Pending {
         reply: ReplyStream<'d, RowItem, X>,
     },
     Throttled {
-        conn: PgHolding<'d, I, S, E>,
+        client: Client<'d, I>,
         reply: ReplyStream<'d, RowItem, X>,
-        throttle: Throttle,
+        throttle: Throttle<'d>,
     },
     Connecting {
-        conn: PgHolding<'d, I, S, E>,
-        pin: Option<Token>,
+        client: Client<'d, I>,
+        target: Option<(Token, u64)>,
         reply: ReplyStream<'d, RowItem, X>,
-        request: Request,
+        request: Option<Pending<'d>>,
     },
     Failed(Option<Error>),
 }
 
-impl<'d, I, S, E, X> DispatchedStream<'d, I, S, E, X>
+impl<'d, I, X> DispatchedStream<'d, I, X>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
     X: Extract<RowItem>,
 {
-    fn poll_settle(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll_settle(
+        &mut self,
+        mut cx: Pin<&mut Context<'_, 'd>>,
+        waiter: Pin<&Waiter<'d>>,
+    ) -> Poll<()> {
         if let DispatchedStream::Connecting {
-            conn,
-            pin,
+            client,
+            target,
             reply,
             request,
         } = self
         {
-            match Disp::retry_connecting(*conn, *pin, cx, reply, request) {
+            match Disp::retry_connecting(*client, *target, cx.as_mut(), waiter, reply, request) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(DispatchOutcome::Enqueued { .. }) => {
                     let reply = std::mem::replace(reply, ReplyStream::new());
@@ -248,7 +308,7 @@ where
                 Poll::Ready(DispatchOutcome::Throttled { throttle }) => {
                     let reply = std::mem::replace(reply, ReplyStream::new());
                     *self = DispatchedStream::Throttled {
-                        conn: *conn,
+                        client: *client,
                         reply,
                         throttle,
                     };
@@ -262,12 +322,12 @@ where
             }
         }
         if let DispatchedStream::Throttled {
-            conn,
+            client,
             reply,
             throttle,
         } = self
         {
-            match Disp::retry_throttled(*conn, cx, reply, throttle) {
+            match Disp::retry_throttled(*client, cx.as_mut(), waiter, reply, throttle) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(())) => {
                     let reply = std::mem::replace(reply, ReplyStream::new());
@@ -282,57 +342,44 @@ where
     }
 }
 
-pub trait PgOps<'d, I, S, E>
+pub trait PgOps<'d, I>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
 {
-    fn holding(&self) -> PgHolding<'d, I, S, E>;
+    fn client(&self) -> Client<'d, I>;
 
     fn backend_pid(&self) -> Option<i32> {
         None
     }
 
     fn is_failed(&self) -> bool {
-        self.holding().session().shared.is_failed()
+        self.client().port.shared.is_failed()
     }
 
     fn is_ready(&self) -> bool {
-        self.holding().session().shared.is_ready()
+        self.client().port.shared.is_ready()
     }
 
     fn live_count(&self) -> usize {
-        self.holding().session().shared.ready_count
-    }
-
-    fn set_max_inflight(&self, cap: usize) {
-        self.holding()
-            .hold()
-            .as_mut()
-            .session_mut()
-            .shared
-            .inflight_total
-            .set_max(cap);
+        self.client().port.shared.ready_count.get()
     }
 
     fn notifications_dropped(&self) -> u64 {
-        self.holding().session().shared.notifications_dropped()
+        self.client().port.shared.notifications_dropped()
     }
 
     fn set_pick_policy(&self, policy: protocol::PickPolicy) {
-        self.holding().hold().as_mut().session_mut().shared.policy = policy;
+        self.client().port.shared.policy.set(policy);
     }
 
     fn pick_policy(&self) -> protocol::PickPolicy {
-        self.holding().session().shared.policy
+        self.client().port.shared.policy.get()
     }
 
     fn run_one<Q>(
         &self,
         params: Q::Params<'_>,
-    ) -> Fiber<'d, impl Future<Output = Result<Q::Row, Error>> + use<'d, I, S, E, Q, Self>>
+    ) -> impl Fiber<'d, Output = Result<Q::Row, Error>> + use<'d, I, Q, Self>
     where
         Q: TypedQuery,
         I: HasGroup<Q::Group>,
@@ -340,8 +387,8 @@ where
     {
         let decoder = Q::decode_row;
         let dispatched =
-            Disp::dispatch_typed::<Q, ExtractFirst, I, S, E>(self.holding(), self.pin(), params);
-        Fiber::new(async move {
+            Disp::dispatch_typed::<Q, ExtractFirst, I>(self.client(), self.target(), params);
+        dope_fiber::fiber!('d => async move {
             match dispatched.await? {
                 None => Err(Error::NotFound),
                 Some(payload) => decode_row(decoder, &payload),
@@ -352,7 +399,7 @@ where
     fn run_first<Q>(
         &self,
         params: Q::Params<'_>,
-    ) -> Fiber<'d, impl Future<Output = Result<Option<Q::Row>, Error>> + use<'d, I, S, E, Q, Self>>
+    ) -> impl Fiber<'d, Output = Result<Option<Q::Row>, Error>> + use<'d, I, Q, Self>
     where
         Q: TypedQuery,
         I: HasGroup<Q::Group>,
@@ -360,8 +407,8 @@ where
     {
         let decoder = Q::decode_row;
         let dispatched =
-            Disp::dispatch_typed::<Q, ExtractFirst, I, S, E>(self.holding(), self.pin(), params);
-        Fiber::new(async move {
+            Disp::dispatch_typed::<Q, ExtractFirst, I>(self.client(), self.target(), params);
+        dope_fiber::fiber!('d => async move {
             match dispatched.await? {
                 None => Ok(None),
                 Some(payload) => decode_row(decoder, &payload).map(Some),
@@ -372,664 +419,601 @@ where
     fn run_all<Q>(
         &self,
         params: Q::Params<'_>,
-    ) -> Fiber<'d, impl Future<Output = Result<Vec<Q::Row>, Error>> + use<'d, I, S, E, Q, Self>>
+    ) -> impl Fiber<'d, Output = Result<Vec<Q::Row>, Error>> + use<'d, I, Q, Self>
     where
         Q: TypedQuery,
         I: HasGroup<Q::Group>,
         Q::Group: crate::query::QueryGroup,
     {
-        let decoder = Q::decode_row;
-        let dispatched =
-            Disp::dispatch_typed::<Q, ExtractAll, I, S, E>(self.holding(), self.pin(), params);
-        Fiber::new(async move {
-            let rows = dispatched.await?;
-            let mut out = Vec::with_capacity(rows.len());
-            for payload in &rows {
-                out.push(decode_row(decoder, payload)?);
-            }
-            Ok(out)
-        })
+        Disp::dispatch_typed::<Q, ExtractAll<Q>, I>(self.client(), self.target(), params)
     }
 
-    fn run_no_rows<Q>(
-        &self,
-        params: Q::Params<'_>,
-    ) -> Fiber<'d, Dispatched<'d, I, S, E, ExtractUnit>>
+    fn run_no_rows<Q>(&self, params: Q::Params<'_>) -> Dispatched<'d, I, ExtractUnit>
     where
         Q: TypedQuery<Row = ()>,
         I: HasGroup<Q::Group>,
         Q::Group: crate::query::QueryGroup,
     {
-        Fiber::new(Disp::dispatch_typed::<Q, ExtractUnit, I, S, E>(
-            self.holding(),
-            self.pin(),
-            params,
-        ))
+        Disp::dispatch_typed::<Q, ExtractUnit, I>(self.client(), self.target(), params)
     }
 
-    fn run_stream<Q>(&self, params: Q::Params<'_>) -> RunStream<'d, I, S, E, Q::Row>
+    fn run_stream<Q>(&self, params: Q::Params<'_>) -> RunStream<'d, I, Q::Row>
     where
         Q: TypedQuery,
         I: HasGroup<Q::Group>,
         Q::Group: crate::query::QueryGroup,
     {
         RunStream {
-            state: Disp::dispatch_stream::<Q, ExtractOne, I, S, E>(
-                self.holding(),
-                self.pin(),
-                params,
-            ),
+            state: Disp::dispatch_stream::<Q, ExtractOne, I>(self.client(), self.target(), params),
             decoder: Q::decode_row,
         }
     }
 
-    fn copy_in(&self, sql: &str, data: &[u8]) -> Fiber<'d, Dispatched<'d, I, S, E, ExtractUnit>> {
-        let mut buf = Owned::with_capacity(data.len());
-        buf.extend_from_slice(data);
-        Fiber::new(Disp::dispatch_raw::<ExtractUnit, I, S, E>(
-            self.holding(),
-            self.pin(),
-            Request::raw_extra(sql, Extra::CopyIn { data: buf }),
-        ))
+    fn copy_in(&self, sql: &str, data: &[u8]) -> Dispatched<'d, I, ExtractUnit> {
+        Disp::dispatch_raw::<ExtractUnit, I>(
+            self.client(),
+            self.target(),
+            Request::raw_extra(sql, Extra::CopyIn { data }),
+        )
     }
 
-    fn copy_in_stream(&self, sql: &str) -> Result<CopyInGuard<'d, I, S, E>, Error> {
-        let holding = self.holding();
+    fn copy_in_stream(&self, sql: &str) -> Result<CopyInGuard<'d, I>, Error> {
+        let client = self.client();
+        let target = self.target();
         let req = Request::raw_extra(sql, Extra::CopyInOpen);
         let mut reply = Reply::<RowItem, ExtractUnit>::new();
-        match Disp::try_dispatch_reply(holding, self.pin(), &mut reply, &req) {
+        let outcome = match Disp::raw(client, req) {
+            Ok(request) => Disp::try_dispatch_reply(client, target, &mut reply, request),
+            Err(error) => DispatchOutcome::Failed(error),
+        };
+        match outcome {
             DispatchOutcome::Enqueued { conn } => Ok(CopyInGuard {
-                conn: holding,
-                pin: conn,
-                reply: Some(reply),
+                client,
+                target: target.unwrap_or((conn, 0)),
+                reply,
             }),
-            DispatchOutcome::Throttled { .. } => Err(holding.session().shared.backpressure(0)),
+            DispatchOutcome::Throttled { .. } => Err(client.port.shared.backpressure(0)),
             DispatchOutcome::NoConn { .. } => Err(Error::NoReadyConn),
             DispatchOutcome::Failed(e) => Err(e),
         }
     }
 
-    fn copy_out(&self, sql: &str) -> CopyOutStream<'d, I, S, E> {
+    fn copy_out(&self, sql: &str) -> CopyOutStream<'d, I> {
         CopyOutStream {
-            state: Disp::dispatch_stream_raw::<ExtractOne, I, S, E>(
-                self.holding(),
-                self.pin(),
+            state: Disp::dispatch_stream_raw::<ExtractOne, I>(
+                self.client(),
+                self.target(),
                 Request::raw(sql),
             ),
         }
     }
 
-    fn dispatch_sql(&self, sql: &str) -> Dispatched<'d, I, S, E, ExtractUnit> {
-        Disp::dispatch_raw::<ExtractUnit, I, S, E>(self.holding(), self.pin(), Request::raw(sql))
+    fn dispatch_sql(&self, sql: &str) -> Dispatched<'d, I, ExtractUnit> {
+        Disp::dispatch_raw::<ExtractUnit, I>(self.client(), self.target(), Request::raw(sql))
     }
 
-    fn next_notification(&self) -> NextNotification<'d, I, S, E> {
+    fn next_notification(&self) -> NextNotification<'d, I> {
         NextNotification {
-            conn: self.holding(),
+            client: self.client(),
+            waiter: Waiter::new(),
         }
     }
 
     fn listen(
         &self,
         channel: impl Into<String>,
-    ) -> Fiber<'d, impl Future<Output = Result<crate::tx::ListenGuard<'d, I, S, E>, Error>>> {
+    ) -> impl Fiber<'d, Output = Result<crate::tx::ListenGuard<'d, I>, Error>> {
         let ch = channel.into();
         let sql = format!("LISTEN \"{}\"", ch.replace('"', "\"\""));
-        let holding = self.holding();
-        let dispatched =
-            Disp::dispatch_raw::<ExtractUnit, I, S, E>(holding, self.pin(), Request::raw(&sql));
-        Fiber::new(async move {
+        let client = self.client();
+        let target = self.target();
+        let dispatched = Disp::dispatch_raw::<ExtractUnit, I>(client, target, Request::raw(&sql));
+        dope_fiber::fiber!('d => async move {
             let conn = dispatched.resolved_conn();
             dispatched.await?;
             let pin = conn.ok_or_else(|| Error::Other("listen lost target conn".into()))?;
-            Ok(crate::tx::ListenGuard::from_parts(holding, pin, ch))
+            Ok(crate::tx::ListenGuard::from_parts(
+                client,
+                target.unwrap_or((pin, 0)),
+                ch,
+            ))
         })
     }
 
-    fn pin(&self) -> Option<Token> {
+    fn target(&self) -> Option<(Token, u64)> {
         None
     }
 
-    fn batch_pin(&self) -> Option<Token> {
-        self.pin()
-            .or_else(|| self.holding().session().shared.pick_conn(None))
+    fn batch_pin(&self) -> Option<(Token, u64)> {
+        self.target().or_else(|| {
+            self.client()
+                .port
+                .shared
+                .pick_conn(None)
+                .map(|conn| (conn, 0))
+        })
     }
 }
 
-impl<'d, I, S, E> PgOps<'d, I, S, E> for PgHolding<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
-    fn holding(&self) -> PgHolding<'d, I, S, E> {
+impl<'d, I: QuerySet + 'd> PgOps<'d, I> for Client<'d, I> {
+    fn client(&self) -> Client<'d, I> {
         *self
     }
 }
 
-pub struct Runner<'d, I, S, E>
+pub struct Runner<'d, I>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
 {
-    holding: PgHolding<'d, I, S, E>,
-    pin: Option<Token>,
+    client: Client<'d, I>,
+    target: Option<(Token, u64)>,
 }
 
-impl<'d, I, S, E> Runner<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
-    pub fn new(holding: PgHolding<'d, I, S, E>, pin: Option<Token>) -> Self {
-        Self { holding, pin }
+impl<'d, I: QuerySet + 'd> Runner<'d, I> {
+    pub fn new(client: Client<'d, I>, target: Option<(Token, u64)>) -> Self {
+        Self { client, target }
     }
 }
 
-impl<'d, I, S, E> Clone for Runner<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
+impl<I: QuerySet> Clone for Runner<'_, I> {
     fn clone(&self) -> Self {
         Self {
-            holding: self.holding,
-            pin: self.pin,
+            client: self.client,
+            target: self.target,
         }
     }
 }
 
-impl<'d, I, S, E> PgOps<'d, I, S, E> for Runner<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
-    fn holding(&self) -> PgHolding<'d, I, S, E> {
-        self.holding
+impl<'d, I: QuerySet + 'd> PgOps<'d, I> for Runner<'d, I> {
+    fn client(&self) -> Client<'d, I> {
+        self.client
     }
 
-    fn pin(&self) -> Option<Token> {
-        self.pin
+    fn target(&self) -> Option<(Token, u64)> {
+        self.target
     }
 }
 
 pub(super) struct Disp;
 
 impl Disp {
-    pub(super) fn dispatch_typed<'d, Q, X, I, S, E>(
-        holding: PgHolding<'d, I, S, E>,
-        pin: Option<Token>,
+    pub(super) fn dispatch_typed<'d, Q, X, I>(
+        client: Client<'d, I>,
+        target: Option<(Token, u64)>,
         params: Q::Params<'_>,
-    ) -> Dispatched<'d, I, S, E, X>
+    ) -> Dispatched<'d, I, X>
     where
         Q: TypedQuery,
         X: Extract<RowItem>,
         I: QuerySet + HasGroup<Q::Group>,
         Q::Group: crate::query::QueryGroup,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
     {
         let mut reply = Reply::<RowItem, X>::new();
-        let outcome = Self::try_dispatch_typed::<Q, X, I, S, E>(holding, pin, &mut reply, params);
-        Self::reply_state(holding, pin, reply, outcome)
+        let outcome = match Self::typed::<Q, I>(client, params, X::SYNC_AFTER) {
+            Ok(request) => Self::try_dispatch_reply(client, target, &mut reply, request),
+            Err(error) => DispatchOutcome::Failed(error),
+        };
+        Self::reply_state(client, target, reply, outcome)
     }
 
-    pub(super) fn dispatch_raw<'d, X, I, S, E>(
-        holding: PgHolding<'d, I, S, E>,
-        pin: Option<Token>,
-        req: Request,
-    ) -> Dispatched<'d, I, S, E, X>
+    pub(super) fn dispatch_raw<'d, X, I>(
+        client: Client<'d, I>,
+        target: Option<(Token, u64)>,
+        req: Request<'_>,
+    ) -> Dispatched<'d, I, X>
     where
         X: Extract<RowItem>,
         I: QuerySet,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
     {
         let mut reply = Reply::<RowItem, X>::new();
-        let outcome = Self::try_dispatch_reply(holding, pin, &mut reply, &req);
-        Self::reply_state(holding, pin, reply, outcome)
+        let outcome = match Self::raw(client, req) {
+            Ok(request) => Self::try_dispatch_reply(client, target, &mut reply, request),
+            Err(error) => DispatchOutcome::Failed(error),
+        };
+        Self::reply_state(client, target, reply, outcome)
     }
 
-    fn reply_state<'d, I, S, E, X>(
-        holding: PgHolding<'d, I, S, E>,
-        pin: Option<Token>,
+    pub(super) fn dispatch_transaction<'d, I>(
+        client: Client<'d, I>,
+        req: Request<'_>,
+    ) -> TransactionDispatched<'d, I>
+    where
+        I: QuerySet,
+    {
+        let mut reply = Reply::<RowItem, ExtractUnit>::new();
+        let outcome = match Self::raw(client, req) {
+            Ok(request) => Self::try_dispatch_transaction(client, &mut reply, request),
+            Err(error) => TransactionDispatchOutcome::Failed(error),
+        };
+        TransactionDispatched::new(client, reply, outcome)
+    }
+
+    fn reply_state<'d, I, X>(
+        client: Client<'d, I>,
+        target: Option<(Token, u64)>,
         reply: Reply<'d, RowItem, X>,
-        outcome: DispatchOutcome,
-    ) -> Dispatched<'d, I, S, E, X>
+        outcome: DispatchOutcome<'d>,
+    ) -> Dispatched<'d, I, X>
     where
         X: Extract<RowItem>,
         I: QuerySet,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
     {
         let state = match outcome {
             DispatchOutcome::Enqueued { conn } => DispatchState::Pending { conn },
-            DispatchOutcome::Throttled { throttle } => DispatchState::Throttled {
-                conn: holding,
-                throttle,
-            },
+            DispatchOutcome::Throttled { throttle } => {
+                DispatchState::Throttled { client, throttle }
+            }
             DispatchOutcome::NoConn { request } => DispatchState::Connecting {
-                conn: holding,
-                pin,
-                request,
+                client,
+                target,
+                request: Some(request),
             },
             DispatchOutcome::Failed(e) => DispatchState::Failed(Some(e)),
         };
-        Dispatched { reply, state }
+        Dispatched::new(reply, state)
     }
 
-    pub(super) fn dispatch_stream<'d, Q, X, I, S, E>(
-        holding: PgHolding<'d, I, S, E>,
-        pin: Option<Token>,
+    pub(super) fn dispatch_stream<'d, Q, X, I>(
+        client: Client<'d, I>,
+        target: Option<(Token, u64)>,
         params: Q::Params<'_>,
-    ) -> DispatchedStream<'d, I, S, E, X>
+    ) -> DispatchedStream<'d, I, X>
     where
         Q: TypedQuery,
         X: Extract<RowItem>,
         I: QuerySet + HasGroup<Q::Group>,
         Q::Group: crate::query::QueryGroup,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
     {
         let mut reply = ReplyStream::<RowItem, X>::new();
-        let outcome = Self::try_dispatch_typed::<Q, X, I, S, E>(holding, pin, &mut reply, params);
-        Self::stream_state(holding, pin, reply, outcome)
+        let outcome = match Self::typed::<Q, I>(client, params, X::SYNC_AFTER) {
+            Ok(request) => Self::try_dispatch_reply(client, target, &mut reply, request),
+            Err(error) => DispatchOutcome::Failed(error),
+        };
+        Self::stream_state(client, target, reply, outcome)
     }
 
-    pub(super) fn dispatch_stream_raw<'d, X, I, S, E>(
-        holding: PgHolding<'d, I, S, E>,
-        pin: Option<Token>,
-        req: Request,
-    ) -> DispatchedStream<'d, I, S, E, X>
+    pub(super) fn dispatch_stream_raw<'d, X, I>(
+        client: Client<'d, I>,
+        target: Option<(Token, u64)>,
+        req: Request<'_>,
+    ) -> DispatchedStream<'d, I, X>
     where
         X: Extract<RowItem>,
         I: QuerySet,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
     {
         let mut reply = ReplyStream::<RowItem, X>::new();
-        let outcome = Self::try_dispatch_reply(holding, pin, &mut reply, &req);
-        Self::stream_state(holding, pin, reply, outcome)
+        let outcome = match Self::raw(client, req) {
+            Ok(request) => Self::try_dispatch_reply(client, target, &mut reply, request),
+            Err(error) => DispatchOutcome::Failed(error),
+        };
+        Self::stream_state(client, target, reply, outcome)
     }
 
-    fn stream_state<'d, I, S, E, X>(
-        holding: PgHolding<'d, I, S, E>,
-        pin: Option<Token>,
+    fn stream_state<'d, I, X>(
+        client: Client<'d, I>,
+        target: Option<(Token, u64)>,
         reply: ReplyStream<'d, RowItem, X>,
-        outcome: DispatchOutcome,
-    ) -> DispatchedStream<'d, I, S, E, X>
+        outcome: DispatchOutcome<'d>,
+    ) -> DispatchedStream<'d, I, X>
     where
         X: Extract<RowItem>,
         I: QuerySet,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
     {
         match outcome {
             DispatchOutcome::Enqueued { .. } => DispatchedStream::Pending { reply },
             DispatchOutcome::Throttled { throttle } => DispatchedStream::Throttled {
-                conn: holding,
+                client,
                 reply,
                 throttle,
             },
             DispatchOutcome::NoConn { request } => DispatchedStream::Connecting {
-                conn: holding,
-                pin,
+                client,
+                target,
                 reply,
-                request,
+                request: Some(request),
             },
             DispatchOutcome::Failed(e) => DispatchedStream::Failed(Some(e)),
         }
     }
 
-    fn try_dispatch_typed<'d, Q, X, I, S, E>(
-        holding: PgHolding<'d, I, S, E>,
-        pin: Option<Token>,
-        reply: &mut impl Registrable<'d, RowItem>,
+    fn typed<'d, Q, I>(
+        client: Client<'d, I>,
         params: Q::Params<'_>,
-    ) -> DispatchOutcome
+        sync: bool,
+    ) -> Result<Pending<'d>, Error>
     where
         Q: TypedQuery,
-        X: Extract<RowItem>,
-        I: QuerySet + HasGroup<Q::Group>,
-        Q::Group: crate::query::QueryGroup,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
+        I: QuerySet,
     {
-        if let Err(e) = Self::check_can_dispatch(holding) {
-            return DispatchOutcome::Failed(e);
-        }
-        let conn_id = match holding.session().shared.pick_conn(pin) {
-            Some(c) => c,
-            None => {
-                return match pin {
-                    Some(_) => {
-                        DispatchOutcome::Failed(Error::Other("pinned conn no longer ready".into()))
-                    }
-                    None => {
-                        no_conn_outcome(&holding.session().shared, || Request::typed::<Q>(params))
-                    }
-                };
-            }
-        };
-        let mut h = holding.hold();
-        let mut pool = h.as_mut();
-        let Some(channel) = pool.as_mut().state_for(conn_id) else {
-            return DispatchOutcome::Failed(Error::Closed);
-        };
-        let queued = channel.egress_len();
-        let staged = {
-            let mut stage = channel.wire_stage();
-            if Emit::frame_typed::<Q, X>(&mut stage, params) {
-                Some(stage.len())
+        let frame = client
+            .port
+            .encode(|frame| Emit::typed::<Q>(frame, params, sync))?;
+        Ok(Pending {
+            frame,
+            boundary: if sync {
+                Boundary::Close
             } else {
-                None
-            }
-        };
-        let Some(n) = staged else {
-            return DispatchOutcome::Failed(pool.session().shared.backpressure(queued));
-        };
-        let action = if X::SYNC_AFTER {
-            BoundaryAction::Close
-        } else {
-            BoundaryAction::Open
-        };
-        Self::commit_staged(pool, conn_id, reply, n, action);
-        DispatchOutcome::Enqueued { conn: conn_id }
+                Boundary::Open
+            },
+        })
     }
 
-    fn try_dispatch_reply<'d, I, S, E>(
-        holding: PgHolding<'d, I, S, E>,
-        pin: Option<Token>,
-        reply: &mut impl Registrable<'d, RowItem>,
-        req: &Request,
-    ) -> DispatchOutcome
+    fn raw<'d, I>(client: Client<'d, I>, req: Request<'_>) -> Result<Pending<'d>, Error>
     where
         I: QuerySet,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
     {
-        if let Err(e) = Self::check_can_dispatch(holding) {
+        let boundary = match req.extra {
+            Extra::Plain | Extra::CopyIn { .. } => Boundary::Close,
+            Extra::CopyInOpen => Boundary::External,
+        };
+        let frame = client.port.encode(|frame| Emit::raw(frame, req))?;
+        Ok(Pending { frame, boundary })
+    }
+
+    fn try_dispatch_reply<'d, I>(
+        client: Client<'d, I>,
+        target: Option<(Token, u64)>,
+        reply: &mut impl Registrable<'d, RowItem>,
+        request: Pending<'d>,
+    ) -> DispatchOutcome<'d>
+    where
+        I: QuerySet,
+    {
+        if let Err(e) = Self::check_can_dispatch(client) {
             return DispatchOutcome::Failed(e);
         }
-        let conn_id = match holding.session().shared.pick_conn(pin) {
+        let shared = &client.port.shared;
+        let conn_id = match shared.pick_conn(target) {
             Some(c) => c,
             None => {
-                return match pin {
+                return match target {
                     Some(_) => {
                         DispatchOutcome::Failed(Error::Other("pinned conn no longer ready".into()))
                     }
-                    None => no_conn_outcome(&holding.session().shared, || req.clone()),
+                    None => no_conn_outcome(shared, request),
                 };
             }
         };
-        let mut h = holding.hold();
-        let pool = h.as_mut();
-        if !Self::stage_request(pool, conn_id, reply, req) {
-            return DispatchOutcome::Throttled {
+        match Self::stage_request(client, conn_id, reply, request) {
+            Ok(()) => DispatchOutcome::Enqueued { conn: conn_id },
+            Err((Error::Backpressure { .. }, request)) => DispatchOutcome::Throttled {
                 throttle: Throttle {
-                    request: req.clone(),
+                    request: Some(request),
                     conn: conn_id,
                 },
+            },
+            Err((error, _)) => DispatchOutcome::Failed(error),
+        }
+    }
+
+    fn try_dispatch_transaction<'d, I>(
+        client: Client<'d, I>,
+        reply: &mut impl Registrable<'d, RowItem>,
+        request: Pending<'d>,
+    ) -> TransactionDispatchOutcome<'d, I>
+    where
+        I: QuerySet,
+    {
+        if let Err(error) = Self::check_can_dispatch(client) {
+            return TransactionDispatchOutcome::Failed(error);
+        }
+        let shared = &client.port.shared;
+        let Some(conn) = shared.pick_conn(None) else {
+            return if shared.tx_saturated() {
+                TransactionDispatchOutcome::Failed(shared.backpressure(0))
+            } else {
+                TransactionDispatchOutcome::NoConn { request }
             };
+        };
+        let Some(lease) = TransactionLease::acquire(client, conn) else {
+            return TransactionDispatchOutcome::NoConn { request };
+        };
+        match Self::stage_request(client, conn, reply, request) {
+            Ok(()) => TransactionDispatchOutcome::Enqueued { lease },
+            Err((Error::Backpressure { .. }, request)) => TransactionDispatchOutcome::Throttled {
+                lease,
+                throttle: Throttle {
+                    request: Some(request),
+                    conn,
+                },
+            },
+            Err((error, _)) => TransactionDispatchOutcome::Failed(error),
         }
-        DispatchOutcome::Enqueued { conn: conn_id }
     }
 
-    fn stage_request<'d, I, S, E>(
-        mut pool: Pin<&mut Connector<0, Session<I>, S, E>>,
+    fn stage_request<'d, I>(
+        client: Client<'d, I>,
         conn_id: Token,
         reply: &mut impl Registrable<'d, RowItem>,
-        req: &Request,
-    ) -> bool
+        request: Pending<'d>,
+    ) -> Result<(), (Error, Pending<'d>)>
     where
         I: QuerySet,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
     {
-        let Some(channel) = pool.as_mut().state_for(conn_id) else {
-            return false;
-        };
-        let n = {
-            let mut stage = channel.wire_stage();
-            if !Emit::frame_request(&mut stage, req) {
-                return false;
-            }
-            stage.len()
-        };
-        let action = match req.extra {
-            Extra::Plain | Extra::CopyIn { .. } => BoundaryAction::Close,
-            Extra::CopyInOpen => BoundaryAction::External,
-        };
-        Self::commit_staged(pool, conn_id, reply, n, action);
-        true
-    }
-
-    fn commit_staged<'d, I, S, E>(
-        mut pool: Pin<&mut Connector<0, Session<I>, S, E>>,
-        conn_id: Token,
-        reply: &mut impl Registrable<'d, RowItem>,
-        n: usize,
-        action: BoundaryAction,
-    ) where
-        I: QuerySet,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
-    {
-        let channel = pool
-            .as_mut()
-            .state_for(conn_id)
-            .expect("channel vanished mid-dispatch");
-        channel.wire_commit(n);
-        reply.attach(&mut channel.conn_state_mut().responses);
+        let Pending { frame, boundary } = request;
+        match client
+            .port
+            .try_enqueue_reply(conn_id, frame, reply, boundary)
         {
-            let st = channel.conn_state_mut();
-            st.unsynced += 1;
-            match action {
-                BoundaryAction::Close => st.push_batch_boundary(),
-                BoundaryAction::Open => st.batch_open = true,
-                BoundaryAction::External => {}
-            }
+            Ok(()) => Ok(()),
+            Err((error, frame)) => Err((error, Pending { frame, boundary })),
         }
-        let s = &mut pool.as_mut().session_mut().shared;
-        s.inflight_total.inc();
-        s.inc_inflight(conn_id);
-        pool.request_flush(conn_id);
     }
 
-    fn retry_connecting<'d, I, S, E>(
-        holding: PgHolding<'d, I, S, E>,
-        pin: Option<Token>,
-        cx: &mut Context<'_>,
+    fn retry_connecting<'d, I>(
+        client: Client<'d, I>,
+        target: Option<(Token, u64)>,
+        cx: Pin<&mut Context<'_, 'd>>,
+        waiter: Pin<&Waiter<'d>>,
         reply: &mut impl Registrable<'d, RowItem>,
-        req: &Request,
-    ) -> Poll<DispatchOutcome>
+        request: &mut Option<Pending<'d>>,
+    ) -> Poll<DispatchOutcome<'d>>
     where
         I: QuerySet,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
     {
-        let outcome = Self::try_dispatch_reply(holding, pin, reply, req);
-        if matches!(outcome, DispatchOutcome::NoConn { .. }) {
-            let mut h = holding.hold();
-            let s = &mut h.as_mut().session_mut().shared;
-            if s.is_failed() {
+        let outcome = Self::try_dispatch_reply(
+            client,
+            target,
+            reply,
+            request.take().expect("missing pending request"),
+        );
+        if let DispatchOutcome::NoConn { request: pending } = outcome {
+            *request = Some(pending);
+            let shared = &client.port.shared;
+            if shared.is_failed() {
+                waiter.unregister();
                 return Poll::Ready(DispatchOutcome::Failed(Error::Closed));
             }
-            s.register_ready_waker(WakeRef::verified(cx.waker()));
-            return Poll::Pending;
+            return if shared.try_register_ready(waiter, cx.as_ref()) {
+                Poll::Pending
+            } else {
+                Poll::Ready(DispatchOutcome::Failed(Error::WaiterCapacity))
+            };
         }
+        waiter.unregister();
         Poll::Ready(outcome)
     }
 
-    fn retry_throttled<'d, I, S, E>(
-        holding: PgHolding<'d, I, S, E>,
-        cx: &mut Context<'_>,
+    fn retry_transaction_connecting<'d, I>(
+        client: Client<'d, I>,
+        cx: Pin<&mut Context<'_, 'd>>,
+        waiter: Pin<&Waiter<'d>>,
         reply: &mut impl Registrable<'d, RowItem>,
-        throttle: &Throttle,
+        request: &mut Option<Pending<'d>>,
+    ) -> Poll<TransactionDispatchOutcome<'d, I>>
+    where
+        I: QuerySet,
+    {
+        let outcome = Self::try_dispatch_transaction(
+            client,
+            reply,
+            request.take().expect("missing pending transaction request"),
+        );
+        if let TransactionDispatchOutcome::NoConn { request: pending } = outcome {
+            *request = Some(pending);
+            let shared = &client.port.shared;
+            if shared.is_failed() {
+                waiter.unregister();
+                return Poll::Ready(TransactionDispatchOutcome::Failed(Error::Closed));
+            }
+            return if shared.try_register_ready(waiter, cx.as_ref()) {
+                Poll::Pending
+            } else {
+                Poll::Ready(TransactionDispatchOutcome::Failed(Error::WaiterCapacity))
+            };
+        }
+        waiter.unregister();
+        Poll::Ready(outcome)
+    }
+
+    fn retry_throttled<'d, I>(
+        client: Client<'d, I>,
+        cx: Pin<&mut Context<'_, 'd>>,
+        waiter: Pin<&Waiter<'d>>,
+        reply: &mut impl Registrable<'d, RowItem>,
+        throttle: &mut Throttle<'d>,
     ) -> Poll<Result<(), Error>>
     where
         I: QuerySet,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
     {
-        if holding.session().shared.is_failed() {
+        let shared = &client.port.shared;
+        if shared.is_failed() {
+            waiter.unregister();
             return Poll::Ready(Err(Error::Closed));
         }
-        let mut h = holding.hold();
-        let mut pool = h.as_mut();
-        if pool.as_mut().state_for(throttle.conn).is_none() {
-            return Poll::Ready(Err(Error::Closed));
+        let request = throttle.request.take().expect("missing throttled request");
+        match Self::stage_request(client, throttle.conn, reply, request) {
+            Ok(()) => {
+                waiter.unregister();
+                return Poll::Ready(Ok(()));
+            }
+            Err((Error::Backpressure { .. }, request)) => throttle.request = Some(request),
+            Err((error, _)) => {
+                waiter.unregister();
+                return Poll::Ready(Err(error));
+            }
         }
-        if Self::stage_request(pool.as_mut(), throttle.conn, reply, &throttle.request) {
-            return Poll::Ready(Ok(()));
+        if shared.try_register_egress(waiter, cx.as_ref()) {
+            Poll::Pending
+        } else {
+            Poll::Ready(Err(Error::WaiterCapacity))
         }
-        pool.as_mut().request_flush(throttle.conn);
-        pool.session_mut()
-            .shared
-            .register_egress_drain_waker(WakeRef::verified(cx.waker()));
-        Poll::Pending
     }
 
-    fn dispatch_copy_data<'d, I, S, E>(
-        holding: PgHolding<'d, I, S, E>,
-        pin: Token,
+    fn dispatch_copy_data<I: QuerySet>(
+        client: Client<'_, I>,
+        target: (Token, u64),
         data: &[u8],
-    ) -> Result<(), Error>
-    where
-        I: QuerySet,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
-    {
-        Self::check_can_dispatch(holding)?;
-        let mut h = holding.hold();
-        let mut pool = h.as_mut();
-        let channel = pool.as_mut().state_for(pin).ok_or(Error::Closed)?;
-        let queued = channel.egress_len();
-        let staged = {
-            let mut stage = channel.wire_stage();
-            encode::copy_data(&mut stage, data);
-            (!stage.overflowed()).then_some(stage.len())
-        };
-        let Some(n) = staged else {
-            return Err(pool.session().shared.backpressure(queued));
-        };
-        let channel = pool
-            .as_mut()
-            .state_for(pin)
-            .expect("channel vanished mid-dispatch");
-        channel.wire_commit(n);
-        pool.request_flush(pin);
+    ) -> Result<(), Error> {
+        Self::check_can_dispatch(client)?;
+        let pin = client
+            .port
+            .shared
+            .pick_conn(Some(target))
+            .ok_or(Error::Closed)?;
+        let frame = client.port.encode(|frame| encode::copy_data(frame, data))?;
+        client
+            .port
+            .try_enqueue(pin, frame)
+            .map_err(|(error, _)| error)
+    }
+
+    fn dispatch_copy_finish<I: QuerySet>(
+        client: Client<'_, I>,
+        target: (Token, u64),
+    ) -> Result<(), Error> {
+        Self::check_can_dispatch(client)?;
+        let pin = client
+            .port
+            .shared
+            .pick_conn(Some(target))
+            .ok_or(Error::Closed)?;
+        if !client.port.can_push_boundary(pin) {
+            return Err(Error::ResponseCapacity);
+        }
+        let frame = client.port.encode(|frame| {
+            encode::copy_done(frame);
+            encode::sync(frame);
+        })?;
+        client
+            .port
+            .try_enqueue(pin, frame)
+            .map_err(|(error, _)| error)?;
+        let marked = client.port.push_boundary(pin);
+        debug_assert!(marked);
         Ok(())
     }
 
-    fn dispatch_copy_finish<'d, I, S, E>(
-        holding: PgHolding<'d, I, S, E>,
-        pin: Token,
-    ) -> Result<(), Error>
-    where
-        I: QuerySet,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
-    {
-        Self::check_can_dispatch(holding)?;
-        let mut h = holding.hold();
-        let mut pool = h.as_mut();
-        let channel = pool.as_mut().state_for(pin).ok_or(Error::Closed)?;
-        let queued = channel.egress_len();
-        let staged = {
-            let mut stage = channel.wire_stage();
-            encode::copy_done(&mut stage);
-            encode::sync(&mut stage);
-            (!stage.overflowed()).then_some(stage.len())
-        };
-        let Some(n) = staged else {
-            return Err(pool.session().shared.backpressure(queued));
-        };
-        let channel = pool
-            .as_mut()
-            .state_for(pin)
-            .expect("channel vanished mid-dispatch");
-        channel.wire_commit(n);
-        channel.conn_state_mut().push_batch_boundary();
-        pool.request_flush(pin);
-        Ok(())
-    }
-
-    pub(super) fn rollback_on_drop<'d, I, S, E>(
-        holding: PgHolding<'d, I, S, E>,
-        pin: Token,
+    pub(super) fn rollback_on_drop<I: QuerySet>(
+        client: Client<'_, I>,
+        target: (Token, u64),
         sql: &str,
-    ) -> DropAction
-    where
-        I: QuerySet,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
-    {
+    ) {
         let req = Request::raw(sql);
         let mut reply = Reply::<RowItem, ExtractUnit>::new();
-        let outcome = Self::try_dispatch_reply(holding, Some(pin), &mut reply, &req);
+        let outcome = match Self::raw(client, req) {
+            Ok(request) => Self::try_dispatch_reply(client, Some(target), &mut reply, request),
+            Err(error) => DispatchOutcome::Failed(error),
+        };
         if matches!(outcome, DispatchOutcome::Enqueued { .. }) {
-            return DropAction::Delivered;
+            return;
         }
-        let mut h = holding.hold();
-        h.as_mut().request_close(pin);
-        DropAction::Quarantined
+        client.port.close(target.0);
     }
 
-    pub(super) fn acquire_exclusive<'d, I, S, E>(holding: PgHolding<'d, I, S, E>, pin: Token)
-    where
-        I: QuerySet,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
-    {
-        let mut h = holding.hold();
-        h.as_mut().session_mut().shared.acquire_exclusive(pin);
+    fn quarantine_transaction<I: QuerySet>(client: Client<'_, I>, target: (Token, u64)) {
+        if !client.port.shared.quarantine_transaction(target) {
+            return;
+        }
+        if let Ok(request) = Self::raw(client, Request::raw("ROLLBACK")) {
+            let mut reply = Reply::<RowItem, ExtractUnit>::new();
+            let _ = Self::stage_request(client, target.0, &mut reply, request);
+        }
+        client.port.close(target.0);
     }
 
-    pub(super) fn release_exclusive<'d, I, S, E>(holding: PgHolding<'d, I, S, E>, pin: Token)
-    where
-        I: QuerySet,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
-    {
-        let mut h = holding.hold();
-        h.as_mut().session_mut().shared.release_exclusive(pin);
-    }
-
-    fn check_can_dispatch<'d, I, S, E>(holding: PgHolding<'d, I, S, E>) -> Result<(), Error>
-    where
-        I: QuerySet,
-        S: Dialer<E::Transport>,
-        E: Env,
-        E::Transport: Transport<Addr: Clone>,
-    {
-        let s = &holding.session().shared;
+    fn check_can_dispatch<I: QuerySet>(client: Client<'_, I>) -> Result<(), Error> {
+        let s = &client.port.shared;
         if s.is_failed() {
             return Err(Error::Closed);
         }
@@ -1037,53 +1021,162 @@ impl Disp {
     }
 }
 
-enum DispatchState<'d, I, S, E>
+enum DispatchState<'d, I>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
 {
     Pending {
         conn: Token,
     },
     Throttled {
-        conn: PgHolding<'d, I, S, E>,
-        throttle: Throttle,
+        client: Client<'d, I>,
+        throttle: Throttle<'d>,
     },
     Connecting {
-        conn: PgHolding<'d, I, S, E>,
-        pin: Option<Token>,
-        request: Request,
+        client: Client<'d, I>,
+        target: Option<(Token, u64)>,
+        request: Option<Pending<'d>>,
     },
     Failed(Option<Error>),
 }
 
-pub struct Dispatched<
-    'd,
-    I,
-    S = Static<Tcp>,
-    E = Bundle<Tcp, Identity, Production>,
-    X = ExtractUnit,
-> where
+enum TransactionDispatchState<'d> {
+    Pending,
+    Throttled(Throttle<'d>),
+    Connecting(Option<Pending<'d>>),
+    Failed(Option<Error>),
+}
+
+#[pin_project]
+pub(super) struct TransactionDispatched<'d, I>
+where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
+{
+    client: Client<'d, I>,
+    reply: Reply<'d, RowItem, ExtractUnit>,
+    lease: Option<TransactionLease<'d, I>>,
+    state: TransactionDispatchState<'d>,
+    #[pin]
+    waiter: Waiter<'d>,
+}
+
+impl<'d, I: QuerySet + 'd> TransactionDispatched<'d, I> {
+    fn new(
+        client: Client<'d, I>,
+        reply: Reply<'d, RowItem, ExtractUnit>,
+        outcome: TransactionDispatchOutcome<'d, I>,
+    ) -> Self {
+        let (lease, state) = match outcome {
+            TransactionDispatchOutcome::Enqueued { lease } => {
+                (Some(lease), TransactionDispatchState::Pending)
+            }
+            TransactionDispatchOutcome::Throttled { lease, throttle } => {
+                (Some(lease), TransactionDispatchState::Throttled(throttle))
+            }
+            TransactionDispatchOutcome::NoConn { request } => {
+                (None, TransactionDispatchState::Connecting(Some(request)))
+            }
+            TransactionDispatchOutcome::Failed(error) => {
+                (None, TransactionDispatchState::Failed(Some(error)))
+            }
+        };
+        Self {
+            client,
+            reply,
+            lease,
+            state,
+            waiter: Waiter::new(),
+        }
+    }
+}
+
+impl<'d, I: QuerySet + 'd> Fiber<'d> for TransactionDispatched<'d, I> {
+    type Output = Result<TransactionLease<'d, I>, Error>;
+    fn poll(self: Pin<&mut Self>, mut cx: Pin<&mut Context<'_, 'd>>) -> Poll<Self::Output> {
+        let me = self.project();
+        let client = *me.client;
+        let waiter = me.waiter.as_ref();
+        if let TransactionDispatchState::Connecting(request) = &mut *me.state {
+            match Disp::retry_transaction_connecting(client, cx.as_mut(), waiter, me.reply, request)
+            {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(TransactionDispatchOutcome::Enqueued { lease }) => {
+                    *me.lease = Some(lease);
+                    *me.state = TransactionDispatchState::Pending;
+                }
+                Poll::Ready(TransactionDispatchOutcome::Throttled { lease, throttle }) => {
+                    *me.lease = Some(lease);
+                    *me.state = TransactionDispatchState::Throttled(throttle);
+                }
+                Poll::Ready(TransactionDispatchOutcome::NoConn { .. }) => {
+                    unreachable!("transaction retry maps NoConn to Pending/Failed")
+                }
+                Poll::Ready(TransactionDispatchOutcome::Failed(error)) => {
+                    *me.state = TransactionDispatchState::Failed(None);
+                    return Poll::Ready(Err(error));
+                }
+            }
+        }
+        if let TransactionDispatchState::Throttled(throttle) = &mut *me.state {
+            match Disp::retry_throttled(client, cx.as_mut(), waiter, me.reply, throttle) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(())) => *me.state = TransactionDispatchState::Pending,
+                Poll::Ready(Err(error)) => {
+                    drop(me.lease.take());
+                    *me.state = TransactionDispatchState::Failed(None);
+                    return Poll::Ready(Err(error));
+                }
+            }
+        }
+        match &mut *me.state {
+            TransactionDispatchState::Pending => match Fiber::poll(Pin::new(me.reply), cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(())) => {
+                    Poll::Ready(Ok(me.lease.take().expect("transaction lease missing")))
+                }
+                Poll::Ready(Err(error)) => {
+                    drop(me.lease.take());
+                    Poll::Ready(Err(error))
+                }
+            },
+            TransactionDispatchState::Failed(error) => Poll::Ready(Err(error
+                .take()
+                .expect("transaction dispatch polled after failure"))),
+            TransactionDispatchState::Throttled(_) => {
+                unreachable!("transaction throttle resolved above")
+            }
+            TransactionDispatchState::Connecting(_) => {
+                unreachable!("transaction connection resolved above")
+            }
+        }
+    }
+}
+
+#[pin_project]
+pub struct Dispatched<'d, I, X = ExtractUnit>
+where
+    I: QuerySet + 'd,
     X: Extract<RowItem>,
 {
     reply: Reply<'d, RowItem, X>,
-    state: DispatchState<'d, I, S, E>,
+    state: DispatchState<'d, I>,
+    #[pin]
+    waiter: Waiter<'d>,
 }
 
-impl<'d, I, S, E, X> Dispatched<'d, I, S, E, X>
+impl<'d, I, X> Dispatched<'d, I, X>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
     X: Extract<RowItem>,
 {
+    fn new(reply: Reply<'d, RowItem, X>, state: DispatchState<'d, I>) -> Self {
+        Self {
+            reply,
+            state,
+            waiter: Waiter::new(),
+        }
+    }
+
     pub(super) fn resolved_conn(&self) -> Option<Token> {
         match &self.state {
             DispatchState::Pending { conn } => Some(*conn),
@@ -1091,29 +1184,35 @@ where
             DispatchState::Connecting { .. } | DispatchState::Failed(_) => None,
         }
     }
+
+    pub(super) fn is_enqueued(&self) -> bool {
+        matches!(self.state, DispatchState::Pending { .. })
+    }
 }
 
-impl<'d, I, S, E, T, X> Future for Dispatched<'d, I, S, E, X>
+impl<'d, I, T, X> Fiber<'d> for Dispatched<'d, I, X>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
     X: Extract<RowItem, Output = Result<T, Error>>,
 {
     type Output = Result<T, Error>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let me = self.get_mut();
-        if let DispatchState::Connecting { conn, pin, request } = &mut me.state {
-            match Disp::retry_connecting(*conn, *pin, cx, &mut me.reply, request) {
+    fn poll(self: Pin<&mut Self>, mut cx: Pin<&mut Context<'_, 'd>>) -> Poll<Self::Output> {
+        let me = self.project();
+        let waiter = me.waiter.as_ref();
+        if let DispatchState::Connecting {
+            client,
+            target,
+            request,
+        } = &mut *me.state
+        {
+            match Disp::retry_connecting(*client, *target, cx.as_mut(), waiter, me.reply, request) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(DispatchOutcome::Enqueued { conn: target }) => {
-                    me.state = DispatchState::Pending { conn: target };
+                    *me.state = DispatchState::Pending { conn: target };
                 }
                 Poll::Ready(DispatchOutcome::Throttled { throttle }) => {
-                    me.state = DispatchState::Throttled {
-                        conn: *conn,
+                    *me.state = DispatchState::Throttled {
+                        client: *client,
                         throttle,
                     };
                 }
@@ -1125,252 +1224,224 @@ where
                 }
             }
         }
-        if let DispatchState::Throttled { conn, throttle, .. } = &mut me.state {
-            match Disp::retry_throttled(*conn, cx, &mut me.reply, throttle) {
+        if let DispatchState::Throttled {
+            client, throttle, ..
+        } = &mut *me.state
+        {
+            match Disp::retry_throttled(*client, cx.as_mut(), waiter, me.reply, throttle) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(())) => {
                     let target = throttle.conn;
-                    me.state = DispatchState::Pending { conn: target };
+                    *me.state = DispatchState::Pending { conn: target };
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             }
         }
-        match &mut me.state {
+        match &mut *me.state {
             DispatchState::Connecting { .. } => unreachable!("Connecting resolved above"),
             DispatchState::Throttled { .. } => unreachable!("Throttled resolved above"),
             DispatchState::Failed(e) => Poll::Ready(Err(e
                 .take()
                 .expect("dispatch future polled after failure delivered"))),
-            DispatchState::Pending { .. } => Pin::new(&mut me.reply).poll(cx),
+            DispatchState::Pending { .. } => Fiber::poll(Pin::new(me.reply), cx),
         }
     }
 }
 
-pub(super) struct Request {
-    sql: String,
-    param_oids: &'static [u32],
-    n_params: u16,
-    param_formats: &'static [u16],
-    result_formats: &'static [u16],
-    param_buf: Owned,
-    extra: Extra,
+#[derive(Clone, Copy)]
+pub(super) struct Request<'a> {
+    sql: &'a str,
+    extra: Extra<'a>,
 }
 
-impl Clone for Request {
-    fn clone(&self) -> Self {
-        Self {
-            sql: self.sql.clone(),
-            param_oids: self.param_oids,
-            n_params: self.n_params,
-            param_formats: self.param_formats,
-            result_formats: self.result_formats,
-            param_buf: self.param_buf.clone(),
-            extra: self.extra.clone(),
-        }
-    }
-}
-
-impl Request {
-    fn typed<Q: TypedQuery>(params: Q::Params<'_>) -> Self {
-        let mut param_buf = Owned::with_capacity(64);
-        {
-            let mut bw = BindWriter::new(&mut param_buf);
-            Q::encode_params(params, &mut bw);
-        }
-        Self {
-            sql: Q::SQL.to_string(),
-            param_oids: Q::PARAM_OIDS,
-            n_params: Q::N_PARAMS,
-            param_formats: Q::PARAM_FORMAT_CODES,
-            result_formats: Q::RESULT_FORMAT_CODES,
-            param_buf,
-            extra: Extra::Plain,
-        }
-    }
-
-    pub(super) fn raw(sql: &str) -> Self {
+impl<'a> Request<'a> {
+    pub(super) fn raw(sql: &'a str) -> Self {
         Self::raw_extra(sql, Extra::Plain)
     }
 
-    pub(super) fn raw_extra(sql: &str, extra: Extra) -> Self {
-        Self {
-            sql: sql.to_string(),
-            param_oids: &[],
-            n_params: 0,
-            param_formats: &[1],
-            result_formats: &[1],
-            param_buf: Owned::with_capacity(0),
-            extra,
-        }
+    pub(super) fn raw_extra(sql: &'a str, extra: Extra<'a>) -> Self {
+        Self { sql, extra }
     }
 }
 
-pub(super) enum Extra {
+#[derive(Clone, Copy)]
+pub(super) enum Extra<'a> {
     Plain,
-    CopyIn { data: Owned },
+    CopyIn { data: &'a [u8] },
     CopyInOpen,
 }
 
-impl Clone for Extra {
-    fn clone(&self) -> Self {
-        match self {
-            Extra::Plain => Extra::Plain,
-            Extra::CopyIn { data } => Extra::CopyIn { data: data.clone() },
-            Extra::CopyInOpen => Extra::CopyInOpen,
-        }
-    }
-}
-
-pub struct RunStream<'d, I, S = Static<Tcp>, E = Bundle<Tcp, Identity, Production>, R = ()>
+pub struct RunStream<'d, I, R = ()>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
     R: 'static,
 {
-    state: DispatchedStream<'d, I, S, E, ExtractOne>,
+    state: DispatchedStream<'d, I, ExtractOne>,
     decoder: Decoder<R>,
 }
 
-impl<'d, I, S, E, R> RunStream<'d, I, S, E, R>
+impl<'d, I, R> RunStream<'d, I, R>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
     R: 'static,
 {
-    pub fn next_row(&mut self) -> Fiber<'d, impl Future<Output = Result<Option<R>, Error>> + '_> {
-        Fiber::new(async move {
-            let decoder = self.decoder;
-            std::future::poll_fn(|cx| self.state.poll_settle(cx)).await;
-            match &mut self.state {
-                DispatchedStream::Throttled { .. } => unreachable!("poll_settle drains Throttled"),
-                DispatchedStream::Connecting { .. } => {
-                    unreachable!("poll_settle drains Connecting")
-                }
-                DispatchedStream::Failed(e) => Err(e
-                    .take()
-                    .expect("stream future polled after failure delivered")),
-                DispatchedStream::Pending { reply } => {
-                    let item = std::future::poll_fn(|cx| Pin::new(&mut *reply).poll_next(cx)).await;
-                    match item {
-                        None => Ok(None),
-                        Some(Ok(payload)) => decode_row(decoder, &payload).map(Some),
-                        Some(Err(e)) => Err(e),
-                    }
-                }
-            }
-        })
+    pub fn next_row(&mut self) -> impl Fiber<'d, Output = Result<Option<R>, Error>> + '_ {
+        NextRow {
+            stream: self,
+            waiter: Waiter::new(),
+        }
     }
 }
 
-pub struct CopyInGuard<'d, I, S, E>
+#[pin_project]
+struct NextRow<'a, 'd, I, R>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
+    R: 'static,
 {
-    conn: PgHolding<'d, I, S, E>,
-    pin: Token,
-    reply: Option<Reply<'d, RowItem, ExtractUnit>>,
+    stream: &'a mut RunStream<'d, I, R>,
+    #[pin]
+    waiter: Waiter<'d>,
 }
 
-impl<'d, I, S, E> CopyInGuard<'d, I, S, E>
+impl<'d, I, R> Fiber<'d> for NextRow<'_, 'd, I, R>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
+    R: 'static,
 {
+    type Output = Result<Option<R>, Error>;
+    fn poll(self: Pin<&mut Self>, mut cx: Pin<&mut Context<'_, 'd>>) -> Poll<Self::Output> {
+        let this = self.project();
+        let waiter = this.waiter.as_ref();
+        let stream = &mut **this.stream;
+        if stream.state.poll_settle(cx.as_mut(), waiter).is_pending() {
+            return Poll::Pending;
+        }
+        match &mut stream.state {
+            DispatchedStream::Throttled { .. } => unreachable!("poll_settle drains Throttled"),
+            DispatchedStream::Connecting { .. } => unreachable!("poll_settle drains Connecting"),
+            DispatchedStream::Failed(error) => Poll::Ready(Err(error
+                .take()
+                .expect("stream fiber polled after failure delivered"))),
+            DispatchedStream::Pending { reply } => match Pin::new(reply).poll_next(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(None) => Poll::Ready(Ok(None)),
+                Poll::Ready(Some(Ok(payload))) => {
+                    Poll::Ready(decode_row(stream.decoder, &payload).map(Some))
+                }
+                Poll::Ready(Some(Err(error))) => Poll::Ready(Err(error)),
+            },
+        }
+    }
+}
+
+pub struct CopyInGuard<'d, I>
+where
+    I: QuerySet + 'd,
+{
+    client: Client<'d, I>,
+    target: (Token, u64),
+    reply: Reply<'d, RowItem, ExtractUnit>,
+}
+
+impl<'d, I: QuerySet + 'd> CopyInGuard<'d, I> {
     pub fn write(&mut self, chunk: &[u8]) -> Result<(), Error> {
-        Disp::dispatch_copy_data(self.conn, self.pin, chunk)
+        Disp::dispatch_copy_data(self.client, self.target, chunk)
     }
 
-    pub fn finish(mut self) -> Fiber<'d, Dispatched<'d, I, S, E, ExtractUnit>> {
-        let reply = self.reply.take().expect("CopyInGuard polled twice");
-        let state = match Disp::dispatch_copy_finish(self.conn, self.pin) {
-            Ok(()) => DispatchState::Pending { conn: self.pin },
+    pub fn finish(self) -> Dispatched<'d, I, ExtractUnit> {
+        let state = match Disp::dispatch_copy_finish(self.client, self.target) {
+            Ok(()) => DispatchState::Pending {
+                conn: self.target.0,
+            },
             Err(e) => DispatchState::Failed(Some(e)),
         };
-        Fiber::new(Dispatched { reply, state })
+        Dispatched::new(self.reply, state)
     }
 }
 
-pub struct CopyOutStream<'d, I, S = Static<Tcp>, E = Bundle<Tcp, Identity, Production>>
+pub struct CopyOutStream<'d, I>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
 {
-    state: DispatchedStream<'d, I, S, E, ExtractOne>,
+    state: DispatchedStream<'d, I, ExtractOne>,
 }
 
-impl<'d, I, S, E> CopyOutStream<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
-    pub fn next_chunk(
-        &mut self,
-    ) -> Fiber<'d, impl Future<Output = Result<Option<Vec<u8>>, Error>> + '_> {
-        Fiber::new(async move {
-            std::future::poll_fn(|cx| self.state.poll_settle(cx)).await;
-            match &mut self.state {
-                DispatchedStream::Throttled { .. } => unreachable!("poll_settle drains Throttled"),
-                DispatchedStream::Connecting { .. } => {
-                    unreachable!("poll_settle drains Connecting")
-                }
-                DispatchedStream::Failed(e) => Err(e
-                    .take()
-                    .expect("copy_out future polled after failure delivered")),
-                DispatchedStream::Pending { reply } => {
-                    let item = std::future::poll_fn(|cx| Pin::new(&mut *reply).poll_next(cx)).await;
-                    match item {
-                        None => Ok(None),
-                        Some(Ok(payload)) => Ok(Some(payload.to_vec())),
-                        Some(Err(e)) => Err(e),
-                    }
-                }
-            }
-        })
+impl<'d, I: QuerySet + 'd> CopyOutStream<'d, I> {
+    pub fn next_chunk(&mut self) -> impl Fiber<'d, Output = Result<Option<Vec<u8>>, Error>> + '_ {
+        NextChunk {
+            stream: self,
+            waiter: Waiter::new(),
+        }
     }
 }
 
-pub struct NextNotification<'d, I, S, E>
+#[pin_project]
+struct NextChunk<'a, 'd, I>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
 {
-    conn: PgHolding<'d, I, S, E>,
+    stream: &'a mut CopyOutStream<'d, I>,
+    #[pin]
+    waiter: Waiter<'d>,
 }
 
-impl<'d, I, S, E> Future for NextNotification<'d, I, S, E>
+impl<'d, I> Fiber<'d> for NextChunk<'_, 'd, I>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
 {
+    type Output = Result<Option<Vec<u8>>, Error>;
+    fn poll(self: Pin<&mut Self>, mut cx: Pin<&mut Context<'_, 'd>>) -> Poll<Self::Output> {
+        let this = self.project();
+        let waiter = this.waiter.as_ref();
+        let state = &mut this.stream.state;
+        if state.poll_settle(cx.as_mut(), waiter).is_pending() {
+            return Poll::Pending;
+        }
+        match state {
+            DispatchedStream::Throttled { .. } => unreachable!("poll_settle drains Throttled"),
+            DispatchedStream::Connecting { .. } => unreachable!("poll_settle drains Connecting"),
+            DispatchedStream::Failed(error) => Poll::Ready(Err(error
+                .take()
+                .expect("copy out fiber polled after failure delivered"))),
+            DispatchedStream::Pending { reply } => match Pin::new(reply).poll_next(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(None) => Poll::Ready(Ok(None)),
+                Poll::Ready(Some(Ok(payload))) => Poll::Ready(Ok(Some(payload.to_vec()))),
+                Poll::Ready(Some(Err(error))) => Poll::Ready(Err(error)),
+            },
+        }
+    }
+}
+
+#[pin_project]
+pub struct NextNotification<'d, I>
+where
+    I: QuerySet + 'd,
+{
+    client: Client<'d, I>,
+    #[pin]
+    waiter: Waiter<'d>,
+}
+
+impl<'d, I: QuerySet + 'd> Fiber<'d> for NextNotification<'d, I> {
     type Output = Result<crate::Notification, Error>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut h = self.conn.hold();
-        let s = &mut h.as_mut().session_mut().shared;
+    fn poll(self: Pin<&mut Self>, cx: Pin<&mut Context<'_, 'd>>) -> Poll<Self::Output> {
+        let this = self.project();
+        let waiter = this.waiter.as_ref();
+        let s = &this.client.port.shared;
         if let Some(n) = s.pop_notification() {
+            waiter.unregister();
             return Poll::Ready(Ok(n));
         }
         if s.is_failed() {
+            waiter.unregister();
             return Poll::Ready(Err(Error::Closed));
         }
-        s.register_notification_waker(WakeRef::verified(cx.waker()));
-        Poll::Pending
+        if s.try_register_notification(waiter, cx.as_ref()) {
+            Poll::Pending
+        } else {
+            Poll::Ready(Err(Error::WaiterCapacity))
+        }
     }
 }

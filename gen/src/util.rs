@@ -9,8 +9,8 @@ impl PathExt for Path {
     fn without_last(&self) -> syn::Result<Path> {
         let mut t = self.clone();
         t.segments.pop();
-        if let Some(pair) = t.segments.pop() {
-            t.segments.push(pair.into_value());
+        if let Some(segment) = t.segments.pop() {
+            t.segments.push(segment);
         }
         if t.segments.is_empty() {
             return Err(syn::Error::new(

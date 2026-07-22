@@ -22,7 +22,11 @@ pub(super) fn parse_auth(payload: &[u8]) -> Result<AuthRequest<'_>, Error> {
     if payload.len() < 4 {
         return Err(Error::Protocol("auth frame truncated"));
     }
-    let kind = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+    let kind = u32::from_be_bytes(
+        payload[0..4]
+            .try_into()
+            .map_err(|_| Error::Protocol("auth frame truncated"))?,
+    );
     let rest = &payload[4..];
     match kind {
         crate::wire::Auth::OK => Ok(AuthRequest::Ok),
@@ -79,7 +83,7 @@ pub(super) fn parse_notification(payload: &[u8]) -> Option<crate::Notification> 
     if payload.len() < 4 {
         return None;
     }
-    let pid = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+    let pid = u32::from_be_bytes(payload[0..4].try_into().ok()?);
     let (channel, rest) = take_cstr(&payload[4..]).ok()?;
     let (msg, _) = take_cstr(rest).ok()?;
     Some(crate::Notification {

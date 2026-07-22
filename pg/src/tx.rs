@@ -1,13 +1,12 @@
-use std::future::Future;
+use std::pin::Pin;
+use std::task::Poll;
 
-use dope::fiber::Fiber;
-use dope::manifold::connector::source::Dialer;
-use dope::manifold::env::Env;
-use dope::runtime::token::Token;
-use dope::transport::Transport;
+use dope::driver::token::Token;
+use dope_fiber::{Context, Fiber, IntoFiber, Waiter};
+use pin_project::pin_project;
 
 use crate::Error;
-use crate::client::{Disp, Dispatched, DropAction, ExtractUnit, PgHolding, PgOps, Request};
+use crate::client::{Client, Disp, Dispatched, ExtractUnit, PgOps, Request, TransactionLease};
 use crate::query::QuerySet;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -27,62 +26,51 @@ pub enum AccessMode {
     ReadOnly,
 }
 
-pub trait PgPool<'d, I, S, E>: PgOps<'d, I, S, E>
+pub trait PgPool<'d, I>: PgOps<'d, I>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
 {
-    fn begin(&self) -> Fiber<'d, impl Future<Output = Result<TxGuard<'d, I, S, E>, Error>>> {
-        TxBuilder::new(self.holding()).begin()
-    }
-
-    fn tx<F, T>(&self, body: F) -> Fiber<'d, impl Future<Output = Result<T, Error>>>
+    fn begin(self) -> impl Fiber<'d, Output = Result<TxGuard<'d, I>, Error>>
     where
-        F: for<'tx> AsyncFnOnce(&'tx TxGuard<'d, I, S, E>) -> Result<T, Error>,
+        Self: Sized,
     {
-        TxBuilder::new(self.holding()).run(body)
+        TxBuilder::new(self.client()).begin()
     }
 
-    fn tx_with(&self) -> TxBuilder<'d, I, S, E> {
-        TxBuilder::new(self.holding())
+    fn tx<F, B, T>(self, body: F) -> impl Fiber<'d, Output = Result<T, Error>>
+    where
+        Self: Sized,
+        F: FnOnce(Tx<'d, I>) -> B,
+        B: IntoFiber<'d, Output = Result<T, Error>>,
+    {
+        TxBuilder::new(self.client()).run(body)
+    }
+
+    fn tx_with(self) -> TxBuilder<'d, I>
+    where
+        Self: Sized,
+    {
+        TxBuilder::new(self.client())
     }
 }
 
-impl<'d, I, S, E> PgPool<'d, I, S, E> for PgHolding<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
-}
+impl<'d, I: QuerySet + 'd> PgPool<'d, I> for Client<'d, I> {}
 
-pub struct TxBuilder<'d, I, S, E>
+pub struct TxBuilder<'d, I>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
 {
-    conn: PgHolding<'d, I, S, E>,
+    client: Client<'d, I>,
     isolation: IsolationLevel,
     access_mode: AccessMode,
     deferrable: bool,
     timeout_ms: Option<u32>,
 }
 
-impl<'d, I, S, E> TxBuilder<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
-    fn new(conn: PgHolding<'d, I, S, E>) -> Self {
+impl<'d, I: QuerySet + 'd> TxBuilder<'d, I> {
+    fn new(client: Client<'d, I>) -> Self {
         Self {
-            conn,
+            client,
             isolation: IsolationLevel::Default,
             access_mode: AccessMode::Default,
             deferrable: false,
@@ -116,66 +104,45 @@ where
         self
     }
 
-    pub fn begin(self) -> Fiber<'d, impl Future<Output = Result<TxGuard<'d, I, S, E>, Error>>> {
+    pub fn begin(self) -> impl Fiber<'d, Output = Result<TxGuard<'d, I>, Error>> {
         let sql = self.build_sql();
         let timeout_ms = self.timeout_ms;
-        let conn = self.conn;
-        let begin = Disp::dispatch_raw::<ExtractUnit, I, S, E>(conn, None, Request::raw(&sql));
-        let begin_pin = begin.resolved_conn();
-        if let Some(pin) = begin_pin {
-            Disp::acquire_exclusive(conn, pin);
-        }
-        Fiber::new(async move {
-            if let Err(e) = begin.await {
-                if let Some(pin) = begin_pin {
-                    Disp::release_exclusive(conn, pin);
-                }
-                return Err(e);
-            }
-            let pin = begin_pin.ok_or(Error::NoReadyConn)?;
+        let client = self.client;
+        let begin = Disp::dispatch_transaction(client, Request::raw(&sql));
+        dope_fiber::fiber!('d => async move {
+            let lease = begin.await?;
+            let target = lease.target();
             if let Some(ms) = timeout_ms {
-                let sql_set = format!("SET LOCAL statement_timeout TO {}", ms);
-                if let Err(e) = Disp::dispatch_raw::<ExtractUnit, I, S, E>(
-                    conn,
-                    Some(pin),
+                let sql_set = ::std::format!("SET LOCAL statement_timeout TO {}", ms);
+                let setting = Disp::dispatch_raw::<ExtractUnit, I>(
+                    client,
+                    Some(target),
                     Request::raw(&sql_set),
-                )
-                .await
-                {
-                    if matches!(
-                        Disp::rollback_on_drop(conn, pin, "ROLLBACK"),
-                        DropAction::Delivered
-                    ) {
-                        Disp::release_exclusive(conn, pin);
-                    }
-                    return Err(e);
-                }
+                );
+                setting.await?;
             }
-            Ok(TxGuard {
-                conn,
-                pin,
-                finalised: false,
-            })
+            Ok(TxGuard::new(lease))
         })
     }
 
-    pub fn run<F, T>(self, body: F) -> Fiber<'d, impl Future<Output = Result<T, Error>>>
+    pub fn run<F, B, T>(self, body: F) -> impl Fiber<'d, Output = Result<T, Error>>
     where
-        F: for<'tx> AsyncFnOnce(&'tx TxGuard<'d, I, S, E>) -> Result<T, Error>,
+        F: FnOnce(Tx<'d, I>) -> B,
+        B: IntoFiber<'d, Output = Result<T, Error>>,
     {
         let begin = self.begin();
-        Fiber::new(async move {
-            let tx = begin.await?;
-            let outcome = body(&tx).await;
+        dope_fiber::fiber!('d => async move {
+            let transaction = begin.await?;
+            let outcome = body(transaction.tx()).into_fiber().await;
+            let finalizer = transaction.finalize(if outcome.is_ok() {
+                "COMMIT"
+            } else {
+                "ROLLBACK"
+            });
+            let finalized = finalizer.await;
             match outcome {
-                Ok(v) => {
-                    tx.commit().await?;
-                    Ok(v)
-                }
-                Err(e) => {
-                    tx.rollback().await.ok();
-                    Err(e)
-                }
+                Ok(value) => finalized.map(|()| value),
+                Err(error) => Err(error),
             }
         })
     }
@@ -201,231 +168,326 @@ where
     }
 }
 
-pub struct TxGuard<'d, I, S, E>
+pub struct TxGuard<'d, I>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
 {
-    conn: PgHolding<'d, I, S, E>,
-    pin: Token,
-    finalised: bool,
+    lease: TransactionLease<'d, I>,
 }
 
-impl<'d, I, S, E> PgOps<'d, I, S, E> for TxGuard<'d, I, S, E>
+pub struct Tx<'d, I>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
 {
-    fn holding(&self) -> PgHolding<'d, I, S, E> {
-        self.conn
+    client: Client<'d, I>,
+    target: (Token, u64),
+}
+
+impl<I: QuerySet> Copy for Tx<'_, I> {}
+
+impl<I: QuerySet> Clone for Tx<'_, I> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'d, I: QuerySet + 'd> PgOps<'d, I> for Tx<'d, I> {
+    fn client(&self) -> Client<'d, I> {
+        self.client
     }
 
-    fn pin(&self) -> Option<Token> {
-        Some(self.pin)
+    fn target(&self) -> Option<(Token, u64)> {
+        Some(self.target)
     }
 
     fn backend_pid(&self) -> Option<i32> {
-        self.conn.session().shared.backend_pid_for(self.pin)
+        self.client.port.shared.backend_pid_for(self.target.0)
     }
 }
 
-impl<'d, I, S, E> TxGuard<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
-    fn finalise(&self, sql: &str) -> Fiber<'d, Dispatched<'d, I, S, E, ExtractUnit>> {
-        Fiber::new(Disp::dispatch_raw::<ExtractUnit, I, S, E>(
-            self.conn,
-            Some(self.pin),
-            Request::raw(sql),
-        ))
+impl<'d, I: QuerySet + 'd> PgOps<'d, I> for TxGuard<'d, I> {
+    fn client(&self) -> Client<'d, I> {
+        self.lease.client()
     }
 
-    pub fn commit(mut self) -> Fiber<'d, Dispatched<'d, I, S, E, ExtractUnit>> {
-        self.finalised = true;
-        self.finalise("COMMIT")
+    fn target(&self) -> Option<(Token, u64)> {
+        Some(self.lease.target())
     }
 
-    pub fn rollback(mut self) -> Fiber<'d, Dispatched<'d, I, S, E, ExtractUnit>> {
-        self.finalised = true;
-        self.finalise("ROLLBACK")
+    fn backend_pid(&self) -> Option<i32> {
+        self.client()
+            .port
+            .shared
+            .backend_pid_for(self.lease.target().0)
+    }
+}
+
+impl<'d, I: QuerySet + 'd> TxGuard<'d, I> {
+    fn new(lease: TransactionLease<'d, I>) -> Self {
+        Self { lease }
+    }
+
+    fn tx(&self) -> Tx<'d, I> {
+        Tx {
+            client: self.lease.client(),
+            target: self.lease.target(),
+        }
+    }
+
+    fn finalize(self, sql: &'static str) -> TransactionFinalizer<'d, I> {
+        let client = self.lease.client();
+        let target = self.lease.target();
+        TransactionFinalizer {
+            client,
+            target,
+            lease: Some(self.lease),
+            dispatched: None,
+            outcome: None,
+            sql,
+            waiter: Waiter::new(),
+        }
+    }
+
+    pub fn commit(self) -> impl Fiber<'d, Output = Result<(), Error>> {
+        self.finalize("COMMIT")
+    }
+
+    pub fn rollback(self) -> impl Fiber<'d, Output = Result<(), Error>> {
+        self.finalize("ROLLBACK")
     }
 
     pub fn savepoint(
         &self,
         name: impl Into<String>,
-    ) -> Fiber<'d, impl Future<Output = Result<SavepointGuard<'d, I, S, E>, Error>>> {
-        SavepointGuard::open(self.conn, self.pin, name.into())
+    ) -> impl Fiber<'d, Output = Result<SavepointGuard<'d, I>, Error>> {
+        SavepointGuard::open(self.lease.client(), self.lease.target(), name.into())
     }
 
-    pub fn cancel_token(&self) -> Option<CancelToken<'d, I, S, E>> {
+    pub fn cancel_token(&self) -> Option<CancelToken<'d, I>> {
         let pid = self.backend_pid()?;
         let secret_key = self
-            .conn
-            .session()
+            .lease
+            .client()
+            .port
             .shared
-            .backend_key_for(self.pin)
-            .unwrap_or(0);
+            .backend_key_for(self.lease.target().0)?;
         Some(CancelToken {
-            conn: self.conn,
+            client: self.lease.client(),
             pid,
             secret_key,
         })
     }
 }
 
-pub struct CancelToken<'d, I, S, E>
+#[pin_project]
+struct TransactionFinalizer<'d, I>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
 {
-    conn: PgHolding<'d, I, S, E>,
+    client: Client<'d, I>,
+    target: (Token, u64),
+    lease: Option<TransactionLease<'d, I>>,
+    dispatched: Option<Pin<Box<Dispatched<'d, I, ExtractUnit>>>>,
+    outcome: Option<Result<(), Error>>,
+    sql: &'static str,
+    #[pin]
+    waiter: Waiter<'d>,
+}
+
+impl<'d, I: QuerySet + 'd> TransactionFinalizer<'d, I> {
+    fn transfer(
+        dispatched: &Option<Pin<Box<Dispatched<'d, I, ExtractUnit>>>>,
+        lease: &mut Option<TransactionLease<'d, I>>,
+    ) -> Result<(), Error> {
+        if !dispatched
+            .as_ref()
+            .is_some_and(|future| future.as_ref().get_ref().is_enqueued())
+        {
+            return Ok(());
+        }
+        let Some(mut lease) = lease.take() else {
+            return Ok(());
+        };
+        if lease.transfer() {
+            Ok(())
+        } else {
+            Err(Error::Closed)
+        }
+    }
+}
+
+impl<'d, I: QuerySet + 'd> Fiber<'d> for TransactionFinalizer<'d, I> {
+    type Output = Result<(), Error>;
+    fn poll(self: Pin<&mut Self>, mut cx: Pin<&mut Context<'_, 'd>>) -> Poll<Self::Output> {
+        let this = self.project();
+        let client = *this.client;
+        let target = *this.target;
+        let sql = *this.sql;
+        let waiter = this.waiter.as_ref();
+        if this.outcome.is_none() && this.dispatched.is_none() {
+            let lease = this.lease.as_ref().expect("transaction lease missing");
+            let lease_client = lease.client();
+            let lease_target = lease.target();
+            if !lease_client.port.shared.is_transaction_held(lease_target) {
+                drop(this.lease.take());
+                waiter.unregister();
+                return Poll::Ready(Err(Error::Closed));
+            }
+            if lease_client.port.response_len(lease_target.0) != 0 {
+                if !lease_client.port.shared.try_register_transaction(
+                    lease_target,
+                    waiter,
+                    cx.as_ref(),
+                ) {
+                    drop(this.lease.take());
+                    waiter.unregister();
+                    return Poll::Ready(Err(Error::Closed));
+                }
+                if lease_client.port.response_len(lease_target.0) != 0 {
+                    return Poll::Pending;
+                }
+                waiter.unregister();
+            }
+            *this.dispatched = Some(Box::pin(Disp::dispatch_raw::<ExtractUnit, I>(
+                lease_client,
+                Some(lease_target),
+                Request::raw(sql),
+            )));
+            if let Err(error) = Self::transfer(this.dispatched, this.lease) {
+                drop(this.lease.take());
+                waiter.unregister();
+                return Poll::Ready(Err(error));
+            }
+        }
+        if this.outcome.is_none() {
+            let outcome = Fiber::poll(
+                this.dispatched
+                    .as_mut()
+                    .expect("transaction finalizer missing")
+                    .as_mut(),
+                cx.as_mut(),
+            );
+            if let Err(error) = Self::transfer(this.dispatched, this.lease) {
+                drop(this.lease.take());
+                waiter.unregister();
+                return Poll::Ready(Err(error));
+            }
+            let Poll::Ready(outcome) = outcome else {
+                return Poll::Pending;
+            };
+            if this.lease.is_some() {
+                drop(this.lease.take());
+            }
+            *this.outcome = Some(outcome);
+            *this.dispatched = None;
+        }
+        loop {
+            match client.port.shared.transaction_settled(target) {
+                Some(true) => {
+                    waiter.unregister();
+                    return Poll::Ready(this.outcome.take().expect("transaction outcome missing"));
+                }
+                Some(false) => {
+                    waiter.unregister();
+                    return Poll::Ready(match this.outcome.take() {
+                        Some(Err(error)) => Err(error),
+                        Some(Ok(())) | None => Err(Error::Closed),
+                    });
+                }
+                None => {}
+            }
+            if !client
+                .port
+                .shared
+                .try_register_transaction(target, waiter, cx.as_ref())
+            {
+                continue;
+            }
+            if client.port.shared.transaction_settled(target).is_none() {
+                return Poll::Pending;
+            }
+        }
+    }
+}
+
+pub struct CancelToken<'d, I>
+where
+    I: QuerySet + 'd,
+{
+    client: Client<'d, I>,
     pid: i32,
     secret_key: i32,
 }
 
-impl<'d, I, S, E> Clone for CancelToken<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
+impl<I: QuerySet> Clone for CancelToken<'_, I> {
     fn clone(&self) -> Self {
         Self {
-            conn: self.conn,
+            client: self.client,
             pid: self.pid,
             secret_key: self.secret_key,
         }
     }
 }
 
-impl<'d, I, S, E> CancelToken<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
+impl<'d, I: QuerySet + 'd> CancelToken<'d, I> {
     pub fn pid(&self) -> i32 {
         self.pid
     }
 
-    /// Backend secret from `BackendKeyData`, paired with [`pid`](Self::pid)
-    /// to authorize an out-of-band CancelRequest.
     pub fn secret_key(&self) -> i32 {
         self.secret_key
     }
 
-    /// Raw CancelRequest packet to send on a *fresh* connection to abort the
-    /// in-flight query, per the postgres cancellation protocol.
     pub fn cancel_request_message(&self) -> [u8; 16] {
-        let mut buf = o3::buffer::Owned::with_capacity(16);
-        crate::encode::cancel_request(&mut buf, self.pid, self.secret_key);
-        let mut out = [0u8; 16];
-        out.copy_from_slice(buf.as_mut_slice());
-        out
+        crate::encode::cancel_request_message(self.pid, self.secret_key)
     }
 
-    pub fn cancel(&self) -> Fiber<'d, Dispatched<'d, I, S, E, ExtractUnit>> {
+    pub fn cancel(&self) -> Dispatched<'d, I, ExtractUnit> {
         let sql = format!("SELECT pg_cancel_backend({})", self.pid);
-        Fiber::new(Disp::dispatch_raw::<ExtractUnit, I, S, E>(
-            self.conn,
-            None,
-            Request::raw(&sql),
-        ))
+        Disp::dispatch_raw::<ExtractUnit, I>(self.client, None, Request::raw(&sql))
     }
 }
 
-impl<'d, I, S, E> Drop for TxGuard<'d, I, S, E>
+pub struct SavepointGuard<'d, I>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
 {
-    fn drop(&mut self) {
-        if !self.finalised {
-            if matches!(
-                Disp::rollback_on_drop(self.conn, self.pin, "ROLLBACK"),
-                DropAction::Delivered
-            ) {
-                Disp::release_exclusive(self.conn, self.pin);
-            }
-        } else {
-            Disp::release_exclusive(self.conn, self.pin);
-        }
-    }
-}
-
-pub struct SavepointGuard<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
-    conn: PgHolding<'d, I, S, E>,
-    pin: Token,
+    client: Client<'d, I>,
+    target: (Token, u64),
     name: String,
-    finalised: bool,
+    finalized: bool,
 }
 
-impl<'d, I, S, E> PgOps<'d, I, S, E> for SavepointGuard<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
-    fn holding(&self) -> PgHolding<'d, I, S, E> {
-        self.conn
+impl<'d, I: QuerySet + 'd> PgOps<'d, I> for SavepointGuard<'d, I> {
+    fn client(&self) -> Client<'d, I> {
+        self.client
     }
 
-    fn pin(&self) -> Option<Token> {
-        Some(self.pin)
+    fn target(&self) -> Option<(Token, u64)> {
+        Some(self.target)
     }
 }
 
-impl<'d, I, S, E> SavepointGuard<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
-    fn raw_pinned(&self, sql: &str) -> Fiber<'d, Dispatched<'d, I, S, E, ExtractUnit>> {
-        Fiber::new(Disp::dispatch_raw::<ExtractUnit, I, S, E>(
-            self.conn,
-            Some(self.pin),
-            Request::raw(sql),
-        ))
+impl<'d, I: QuerySet + 'd> SavepointGuard<'d, I> {
+    fn raw_pinned(&self, sql: &str) -> Dispatched<'d, I, ExtractUnit> {
+        Disp::dispatch_raw::<ExtractUnit, I>(self.client, Some(self.target), Request::raw(sql))
     }
 
     fn open(
-        conn: PgHolding<'d, I, S, E>,
-        pin: Token,
+        client: Client<'d, I>,
+        target: (Token, u64),
         name: String,
-    ) -> Fiber<'d, impl Future<Output = Result<SavepointGuard<'d, I, S, E>, Error>>> {
+    ) -> impl Fiber<'d, Output = Result<SavepointGuard<'d, I>, Error>> {
         let sql = format!("SAVEPOINT \"{}\"", name.replace('"', "\"\""));
         let opening =
-            Disp::dispatch_raw::<ExtractUnit, I, S, E>(conn, Some(pin), Request::raw(&sql));
-        Fiber::new(async move {
+            Disp::dispatch_raw::<ExtractUnit, I>(client, Some(target), Request::raw(&sql));
+        dope_fiber::fiber!('d => async move {
             opening.await?;
             Ok(SavepointGuard {
-                conn,
-                pin,
+                client,
+                target,
                 name,
-                finalised: false,
+                finalized: false,
             })
         })
     }
@@ -434,14 +496,14 @@ where
         &self.name
     }
 
-    pub fn release(mut self) -> Fiber<'d, Dispatched<'d, I, S, E, ExtractUnit>> {
-        self.finalised = true;
+    pub fn release(mut self) -> Dispatched<'d, I, ExtractUnit> {
+        self.finalized = true;
         let sql = format!("RELEASE SAVEPOINT \"{}\"", self.name.replace('"', "\"\""));
         self.raw_pinned(&sql)
     }
 
-    pub fn rollback(mut self) -> Fiber<'d, Dispatched<'d, I, S, E, ExtractUnit>> {
-        self.finalised = true;
+    pub fn rollback(mut self) -> Dispatched<'d, I, ExtractUnit> {
+        self.finalized = true;
         let sql = format!(
             "ROLLBACK TO SAVEPOINT \"{}\"",
             self.name.replace('"', "\"\"")
@@ -452,104 +514,73 @@ where
     pub fn savepoint(
         &self,
         name: impl Into<String>,
-    ) -> Fiber<'d, impl Future<Output = Result<SavepointGuard<'d, I, S, E>, Error>>> {
-        SavepointGuard::open(self.conn, self.pin, name.into())
+    ) -> impl Fiber<'d, Output = Result<SavepointGuard<'d, I>, Error>> {
+        SavepointGuard::open(self.client, self.target, name.into())
     }
 }
 
-impl<'d, I, S, E> Drop for SavepointGuard<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
+impl<I: QuerySet> Drop for SavepointGuard<'_, I> {
     fn drop(&mut self) {
-        if !self.finalised {
+        if !self.finalized {
             let sql = format!(
                 "ROLLBACK TO SAVEPOINT \"{}\"",
                 self.name.replace('"', "\"\"")
             );
-            Disp::rollback_on_drop(self.conn, self.pin, &sql);
+            Disp::rollback_on_drop(self.client, self.target, &sql);
         }
     }
 }
 
-pub struct ListenGuard<'d, I, S, E>
+pub struct ListenGuard<'d, I>
 where
     I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
 {
-    conn: PgHolding<'d, I, S, E>,
-    pin: Token,
+    client: Client<'d, I>,
+    target: (Token, u64),
     channel: String,
-    finalised: bool,
+    finalized: bool,
 }
 
-impl<'d, I, S, E> PgOps<'d, I, S, E> for ListenGuard<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
-    fn holding(&self) -> PgHolding<'d, I, S, E> {
-        self.conn
+impl<'d, I: QuerySet + 'd> PgOps<'d, I> for ListenGuard<'d, I> {
+    fn client(&self) -> Client<'d, I> {
+        self.client
     }
 
-    fn pin(&self) -> Option<Token> {
-        Some(self.pin)
+    fn target(&self) -> Option<(Token, u64)> {
+        Some(self.target)
     }
 }
 
-impl<'d, I, S, E> ListenGuard<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
-    pub(super) fn from_parts(conn: PgHolding<'d, I, S, E>, pin: Token, channel: String) -> Self {
+impl<'d, I: QuerySet + 'd> ListenGuard<'d, I> {
+    pub(super) fn from_parts(client: Client<'d, I>, target: (Token, u64), channel: String) -> Self {
         Self {
-            conn,
-            pin,
+            client,
+            target,
             channel,
-            finalised: false,
+            finalized: false,
         }
     }
 
-    fn raw_pinned(&self, sql: &str) -> Fiber<'d, Dispatched<'d, I, S, E, ExtractUnit>> {
-        Fiber::new(Disp::dispatch_raw::<ExtractUnit, I, S, E>(
-            self.conn,
-            Some(self.pin),
-            Request::raw(sql),
-        ))
+    fn raw_pinned(&self, sql: &str) -> Dispatched<'d, I, ExtractUnit> {
+        Disp::dispatch_raw::<ExtractUnit, I>(self.client, Some(self.target), Request::raw(sql))
     }
 
     pub fn channel(&self) -> &str {
         &self.channel
     }
 
-    pub fn unlisten(mut self) -> Fiber<'d, Dispatched<'d, I, S, E, ExtractUnit>> {
-        self.finalised = true;
+    pub fn unlisten(mut self) -> Dispatched<'d, I, ExtractUnit> {
+        self.finalized = true;
         let sql = format!("UNLISTEN \"{}\"", self.channel.replace('"', "\"\""));
         self.raw_pinned(&sql)
     }
 }
 
-impl<'d, I, S, E> Drop for ListenGuard<'d, I, S, E>
-where
-    I: QuerySet + 'd,
-    S: Dialer<E::Transport> + 'd,
-    E: Env + 'd,
-    E::Transport: Transport<Addr: Clone>,
-{
+impl<I: QuerySet> Drop for ListenGuard<'_, I> {
     fn drop(&mut self) {
-        if !self.finalised {
+        if !self.finalized {
             let sql = format!("UNLISTEN \"{}\"", self.channel.replace('"', "\"\""));
-            Disp::rollback_on_drop(self.conn, self.pin, &sql);
+            Disp::rollback_on_drop(self.client, self.target, &sql);
         }
     }
 }
