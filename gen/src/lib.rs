@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 #![allow(clippy::too_many_arguments)]
 
 extern crate proc_macro;

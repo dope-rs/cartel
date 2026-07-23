@@ -303,6 +303,14 @@ impl<'d, I: QuerySet> Port<'d, I> {
         self.shared.config
     }
 
+    pub(super) fn backpressure(&self, queued: usize, region: &mut RegionToken<'d>) -> Error {
+        Error::Backpressure {
+            inflight: self.responses.inflight(region),
+            queued,
+            cap: self.shared.config.inflight_capacity(),
+        }
+    }
+
     pub fn connect<const ID: u8, S, E>(
         &'d self,
         upstreams: S,
@@ -394,10 +402,10 @@ impl<'d, I: QuerySet> Port<'d, I> {
         let requests = self.request_lane(token);
         let queued = requests.weight(region);
         if !requests.has_capacity(region) {
-            return Err((self.shared.backpressure(queued), bytes));
+            return Err((self.backpressure(queued, region), bytes));
         }
         self.enqueue_request(token, bytes, region)
-            .map_err(|bytes| (self.shared.backpressure(queued), bytes))?;
+            .map_err(|bytes| (self.backpressure(queued, region), bytes))?;
         conn.wake();
         Ok(())
     }
@@ -416,7 +424,7 @@ impl<'d, I: QuerySet> Port<'d, I> {
         let requests = self.request_lane(token);
         let queued = requests.weight(region);
         if !requests.has_capacity(region) {
-            return Err((self.shared.backpressure(queued), bytes));
+            return Err((self.backpressure(queued, region), bytes));
         }
         let lane = token.slot().raw() as usize;
         if !reply.try_attach_with_boundary(
@@ -424,10 +432,10 @@ impl<'d, I: QuerySet> Port<'d, I> {
             self.responses.lane(lane),
             matches!(boundary, Boundary::Close),
         ) {
-            return Err((self.shared.backpressure(queued), bytes));
+            return Err((self.backpressure(queued, region), bytes));
         }
         self.enqueue_request(token, bytes, region)
-            .map_err(|bytes| (self.shared.backpressure(queued), bytes))?;
+            .map_err(|bytes| (self.backpressure(queued, region), bytes))?;
         conn.unsynced.set(conn.unsynced.get().saturating_add(1));
         match boundary {
             Boundary::Close => {
@@ -437,7 +445,6 @@ impl<'d, I: QuerySet> Port<'d, I> {
             Boundary::Open => conn.batch_open.set(true),
             Boundary::External => {}
         }
-        self.shared.inflight_total.inc();
         self.shared.inc_inflight(token);
         conn.wake();
         Ok(())

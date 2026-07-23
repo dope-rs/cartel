@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 pub mod dsl;
 pub mod sql;
 

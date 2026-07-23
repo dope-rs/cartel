@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 mod client;
 mod decode;
 pub mod dsl;
@@ -437,22 +435,6 @@ pub enum Error {
         cap: usize,
     },
     Other(String),
-}
-
-impl From<cartel_core::Error> for Error {
-    fn from(e: cartel_core::Error) -> Self {
-        match e {
-            cartel_core::Error::Backpressure {
-                inflight,
-                queued,
-                cap,
-            } => Self::Backpressure {
-                inflight,
-                queued,
-                cap,
-            },
-        }
-    }
 }
 
 impl From<std::io::Error> for Error {

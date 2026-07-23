@@ -47,9 +47,13 @@ fn overflow_error() -> Error {
     Error::ResponseCapacity
 }
 
-fn no_conn_outcome<'d>(shared: &protocol::Shared, request: Pending<'d>) -> DispatchOutcome<'d> {
-    if shared.tx_saturated() {
-        DispatchOutcome::Failed(shared.backpressure(0))
+fn no_conn_outcome<'d, I: QuerySet>(
+    client: Client<'d, I>,
+    request: Pending<'d>,
+    region: &mut RegionToken<'d>,
+) -> DispatchOutcome<'d> {
+    if client.port.shared.tx_saturated() {
+        DispatchOutcome::Failed(client.port.backpressure(0, region))
     } else {
         DispatchOutcome::NoConn { request }
     }
@@ -806,7 +810,7 @@ impl Disp {
     where
         I: QuerySet,
     {
-        if let Err(e) = Self::check_can_dispatch(client) {
+        if let Err(e) = Self::check_open(client) {
             return DispatchOutcome::Failed(e);
         }
         let shared = &client.port.shared;
@@ -817,7 +821,7 @@ impl Disp {
                     Some(_) => {
                         DispatchOutcome::Failed(Error::Other("pinned conn no longer ready".into()))
                     }
-                    None => no_conn_outcome(shared, request),
+                    None => no_conn_outcome(client, request, region),
                 };
             }
         };
@@ -842,13 +846,13 @@ impl Disp {
     where
         I: QuerySet,
     {
-        if let Err(error) = Self::check_can_dispatch(client) {
+        if let Err(error) = Self::check_open(client) {
             return TransactionDispatchOutcome::Failed(error);
         }
         let shared = &client.port.shared;
         let Some(conn) = shared.pick_conn(None) else {
             return if shared.tx_saturated() {
-                TransactionDispatchOutcome::Failed(shared.backpressure(0))
+                TransactionDispatchOutcome::Failed(client.port.backpressure(0, region))
             } else {
                 TransactionDispatchOutcome::NoConn { request }
             };
@@ -1016,7 +1020,7 @@ impl Disp {
         data: &[u8],
         region: &mut RegionToken<'d>,
     ) -> Result<(), Error> {
-        Self::check_can_dispatch(client)?;
+        Self::check_open(client)?;
         let frame = client.port.encode(|frame| encode::copy_data(frame, data))?;
         client
             .port
@@ -1029,7 +1033,7 @@ impl Disp {
         target: Token,
         region: &mut RegionToken<'d>,
     ) -> Result<(), Error> {
-        Self::check_can_dispatch(client)?;
+        Self::check_open(client)?;
         if !client.port.can_push_boundary(target, region) {
             return Err(Error::ResponseCapacity);
         }
@@ -1063,12 +1067,12 @@ impl Disp {
         client.port.close(target.0);
     }
 
-    fn check_can_dispatch<I: QuerySet>(client: Client<'_, I>) -> Result<(), Error> {
+    fn check_open<I: QuerySet>(client: Client<'_, I>) -> Result<(), Error> {
         let s = &client.port.shared;
         if s.is_failed() {
             return Err(Error::Closed);
         }
-        s.inflight_total.check().map_err(Error::from)
+        Ok(())
     }
 }
 

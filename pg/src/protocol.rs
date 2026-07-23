@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::pin::Pin;
 
-use cartel_core::{FrontKind, Inflight};
+use cartel_core::FrontKind;
 use dope::driver::token::Token;
 use dope::manifold::connector;
 use dope::manifold::connector::state::{IOV_CAP, Queue};
@@ -112,7 +112,6 @@ pub(super) struct Shared {
     notifications: RefCell<FixedQueue<Notification>>,
     notifications_dropped: Cell<u64>,
     notification_waiters: Pin<Box<WaitQueue>>,
-    pub(super) inflight_total: Inflight,
     egress_waiters: Pin<Box<WaitQueue>>,
     backend_pids: Box<[Cell<i32>]>,
     backend_keys: Box<[Cell<i32>]>,
@@ -123,7 +122,6 @@ impl Shared {
         let max_connections = config.connection_capacity();
         let waiter_capacity = config.waiter_capacity();
         let max_pending_per_conn = config.request_capacity().div_ceil(max_connections);
-        let inflight_total = Inflight::with_capacity(config.inflight_capacity());
         Self {
             database,
             config,
@@ -159,7 +157,6 @@ impl Shared {
             notifications: RefCell::new(FixedQueue::with_capacity(config.notification_capacity())),
             notifications_dropped: Cell::new(0),
             notification_waiters: Box::pin(WaitQueue::with_capacity(waiter_capacity)),
-            inflight_total,
             egress_waiters: Box::pin(WaitQueue::with_capacity(waiter_capacity)),
             backend_pids: (0..max_connections).map(|_| Cell::new(0)).collect(),
             backend_keys: (0..max_connections).map(|_| Cell::new(0)).collect(),
@@ -248,14 +245,6 @@ impl Shared {
         context: Pin<&Context<'_, 'd>>,
     ) -> bool {
         self.ready_waiters.as_ref().try_register(waiter, context)
-    }
-
-    pub(super) fn backpressure(&self, queued: usize) -> Error {
-        Error::Backpressure {
-            inflight: self.inflight_total.len(),
-            queued,
-            cap: self.inflight_total.capacity(),
-        }
     }
 
     pub(super) fn is_ready(&self) -> bool {
@@ -471,7 +460,9 @@ impl Shared {
         let index = slot.slot().raw() as usize;
         if let Some(inflight) = self.inflight.get(index) {
             self.unlink_bucket(index);
-            inflight.set(inflight.get().saturating_add(1));
+            let current = inflight.get();
+            debug_assert!(current < u32::MAX);
+            inflight.set(current + 1);
             if self.ready_tokens[index].get() == Some(slot)
                 && self.transactions[index].get().is_none()
             {
@@ -484,12 +475,28 @@ impl Shared {
         let index = slot.slot().raw() as usize;
         if let Some(inflight) = self.inflight.get(index) {
             self.unlink_bucket(index);
-            inflight.set(inflight.get().saturating_sub(1));
+            let current = inflight.get();
+            debug_assert!(current > 0);
+            inflight.set(current - 1);
             if self.ready_tokens[index].get() == Some(slot)
                 && self.transactions[index].get().is_none()
             {
                 self.link_bucket(index, inflight.get() as usize);
             }
+        }
+    }
+
+    fn reset_inflight(&self, slot: Token, failed: usize) {
+        let index = slot.slot().raw() as usize;
+        let Some(inflight) = self.inflight.get(index) else {
+            return;
+        };
+        self.unlink_bucket(index);
+        let previous = inflight.replace(0);
+        debug_assert_eq!(previous as usize, failed);
+        if self.ready_tokens[index].get() == Some(slot) && self.transactions[index].get().is_none()
+        {
+            self.link_bucket(index, 0);
         }
     }
 
@@ -732,13 +739,13 @@ impl<'d, I: QuerySet> Session<'d, I> {
         });
         self.port.set_batch_open(conn_id, false);
         let s = &self.port.shared;
-        s.inflight_total.dec_n(n);
         if permanent {
             s.record_fatal(err);
         }
         if was_ready {
             s.remove_ready(conn_id);
         }
+        s.reset_inflight(conn_id, n);
         s.clear_transaction(conn_id, false);
         s.ready_waiters.as_ref().wake();
         s.egress_waiters.as_ref().wake();
@@ -937,7 +944,6 @@ impl<'d, I: QuerySet> Session<'d, I> {
                     )),
                     FrontKind::Slot(_) | FrontKind::Detached => {
                         responses.complete(region);
-                        self.port.shared.inflight_total.dec();
                         self.port.shared.dec_inflight(conn_id);
                         Ok(())
                     }
@@ -983,7 +989,6 @@ impl<'d, I: QuerySet> Session<'d, I> {
                     FrontKind::Empty | FrontKind::Boundary => Err(Error::Db(db)),
                     FrontKind::Slot(_) | FrontKind::Detached => {
                         responses.fail_one(region, || Err(Error::Db(db)));
-                        self.port.shared.inflight_total.dec();
                         self.port.shared.dec_inflight(conn_id);
                         conn_state.error_skip = true;
                         Ok(())
@@ -1020,7 +1025,6 @@ impl<'d, I: QuerySet> Session<'d, I> {
                             } else {
                                 responses.complete(region);
                             }
-                            self.port.shared.inflight_total.dec();
                             self.port.shared.dec_inflight(conn_id);
                         }
                     }
@@ -1174,11 +1178,11 @@ impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
         });
         self.port.set_batch_open(conn_id, false);
         let s = &self.port.shared;
-        s.inflight_total.dec_n(n);
         s.clear_backend(conn_id);
         if was_ready {
             s.remove_ready(conn_id);
         }
+        s.reset_inflight(conn_id, n);
         s.clear_transaction(conn_id, false);
         s.wake_all();
         self.port.deactivate(conn_id, ctx.region);

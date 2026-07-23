@@ -1053,13 +1053,34 @@ fn with_rt<I: cartel_pg::QuerySet + 'static>(
     f: impl for<'c, 'scope, 'd> FnOnce(&mut Rt<'c, 'scope, 'd, I>),
 ) {
     let request_entries = max_connections.checked_mul(16).expect("request entries");
+    with_rt_inflight(
+        addr,
+        cfg,
+        max_connections,
+        request_entries,
+        schema,
+        drop_schema,
+        f,
+    );
+}
+
+fn with_rt_inflight<I: cartel_pg::QuerySet + 'static>(
+    addr: SocketAddr,
+    cfg: cartel_pg::Config,
+    max_connections: usize,
+    inflight: usize,
+    schema: String,
+    drop_schema: bool,
+    f: impl for<'c, 'scope, 'd> FnOnce(&mut Rt<'c, 'scope, 'd, I>),
+) {
+    let request_entries = max_connections.checked_mul(16).expect("request entries");
     let port_config = cartel_pg::port::Config::new(cartel_pg::port::Capacities {
         connections: max_connections,
         request_entries,
         request_bytes: 4 * 1024,
         response_entries: 65_536,
         response_bytes: 256 * 1024 * 1024,
-        inflight: request_entries,
+        inflight,
         waiters: request_entries,
         notifications: 1024,
     })
@@ -1266,6 +1287,15 @@ fn boot_with(
     max_connections: usize,
     f: impl for<'c, 'scope, 'd> FnOnce(&mut Rt<'c, 'scope, 'd, Db>),
 ) {
+    let inflight = max_connections.checked_mul(16).expect("inflight entries");
+    boot_with_inflight(max_connections, inflight, f);
+}
+
+fn boot_with_inflight(
+    max_connections: usize,
+    inflight: usize,
+    f: impl for<'c, 'scope, 'd> FnOnce(&mut Rt<'c, 'scope, 'd, Db>),
+) {
     if std::env::var_os("CARTEL_PG_TEST").is_none() {
         return;
     }
@@ -1273,10 +1303,11 @@ fn boot_with(
     let addr = env.tcp_addr();
     let schema = ::std::format!("cartel_pg_test_{}", unique_suffix());
     provision_schema(addr, env.cartel_config(), &schema);
-    with_rt::<Db>(
+    with_rt_inflight::<Db>(
         addr,
         env.cartel_config(),
         max_connections,
+        inflight,
         schema,
         true,
         |rt| {
@@ -2246,8 +2277,8 @@ fn copy_out_binary() {
 }
 
 #[test]
-fn copy_in_stream_chunks() {
-    boot(|rt| {
+fn copy_in_stream_chunks_at_inflight_capacity() {
+    boot_with_inflight(1, 1, |rt| {
         let client = rt.client();
         block_on!(rt, async move {
             client
