@@ -282,7 +282,7 @@ impl<'d> Redis<'d> {
         self,
         config: Connect<S>,
         driver: &mut DriverContext<'_, 'd>,
-    ) -> io::Result<impl Manifold<'d> + 'd>
+    ) -> io::Result<impl Manifold<'d> + 'd + use<'d, ID, S, E>>
     where
         S: Dialer<E::Transport> + 'd,
         E: Env + 'd,
@@ -301,7 +301,7 @@ impl<'d> Redis<'d> {
         config: Connect<S>,
         wire: <E::Wire as Wire>::InitConfig,
         driver: &mut DriverContext<'_, 'd>,
-    ) -> io::Result<impl Manifold<'d> + 'd>
+    ) -> io::Result<impl Manifold<'d> + 'd + use<'d, ID, S, E>>
     where
         S: Dialer<E::Transport> + 'd,
         E: Env + 'd,

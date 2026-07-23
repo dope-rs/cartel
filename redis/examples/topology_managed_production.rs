@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use cartel_redis::{Capacities, Config, ConfigError, Connect, DEFAULT_BACKOFF, Ops};
+use cartel_redis::{Capacities, Config, ConfigError, DEFAULT_BACKOFF, Ops};
 use dope::driver;
 use dope::manifold::connector::source::Static;
 use dope::manifold::env::Bundle;
@@ -34,17 +34,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let exec = Executor::new(driver)?.with_storage_factory(redis_config()?.factory());
     exec.enter(|mut session| -> Result<(), Box<dyn std::error::Error>> {
         let backoff = session.seed().derive(dope::hash::domain::BACKOFF).state();
-        let redis = session.storage().redis();
-        let connector = {
-            let mut driver = session.driver_access();
-            redis
-                .connect::<0, _, Env>(
-                    Connect {
-                        topology: Static::<Tcp>::new(vec![addr], DEFAULT_BACKOFF, backoff),
-                    },
-                    &mut driver,
-                )?
-        };
+        let (redis, connector) = cartel_redis::attach::<0, Env>(
+            &mut session,
+            Static::<Tcp>::new(vec![addr], DEFAULT_BACKOFF, backoff),
+        )?;
 
         let probe = dope_fiber::fiber!('_ => async move {
             redis.wait_active().await?;

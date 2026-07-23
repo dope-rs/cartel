@@ -1,3 +1,4 @@
+mod attach;
 mod client;
 mod decode;
 pub mod dsl;
@@ -12,6 +13,7 @@ mod tx;
 mod value;
 mod wire;
 
+pub use attach::attach;
 pub use cartel_gen::PgTable;
 pub use client::{
     Client, CopyInGuard, CopyOutStream, Dispatched, ExtractUnit, NextNotification, PgOps,

@@ -31,7 +31,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "cartel-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "dope",
  "dope-fiber",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "cartel-gen"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cartel-core",
  "dope",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "cartel-pg"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64",
  "cartel-core",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "cartel-redis"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cartel-core",
  "cartel-gen",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "cartel-sqlite"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cartel-gen",
  "rusqlite",

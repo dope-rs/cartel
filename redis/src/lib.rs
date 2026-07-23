@@ -1,5 +1,6 @@
 use std::fmt;
 
+mod attach;
 mod client;
 mod decode;
 #[allow(dead_code)]
@@ -9,6 +10,7 @@ mod port;
 pub mod protocol;
 mod value;
 
+pub use attach::attach;
 pub use client::{
     Capacities, Config, ConfigError, Connect, DEFAULT_BACKOFF, Factory, GeoCoord,
     MAX_FRAME_CAPACITY, Ops, Redis, Store,

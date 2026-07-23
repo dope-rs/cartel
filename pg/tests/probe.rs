@@ -6,7 +6,6 @@ use cartel_gen::pg_instance;
 use cartel_pg::{PgOps, port};
 use dope::driver::token::Token;
 use dope::manifold::Manifold;
-use dope::manifold::connector::Connector;
 use dope::manifold::connector::source::Static;
 use dope::manifold::env::Bundle;
 use dope::runtime::profile::Throughput;
@@ -18,9 +17,6 @@ use o3::cell::BrandCell as Branded;
 const ROUTE: u8 = 0;
 
 pg_instance! { Probe: }
-
-type PgConn<'d> =
-    Connector<'d, 0, cartel_pg::Session<'d, Probe>, Static<Tcp>, Bundle<Tcp, Identity, Throughput>>;
 
 fn pg_addr() -> SocketAddr {
     let host = std::env::var("PG_HOST").unwrap_or_else(|_| "127.0.0.1".into());
@@ -63,15 +59,15 @@ fn probe_step_by_step() {
         .with_storage_factory(cartel_pg::Port::<Probe>::factory(cfg, port_config));
     exec.enter(|mut sess| {
         let backoff = sess.seed().derive(dope::hash::domain::BACKOFF).state();
-        let port = sess.storage();
-        let (token, mut driver) = sess.token_and_driver();
         let upstreams = Static::<Tcp>::new(vec![addr], Duration::from_millis(500), backoff);
-        let connector: PgConn<'_> = port
-            .connect::<0, _, Bundle<Tcp, Identity, Throughput>>(upstreams, &mut driver)
+        let (client, connector) =
+            cartel_pg::attach::<ROUTE, Bundle<Tcp, Identity, Throughput>, Probe>(
+                &mut sess, upstreams,
+            )
             .expect("connector");
         let pg = pin!(Branded::new(connector));
         let pg = pg.as_ref();
-        let client = port.client();
+        let (token, mut driver) = sess.token_and_driver();
 
         pg.borrow_pin_mut(token).pre_park(&mut driver);
 
@@ -95,7 +91,7 @@ fn probe_step_by_step() {
                 .drain_ready(|target| wake_buf.push(target));
             for t in &wake_buf {
                 if t.route() == ROUTE {
-                    let __typed = dope::manifold::TypedToken::<PgConn>::try_new(*t)
+                    let __typed = dope::manifold::TypedToken::try_new(*t)
                         .expect("ready target route was checked");
                     Manifold::activate(pg.borrow_pin_mut(token), __typed, &mut driver);
                 }
