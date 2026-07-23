@@ -287,6 +287,7 @@ impl<'d> Redis<'d> {
         S: Dialer<E::Transport> + 'd,
         E: Env + 'd,
         E::Transport: Transport<Addr: Clone>,
+        <E::Wire as Wire>::InitConfig: Default,
     {
         Connector::<'d, ID, Session<'d>, S, E>::new(
             Session::new(self.port),
@@ -307,13 +308,13 @@ impl<'d> Redis<'d> {
         E: Env + 'd,
         E::Transport: Transport<Addr: Clone>,
     {
-        Connector::<'d, ID, Session<'d>, S, E>::new(
+        Connector::<'d, ID, Session<'d>, S, E>::new_with_wire_config(
             Session::new(self.port),
             config.topology,
             self.port.capacity(),
+            wire,
             driver,
         )
-        .map(|connector| connector.config(wire))
     }
 }
 

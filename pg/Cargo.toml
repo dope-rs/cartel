@@ -18,7 +18,7 @@ cartel-gen.workspace = true
 sha2 = { version = "0.11", default-features = false }
 hmac = { version = "0.13", default-features = false }
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 stringprep = { version = "0.1" }
 rand = { version = "0.10", default-features = false, features = ["std", "sys_rng"] }
 pin-project.workspace = true

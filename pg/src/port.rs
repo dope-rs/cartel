@@ -11,6 +11,7 @@ use dope::manifold::env::Env;
 use dope::runtime::StorageFactory;
 use dope::{DriverContext, DriverRef};
 use dope_net::Transport;
+use dope_net::wire::Wire;
 use o3::buffer::{Lease, Pool, PoolLayout};
 use o3::cell::RegionToken;
 
@@ -320,11 +321,36 @@ impl<'d, I: QuerySet> Port<'d, I> {
         S: Dialer<E::Transport> + 'd,
         E: Env + 'd,
         E::Transport: Transport,
+        <E::Wire as Wire>::InitConfig: Default,
     {
         Connector::new(
             Session::new(self),
             upstreams,
             self.config().connection_capacity(),
+            driver,
+        )
+    }
+
+    /// Creates a connector whose wire runtime is local to this core.
+    ///
+    /// The configuration is consumed once when the connector's wire runtime is
+    /// initialized, rather than cloned into individual connections.
+    pub fn connect_configured<const ID: u8, S, E>(
+        &'d self,
+        upstreams: S,
+        wire: <E::Wire as Wire>::InitConfig,
+        driver: &mut DriverContext<'_, 'd>,
+    ) -> std::io::Result<Connector<'d, ID, Session<'d, I>, S, E>>
+    where
+        S: Dialer<E::Transport> + 'd,
+        E: Env + 'd,
+        E::Transport: Transport,
+    {
+        Connector::new_with_wire_config(
+            Session::new(self),
+            upstreams,
+            self.config().connection_capacity(),
+            wire,
             driver,
         )
     }

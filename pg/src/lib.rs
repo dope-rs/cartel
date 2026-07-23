@@ -13,7 +13,7 @@ mod tx;
 mod value;
 mod wire;
 
-pub use attach::attach;
+pub use attach::{attach, attach_configured};
 pub use cartel_gen::PgTable;
 pub use client::{
     Client, CopyInGuard, CopyOutStream, Dispatched, ExtractUnit, NextNotification, PgOps,

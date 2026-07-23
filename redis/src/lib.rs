@@ -10,7 +10,7 @@ mod port;
 pub mod protocol;
 mod value;
 
-pub use attach::attach;
+pub use attach::{attach, attach_configured};
 pub use client::{
     Capacities, Config, ConfigError, Connect, DEFAULT_BACKOFF, Factory, GeoCoord,
     MAX_FRAME_CAPACITY, Ops, Redis, Store,
