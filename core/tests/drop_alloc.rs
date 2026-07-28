@@ -3,8 +3,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use cartel_core::{Arena, Extract, Limits, Registrable, Reply, Slot};
+use dope::runtime::executor::{Executor, StorageFactory};
 use dope::runtime::profile::Throughput;
-use dope::runtime::{Executor, StorageFactory};
 use dope::{DriverContext, driver};
 
 struct CountingAllocator;

@@ -4,8 +4,9 @@ use std::task::Poll;
 
 use dope::DriverContext;
 use dope::driver::ready::CompletionWaker;
-use dope::runtime::StorageFactory;
-use dope_fiber::{Context, Fiber};
+use dope::runtime::executor::StorageFactory;
+use dope_fiber::abi::Fiber;
+use dope_fiber::raw::task::{CompletionRegistrarWithRegion, Context};
 use o3::cell::{RegionCell, RegionToken};
 use o3::collections::{CellQueue, LinkedArena, RoundRobinSet, Slab, SlabKey};
 use o3::mem::FairCredits;
@@ -1065,13 +1066,14 @@ impl<'d, C, X: Extract<C>> sealed::Registrable<'d, C> for Reply<'d, C, X> {
     }
 }
 
-impl<'d, C, X: Extract<C>> Fiber<'d> for Reply<'d, C, X> {
-    type Output = X::Output;
+// SAFETY: Handle::drop queues retirement, and every arena operation drains
+// retirements before it can observe or invoke the stored completion handle.
+unsafe impl<'d, C, X: Extract<C>> CompletionRegistrarWithRegion<'d> for Pin<&mut Reply<'d, C, X>> {
+    type Output = Poll<X::Output>;
 
-    fn poll(mut self: Pin<&mut Self>, mut cx: Pin<&mut Context<'_, 'd>>) -> Poll<X::Output> {
-        let wake = cx.as_ref().completion_waker();
-        let token = cx.as_mut().region_token();
-        let me = self.as_mut().get_mut();
+    #[inline(always)]
+    fn register(self, wake: CompletionWaker<'d>, token: &mut RegionToken<'d>) -> Self::Output {
+        let me = self.get_mut();
         let Some(poll) = me.handle.with_slot(token, |slot, waker| {
             if let Some(output) = X::extract(slot) {
                 return Poll::Ready(output);
@@ -1085,6 +1087,14 @@ impl<'d, C, X: Extract<C>> Fiber<'d> for Reply<'d, C, X> {
             me.handle.release_done();
         }
         poll
+    }
+}
+
+impl<'d, C, X: Extract<C>> Fiber<'d> for Reply<'d, C, X> {
+    type Output = X::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: Pin<&mut Context<'_, 'd>>) -> Poll<X::Output> {
+        cx.register_completion_with_region(self)
     }
 }
 
@@ -1102,12 +1112,23 @@ impl<'d, C, X: Extract<C>> ReplyStream<'d, C, X> {
     }
 
     pub fn poll_next(
-        mut self: Pin<&mut Self>,
-        mut cx: Pin<&mut Context<'_, 'd>>,
+        self: Pin<&mut Self>,
+        cx: Pin<&mut Context<'_, 'd>>,
     ) -> Poll<Option<X::Output>> {
-        let wake = cx.as_ref().completion_waker();
-        let token = cx.as_mut().region_token();
-        let me = self.as_mut().get_mut();
+        cx.register_completion_with_region(self)
+    }
+}
+
+// SAFETY: Handle::drop queues retirement, and every arena operation drains
+// retirements before it can observe or invoke the stored completion handle.
+unsafe impl<'d, C, X: Extract<C>> CompletionRegistrarWithRegion<'d>
+    for Pin<&mut ReplyStream<'d, C, X>>
+{
+    type Output = Poll<Option<X::Output>>;
+
+    #[inline(always)]
+    fn register(self, wake: CompletionWaker<'d>, token: &mut RegionToken<'d>) -> Self::Output {
+        let me = self.get_mut();
         let Some(poll) = me.handle.with_slot(token, |slot, waker| {
             if let Some(output) = X::extract(slot) {
                 return Poll::Ready(Some(output));

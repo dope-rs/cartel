@@ -6,11 +6,13 @@ use std::time::Duration;
 use cartel_core::{Extract, Reply, Slot};
 use dope::DriverContext;
 use dope::manifold::Manifold;
-use dope::manifold::connector::Connector;
+use dope::manifold::connector::session::Connector;
 use dope::manifold::connector::source::Dialer;
 use dope::manifold::env::Env;
-use dope::runtime::StorageFactory;
-use dope_fiber::Fiber;
+use dope::runtime::executor::StorageFactory;
+use dope_fiber::abi::Fiber;
+use dope_fiber::abi::pollfn::PollFn;
+use dope_fiber::wait::WaitFn;
 use dope_net::Transport;
 use dope_net::wire::Wire;
 use o3::buffer::{PoolLayout, Shared};
@@ -245,6 +247,12 @@ pub struct Store<'d> {
     port: Port<'d>,
 }
 
+impl<'d> AsRef<Self> for Store<'d> {
+    fn as_ref(&self) -> &Self {
+        self
+    }
+}
+
 impl<'d> Store<'d> {
     pub fn redis(&'d self) -> Redis<'d> {
         Redis { port: &self.port }
@@ -287,12 +295,13 @@ impl<'d> Redis<'d> {
         S: Dialer<E::Transport> + 'd,
         E: Env + 'd,
         E::Transport: Transport<Addr: Clone>,
-        <E::Wire as Wire>::InitConfig: Default,
+        <E::Wire as Wire>::InitConfig<'d>: Default,
     {
         Connector::<'d, ID, Session<'d>, S, E>::new(
             Session::new(self.port),
             config.topology,
             self.port.capacity(),
+            self.port.egress(),
             driver,
         )
     }
@@ -300,7 +309,7 @@ impl<'d> Redis<'d> {
     pub fn connect_configured<const ID: u8, S, E>(
         self,
         config: Connect<S>,
-        wire: <E::Wire as Wire>::InitConfig,
+        wire: <E::Wire as Wire>::InitConfig<'d>,
         driver: &mut DriverContext<'_, 'd>,
     ) -> io::Result<impl Manifold<'d> + 'd + use<'d, ID, S, E>>
     where
@@ -313,6 +322,7 @@ impl<'d> Redis<'d> {
             config.topology,
             self.port.capacity(),
             wire,
+            self.port.egress(),
             driver,
         )
     }
@@ -575,7 +585,7 @@ pub trait Ops<'d> {
 impl<'d> Ops<'d> for Redis<'d> {
     fn wait_active(self) -> impl Fiber<'d, Output = Result<(), Error>> {
         let redis = self;
-        dope_fiber::wait_fn(move |cx, waiter| {
+        WaitFn::new(move |cx, waiter| {
             if redis.port.active() {
                 return Poll::Ready(Ok(()));
             }
@@ -1302,7 +1312,7 @@ impl Redis<'_> {
         frame: crate::port::Frame<'d>,
     ) -> impl Fiber<'d, Output = Result<Reply<'d, Outcome, ExtractValue>, Error>> {
         let mut pending = Some((frame, Reply::new()));
-        dope_fiber::poll_fn(move |mut cx| {
+        PollFn::new(move |mut cx| {
             let Some((frame, mut reply)) = pending.take() else {
                 return std::task::Poll::Ready(Err(Error::Closed));
             };

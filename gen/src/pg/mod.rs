@@ -217,7 +217,7 @@ impl PgBackend {
                             _,
                             #each_elem_out,
                             __N,
-                        >::new();
+                        >::empty();
                         for #each_arg_pat in __args.iter() {
                             let __captured = ( #( #each_capture, )* );
                             let __runner = ::cartel_pg::Runner::new(__pg, __pin);

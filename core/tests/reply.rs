@@ -5,10 +5,11 @@ use cartel_core::{
     Arena, ArenaConfig, Extract, FrontKind, Limits, Registrable, Reply, ReplyStream, Slot,
 };
 use dope::driver::token::{Epoch, SlotIndex, Token};
+use dope::runtime::executor::{Executor, StorageFactory};
 use dope::runtime::profile::Throughput;
-use dope::runtime::{Executor, StorageFactory};
 use dope::{DriverContext, driver};
-use dope_fiber::{Context, Fiber};
+use dope_fiber::abi::Fiber;
+use dope_fiber::raw::task::Context;
 
 struct First;
 
@@ -43,7 +44,7 @@ fn with_arena(
             let reference = session.driver();
             let wake = Box::pin(
                 reference
-                    .make_ready_slot(Token::new(0, SlotIndex::new(0), Epoch::INITIAL))
+                    .make_ready_slot(Token::new(0, SlotIndex::ZERO, Epoch::INITIAL))
                     .expect("ready slot"),
             );
             let mut context = pin!(Context::from_ready(

@@ -2,7 +2,9 @@ use std::pin::Pin;
 use std::task::Poll;
 
 use dope::driver::token::Token;
-use dope_fiber::{Context, Fiber, IntoFiber, Waiter};
+use dope_fiber::abi::{Fiber, IntoFiber};
+use dope_fiber::raw::task::Context;
+use dope_fiber::raw::wait::Waiter;
 use pin_project::pin_project;
 
 use crate::Error;

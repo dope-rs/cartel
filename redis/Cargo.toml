@@ -19,5 +19,4 @@ ryu.workspace = true
 
 [dev-dependencies]
 cartel-gen.workspace = true
-dope-extra.workspace = true
 pin-project.workspace = true

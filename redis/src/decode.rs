@@ -248,7 +248,10 @@ pub fn scan(
 fn complete(state: &mut ParseState, buf: &Shared) -> Scan {
     let consumed = state.cursor;
     let value_count = state.values;
-    let frame = buf.slice(..consumed);
+    let Some(frame) = buf.get(..consumed) else {
+        state.reset();
+        return Scan::Invalid(protocol::Error::TrailingBytes, consumed);
+    };
     state.reset();
     Scan::Complete(Scanned { frame, value_count }, consumed)
 }
@@ -325,7 +328,11 @@ fn build_at(frame: &Shared, offset: usize, depth: usize) -> Result<(Value, usize
             let value = if bytes[start..line_end] == *b"OK" {
                 Value::Ok
             } else {
-                Value::Status(frame.slice(start..line_end))
+                Value::Status(
+                    frame
+                        .get(start..line_end)
+                        .ok_or(Error::Protocol(protocol::Error::TrailingBytes))?,
+                )
             };
             Ok((value, line_end + 2))
         }
@@ -333,7 +340,10 @@ fn build_at(frame: &Shared, offset: usize, depth: usize) -> Result<(Value, usize
             let start = offset + 1;
             let line_end = find_crlf_from(bytes, start)
                 .ok_or(Error::Protocol(protocol::Error::TrailingBytes))?;
-            Ok((Value::Error(frame.slice(start..line_end)), line_end + 2))
+            let value = frame
+                .get(start..line_end)
+                .ok_or(Error::Protocol(protocol::Error::TrailingBytes))?;
+            Ok((Value::Error(value), line_end + 2))
         }
         b':' => {
             let start = offset + 1;
@@ -354,10 +364,10 @@ fn build_at(frame: &Shared, offset: usize, depth: usize) -> Result<(Value, usize
             let length = usize::try_from(length)
                 .map_err(|_| Error::Protocol(protocol::Error::InvalidLength))?;
             let payload_end = payload_start + length;
-            Ok((
-                Value::Bulk(frame.slice(payload_start..payload_end)),
-                payload_end + 2,
-            ))
+            let value = frame
+                .get(payload_start..payload_end)
+                .ok_or(Error::Protocol(protocol::Error::TrailingBytes))?;
+            Ok((Value::Bulk(value), payload_end + 2))
         }
         b'*' => {
             let start = offset + 1;

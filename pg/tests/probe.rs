@@ -6,7 +6,7 @@ use cartel_gen::pg_instance;
 use cartel_pg::{PgOps, port};
 use dope::driver::token::Token;
 use dope::manifold::Manifold;
-use dope::manifold::connector::source::Static;
+use dope::manifold::connector::source::health::Static;
 use dope::manifold::env::Bundle;
 use dope::runtime::profile::Throughput;
 use dope::{Completion as _, driver};
@@ -54,9 +54,10 @@ fn probe_step_by_step() {
     })
     .expect("port config");
 
-    let exec = dope::runtime::Executor::new(driver::Config::for_tcp_profile::<Throughput>(8))
-        .expect("driver")
-        .with_storage_factory(cartel_pg::Port::<Probe>::factory(cfg, port_config));
+    let exec =
+        dope::runtime::executor::Executor::new(driver::Config::for_tcp_profile::<Throughput>(8))
+            .expect("driver")
+            .with_storage_factory(cartel_pg::Port::<Probe>::factory(cfg, port_config));
     exec.enter(|mut sess| {
         let backoff = sess.seed().derive(dope::hash::domain::BACKOFF).state();
         let upstreams = Static::<Tcp>::new(vec![addr], Duration::from_millis(500), backoff);
@@ -91,7 +92,7 @@ fn probe_step_by_step() {
                 .drain_ready(|target| wake_buf.push(target));
             for t in &wake_buf {
                 if t.route() == ROUTE {
-                    let __typed = dope::manifold::TypedToken::try_new(*t)
+                    let __typed = dope::manifold::typed::TypedToken::try_new(*t)
                         .expect("ready target route was checked");
                     Manifold::activate(pg.borrow_pin_mut(token), __typed, &mut driver);
                 }

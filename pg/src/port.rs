@@ -1,19 +1,18 @@
-use std::cell::Cell;
-use std::marker::PhantomData;
-use std::pin::Pin;
-
 use cartel_core::{Arena, ArenaConfig, ArenaLane, Limits, QueueArena, QueueLane, Registrable};
 use dope::driver::ready::ReadyKey;
 use dope::driver::token::Token;
-use dope::manifold::connector::Connector;
+use dope::manifold::connector::session::Connector;
 use dope::manifold::connector::source::Dialer;
 use dope::manifold::env::Env;
-use dope::runtime::StorageFactory;
+use dope::runtime::executor::StorageFactory;
 use dope::{DriverContext, DriverRef};
 use dope_net::Transport;
+use dope_net::link::egress::storage::Storage as EgressStorage;
 use dope_net::wire::Wire;
 use o3::buffer::{Lease, Pool, PoolLayout};
 use o3::cell::RegionToken;
+use std::cell::Cell;
+use std::marker::PhantomData;
 
 use crate::protocol::{RowItem, Session, Shared as PoolState};
 use crate::query::QuerySet;
@@ -242,10 +241,17 @@ impl<'d> Conn<'d> {
 pub struct Port<'d, I: QuerySet> {
     pub(super) shared: PoolState,
     conns: Box<[Conn<'d>]>,
-    requests: Pin<Box<Pool>>,
     request_queue: QueueArena<'d, Frame<'d>>,
+    requests: Pool,
     responses: Arena<'d, RowItem>,
+    egress: EgressStorage,
     _instance: PhantomData<fn() -> I>,
+}
+
+impl<'d, I: QuerySet> AsRef<Self> for Port<'d, I> {
+    fn as_ref(&self) -> &Self {
+        self
+    }
 }
 
 pub struct PortFactory<I> {
@@ -289,9 +295,10 @@ impl<'d, I: QuerySet> Port<'d, I> {
         Self {
             shared: PoolState::new(database, config),
             conns: (0..connections).map(|_| Conn::new(driver)).collect(),
-            requests: Box::pin(Pool::new(config.request_pool())),
             request_queue,
+            requests: Pool::from_layout(config.request_pool()),
             responses,
+            egress: EgressStorage::default(),
             _instance: PhantomData,
         }
     }
@@ -321,12 +328,13 @@ impl<'d, I: QuerySet> Port<'d, I> {
         S: Dialer<E::Transport> + 'd,
         E: Env + 'd,
         E::Transport: Transport,
-        <E::Wire as Wire>::InitConfig: Default,
+        <E::Wire as Wire>::InitConfig<'d>: Default,
     {
         Connector::new(
             Session::new(self),
             upstreams,
             self.config().connection_capacity(),
+            &self.egress,
             driver,
         )
     }
@@ -338,7 +346,7 @@ impl<'d, I: QuerySet> Port<'d, I> {
     pub fn connect_configured<const ID: u8, S, E>(
         &'d self,
         upstreams: S,
-        wire: <E::Wire as Wire>::InitConfig,
+        wire: <E::Wire as Wire>::InitConfig<'d>,
         driver: &mut DriverContext<'_, 'd>,
     ) -> std::io::Result<Connector<'d, ID, Session<'d, I>, S, E>>
     where
@@ -351,6 +359,7 @@ impl<'d, I: QuerySet> Port<'d, I> {
             upstreams,
             self.config().connection_capacity(),
             wire,
+            &self.egress,
             driver,
         )
     }
@@ -384,7 +393,6 @@ impl<'d, I: QuerySet> Port<'d, I> {
 
     pub(super) fn frame(&'d self) -> Result<Frame<'d>, Error> {
         self.requests
-            .as_ref()
             .try_acquire()
             .map(|buffer| Frame {
                 buffer,
@@ -490,17 +498,16 @@ impl<'d, I: QuerySet> Port<'d, I> {
         token: Token,
         push: impl FnMut(Frame<'d>) -> Result<(), Frame<'d>>,
         region: &mut RegionToken<'d>,
-    ) -> dope::manifold::connector::Requests {
+    ) -> dope::manifold::connector::app::Requests {
         let Some(conn) = self.conn(token) else {
-            return dope::manifold::connector::Requests::default();
+            return dope::manifold::connector::app::Requests::default();
         };
         self.request_lane(token).drain(region, push);
-        dope::manifold::connector::Requests {
-            shutdown: None,
+        dope::manifold::connector::app::Requests {
             close: conn
                 .close
                 .take()
-                .then_some(dope::manifold::connector::CloseKind::Reconnect),
+                .then_some(dope::manifold::connector::app::CloseKind::Reconnect),
         }
     }
 

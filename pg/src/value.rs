@@ -144,8 +144,11 @@ impl<'a> RowReader<'a> {
         let len = self.take_len()?.ok_or(Error::UnexpectedNull)?;
         let start = self.payload.len() - self.buf.len();
         self.take_bytes(len)?;
-        crate::Text::from_shared(self.payload.slice(start..start + len))
-            .map_err(|_| Error::Protocol("invalid utf-8 in text column"))
+        let bytes = self
+            .payload
+            .get(start..start + len)
+            .ok_or(Error::Protocol("text column range is out of bounds"))?;
+        crate::Text::from_shared(bytes).map_err(|_| Error::Protocol("invalid utf-8 in text column"))
     }
 
     pub fn read_jsonb(&mut self) -> Result<crate::Jsonb, Error> {
@@ -158,7 +161,11 @@ impl<'a> RowReader<'a> {
         if bytes[0] != 0x01 {
             return Err(Error::Protocol("unsupported jsonb wire version"));
         }
-        crate::Jsonb::from_shared(self.payload.slice(start + 1..start + len))
+        let bytes = self
+            .payload
+            .get(start + 1..start + len)
+            .ok_or(Error::Protocol("jsonb column range is out of bounds"))?;
+        crate::Jsonb::from_shared(bytes)
             .map_err(|_| Error::Protocol("invalid utf-8 in jsonb column"))
     }
 

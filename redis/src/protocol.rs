@@ -1,8 +1,7 @@
 use std::fmt;
 
 use dope::driver::token::Token;
-use dope::manifold::connector;
-use dope::manifold::connector::{Close, Ctx};
+use dope::manifold::connector::{app, codec, lifecycle, session};
 use o3::buffer;
 use o3::cell::RegionToken;
 
@@ -44,12 +43,12 @@ pub struct ConnState {
     poisoned: bool,
 }
 
-impl connector::Lifecycle for ConnState {
-    fn wants_close(&self) -> Close {
+impl lifecycle::Lifecycle for ConnState {
+    fn wants_close(&self) -> lifecycle::Close {
         if self.poisoned {
-            Close::Reconnect
+            lifecycle::Close::Reconnect
         } else {
-            Close::Keep
+            lifecycle::Close::Keep
         }
     }
 
@@ -78,7 +77,7 @@ impl Codec {
     }
 }
 
-impl connector::Codec for Codec {
+impl codec::Codec for Codec {
     type Head = Head;
     type ParseState = ParseState;
 
@@ -136,7 +135,7 @@ impl<'d> Session<'d> {
     }
 }
 
-impl<'d> connector::Session<'d> for Session<'d> {
+impl<'d> session::Session<'d> for Session<'d> {
     type Codec = Codec;
     type ConnState = ConnState;
     type Send = SendFrame<'d>;
@@ -154,13 +153,13 @@ impl<'d> connector::Session<'d> for Session<'d> {
         assert!(self.port.activate(token, ready, region));
     }
 
-    fn connect(&mut self, ctx: &mut Ctx<'_, 'd, Self>) {
+    fn connect(&mut self, ctx: &mut session::Ctx<'_, '_, 'd, Self>) {
         ctx.state.poisoned = false;
         self.port.clear_fatal();
         self.port.wake_active();
     }
 
-    fn response(&mut self, head: Head, ctx: &mut Ctx<'_, 'd, Self>) {
+    fn response(&mut self, head: Head, ctx: &mut session::Ctx<'_, '_, 'd, Self>) {
         match head {
             Head::Reply(value) => {
                 let bytes = value.frame_len();
@@ -178,7 +177,7 @@ impl<'d> connector::Session<'d> for Session<'d> {
         }
     }
 
-    fn disconnect(&mut self, ctx: &mut Ctx<'_, 'd, Self>) {
+    fn disconnect(&mut self, ctx: &mut session::Ctx<'_, '_, 'd, Self>) {
         let message = self
             .port
             .fatal_message()
@@ -195,7 +194,7 @@ impl<'d> connector::Session<'d> for Session<'d> {
         token: Token,
         push: impl FnMut(Self::Send) -> Result<(), Self::Send>,
         region: &mut RegionToken<'d>,
-    ) -> connector::Requests {
+    ) -> app::Requests {
         self.port.drain_requests(token, push, region)
     }
 

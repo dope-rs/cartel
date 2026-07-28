@@ -1,4 +1,4 @@
-use dope_fiber::Fiber;
+use dope_fiber::abi::Fiber;
 
 use crate::{Dispatched, Error, ExtractUnit, PgOps, QuerySet};
 

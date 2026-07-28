@@ -14,11 +14,13 @@ use cartel_pg::{
     Tx, Uuid,
 };
 use dope::driver;
-use dope::manifold::connector::Connector;
-use dope::manifold::connector::source::Static;
+use dope::manifold::connector::session::Connector;
+use dope::manifold::connector::source::health::Static;
 use dope::manifold::env::Bundle;
-use dope::runtime::Executor;
+use dope::runtime::executor::Executor;
 use dope::runtime::profile::Throughput;
+use dope_fiber::abi::pollfn::PollFn;
+use dope_fiber::abi::ready::Ready;
 use dope_net::tcp::Tcp;
 use dope_net::wire::identity::Identity;
 
@@ -1017,7 +1019,7 @@ impl<'c, 'scope, 'd: 'scope, I: cartel_pg::QuerySet + 'static> Rt<'c, 'scope, 'd
         self.client
     }
 
-    fn block_on<F: dope_fiber::Fiber<'d>>(&mut self, fiber: F) -> F::Output {
+    fn block_on<F: dope_fiber::abi::Fiber<'d>>(&mut self, fiber: F) -> F::Output {
         self.runtime.block_on(fiber).expect("runtime")
     }
 }
@@ -1109,7 +1111,7 @@ fn with_rt_inflight<I: cartel_pg::QuerySet + 'static>(
                 schema,
                 drop_schema,
             };
-            rt.block_on(dope_fiber::ready(()));
+            rt.block_on(Ready::new(()));
             f(&mut rt);
         });
     });
@@ -1118,8 +1120,8 @@ fn with_rt_inflight<I: cartel_pg::QuerySet + 'static>(
 fn wait_ready<'d, I: cartel_pg::QuerySet + 'static>(
     client: CartelClient<'d, I>,
     count: usize,
-) -> impl dope_fiber::Fiber<'d, Output = ()> {
-    dope_fiber::poll_fn(move |_cx| {
+) -> impl dope_fiber::abi::Fiber<'d, Output = ()> {
+    PollFn::new(move |_cx| {
         if client.is_failed() {
             ::core::panic!("cartel-pg: connection failed");
         }
@@ -1972,7 +1974,7 @@ fn raw_typed_query() {
 
 fn commit_body<'d>(
     tx: Tx<'d, Db>,
-) -> impl dope_fiber::Fiber<'d, Output = Result<User, cartel_pg::Error>> {
+) -> impl dope_fiber::abi::Fiber<'d, Output = Result<User, cartel_pg::Error>> {
     dope_fiber::fiber!('d => async move {
         User::rename(&tx, 1, "closure-committed".into()).await?;
         User::by_id(&tx, 1).await
@@ -1981,7 +1983,7 @@ fn commit_body<'d>(
 
 fn rollback_body<'d>(
     tx: Tx<'d, Db>,
-) -> impl dope_fiber::Fiber<'d, Output = Result<(), cartel_pg::Error>> {
+) -> impl dope_fiber::abi::Fiber<'d, Output = Result<(), cartel_pg::Error>> {
     dope_fiber::fiber!('d => async move {
         User::rename(&tx, 1, "closure-failed".into()).await?;
         Err(cartel_pg::Error::Other("simulate failure".into()))
@@ -2062,7 +2064,7 @@ fn tx_generation_rejects_stale_view() {
         let client = rt.client();
         block_on!(rt, async move {
             let stale = client
-                .tx(|tx| dope_fiber::ready(Ok::<_, cartel_pg::Error>(tx)))
+                .tx(|tx| Ready::new(Ok::<_, cartel_pg::Error>(tx)))
                 .await
                 .unwrap();
             let tx = client.begin().await.unwrap();
@@ -2479,7 +2481,7 @@ fn type_param_binding_each() {
 
 fn seed_alltypes<'d>(
     client: CartelClient<'d, Db>,
-) -> impl dope_fiber::Fiber<'d, Output = Result<(), cartel_pg::Error>> {
+) -> impl dope_fiber::abi::Fiber<'d, Output = Result<(), cartel_pg::Error>> {
     client.execute_raw(
         "INSERT INTO cartel_pg_types
             (id, v_i16, v_i32, v_i64, v_f32, v_f64, v_bool, v_string, v_bytes,
@@ -2510,7 +2512,7 @@ fn permanent_failure_no_infinite_retry() {
                 break;
             }
             let mut yielded = false;
-            rt.block_on(dope_fiber::poll_fn(|cx| {
+            rt.block_on(PollFn::new(|cx| {
                 if yielded {
                     Poll::Ready(())
                 } else {

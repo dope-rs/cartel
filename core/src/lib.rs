@@ -1,6 +1,7 @@
 pub mod fatal_slot;
 pub mod queue;
 pub mod reply;
+pub mod runtime;
 
 pub use fatal_slot::FatalSlot;
 pub use queue::{QueueArena, QueueLane};

@@ -1,3 +1,5 @@
+use dope_net::link::egress::stage;
+
 pub trait Sink {
     fn push(&mut self, byte: u8);
     fn extend_from_slice(&mut self, src: &[u8]);
@@ -23,18 +25,18 @@ impl Sink for Vec<u8> {
     }
 }
 
-impl<B> Sink for dope::manifold::connector::state::Stage<'_, B> {
+impl<B> Sink for stage::Stage<'_, '_, B> {
     fn push(&mut self, byte: u8) {
-        dope::manifold::connector::state::Stage::push(self, byte);
+        stage::Stage::push(self, byte);
     }
     fn extend_from_slice(&mut self, src: &[u8]) {
-        dope::manifold::connector::state::Stage::extend_from_slice(self, src);
+        stage::Stage::extend_from_slice(self, src);
     }
     fn len(&self) -> usize {
-        dope::manifold::connector::state::Stage::len(self)
+        stage::Stage::len(self)
     }
     fn as_mut_slice(&mut self) -> &mut [u8] {
-        dope::manifold::connector::state::Stage::as_mut_slice(self)
+        stage::Stage::as_mut_slice(self)
     }
 }
 

@@ -6,7 +6,9 @@ use dope::DriverRef;
 use dope::driver::ready::ReadyKey;
 use dope::driver::token::Token;
 use dope::manifold::connector;
-use dope_fiber::WaitQueue;
+use dope_fiber::raw::task::Context;
+use dope_fiber::raw::wait::{WaitQueue, Waiter};
+use dope_net::link::egress::storage::Storage as EgressStorage;
 use o3::buffer::{Lease, Pool};
 use o3::cell::RegionToken;
 
@@ -67,10 +69,11 @@ pub(super) struct Port<'d> {
     fatal: RefCell<FatalSlot<Error>>,
     max_frame_capacity: usize,
     response_value_capacity: usize,
-    requests: Pin<Box<Pool>>,
     request_queue: QueueArena<'d, Frame<'d>>,
+    requests: Pool,
     inflight_capacity: usize,
     responses: Arena<'d, Outcome>,
+    egress: EgressStorage,
 }
 
 impl<'d> Port<'d> {
@@ -104,15 +107,20 @@ impl<'d> Port<'d> {
             fatal: RefCell::new(FatalSlot::default()),
             max_frame_capacity: config.max_frame_capacity(),
             response_value_capacity: config.response_value_capacity(),
-            requests: Box::pin(Pool::new(config.request_pool())),
             request_queue,
+            requests: Pool::from_layout(config.request_pool()),
             inflight_capacity: config.inflight_capacity(),
             responses,
+            egress: EgressStorage::default(),
         }
     }
 
     pub(super) fn capacity(&self) -> usize {
         self.conns.len()
+    }
+
+    pub(super) fn egress(&self) -> &EgressStorage {
+        &self.egress
     }
 
     pub(super) fn active(&self) -> bool {
@@ -129,8 +137,8 @@ impl<'d> Port<'d> {
 
     pub(super) fn try_register_active(
         &self,
-        waiter: Pin<&dope_fiber::Waiter<'d>>,
-        context: Pin<&dope_fiber::Context<'_, 'd>>,
+        waiter: Pin<&Waiter<'d>>,
+        context: Pin<&Context<'_, 'd>>,
     ) -> bool {
         self.active_waiters.as_ref().try_register(waiter, context)
     }
@@ -190,7 +198,6 @@ impl<'d> Port<'d> {
     pub(super) fn frame(&'d self) -> Result<Frame<'d>, Error> {
         let buffer = self
             .requests
-            .as_ref()
             .try_acquire()
             .ok_or(Error::RequestEntryCapacity)?;
         Ok(Frame {
@@ -250,14 +257,14 @@ impl<'d> Port<'d> {
         token: Token,
         push: impl FnMut(Frame<'d>) -> Result<(), Frame<'d>>,
         region: &mut RegionToken<'d>,
-    ) -> connector::Requests {
+    ) -> connector::app::Requests {
         if self.conn(token).is_none() {
-            return connector::Requests::default();
+            return connector::app::Requests::default();
         }
         self.request_queue
             .lane(token.slot().raw() as usize)
             .drain(region, push);
-        connector::Requests::default()
+        connector::app::Requests::default()
     }
 
     fn conn(&self, token: Token) -> Option<&Conn<'d>> {

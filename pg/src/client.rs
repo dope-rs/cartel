@@ -4,7 +4,10 @@ use std::task::Poll;
 
 use cartel_core::{Extract, Registrable, Reply, ReplyStream, Slot};
 use dope::driver::token::Token;
-use dope_fiber::{Context, Fiber, Waiter};
+use dope_fiber::abi::Fiber;
+use dope_fiber::abi::pollfn::PollFn;
+use dope_fiber::raw::task::Context;
+use dope_fiber::raw::wait::Waiter;
 use o3::buffer::Shared;
 use o3::cell::RegionToken;
 use pin_project::pin_project;
@@ -1434,7 +1437,7 @@ impl<'d, I: QuerySet + 'd> CopyInGuard<'d, I> {
     ) -> impl Fiber<'d, Output = Result<(), Error>> + 'a {
         let client = self.client;
         let mut completed = false;
-        dope_fiber::poll_fn(move |mut cx| {
+        PollFn::new(move |mut cx| {
             if completed {
                 return Poll::Ready(Err(Error::Closed));
             }
@@ -1457,7 +1460,7 @@ impl<'d, I: QuerySet + 'd> CopyInGuard<'d, I> {
         let client = self.client;
         let mut dispatched = self.dispatched;
         let mut finished = false;
-        dope_fiber::poll_fn(move |mut cx| {
+        PollFn::new(move |mut cx| {
             if !finished {
                 match Fiber::poll(dispatched.as_mut(), cx.as_mut()) {
                     Poll::Ready(output) => return Poll::Ready(output),

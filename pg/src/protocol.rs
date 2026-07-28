@@ -4,11 +4,11 @@ use std::pin::Pin;
 
 use cartel_core::FrontKind;
 use dope::driver::token::Token;
-use dope::manifold::connector;
-use dope::manifold::connector::state::{IOV_CAP, Queue};
-use dope::manifold::connector::{Close, Ctx};
-use dope_fiber::WaitQueue;
-use dope_fiber::{Context, Waiter};
+use dope::manifold::connector::state::IOV_CAP;
+use dope::manifold::connector::{app, codec, lifecycle, session};
+use dope_fiber::raw::task::Context;
+use dope_fiber::raw::wait::{WaitQueue, Waiter};
+use dope_net::link::egress::queue::Queue;
 use o3::buffer;
 use o3::cell::RegionToken;
 use o3::collections::FixedQueue;
@@ -60,14 +60,14 @@ pub struct ConnState {
     close_permanent: bool,
 }
 
-impl connector::Lifecycle for ConnState {
-    fn wants_close(&self) -> Close {
+impl lifecycle::Lifecycle for ConnState {
+    fn wants_close(&self) -> lifecycle::Close {
         if !self.pending_close {
-            Close::Keep
+            lifecycle::Close::Keep
         } else if self.close_permanent {
-            Close::Permanent
+            lifecycle::Close::Permanent
         } else {
-            Close::Reconnect
+            lifecycle::Close::Reconnect
         }
     }
 
@@ -376,7 +376,7 @@ impl Shared {
     }
 
     fn transaction_waiter(&self, index: usize) -> Option<Pin<&WaitQueue>> {
-        WaitQueue::get_pinned(self.transaction_waiters.as_ref(), index)
+        WaitQueue::pinned(self.transaction_waiters.as_ref(), index)
     }
 
     fn clear_transaction(&self, slot: Token, available: bool) {
@@ -656,7 +656,7 @@ pub struct Codec {
     max_response_bytes: usize,
 }
 
-impl connector::Codec for Codec {
+impl codec::Codec for Codec {
     type Head = Frame;
     type ParseState = ();
 
@@ -690,7 +690,7 @@ impl connector::Codec for Codec {
         if buf.len() < total {
             return None;
         }
-        let payload = buf.slice(5..total);
+        let payload = buf.get(5..total)?;
         Some((Frame { typ, payload }, total))
     }
 }
@@ -1046,7 +1046,7 @@ impl<'d, I: QuerySet> Session<'d, I> {
     }
 }
 
-impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
+impl<'d, I: QuerySet> session::Session<'d> for Session<'d, I> {
     type Codec = Codec;
     type ConnState = ConnState;
     type Send = SendFrame<'d>;
@@ -1064,9 +1064,9 @@ impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
         self.port.activate(token, ready);
     }
 
-    fn connect(&mut self, ctx: &mut Ctx<'_, 'd, Self>) {
+    fn connect(&mut self, ctx: &mut session::Ctx<'_, '_, 'd, Self>) {
         let conn_state = &mut *ctx.state;
-        let out = &mut *ctx.sink;
+        let out = &mut ctx.sink;
         self.port.shared.clear_fatal();
         let frame = self.port.encode(|frame| {
             encode::startup(
@@ -1086,11 +1086,11 @@ impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
         }
     }
 
-    fn flush_trailer(&mut self, ctx: &mut Ctx<'_, 'd, Self>) {
+    fn flush_trailer(&mut self, ctx: &mut session::Ctx<'_, '_, 'd, Self>) {
         self.port.shared.egress_waiters.as_ref().wake();
         let conn_id = ctx.conn_id;
         let conn_state = &mut *ctx.state;
-        let out = &mut *ctx.sink;
+        let out = &mut ctx.sink;
         if !matches!(conn_state.phase, Phase::Ready) {
             return;
         }
@@ -1112,10 +1112,10 @@ impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
         }
     }
 
-    fn response(&mut self, head: Frame, ctx: &mut Ctx<'_, 'd, Self>) {
+    fn response(&mut self, head: Frame, ctx: &mut session::Ctx<'_, '_, 'd, Self>) {
         let conn_id = ctx.conn_id;
         let conn_state = &mut *ctx.state;
-        let out = &mut *ctx.sink;
+        let out = &mut ctx.sink;
         let typ = head.typ;
         if typ == OVERSIZE_FRAME {
             self.fail(
@@ -1163,7 +1163,7 @@ impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
         }
     }
 
-    fn disconnect(&mut self, ctx: &mut Ctx<'_, 'd, Self>) {
+    fn disconnect(&mut self, ctx: &mut session::Ctx<'_, '_, 'd, Self>) {
         let conn_id = ctx.conn_id;
         let conn_state = &mut *ctx.state;
         let msg = self
@@ -1193,7 +1193,7 @@ impl<'d, I: QuerySet> connector::Session<'d> for Session<'d, I> {
         token: Token,
         push: impl FnMut(Self::Send) -> Result<(), Self::Send>,
         region: &mut RegionToken<'d>,
-    ) -> connector::Requests {
+    ) -> app::Requests {
         self.port.drain_requests(token, push, region)
     }
 

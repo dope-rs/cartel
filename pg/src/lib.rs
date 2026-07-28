@@ -14,13 +14,15 @@ mod value;
 mod wire;
 
 pub use attach::{attach, attach_configured};
+pub use cartel_core::runtime::AppRuntime;
 pub use cartel_gen::PgTable;
 pub use client::{
     Client, CopyInGuard, CopyOutStream, Dispatched, ExtractUnit, NextNotification, PgOps,
     RunStream, Runner,
 };
-pub use dope_extra::runtime::AppRuntime;
-pub use dope_fiber::{Batch, Fiber, Lazy};
+pub use dope_fiber::abi::Fiber;
+pub use dope_fiber::abi::batch::Batch;
+pub use dope_fiber::abi::future::lazy::Lazy;
 
 pub use dsl::{
     AggBuilder, AggHandle, ConflictTarget, Cte, DeleteBuilder, EachClosure, EachCols,

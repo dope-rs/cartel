@@ -3,9 +3,9 @@ use std::time::Instant;
 
 use cartel_redis::{Capacities, Config, ConfigError, DEFAULT_BACKOFF, Ops};
 use dope::driver;
-use dope::manifold::connector::source::Static;
+use dope::manifold::connector::source::health::Static;
 use dope::manifold::env::Bundle;
-use dope::runtime::Executor;
+use dope::runtime::executor::Executor;
 use dope::runtime::profile::Throughput;
 use dope_net::tcp::Tcp;
 use dope_net::wire::identity::Identity;
@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok::<_, cartel_redis::Error>((hits, elapsed, id, info))
         });
         let (hits, elapsed, id, info) =
-            dope_extra::runtime::AppRuntime::enter(&mut session, connector, |mut runtime| {
+            cartel_core::runtime::AppRuntime::enter(&mut session, connector, |mut runtime| {
                 runtime.block_on(probe)
             })??;
         let info_summary = std::str::from_utf8(info.as_slice())

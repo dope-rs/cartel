@@ -1,6 +1,6 @@
 use cartel_redis::protocol::{Codec, Head};
 use cartel_redis::{FromValue, GeoCoord, Value};
-use dope::manifold::connector::Codec as _;
+use dope::manifold::connector::codec::Codec as _;
 use o3::buffer::Shared;
 
 fn parse(bytes: &[u8], frame_capacity: usize, value_capacity: usize) -> Head {
