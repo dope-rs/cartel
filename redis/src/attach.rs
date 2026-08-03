@@ -1,7 +1,7 @@
 use dope::manifold::Manifold;
 use dope::manifold::connector::source::Dialer;
 use dope::manifold::env::Env;
-use dope::runtime::executor::Session as RuntimeSession;
+use dope::runtime::executor;
 use dope_net::Transport;
 use dope_net::wire::Wire;
 
@@ -10,7 +10,7 @@ use crate::{Connect, Redis, Store};
 /// Attaches a Redis client and its connector resource to a runtime session.
 #[inline(always)]
 pub fn attach<'scope, 'd: 'scope, const ID: u8, E>(
-    session: &mut RuntimeSession<'scope, 'd, impl AsRef<Store<'d>> + 'd>,
+    session: &mut executor::Session<'scope, 'd, impl AsRef<Store<'d>> + 'd>,
     topology: impl Dialer<E::Transport> + 'd,
 ) -> std::io::Result<(Redis<'d>, impl Manifold<'d> + 'd)>
 where
@@ -32,7 +32,7 @@ where
 /// application, call this once per runtime session with that core's config.
 #[inline(always)]
 pub fn attach_configured<'scope, 'd: 'scope, const ID: u8, E>(
-    session: &mut RuntimeSession<'scope, 'd, impl AsRef<Store<'d>> + 'd>,
+    session: &mut executor::Session<'scope, 'd, impl AsRef<Store<'d>> + 'd>,
     topology: impl Dialer<E::Transport> + 'd,
     wire: <E::Wire as Wire>::InitConfig<'d>,
 ) -> std::io::Result<(Redis<'d>, impl Manifold<'d> + 'd)>

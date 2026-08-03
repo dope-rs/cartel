@@ -9,10 +9,10 @@ use dope::manifold::Manifold;
 use dope::manifold::connector::source::health::Static;
 use dope::manifold::env::Bundle;
 use dope::runtime::profile::Throughput;
-use dope::{Completion as _, driver};
+use dope::{Completion, driver};
 use dope_net::tcp::Tcp;
 use dope_net::wire::identity::Identity;
-use o3::cell::BrandCell as Branded;
+use o3::cell;
 
 const ROUTE: u8 = 0;
 
@@ -66,7 +66,7 @@ fn probe_step_by_step() {
                 &mut sess, upstreams,
             )
             .expect("connector");
-        let pg = pin!(Branded::new(connector));
+        let pg = pin!(cell::BrandCell::new(connector));
         let pg = pg.as_ref();
         let (token, mut driver) = sess.token_and_driver();
 

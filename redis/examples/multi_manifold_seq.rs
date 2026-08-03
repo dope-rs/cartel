@@ -8,7 +8,7 @@ use dope::manifold::connector::source::health::Static;
 use dope::manifold::env::Bundle;
 use dope::runtime::executor::Executor;
 use dope::runtime::profile::Throughput;
-use dope_fiber::extensions::SessionExt as _;
+use dope_fiber::extensions::SessionExt;
 use dope_net::tcp::Tcp;
 use dope_net::wire::identity::Identity;
 use o3::cell::BrandCell;

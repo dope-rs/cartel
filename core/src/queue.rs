@@ -138,9 +138,13 @@ impl<'d, T: Unpin> QueueLane<'_, 'd, T> {
             .map(|(item, _)| item)
     }
 
-    pub fn drain(self, token: &mut RegionToken<'d>, mut push: impl FnMut(T) -> Result<(), T>) {
+    pub fn drain(
+        self,
+        token: &mut RegionToken<'d>,
+        mut push: impl FnMut(&mut RegionToken<'d>, T) -> Result<(), T>,
+    ) {
         while let Some((item, weight)) = self.arena.state.borrow_mut(token).pop_front(self.lane) {
-            if let Err(item) = push(item) {
+            if let Err(item) = push(token, item) {
                 self.arena
                     .state
                     .borrow_mut(token)

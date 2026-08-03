@@ -14,7 +14,7 @@ use o3::cell::RegionToken;
 use o3::collections::FixedQueue;
 
 use crate::decode::{AuthRequest, parse_auth, parse_db_error, parse_notification};
-use crate::port::{self, Frame as SendFrame, Port};
+use crate::port;
 use crate::query::QuerySet;
 use crate::scram::Scram;
 use crate::wire::Be;
@@ -697,12 +697,12 @@ impl codec::Codec for Codec {
 
 pub struct Session<'d, I: QuerySet> {
     codec: Codec,
-    port: &'d Port<'d, I>,
+    port: &'d port::Port<'d, I>,
     _instance: PhantomData<fn() -> I>,
 }
 
 impl<'d, I: QuerySet> Session<'d, I> {
-    pub(super) fn new(port: &'d Port<'d, I>) -> Self {
+    pub(super) fn new(port: &'d port::Port<'d, I>) -> Self {
         Self {
             codec: Codec {
                 max_response_bytes: port.shared.config.response_byte_capacity(),
@@ -712,8 +712,13 @@ impl<'d, I: QuerySet> Session<'d, I> {
         }
     }
 
-    fn enqueue(out: &Queue<IOV_CAP, SendFrame<'d>>, frame: SendFrame<'d>) -> Result<(), Error> {
-        out.try_enqueue(frame).map_err(|_| Error::RequestCapacity)
+    fn enqueue(
+        out: &Queue<'_, 'd, '_, IOV_CAP, port::Frame<'d>>,
+        region: &mut RegionToken<'d>,
+        frame: port::Frame<'d>,
+    ) -> Result<(), Error> {
+        out.try_enqueue(region, frame)
+            .map_err(|_| Error::RequestCapacity)
     }
 
     fn fail(
@@ -751,7 +756,11 @@ impl<'d, I: QuerySet> Session<'d, I> {
         s.egress_waiters.as_ref().wake();
     }
 
-    fn send_prepare(&self, out: &mut Queue<IOV_CAP, SendFrame<'d>>) -> Result<u32, Error> {
+    fn send_prepare(
+        &self,
+        out: &mut Queue<'_, 'd, '_, IOV_CAP, port::Frame<'d>>,
+        region: &mut RegionToken<'d>,
+    ) -> Result<u32, Error> {
         let mut count = 0u32;
         let mut queries = I::GROUPS.iter().flat_map(|group| group.iter()).peekable();
         while let Some(meta) = queries.next() {
@@ -761,11 +770,11 @@ impl<'d, I: QuerySet> Session<'d, I> {
                     encode::sync(frame);
                 }
             })?;
-            Self::enqueue(out, frame)?;
+            Self::enqueue(out, region, frame)?;
             count += 1;
         }
         if count == 0 {
-            Self::enqueue(out, self.port.encode(|frame| encode::sync(frame))?)?;
+            Self::enqueue(out, region, self.port.encode(|frame| encode::sync(frame))?)?;
         }
         Ok(count)
     }
@@ -776,7 +785,8 @@ impl<'d, I: QuerySet> Session<'d, I> {
         conn_state: &mut ConnState,
         typ: u8,
         payload: &[u8],
-        out: &mut Queue<IOV_CAP, SendFrame<'d>>,
+        out: &mut Queue<'_, 'd, '_, IOV_CAP, port::Frame<'d>>,
+        region: &mut RegionToken<'d>,
     ) -> Result<(), Error> {
         match typ {
             Be::AUTH => {
@@ -793,7 +803,7 @@ impl<'d, I: QuerySet> Session<'d, I> {
                         let frame = self.port.encode(|frame| {
                             encode::sasl_initial_response(frame, mech, client_first.as_bytes());
                         })?;
-                        Self::enqueue(out, frame)?;
+                        Self::enqueue(out, region, frame)?;
                         conn_state.phase = Phase::AwaitingSaslContinue {
                             scram: Box::new(scram),
                         };
@@ -826,7 +836,8 @@ impl<'d, I: QuerySet> Session<'d, I> {
         conn_state: &mut ConnState,
         typ: u8,
         payload: &[u8],
-        out: &mut Queue<IOV_CAP, SendFrame<'d>>,
+        out: &mut Queue<'_, 'd, '_, IOV_CAP, port::Frame<'d>>,
+        region: &mut RegionToken<'d>,
     ) -> Result<(), Error> {
         if typ == Be::ERROR_RESPONSE {
             return Err(Error::Db(Box::new(parse_db_error(payload))));
@@ -845,7 +856,7 @@ impl<'d, I: QuerySet> Session<'d, I> {
                 let frame = self
                     .port
                     .encode(|frame| encode::sasl_response(frame, client_final.as_bytes()))?;
-                Self::enqueue(out, frame)?;
+                Self::enqueue(out, region, frame)?;
                 conn_state.phase = Phase::AwaitingSaslFinal { scram };
                 Ok(())
             }
@@ -1049,7 +1060,7 @@ impl<'d, I: QuerySet> Session<'d, I> {
 impl<'d, I: QuerySet> session::Session<'d> for Session<'d, I> {
     type Codec = Codec;
     type ConnState = ConnState;
-    type Send = SendFrame<'d>;
+    type Send = port::Frame<'d>;
 
     fn codec(&self) -> &Codec {
         &self.codec
@@ -1078,7 +1089,7 @@ impl<'d, I: QuerySet> session::Session<'d> for Session<'d, I> {
                 self.port.shared.database.statement_timeout_ms(),
             );
         });
-        match frame.and_then(|frame| Self::enqueue(out, frame)) {
+        match frame.and_then(|frame| Self::enqueue(out, ctx.region, frame)) {
             Ok(()) => {
                 conn_state.phase = Phase::StartupSent;
             }
@@ -1102,7 +1113,7 @@ impl<'d, I: QuerySet> session::Session<'d> for Session<'d, I> {
             return;
         }
         let committed = {
-            let mut stage = out.wire_stage();
+            let mut stage = out.wire_stage(ctx.region);
             encode::sync(&mut stage);
             stage.commit()
         };
@@ -1129,10 +1140,10 @@ impl<'d, I: QuerySet> session::Session<'d> for Session<'d, I> {
         let prev_phase_was_awaiting_ready = matches!(conn_state.phase, Phase::AwaitingReady);
         let result = match conn_state.phase {
             Phase::StartupSent | Phase::AwaitingReady => {
-                self.handle_startup(conn_id, conn_state, typ, &head.payload, out)
+                self.handle_startup(conn_id, conn_state, typ, &head.payload, out, ctx.region)
             }
             Phase::AwaitingSaslContinue { .. } | Phase::AwaitingSaslFinal { .. } => {
-                self.handle_sasl(conn_state, typ, &head.payload, out)
+                self.handle_sasl(conn_state, typ, &head.payload, out, ctx.region)
             }
             Phase::Preparing { remaining } => {
                 self.handle_preparing(conn_id, typ, &head.payload, conn_state, remaining)
@@ -1153,7 +1164,7 @@ impl<'d, I: QuerySet> session::Session<'d> for Session<'d, I> {
             && typ == Be::READY_FOR_QUERY
             && matches!(conn_state.phase, Phase::AwaitingReady)
         {
-            match self.send_prepare(out) {
+            match self.send_prepare(out, ctx.region) {
                 Ok(count) => conn_state.phase = Phase::Preparing { remaining: count },
                 Err(error) => self.fail(conn_id, conn_state, error, ctx.region),
             }
@@ -1191,7 +1202,7 @@ impl<'d, I: QuerySet> session::Session<'d> for Session<'d, I> {
     fn drain_requests(
         &self,
         token: Token,
-        push: impl FnMut(Self::Send) -> Result<(), Self::Send>,
+        push: impl FnMut(&mut RegionToken<'d>, Self::Send) -> Result<(), Self::Send>,
         region: &mut RegionToken<'d>,
     ) -> app::Requests {
         self.port.drain_requests(token, push, region)

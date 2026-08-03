@@ -1,10 +1,10 @@
-use cartel_redis::protocol::{Codec, Head};
+use cartel_redis::protocol::{self, Head};
 use cartel_redis::{FromValue, GeoCoord, Value};
-use dope::manifold::connector::codec::Codec as _;
+use dope::manifold::connector::codec::Codec;
 use o3::buffer::Shared;
 
 fn parse(bytes: &[u8], frame_capacity: usize, value_capacity: usize) -> Head {
-    let codec = Codec::new(frame_capacity, value_capacity);
+    let codec = protocol::Codec::new(frame_capacity, value_capacity);
     let mut state = Default::default();
     let frame = Shared::copy_from_slice(bytes);
     let (head, consumed) = codec.parse(&mut state, &frame).expect("complete frame");
@@ -15,7 +15,7 @@ fn parse(bytes: &[u8], frame_capacity: usize, value_capacity: usize) -> Head {
 #[test]
 fn parser_resumes_partial_nested_frame() {
     let bytes = b"*2\r\n$3\r\nfoo\r\n:7\r\n";
-    let codec = Codec::new(128, 8);
+    let codec = protocol::Codec::new(128, 8);
     let mut state = Default::default();
     for end in 1..bytes.len() {
         let partial = Shared::copy_from_slice(&bytes[..end]);

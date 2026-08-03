@@ -6,7 +6,7 @@ use o3::buffer;
 use o3::cell::RegionToken;
 
 use crate::decode::{ParseState, Scan, Scanned, scan};
-use crate::port::{Frame as SendFrame, Port};
+use crate::port;
 
 #[derive(Debug)]
 pub enum Error {
@@ -114,11 +114,11 @@ impl codec::Codec for Codec {
 
 pub(super) struct Session<'d> {
     codec: Codec,
-    port: &'d Port<'d>,
+    port: &'d port::Port<'d>,
 }
 
 impl<'d> Session<'d> {
-    pub(super) fn new(port: &'d Port<'d>) -> Self {
+    pub(super) fn new(port: &'d port::Port<'d>) -> Self {
         Self {
             codec: Codec::new(port.max_frame_capacity(), port.response_value_capacity()),
             port,
@@ -138,7 +138,7 @@ impl<'d> Session<'d> {
 impl<'d> session::Session<'d> for Session<'d> {
     type Codec = Codec;
     type ConnState = ConnState;
-    type Send = SendFrame<'d>;
+    type Send = port::Frame<'d>;
 
     fn codec(&self) -> &Self::Codec {
         &self.codec
@@ -192,7 +192,7 @@ impl<'d> session::Session<'d> for Session<'d> {
     fn drain_requests(
         &self,
         token: Token,
-        push: impl FnMut(Self::Send) -> Result<(), Self::Send>,
+        push: impl FnMut(&mut RegionToken<'d>, Self::Send) -> Result<(), Self::Send>,
         region: &mut RegionToken<'d>,
     ) -> app::Requests {
         self.port.drain_requests(token, push, region)

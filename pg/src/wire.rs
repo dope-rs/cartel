@@ -25,7 +25,7 @@ impl Sink for Vec<u8> {
     }
 }
 
-impl<B> Sink for stage::Stage<'_, '_, B> {
+impl<B> Sink for stage::Stage<'_, '_, '_, B> {
     fn push(&mut self, byte: u8) {
         stage::Stage::push(self, byte);
     }

@@ -3,10 +3,11 @@ use std::pin::Pin;
 use std::task::Poll;
 
 use dope::DriverContext;
-use dope::driver::ready::CompletionWaker;
 use dope::runtime::executor::StorageFactory;
 use dope_fiber::abi::Fiber;
-use dope_fiber::raw::task::{CompletionRegistrarWithRegion, Context};
+use dope_fiber::local::LocalContext;
+use dope_fiber::notify::{NotifyArena, NotifyReceiver, NotifySender};
+use dope_fiber::raw::task::Context;
 use o3::cell::{RegionCell, RegionToken};
 use o3::collections::{CellQueue, LinkedArena, RoundRobinSet, Slab, SlabKey};
 use o3::mem::FairCredits;
@@ -116,7 +117,7 @@ struct Entry<'d, C> {
     lane: usize,
     live: bool,
     ordered: bool,
-    waker: Option<CompletionWaker<'d>>,
+    notify: NotifySender<'d>,
 }
 
 struct Lane {
@@ -206,7 +207,12 @@ impl<'d, C> ArenaState<'d, C> {
             .unwrap_or_else(|_| unreachable!("reply order capacity was reserved"));
     }
 
-    fn register(&mut self, lane: usize, trailing_boundary: bool) -> Option<EntryKey> {
+    fn register(
+        &mut self,
+        lane: usize,
+        trailing_boundary: bool,
+        notify: NotifySender<'d>,
+    ) -> Option<EntryKey> {
         if !self.lanes.get(lane)?.accepting {
             return None;
         }
@@ -217,7 +223,7 @@ impl<'d, C> ArenaState<'d, C> {
             lane,
             live: true,
             ordered: true,
-            waker: None,
+            notify,
         }) {
             Ok(key) => key,
             Err(_) => {
@@ -262,7 +268,6 @@ impl<'d, C> ArenaState<'d, C> {
         entry.live = false;
         entry.slot.completed = false;
         entry.slot.overflow = false;
-        entry.waker = None;
         self.lanes[entry.lane].live -= 1;
         true
     }
@@ -386,7 +391,7 @@ impl<'d, C> ArenaState<'d, C> {
         item: C,
         item_bytes: usize,
         item_credits: usize,
-    ) -> (Result<(), C>, Option<CompletionWaker<'d>>) {
+    ) -> (Result<(), C>, Option<NotifySender<'d>>) {
         let Front::Slot(key) = self.front(lane) else {
             return (Err(item), None);
         };
@@ -439,10 +444,10 @@ impl<'d, C> ArenaState<'d, C> {
         }
         slot.bytes = next_bytes;
         slot.credits = next_credits;
-        (Ok(()), entry.waker.take())
+        (Ok(()), Some(entry.notify))
     }
 
-    fn complete(&mut self, lane: usize) -> Option<CompletionWaker<'d>> {
+    fn complete(&mut self, lane: usize) -> Option<NotifySender<'d>> {
         match self.front(lane) {
             Front::Slot(key) => {
                 self.pop_live(lane, key);
@@ -451,7 +456,7 @@ impl<'d, C> ArenaState<'d, C> {
                     .get_mut(key)
                     .unwrap_or_else(|| unreachable!("completed reply entry must exist"));
                 entry.slot.completed = true;
-                entry.waker.take()
+                Some(entry.notify)
             }
             Front::Detached => {
                 self.drop_front(lane);
@@ -461,7 +466,7 @@ impl<'d, C> ArenaState<'d, C> {
         }
     }
 
-    fn fail_one(&mut self, lane: usize, item: C) -> (Option<C>, Option<CompletionWaker<'d>>) {
+    fn fail_one(&mut self, lane: usize, item: C) -> (Option<C>, Option<NotifySender<'d>>) {
         let Front::Slot(key) = self.front(lane) else {
             if matches!(self.front(lane), Front::Detached) {
                 self.drop_front(lane);
@@ -475,7 +480,7 @@ impl<'d, C> ArenaState<'d, C> {
             .get_mut(key)
             .unwrap_or_else(|| unreachable!("failed reply entry must exist"));
         entry.slot.completed = true;
-        (result.err(), wake.or_else(|| entry.waker.take()))
+        (result.err(), wake.or(Some(entry.notify)))
     }
 
     fn try_push_detached(
@@ -484,7 +489,7 @@ impl<'d, C> ArenaState<'d, C> {
         item: C,
         item_bytes: usize,
         item_credits: usize,
-    ) -> (Result<(), C>, Option<CompletionWaker<'d>>) {
+    ) -> (Result<(), C>, Option<NotifySender<'d>>) {
         let Self {
             lanes,
             slots,
@@ -525,7 +530,7 @@ impl<'d, C> ArenaState<'d, C> {
         }
         slot.bytes += item_bytes;
         slot.credits += item_credits;
-        (Ok(()), entry.waker.take())
+        (Ok(()), Some(entry.notify))
     }
 
     fn activate(&mut self, lane: usize) {
@@ -644,6 +649,7 @@ struct Retired {
 /// A fixed-capacity, multi-lane reply arena protected by a runtime region.
 pub struct Arena<'d, C> {
     state: RegionCell<'d, ArenaState<'d, C>>,
+    notifications: NotifyArena<'d>,
     retired: CellQueue<Retired>,
     lanes: usize,
 }
@@ -681,6 +687,7 @@ impl<'d, C> Arena<'d, C> {
     pub fn new(config: ArenaConfig) -> Self {
         Self {
             state: RegionCell::new(ArenaState::new(config)),
+            notifications: NotifyArena::with_capacity(config.entries),
             retired: CellQueue::with_capacity(config.entries),
             lanes: config.lanes,
         }
@@ -755,29 +762,29 @@ impl<'d, C> Arena<'d, C> {
         item_credits: usize,
     ) -> bool {
         self.drain_retired(token);
-        let (pushed, waker) =
+        let (pushed, notify) =
             self.state
                 .borrow_mut(token)
                 .try_push(lane, item, item_bytes, item_credits);
-        if let Some(waker) = waker {
-            waker.wake();
+        if let Some(notify) = notify {
+            notify.notify(&mut LocalContext::from_region(token));
         }
         pushed.is_ok()
     }
 
     pub fn complete(&self, token: &mut RegionToken<'d>, lane: usize) {
         self.drain_retired(token);
-        let waker = self.state.borrow_mut(token).complete(lane);
-        if let Some(waker) = waker {
-            waker.wake();
+        let notify = self.state.borrow_mut(token).complete(lane);
+        if let Some(notify) = notify {
+            notify.notify(&mut LocalContext::from_region(token));
         }
     }
 
     pub fn fail_one(&self, token: &mut RegionToken<'d>, lane: usize, make: impl FnOnce() -> C) {
         self.drain_retired(token);
-        let (rejected, waker) = self.state.borrow_mut(token).fail_one(lane, make());
-        if let Some(waker) = waker {
-            waker.wake();
+        let (rejected, notify) = self.state.borrow_mut(token).fail_one(lane, make());
+        if let Some(notify) = notify {
+            notify.notify(&mut LocalContext::from_region(token));
         }
         drop(rejected);
     }
@@ -801,9 +808,9 @@ impl<'d, C> Arena<'d, C> {
                     failed += 1;
                 }
                 FrontKind::Slot(_) => {
-                    let (rejected, waker) = self.state.borrow_mut(token).fail_one(lane, make());
-                    if let Some(waker) = waker {
-                        waker.wake();
+                    let (rejected, notify) = self.state.borrow_mut(token).fail_one(lane, make());
+                    if let Some(notify) = notify {
+                        notify.notify(&mut LocalContext::from_region(token));
                     }
                     drop(rejected);
                     failed += 1;
@@ -833,22 +840,27 @@ impl<'d, C> Arena<'d, C> {
     }
 
     fn register(
-        &self,
+        &'d self,
         token: &mut RegionToken<'d>,
         lane: usize,
         trailing_boundary: bool,
-    ) -> Option<EntryKey> {
+    ) -> Option<(EntryKey, NotifyReceiver<'d>)> {
         self.drain_retired(token);
-        self.state
+        let (notify, receiver) = self
+            .notifications
+            .pair(&mut LocalContext::from_region(token))?;
+        let key = self
+            .state
             .borrow_mut(token)
-            .register(lane, trailing_boundary)
+            .register(lane, trailing_boundary, notify)?;
+        Some((key, receiver))
     }
 
     fn with_slot<R>(
         &self,
         token: &mut RegionToken<'d>,
         key: EntryKey,
-        f: impl FnOnce(&mut Slot<'_, C>, &mut Option<CompletionWaker<'d>>) -> R,
+        f: impl FnOnce(&mut Slot<'_, C>) -> R,
     ) -> Option<R> {
         self.drain_retired(token);
         let state = self.state.borrow_mut(token);
@@ -869,7 +881,7 @@ impl<'d, C> Arena<'d, C> {
             resources,
             lane: entry.lane,
         };
-        Some(f(&mut slot, &mut entry.waker))
+        Some(f(&mut slot))
     }
 }
 
@@ -948,6 +960,7 @@ pub trait Extract<C> {
 struct Registration<'d, C> {
     lane: ArenaLane<'d, C>,
     key: EntryKey,
+    receiver: NotifyReceiver<'d>,
 }
 
 struct Handle<'d, C> {
@@ -968,23 +981,31 @@ impl<'d, C> Handle<'d, C> {
         if self.registration.is_some() {
             return false;
         }
-        let Some(key) = lane.arena.register(token, lane.lane, trailing_boundary) else {
+        let Some((key, receiver)) = lane.arena.register(token, lane.lane, trailing_boundary) else {
             return false;
         };
-        self.registration = Some(Registration { lane, key });
+        self.registration = Some(Registration {
+            lane,
+            key,
+            receiver,
+        });
         true
     }
 
     fn with_slot<R>(
         &self,
         token: &mut RegionToken<'d>,
-        f: impl FnOnce(&mut Slot<'_, C>, &mut Option<CompletionWaker<'d>>) -> R,
+        f: impl FnOnce(&mut Slot<'_, C>) -> R,
     ) -> Option<R> {
         let registration = self.registration.as_ref()?;
         registration
             .lane
             .arena
             .with_slot(token, registration.key, f)
+    }
+
+    fn receiver(&mut self) -> Option<Pin<&mut NotifyReceiver<'d>>> {
+        Some(Pin::new(&mut self.registration.as_mut()?.receiver))
     }
 
     fn release_done(&mut self) {
@@ -1066,35 +1087,27 @@ impl<'d, C, X: Extract<C>> sealed::Registrable<'d, C> for Reply<'d, C, X> {
     }
 }
 
-// SAFETY: Handle::drop queues retirement, and every arena operation drains
-// retirements before it can observe or invoke the stored completion handle.
-unsafe impl<'d, C, X: Extract<C>> CompletionRegistrarWithRegion<'d> for Pin<&mut Reply<'d, C, X>> {
-    type Output = Poll<X::Output>;
-
-    #[inline(always)]
-    fn register(self, wake: CompletionWaker<'d>, token: &mut RegionToken<'d>) -> Self::Output {
-        let me = self.get_mut();
-        let Some(poll) = me.handle.with_slot(token, |slot, waker| {
-            if let Some(output) = X::extract(slot) {
-                return Poll::Ready(output);
-            }
-            *waker = Some(wake);
-            Poll::Pending
-        }) else {
-            return Poll::Pending;
-        };
-        if poll.is_ready() {
-            me.handle.release_done();
-        }
-        poll
-    }
-}
-
 impl<'d, C, X: Extract<C>> Fiber<'d> for Reply<'d, C, X> {
     type Output = X::Output;
 
-    fn poll(self: Pin<&mut Self>, cx: Pin<&mut Context<'_, 'd>>) -> Poll<X::Output> {
-        cx.register_completion_with_region(self)
+    fn poll(mut self: Pin<&mut Self>, mut cx: Pin<&mut Context<'_, 'd>>) -> Poll<X::Output> {
+        let me = self.as_mut().get_mut();
+        loop {
+            let output = me
+                .handle
+                .with_slot(cx.as_mut().region_token(), X::extract)
+                .flatten();
+            if let Some(output) = output {
+                me.handle.release_done();
+                return Poll::Ready(output);
+            }
+            let Some(receiver) = me.handle.receiver() else {
+                return Poll::Pending;
+            };
+            if receiver.poll(cx.as_mut()).is_pending() {
+                return Poll::Pending;
+            }
+        }
     }
 }
 
@@ -1112,39 +1125,32 @@ impl<'d, C, X: Extract<C>> ReplyStream<'d, C, X> {
     }
 
     pub fn poll_next(
-        self: Pin<&mut Self>,
-        cx: Pin<&mut Context<'_, 'd>>,
+        mut self: Pin<&mut Self>,
+        mut cx: Pin<&mut Context<'_, 'd>>,
     ) -> Poll<Option<X::Output>> {
-        cx.register_completion_with_region(self)
-    }
-}
-
-// SAFETY: Handle::drop queues retirement, and every arena operation drains
-// retirements before it can observe or invoke the stored completion handle.
-unsafe impl<'d, C, X: Extract<C>> CompletionRegistrarWithRegion<'d>
-    for Pin<&mut ReplyStream<'d, C, X>>
-{
-    type Output = Poll<Option<X::Output>>;
-
-    #[inline(always)]
-    fn register(self, wake: CompletionWaker<'d>, token: &mut RegionToken<'d>) -> Self::Output {
-        let me = self.get_mut();
-        let Some(poll) = me.handle.with_slot(token, |slot, waker| {
-            if let Some(output) = X::extract(slot) {
-                return Poll::Ready(Some(output));
+        let me = self.as_mut().get_mut();
+        loop {
+            let state = me.handle.with_slot(cx.as_mut().region_token(), |slot| {
+                X::extract(slot).map_or_else(
+                    || (slot.completed() && slot.is_empty()).then_some(None),
+                    |output| Some(Some(output)),
+                )
+            });
+            match state {
+                Some(Some(Some(output))) => return Poll::Ready(Some(output)),
+                Some(Some(None)) | None => {
+                    me.handle.release_done();
+                    return Poll::Ready(None);
+                }
+                Some(None) => {}
             }
-            if slot.completed() && slot.is_empty() {
+            let Some(receiver) = me.handle.receiver() else {
                 return Poll::Ready(None);
+            };
+            if receiver.poll(cx.as_mut()).is_pending() {
+                return Poll::Pending;
             }
-            *waker = Some(wake);
-            Poll::Pending
-        }) else {
-            return Poll::Ready(None);
-        };
-        if matches!(poll, Poll::Ready(None)) {
-            me.handle.release_done();
         }
-        poll
     }
 }
 

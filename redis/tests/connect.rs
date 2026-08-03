@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::convert::Infallible;
 use std::mem::{align_of, size_of};
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -10,11 +11,10 @@ use dope::manifold::connector::source::health::Static;
 use dope::manifold::env::Bundle;
 use dope::runtime::executor::Executor;
 use dope::runtime::profile::Throughput;
-use dope_net::ProvidedLease;
 use dope_net::tcp::Tcp;
 use dope_net::wire::identity::Identity;
 use dope_net::wire::send::{Plain, Prepared, Storage, Vectored};
-use dope_net::wire::{ReadyOpen, Reclaim, RuntimeLimits, Wire};
+use dope_net::wire::{Lease, ReadyOpen, Reclaim, RuntimeLimits, Wire};
 
 struct CoreLocalConfig {
     initialized: Rc<Cell<usize>>,
@@ -31,6 +31,7 @@ impl Wire for CoreLocalWire {
         = ReadyOpen<Self::Connection<'d>, Self::SendStorage>
     where
         'd: 'a;
+    type OpenError = Infallible;
     type Recv<'a> = <Identity as Wire>::Recv<'a>;
     type RecvBatch<'a> = <Identity as Wire>::RecvBatch<'a>;
     type RetainedRecv<'d> = <Identity as Wire>::RetainedRecv<'d>;
@@ -51,11 +52,13 @@ impl Wire for CoreLocalWire {
         Ok(())
     }
 
-    fn prepare_open<'a, 'd>(_: &'a mut Self::RuntimeContext<'d>) -> Option<Self::Open<'a, 'd>>
+    fn prepare_open<'a, 'd>(
+        _: &'a mut Self::RuntimeContext<'d>,
+    ) -> Result<Option<Self::Open<'a, 'd>>, Self::OpenError>
     where
         'd: 'a,
     {
-        Some(ReadyOpen::new(Self(Identity), ()))
+        Ok(Some(ReadyOpen::new(Self(Identity), ())))
     }
 
     fn process_recv<'a, 'd>(
@@ -69,7 +72,7 @@ impl Wire for CoreLocalWire {
     fn process_retained_recv<'a, 'd>(
         wire: &mut Self::Connection<'d>,
         runtime: &mut Self::RuntimeContext<'d>,
-        bytes: ProvidedLease<'a>,
+        bytes: Lease<'a>,
     ) -> Option<Self::RetainedRecv<'a>> {
         Identity::process_retained_recv(&mut wire.0, runtime, bytes)
     }

@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use cartel_gen::{pg_instance, query_group};
 use cartel_pg::dsl::{
-    Array as _, Fts as _, In as _, Ltree as _, Text as _, array_length, cardinality, exists, lag,
-    lead, not_exists, plainto_tsquery, row_number, to_tsquery, to_tsvector, ts_rank,
+    Array, Fts, In, Ltree as LtreeDsl, Text, array_length, cardinality, exists, lag, lead,
+    not_exists, plainto_tsquery, row_number, to_tsquery, to_tsvector, ts_rank,
 };
 use cartel_pg::{
     Client, Date, IsolationLevel, Ltree, PgOps, PgPool, PgRawExt, PgTable, Port, Stream, Timestamp,

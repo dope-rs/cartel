@@ -26,7 +26,7 @@ fn rejected_drain_item_is_restored_at_the_front() {
         queue.try_push(&mut token, 1, 10).unwrap();
         queue.try_push(&mut token, 2, 20).unwrap();
 
-        queue.drain(&mut token, Err);
+        queue.drain(&mut token, |_, item| Err(item));
         assert_eq!(queue.len(&token), 2);
         assert_eq!(queue.weight(&token), 30);
         assert_eq!(queue.pop_front(&mut token), Some(1));

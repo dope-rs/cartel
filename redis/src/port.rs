@@ -8,8 +8,8 @@ use dope::driver::token::Token;
 use dope::manifold::connector;
 use dope_fiber::raw::task::Context;
 use dope_fiber::raw::wait::{WaitQueue, Waiter};
-use dope_net::link::egress::storage::Storage as EgressStorage;
-use o3::buffer::{Lease, Pool};
+use dope_net::link::egress::{self, LeaseBuffer};
+use o3::buffer::Pool;
 use o3::cell::RegionToken;
 
 use crate::Error;
@@ -17,30 +17,15 @@ use crate::client::Config;
 use crate::encode::Sink;
 use crate::protocol::Outcome;
 
-pub(super) struct Frame<'d> {
-    buffer: Lease<'d>,
-    overflowed: bool,
-}
-
-impl Frame<'_> {
-    fn overflowed(&self) -> bool {
-        self.overflowed
-    }
-}
-
-impl AsRef<[u8]> for Frame<'_> {
-    fn as_ref(&self) -> &[u8] {
-        self.buffer.as_ref()
-    }
-}
+pub(super) type Frame<'d> = LeaseBuffer<'d>;
 
 impl Sink for Frame<'_> {
     fn push(&mut self, byte: u8) {
-        self.overflowed |= self.buffer.try_push(byte).is_err();
+        let _ = self.try_push(byte);
     }
 
     fn extend_from_slice(&mut self, src: &[u8]) {
-        self.overflowed |= self.buffer.try_extend_from_slice(src).is_err();
+        let _ = self.try_extend_from_slice(src);
     }
 }
 
@@ -73,7 +58,7 @@ pub(super) struct Port<'d> {
     requests: Pool,
     inflight_capacity: usize,
     responses: Arena<'d, Outcome>,
-    egress: EgressStorage,
+    egress: egress::storage::Storage,
 }
 
 impl<'d> Port<'d> {
@@ -111,7 +96,7 @@ impl<'d> Port<'d> {
             requests: Pool::from_layout(config.request_pool()),
             inflight_capacity: config.inflight_capacity(),
             responses,
-            egress: EgressStorage::default(),
+            egress: egress::storage::Storage::default(),
         }
     }
 
@@ -119,7 +104,7 @@ impl<'d> Port<'d> {
         self.conns.len()
     }
 
-    pub(super) fn egress(&self) -> &EgressStorage {
+    pub(super) fn egress(&self) -> &egress::storage::Storage {
         &self.egress
     }
 
@@ -200,10 +185,7 @@ impl<'d> Port<'d> {
             .requests
             .try_acquire()
             .ok_or(Error::RequestEntryCapacity)?;
-        Ok(Frame {
-            buffer,
-            overflowed: false,
-        })
+        Ok(Frame::new(buffer))
     }
 
     pub(super) fn encode(
@@ -255,7 +237,7 @@ impl<'d> Port<'d> {
     pub(super) fn drain_requests(
         &'d self,
         token: Token,
-        push: impl FnMut(Frame<'d>) -> Result<(), Frame<'d>>,
+        push: impl FnMut(&mut RegionToken<'d>, Frame<'d>) -> Result<(), Frame<'d>>,
         region: &mut RegionToken<'d>,
     ) -> connector::app::Requests {
         if self.conn(token).is_none() {

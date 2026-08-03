@@ -7,17 +7,17 @@ use dope::manifold::env::Env;
 use dope::runtime::executor::StorageFactory;
 use dope::{DriverContext, DriverRef};
 use dope_net::Transport;
-use dope_net::link::egress::storage::Storage as EgressStorage;
+use dope_net::link::egress::{self, LeaseBuffer};
 use dope_net::wire::Wire;
-use o3::buffer::{Lease, Pool, PoolLayout};
+use o3::buffer::{Pool, PoolLayout};
 use o3::cell::RegionToken;
 use std::cell::Cell;
 use std::marker::PhantomData;
 
-use crate::protocol::{RowItem, Session, Shared as PoolState};
+use crate::Error;
+use crate::protocol;
 use crate::query::QuerySet;
 use crate::wire::Sink;
-use crate::{Config as DatabaseConfig, Error};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -164,38 +164,23 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-pub struct Frame<'d> {
-    buffer: Lease<'d>,
-    overflowed: bool,
-}
-
-impl Frame<'_> {
-    pub(super) fn overflowed(&self) -> bool {
-        self.overflowed
-    }
-}
-
-impl AsRef<[u8]> for Frame<'_> {
-    fn as_ref(&self) -> &[u8] {
-        self.buffer.as_ref()
-    }
-}
+pub type Frame<'d> = LeaseBuffer<'d>;
 
 impl Sink for Frame<'_> {
     fn push(&mut self, byte: u8) {
-        self.overflowed |= self.buffer.try_push(byte).is_err();
+        let _ = self.try_push(byte);
     }
 
     fn extend_from_slice(&mut self, src: &[u8]) {
-        self.overflowed |= self.buffer.try_extend_from_slice(src).is_err();
+        let _ = self.try_extend_from_slice(src);
     }
 
     fn len(&self) -> usize {
-        self.buffer.len()
+        self.len()
     }
 
     fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.buffer.as_mut_slice()
+        self.as_mut_slice()
     }
 }
 
@@ -239,12 +224,12 @@ impl<'d> Conn<'d> {
 }
 
 pub struct Port<'d, I: QuerySet> {
-    pub(super) shared: PoolState,
+    pub(super) shared: protocol::Shared,
     conns: Box<[Conn<'d>]>,
     request_queue: QueueArena<'d, Frame<'d>>,
     requests: Pool,
-    responses: Arena<'d, RowItem>,
-    egress: EgressStorage,
+    responses: Arena<'d, protocol::RowItem>,
+    egress: egress::storage::Storage,
     _instance: PhantomData<fn() -> I>,
 }
 
@@ -255,7 +240,7 @@ impl<'d, I: QuerySet> AsRef<Self> for Port<'d, I> {
 }
 
 pub struct PortFactory<I> {
-    database: DatabaseConfig,
+    database: crate::Config,
     config: Config,
     instance: PhantomData<fn() -> I>,
 }
@@ -267,7 +252,7 @@ impl<I> PortFactory<I> {
 }
 
 impl<'d, I: QuerySet> Port<'d, I> {
-    pub fn factory(database: DatabaseConfig, config: Config) -> PortFactory<I> {
+    pub fn factory(database: crate::Config, config: Config) -> PortFactory<I> {
         PortFactory {
             database,
             config,
@@ -275,7 +260,7 @@ impl<'d, I: QuerySet> Port<'d, I> {
         }
     }
 
-    pub fn new(database: DatabaseConfig, config: Config, driver: DriverRef<'d>) -> Self {
+    pub fn new(database: crate::Config, config: Config, driver: DriverRef<'d>) -> Self {
         let connections = config.connection_capacity();
         let request_entries = config.request_capacity();
         let limits = Limits::new(
@@ -293,12 +278,12 @@ impl<'d, I: QuerySet> Port<'d, I> {
             limits,
         ));
         Self {
-            shared: PoolState::new(database, config),
+            shared: protocol::Shared::new(database, config),
             conns: (0..connections).map(|_| Conn::new(driver)).collect(),
             request_queue,
             requests: Pool::from_layout(config.request_pool()),
             responses,
-            egress: EgressStorage::default(),
+            egress: egress::storage::Storage::default(),
             _instance: PhantomData,
         }
     }
@@ -323,7 +308,7 @@ impl<'d, I: QuerySet> Port<'d, I> {
         &'d self,
         upstreams: S,
         driver: &mut DriverContext<'_, 'd>,
-    ) -> std::io::Result<Connector<'d, ID, Session<'d, I>, S, E>>
+    ) -> std::io::Result<Connector<'d, ID, protocol::Session<'d, I>, S, E>>
     where
         S: Dialer<E::Transport> + 'd,
         E: Env + 'd,
@@ -331,7 +316,7 @@ impl<'d, I: QuerySet> Port<'d, I> {
         <E::Wire as Wire>::InitConfig<'d>: Default,
     {
         Connector::new(
-            Session::new(self),
+            protocol::Session::new(self),
             upstreams,
             self.config().connection_capacity(),
             &self.egress,
@@ -348,14 +333,14 @@ impl<'d, I: QuerySet> Port<'d, I> {
         upstreams: S,
         wire: <E::Wire as Wire>::InitConfig<'d>,
         driver: &mut DriverContext<'_, 'd>,
-    ) -> std::io::Result<Connector<'d, ID, Session<'d, I>, S, E>>
+    ) -> std::io::Result<Connector<'d, ID, protocol::Session<'d, I>, S, E>>
     where
         S: Dialer<E::Transport> + 'd,
         E: Env + 'd,
         E::Transport: Transport,
     {
         Connector::new_with_wire_config(
-            Session::new(self),
+            protocol::Session::new(self),
             upstreams,
             self.config().connection_capacity(),
             wire,
@@ -394,10 +379,7 @@ impl<'d, I: QuerySet> Port<'d, I> {
     pub(super) fn frame(&'d self) -> Result<Frame<'d>, Error> {
         self.requests
             .try_acquire()
-            .map(|buffer| Frame {
-                buffer,
-                overflowed: false,
-            })
+            .map(Frame::new)
             .ok_or(Error::RequestCapacity)
     }
 
@@ -448,7 +430,7 @@ impl<'d, I: QuerySet> Port<'d, I> {
         &'d self,
         token: Token,
         bytes: Frame<'d>,
-        reply: &mut impl Registrable<'d, RowItem>,
+        reply: &mut impl Registrable<'d, protocol::RowItem>,
         boundary: Boundary,
         region: &mut RegionToken<'d>,
     ) -> Result<(), (Error, Frame<'d>)> {
@@ -496,7 +478,7 @@ impl<'d, I: QuerySet> Port<'d, I> {
     pub(super) fn drain_requests(
         &'d self,
         token: Token,
-        push: impl FnMut(Frame<'d>) -> Result<(), Frame<'d>>,
+        push: impl FnMut(&mut RegionToken<'d>, Frame<'d>) -> Result<(), Frame<'d>>,
         region: &mut RegionToken<'d>,
     ) -> dope::manifold::connector::app::Requests {
         let Some(conn) = self.conn(token) else {
@@ -557,7 +539,7 @@ impl<'d, I: QuerySet> Port<'d, I> {
         true
     }
 
-    pub(super) fn responses(&'d self, token: Token) -> Option<ArenaLane<'d, RowItem>> {
+    pub(super) fn responses(&'d self, token: Token) -> Option<ArenaLane<'d, protocol::RowItem>> {
         self.conn(token)?;
         Some(self.responses.lane(token.slot().raw() as usize))
     }

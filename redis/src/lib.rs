@@ -15,7 +15,7 @@ pub use client::{
     Capacities, Config, ConfigError, Connect, DEFAULT_BACKOFF, Factory, GeoCoord,
     MAX_FRAME_CAPACITY, Ops, Redis, Store,
 };
-pub use protocol::Error as ProtocolError;
+pub type ProtocolError = protocol::Error;
 pub use value::{FromValue, Value};
 
 #[derive(Debug)]
