@@ -1,0 +1,140 @@
+use crate::backend;
+use crate::dialect::pg::types::TypeExt as _;
+use syn::visit::Visit as _;
+
+pub(crate) struct Row<'a>(pub(crate) &'a syn::DeriveInput);
+
+impl Row<'_> {
+    pub(crate) fn emit(self) -> syn::Result<proc_macro2::TokenStream> {
+        let input = self.0;
+        if !input.generics.params.is_empty() || input.generics.where_clause.is_some() {
+            return Err(syn::Error::new_spanned(
+                &input.generics,
+                "#[derive(PgRow)] does not support generic structs",
+            ));
+        }
+        let syn::Data::Struct(data) = &input.data else {
+            return Err(syn::Error::new_spanned(
+                input,
+                "PgRow requires named fields",
+            ));
+        };
+        let syn::Fields::Named(fields) = &data.fields else {
+            return Err(syn::Error::new_spanned(
+                input,
+                "PgRow requires named fields",
+            ));
+        };
+        if fields.named.is_empty() || fields.named.len() > i16::MAX as usize {
+            return Err(syn::Error::new_spanned(
+                fields,
+                format!(
+                    "PostgreSQL row requires 1..={} fields; actual={}",
+                    i16::MAX,
+                    fields.named.len()
+                ),
+            ));
+        }
+        let mut named = false;
+        for attr in &input.attrs {
+            if attr.path().is_ident("row") {
+                attr.parse_nested_meta(|meta| {
+                    if !meta.path.is_ident("view") {
+                        return Err(meta.error("expected view"));
+                    }
+                    if named {
+                        return Err(meta.error("duplicate view"));
+                    }
+                    named = true;
+                    Ok(())
+                })?;
+            }
+        }
+        let name = &input.ident;
+        let types: Vec<_> = fields.named.iter().map(|field| &field.ty).collect();
+        let names: Vec<_> = fields.named.iter().map(|field| &field.ident).collect();
+        let shape = types.iter().rev().fold(quote::quote! { () }, |tail, ty| {
+            quote::quote! { (#ty, #tail) }
+        });
+        let mut owned = Vec::new();
+        for (name, ty) in names.iter().zip(&types) {
+            let read = ty.row_read()?;
+            owned.push(quote::quote! { #name: #read, });
+        }
+        let (view, decode, project) = if named {
+            let row = quote::format_ident!("{name}View");
+            let mut reserved = backend::Names::default();
+            reserved.visit_derive_input(input);
+            let lease = reserved.fresh("__cartel_lease_");
+            let vis = &input.vis;
+            let mut decls = Vec::new();
+            for field in &fields.named {
+                let name = &field.ident;
+                let vis = &field.vis;
+                let ty = field.ty.view_type()?;
+                decls.push(quote::quote! { #vis #name: #ty });
+            }
+            let pattern = names.iter().rev().fold(quote::quote! { () }, |tail, name| {
+                quote::quote! { (#name, #tail) }
+            });
+            (
+                quote::quote! { #row<'row> },
+                quote::quote! {
+                    let fields = <<Self as ::cartel_pg::schema::Project>::Fields as ::cartel_pg::schema::Row>::decode(row)?;
+                    ::core::result::Result::Ok(<Self as ::cartel_pg::schema::Project>::project(fields))
+                },
+                quote::quote! {
+                    #[derive(Clone, Copy)]
+                    #vis struct #row<'row> {
+                        #(#decls,)*
+                        #lease: ::core::marker::PhantomData<&'row ()>,
+                    }
+
+                    impl ::cartel_pg::schema::Project for #name {
+                        type Fields = #shape;
+
+                        fn project<'row>(fields: <Self::Fields as ::cartel_pg::schema::Row>::View<'row>) -> Self::View<'row> {
+                            let #pattern = fields;
+                            #row { #(#names,)* #lease: ::core::marker::PhantomData }
+                        }
+                    }
+                },
+            )
+        } else {
+            (
+                quote::quote! { <#shape as ::cartel_pg::schema::Row>::View<'row> },
+                quote::quote! { <#shape as ::cartel_pg::schema::Row>::decode(row) },
+                quote::quote! {},
+            )
+        };
+        Ok(quote::quote! {
+            #project
+
+            impl ::cartel_pg::schema::Row for #name {
+                type View<'row> = #view;
+
+                fn decode<'row>(row: &mut ::cartel_pg::protocol::value::decode::RowReader<'row>) -> ::core::result::Result<Self::View<'row>, ::cartel_pg::Error> {
+                    #decode
+                }
+
+                fn decode_owned(row: &mut ::cartel_pg::protocol::value::decode::RowReader<'_>) -> ::core::result::Result<Self, ::cartel_pg::Error> {
+                    ::core::result::Result::Ok(Self { #(#owned)* })
+                }
+            }
+
+            impl ::cartel_pg::schema::desc::Validate for #name {
+                const DYNAMIC_TYPES: u8 =
+                    0u8 #( | <#types as ::cartel_pg::schema::desc::Validate>::DYNAMIC_TYPES )*;
+
+                fn validate(types: &mut ::cartel_pg::schema::desc::Types<'_>) -> ::core::result::Result<(), ::cartel_pg::Error> {
+                    #(<#types as ::cartel_pg::schema::desc::Validate>::validate(types)?;)*
+                    ::core::result::Result::Ok(())
+                }
+
+                fn formats(values: &mut ::cartel_pg::schema::desc::Formats<'_>) -> ::core::result::Result<(), ::cartel_pg::protocol::encode::Error> {
+                    <#shape as ::cartel_pg::schema::desc::Validate>::formats(values)
+                }
+            }
+        })
+    }
+}

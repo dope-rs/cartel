@@ -1,0 +1,491 @@
+use cartel_pg::api::traits::{Client as _, Status as _};
+use cartel_pg::{
+    api::results::Row,
+    port::replies::Payload,
+    protocol::{Reason, Wire},
+};
+use cartel_pg::{
+    api::{Client, traits},
+    port, schema,
+    schema::{array::Element as _, result},
+};
+use common::port::Reply;
+use common::wire::checked::{ArrayQuery, Database, MixedQuery, TextQuery, TextRow};
+use common::{topology, wire::checked::Group};
+use dope::core::driver::life::recovery;
+use dope::{
+    core::driver::route::Id, manifold::app::env::Bundle, manifold::timing::Throughput,
+    net::tcp::Tcp, net::wire::Identity, runtime::executor::session::Completion,
+};
+use dope_fiber::BlockOn as _;
+use dope_test::alloc::Tracker;
+use dope_test::{harness::GUARD, harness::peer::TcpScript, reclaim::Reports};
+use std::time::Duration;
+
+pub mod common;
+
+#[global_allocator]
+static ALLOCATOR: Tracker = Tracker::new();
+
+fn with_row<Q, R>(
+    bytes: &[u8],
+    check: impl for<'b, 'c, 'd> FnOnce(Row<Payload<'b, 'c, 'd>, Q>) -> R,
+) -> R
+where
+    Q: schema::TypedQuery<Group = Group, Result = result::Rows>,
+    for<'p> Q::Params<'p>: Default,
+{
+    TcpScript::with(
+        |socket| Database::serve_rows(socket, [bytes]),
+        |server| {
+            let login = cartel_pg::Config::new("user".into(), "password".into(), "database".into())
+                .expect("database credentials");
+            let config = Database::config().expect("bounded PostgreSQL config");
+            let ready = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+                port::Port::<Database>::plan(login, config),
+                server.addr(),
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+            )
+            .expect("prepared PostgreSQL topology");
+            let mut reports = Reports::<_>::new(ready.layout(), [Id::fixed::<0>()]);
+            let mut report = Completion::new();
+            let result = ready
+                .with_local(
+                    |worker| {
+                        worker.lend(|node, stage| {
+                            node.install(stage, |host, stage| {
+                                stage.with_quiesce(&mut report, host, GUARD, |mut app| {
+                                    let client: Client<'_, '_, '_, '_, '_, '_, '_, _, Database> =
+                                        app.root_client();
+                                    app.block_on(client.status().wait_ready())
+                                        .expect("driver ready")
+                                        .ok()
+                                        .expect("PostgreSQL ready");
+                                    let row = app
+                                        .block_on(traits::Query::run_one::<Q>(
+                                            client.query(),
+                                            Default::default(),
+                                        ))
+                                        .expect("driver query");
+                                    assert!(
+                                        row.is_ok(),
+                                        "{:?}",
+                                        row.as_ref().err().map(Reply::from)
+                                    );
+                                    check(row.ok().expect("query row"))
+                                })
+                            })
+                        })
+                    },
+                    recovery::Policy::new(|event| reports.push(event), common::recover),
+                    |outcome| {
+                        assert!(
+                            outcome.is_ok(),
+                            "{:?}",
+                            outcome.as_ref().err().map(|error| error.cause())
+                        );
+                        outcome.ok().expect("application entry")
+                    },
+                )
+                .expect("scoped PostgreSQL")
+                .ok()
+                .expect("application scope");
+            assert!(
+                reports.events().expect("native reclamation").is_empty(),
+                "unexpected native recovery"
+            );
+            server
+                .finish()
+                .expect("script execution")
+                .expect("PostgreSQL script");
+            result
+        },
+    )
+    .expect("script listener")
+}
+
+#[test]
+fn retains_source() {
+    let bytes = TextRow::wire(i64::MIN, "여름".as_bytes());
+    with_row::<TextQuery, _>(&bytes, |row| {
+        let ptr = row.decode().expect("decoded row").name.as_ptr();
+        let (row, count) = Tracker::count(|| row.validate());
+        let row = row.expect("validated row");
+        let (view, read) = Tracker::count(|| row.view());
+        assert_eq!((count, read), (0, 0));
+        assert_eq!(view.lease, i64::MIN);
+        assert_eq!(view.name, "여름");
+        assert_eq!(view.name.as_ptr(), ptr);
+    });
+}
+
+#[test]
+fn collects_multiple_rows() {
+    let first = TextRow::wire(3, b"first");
+    let second = TextRow::wire(7, b"second");
+    TcpScript::with(
+        |socket| Database::serve_batch(socket, [first.as_slice(), second.as_slice()]),
+        |server| {
+            let login = cartel_pg::Config::new("user".into(), "password".into(), "database".into())
+                .expect("database credentials");
+            let config = Database::config().expect("bounded PostgreSQL config");
+            let ready = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+                port::Port::<Database>::plan(login, config),
+                server.addr(),
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+            )
+            .expect("prepared PostgreSQL topology");
+            let mut reports = Reports::<_>::new(ready.layout(), [Id::fixed::<0>()]);
+            let mut report = Completion::new();
+            ready
+                .with_local(
+                    |worker| {
+                        worker.lend(|node, stage| {
+                            node.install(stage, |host, stage| {
+                                stage.with_quiesce(&mut report, host, GUARD, |mut app| {
+                                    let client: Client<'_, '_, '_, '_, '_, '_, '_, _, Database> =
+                                        app.root_client();
+                                    app.block_on(client.status().wait_ready())
+                                        .expect("driver ready")
+                                        .ok()
+                                        .expect("PostgreSQL ready");
+                                    let rows = app
+                                        .block_on(traits::Query::run_all::<TextQuery>(
+                                            client.query(),
+                                            (),
+                                        ))
+                                        .expect("driver query");
+                                    assert!(
+                                        rows.is_ok(),
+                                        "{:?}",
+                                        rows.as_ref().err().map(Reply::from)
+                                    );
+                                    let rows = rows.ok().expect("query rows");
+                                    let rows = rows.validate().expect("validated rows");
+                                    let mut rows = rows.iter();
+                                    let first = rows.next().expect("first row");
+                                    assert_eq!((first.lease, first.name), (3, "first"));
+                                    let second = rows.next().expect("second row");
+                                    assert_eq!((second.lease, second.name), (7, "second"));
+                                    assert!(rows.next().is_none());
+                                })
+                            })
+                        })
+                    },
+                    recovery::Policy::new(|event| reports.push(event), common::recover),
+                    |outcome| {
+                        assert!(
+                            outcome.is_ok(),
+                            "{:?}",
+                            outcome.as_ref().err().map(|error| error.cause())
+                        );
+                        outcome.ok().expect("application entry")
+                    },
+                )
+                .expect("scoped PostgreSQL")
+                .expect("application scope");
+            assert!(
+                reports.events().expect("native reclamation").is_empty(),
+                "unexpected native recovery"
+            );
+            server
+                .finish()
+                .expect("script execution")
+                .expect("PostgreSQL script");
+        },
+    )
+    .expect("script listener");
+}
+
+#[test]
+fn owned_batch_failure() {
+    let first = TextRow::wire(3, b"first");
+    let mut second = TextRow::wire(7, b"second");
+    second.push(9);
+    TcpScript::with(
+        |socket| Database::serve_batch(socket, [first.as_slice(), second.as_slice()]),
+        |server| {
+            let login = cartel_pg::Config::new("user".into(), "password".into(), "database".into())
+                .expect("database credentials");
+            let config = Database::config().expect("bounded PostgreSQL config");
+            let ready = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+                port::Port::<Database>::plan(login, config),
+                server.addr(),
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+            )
+            .expect("prepared PostgreSQL topology");
+            let mut reports = Reports::<_>::new(ready.layout(), [Id::fixed::<0>()]);
+            let mut report = Completion::new();
+            ready
+                .with_local(
+                    |worker| {
+                        worker.lend(|node, stage| {
+                            node.install(stage, |host, stage| {
+                                stage.with_quiesce(&mut report, host, GUARD, |mut app| {
+                                    let client: Client<'_, '_, '_, '_, '_, '_, '_, _, Database> =
+                                        app.root_client();
+                                    app.block_on(client.status().wait_ready())
+                                        .expect("driver ready")
+                                        .ok()
+                                        .expect("PostgreSQL ready");
+                                    let rows = app
+                                        .block_on(traits::Query::run_all::<TextQuery>(
+                                            client.query(),
+                                            (),
+                                        ))
+                                        .expect("driver query");
+                                    let rows = rows.ok().expect("query rows");
+                                    let (result, counts) = Tracker::measure(|| rows.into_owned());
+                                    assert!(matches!(
+                                        result,
+                                        Err(cartel_pg::Error::Protocol(Reason::RowTrailing {
+                                            actual
+                                        })) if actual.get() == 1
+                                    ));
+                                    let bytes = 2 * size_of::<TextRow>() + 11;
+                                    assert_eq!(counts, [3, bytes, 3, bytes]);
+                                })
+                            })
+                        })
+                    },
+                    recovery::Policy::new(|event| reports.push(event), common::recover),
+                    |outcome| outcome.ok().expect("application entry"),
+                )
+                .expect("scoped PostgreSQL")
+                .expect("application scope");
+            assert!(
+                reports.events().expect("native reclamation").is_empty(),
+                "unexpected native recovery"
+            );
+            server
+                .finish()
+                .expect("script execution")
+                .expect("PostgreSQL script");
+        },
+    )
+    .expect("script listener");
+}
+
+#[test]
+fn rejects_invalid_utf8() {
+    with_row::<TextQuery, _>(&TextRow::wire(3, &[0xff]), |row| {
+        assert!(matches!(
+            row.validate(),
+            Err(cartel_pg::Error::Protocol(Reason::TextUtf8 {
+                column: 1,
+                ..
+            }))
+        ));
+    });
+}
+
+#[test]
+fn rejects_scalar_width() {
+    let mut bytes = TextRow::wire(3, b"name");
+    bytes[2..6].copy_from_slice(&7i32.to_be_bytes());
+    with_row::<TextQuery, _>(&bytes, |row| {
+        assert!(matches!(
+            row.validate(),
+            Err(cartel_pg::Error::Protocol(Reason::ColumnWidth {
+                column: 0,
+                ..
+            }))
+        ));
+    });
+}
+
+#[test]
+fn rejects_null_text() {
+    let mut bytes = TextRow::wire(3, b"");
+    bytes[14..18].copy_from_slice(&(-1i32).to_be_bytes());
+    with_row::<TextQuery, _>(&bytes, |row| {
+        assert!(matches!(
+            row.validate(),
+            Err(cartel_pg::Error::Protocol(Reason::ColumnNull { column: 1 }))
+        ));
+    });
+}
+
+#[test]
+fn rejects_row_shape() {
+    let mut bytes = TextRow::wire(3, b"name");
+    bytes[..2].copy_from_slice(&1u16.to_be_bytes());
+    with_row::<TextQuery, _>(&bytes, |row| {
+        assert!(matches!(
+            row.validate(),
+            Err(cartel_pg::Error::Protocol(Reason::ColumnCount {
+                actual: 1,
+                expected: 2
+            }))
+        ));
+    });
+    bytes[..2].copy_from_slice(&2u16.to_be_bytes());
+    bytes.push(0);
+    with_row::<TextQuery, _>(&bytes, |row| {
+        assert!(matches!(
+            row.validate(),
+            Err(cartel_pg::Error::Protocol(Reason::RowTrailing { .. }))
+        ));
+    });
+}
+
+#[test]
+fn rejects_truncated_text() {
+    let mut bytes = TextRow::wire(3, b"name");
+    bytes.pop();
+    with_row::<TextQuery, _>(&bytes, |row| {
+        assert!(matches!(
+            row.validate(),
+            Err(cartel_pg::Error::Protocol(Reason::ColumnBytes {
+                column: 1,
+                ..
+            }))
+        ));
+    });
+}
+
+#[test]
+fn retains_mixed_widths() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&3u16.to_be_bytes());
+    bytes.extend_from_slice(&8i32.to_be_bytes());
+    bytes.extend_from_slice(&i64::MIN.to_be_bytes());
+    bytes.extend_from_slice(&4i32.to_be_bytes());
+    bytes.extend_from_slice(&i32::MIN.to_be_bytes());
+    bytes.extend_from_slice(&8i32.to_be_bytes());
+    bytes.extend_from_slice(&i64::MAX.to_be_bytes());
+    with_row::<MixedQuery, _>(&bytes, |row| {
+        let (row, count) = Tracker::count(|| row.validate());
+        let row = row.expect("mixed scalar fields");
+        let (view, read) = Tracker::count(|| row.view());
+        assert_eq!((count, read), (0, 0));
+        assert_eq!(
+            (view.low, view.middle, view.high),
+            (i64::MIN, i32::MIN, i64::MAX)
+        );
+    });
+    bytes[14..18].copy_from_slice(&3i32.to_be_bytes());
+    with_row::<MixedQuery, _>(&bytes, |row| {
+        assert!(matches!(
+            row.validate(),
+            Err(cartel_pg::Error::Protocol(Reason::ColumnWidth {
+                column: 1,
+                ..
+            }))
+        ));
+    });
+}
+
+#[test]
+fn array_keeps_tail() {
+    let mut bytes = Wire::try_new(&[
+        0, 0, 0, 4, 255, 255, 255, 255, 0, 0, 0, 8, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0xe2,
+        0x82, 0xac, 9,
+    ])
+    .expect("bounded array");
+    assert_eq!(i32::__read(&mut bytes).expect("array i32"), -1);
+    assert_eq!(i64::__read(&mut bytes).expect("array i64"), i64::MIN);
+    assert_eq!(<&str>::__read(&mut bytes).expect("array text"), "€");
+    assert_eq!(bytes.as_slice(), &[9]);
+}
+
+#[test]
+fn array_error_progress() {
+    let mut bytes = Wire::try_new(&[0, 0, 0]).expect("bounded array");
+    assert!(matches!(
+        i32::__read(&mut bytes),
+        Err(cartel_pg::Error::Protocol(Reason::ArrayLength { .. }))
+    ));
+    assert_eq!(bytes.as_slice(), &[0, 0, 0]);
+    let mut bytes = Wire::try_new(&[0, 0, 0, 4, 1, 2]).expect("bounded array");
+    assert!(matches!(
+        i32::__read(&mut bytes),
+        Err(cartel_pg::Error::Protocol(Reason::ArrayBytes { .. }))
+    ));
+    assert_eq!(bytes.as_slice(), &[1, 2]);
+    let mut bytes = Wire::try_new(&[0x7f, 0xff, 0xff, 0xff, 1, 2]).expect("bounded array");
+    assert!(matches!(
+        i32::__read(&mut bytes),
+        Err(cartel_pg::Error::Protocol(Reason::ArrayBytes { actual, required }))
+            if actual.get() == 2 && required.get() == i32::MAX as u32
+    ));
+    assert_eq!(bytes.as_slice(), &[1, 2]);
+    let mut bytes = Wire::try_new(&[0, 0, 0, 3, 1, 2, 3, 9]).expect("bounded array");
+    assert!(matches!(
+        i32::__read(&mut bytes),
+        Err(cartel_pg::Error::Protocol(Reason::ArrayI32Width { .. }))
+    ));
+    assert_eq!(bytes.as_slice(), &[9]);
+    let mut bytes = Wire::try_new(&[0, 0, 0, 4, 1, 2, 3, 4, 9]).expect("bounded array");
+    assert!(matches!(
+        i64::__read(&mut bytes),
+        Err(cartel_pg::Error::Protocol(Reason::ArrayI64Width { .. }))
+    ));
+    assert_eq!(bytes.as_slice(), &[9]);
+    let mut bytes = Wire::try_new(&[0, 0, 0, 2, b'a', 0xff, 9]).expect("bounded array");
+    assert!(matches!(
+        <&str>::__read(&mut bytes),
+        Err(cartel_pg::Error::Protocol(Reason::ArrayTextUtf8 { valid, error }))
+            if valid.get() == 1 && error == cartel_pg::protocol::Utf8::One
+    ));
+    assert_eq!(bytes.as_slice(), &[9]);
+}
+
+#[test]
+fn array_collect_owns() {
+    for (len, count, bytes) in [(0, 0, 0), (2, 3, 2 * size_of::<String>() + 11)] {
+        let values: &[&[u8]] = &[b"first", b"second"];
+        let input = ArrayQuery::wire(&values[..len], &[]);
+        with_row::<ArrayQuery, _>(&input, |row| {
+            let array = row.decode().expect("array row");
+            let (owned, counts) =
+                Tracker::measure(|| Tracker::fail_after(count, || array.try_collect()));
+            let owned = owned.expect("owned array");
+            assert_eq!(owned, &["first", "second"][..len]);
+            assert_eq!(counts, [count, bytes, 0, 0]);
+            let ((), counts) = Tracker::measure(|| drop(owned));
+            assert_eq!(counts, [0, 0, count, bytes]);
+        });
+    }
+}
+
+#[test]
+fn array_collect_fails() {
+    use cartel_pg::Error::{Allocation, Protocol};
+    let outer = 2 * size_of::<String>();
+    type Case<'a, 'b, 'c> = (&'a [&'b [u8]], &'c [u8], usize, usize);
+    let cases: [Case<'_, '_, '_>; 3] = [
+        (&[], &[9], 0, 0),
+        (&[b"first", b"second"], &[9], 3, outer + 11),
+        (&[b"first", b"a\xff"], &[], 2, outer + 5),
+    ];
+    for (values, trailing, count, size) in cases {
+        let bytes = ArrayQuery::wire(values, trailing);
+        with_row::<ArrayQuery, _>(&bytes, |row| {
+            let array = row.decode().expect("array row");
+            if count == 3 {
+                for (allows, bytes) in [0, outer, outer + 5].into_iter().enumerate() {
+                    let (result, counts) =
+                        Tracker::measure(|| Tracker::fail_after(allows, || array.try_collect()));
+                    assert!(matches!(
+                        result,
+                        Err(Allocation(o3::alloc::Error::Exhausted))
+                    ));
+                    assert_eq!(counts, [allows, bytes, allows, bytes]);
+                }
+            }
+            let (result, counts) =
+                Tracker::measure(|| Tracker::fail_after(count, || array.try_collect()));
+            assert!(matches!(result, Err(Protocol(reason)) if match reason {
+                Reason::ArrayTrailing { actual } => !trailing.is_empty() && actual.get() == 1,
+                Reason::ArrayTextUtf8 { valid, error } => trailing.is_empty()
+                    && valid.get() == 1 && error == cartel_pg::protocol::Utf8::One,
+                _ => false,
+            }));
+            assert_eq!(counts, [count, size, count, size]);
+        });
+    }
+}

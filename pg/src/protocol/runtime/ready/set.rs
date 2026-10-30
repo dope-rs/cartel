@@ -1,0 +1,169 @@
+use crate::port::Disposition;
+use dope::core::driver::{self, route, schedule::ready::Target};
+use dope::manifold::client::conn;
+use dope_fiber::wait::Capacity;
+use dope_fiber::{context, wait};
+use o3::alloc::Error;
+use std::{cell, num, pin};
+
+use crate::port::pool::{access, slot};
+use crate::port::replies;
+use crate::protocol;
+use crate::protocol::runtime::{ready, tx::poll, waiters};
+use cartel_core::reply::order::Depth;
+use ready::{plan, storage};
+
+pub(crate) struct Set<'d, const ID: u8> {
+    index: storage::Index<'d, ID>,
+    policy: cell::Cell<protocol::PickPolicy>,
+    pub(in crate::protocol) waiters: waiters::Queue<'d>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Bind {
+    Bound,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum Blocking {
+    Clear,
+    Held(num::NonZero<usize>),
+}
+
+impl<'d, const ID: u8> Set<'d, ID> {
+    pub(crate) fn try_new(
+        plan: plan::Plan,
+        driver: driver::Reference<'d>,
+        cap: Capacity,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            index: storage::Index::try_new(plan)?,
+            policy: cell::Cell::new(protocol::PickPolicy::default()),
+            waiters: waiters::Queue::new(driver, cap),
+        })
+    }
+
+    pub(crate) fn try_register<'target, 'poll>(
+        &'target self,
+        waiter: pin::Pin<&wait::Waiter<'target, 'd>>,
+        ctx: pin::Pin<&context::Context<'poll, 'd>>,
+    ) -> Result<(), wait::Error<'d>> {
+        self.waiters.try_register(waiter, ctx)
+    }
+
+    pub(crate) fn connection(
+        &self,
+        id: conn::Id<'d, route::KeyTag<ID>>,
+    ) -> Option<&slot::Slot<'d, ID>> {
+        let slot = self.index.entry(id.index().into_usize())?.slot();
+        slot.matches(id).then_some(slot)
+    }
+
+    pub(crate) fn current(
+        &self,
+        id: conn::Id<'d, route::KeyTag<ID>>,
+    ) -> access::Current<'_, 'd, ID> {
+        let Some(entry) = self.index.entry(id.index().into_usize()) else {
+            return access::Current::Stale;
+        };
+        access::Access::new(entry.slot()).current(id)
+    }
+
+    pub(crate) fn bind(&self, id: conn::Id<'d, route::KeyTag<ID>>, target: Target<'d>) -> Bind {
+        let Some(entry) = self.index.entry(id.index().into_usize()) else {
+            return Bind::Rejected;
+        };
+        if entry.is_listed() {
+            return Bind::Rejected;
+        }
+        match entry.slot().bind(id, target) {
+            slot::Bind::Bound => Bind::Bound,
+            slot::Bind::Occupied => Bind::Rejected,
+        }
+    }
+
+    pub(crate) fn pick<const GROUP: bool>(&self) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
+        match (self.policy.get(), GROUP) {
+            (protocol::PickPolicy::RoundRobin, false) => self.index.next(),
+            (protocol::PickPolicy::LeastInflight, false) => self.index.minimum(),
+            (protocol::PickPolicy::RoundRobin, true) => self.index.next_group(),
+            (protocol::PickPolicy::LeastInflight, true) => self.index.least_group(),
+        }
+    }
+
+    pub(crate) fn try_ready(
+        &self,
+        id: conn::Id<'d, route::KeyTag<ID>>,
+        depth: usize,
+    ) -> Result<(), protocol::Reason> {
+        self.index.try_ready(id, depth)?;
+        self.waiters.wake();
+        Ok(())
+    }
+
+    pub(crate) fn release(
+        &self,
+        proof: access::Reservation<'_, 'd, ID>,
+        depth: usize,
+    ) -> access::Release {
+        self.index.release(proof, depth)
+    }
+
+    pub(crate) fn reserve(
+        &self,
+        id: conn::Id<'d, route::KeyTag<ID>>,
+    ) -> access::Reserve<'_, 'd, ID> {
+        self.index.reserve(id)
+    }
+
+    pub(in crate::protocol) fn poll_ready(
+        &self,
+        id: conn::Id<'d, route::KeyTag<ID>>,
+        status: poll::Status,
+        depth: usize,
+    ) -> (poll::Readiness, Option<access::Transaction<'d, ID>>) {
+        self.index.poll_ready(id, status, depth)
+    }
+
+    pub(crate) fn finalize(&self, id: access::Transaction<'d, ID>) -> access::Finalization<'d, ID> {
+        self.index.finalize(id)
+    }
+
+    pub(crate) fn try_close(
+        &self,
+        id: conn::Id<'d, route::KeyTag<ID>>,
+        cause: replies::Failure,
+        fate: Disposition,
+    ) -> Option<slot::Close<'d, ID>> {
+        self.index.close(id, cause, fate)
+    }
+
+    pub(crate) fn reindex(
+        &self,
+        id: conn::Id<'d, route::KeyTag<ID>>,
+        depth: Depth,
+    ) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
+        self.index.reindex(id, depth)
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.index.count()
+    }
+
+    pub(crate) fn blocking(&self) -> Blocking {
+        match self.index.blockers() {
+            Some(count) => Blocking::Held(count),
+            None => Blocking::Clear,
+        }
+    }
+
+    pub(crate) fn set_policy(&self, policy: protocol::PickPolicy) {
+        self.policy.set(policy);
+    }
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<Blocking>() == std::mem::size_of::<usize>());
+    assert!(std::mem::align_of::<Blocking>() == std::mem::align_of::<usize>());
+};

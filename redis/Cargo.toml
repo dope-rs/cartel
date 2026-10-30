@@ -2,6 +2,7 @@
 name = "cartel-redis"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Async Redis driver for the dope runtime"
 license.workspace = true
 repository.workspace = true
@@ -11,12 +12,14 @@ authors.workspace = true
 o3.workspace = true
 dope.workspace = true
 dope-fiber.workspace = true
-dope-net.workspace = true
 cartel-core.workspace = true
 ryu.workspace = true
+pin-project.workspace = true
+zeroize = "1.8"
 
 [lib]
+test = false
+doctest = false
 
 [dev-dependencies]
-cartel-gen.workspace = true
-pin-project.workspace = true
+dope-test.workspace = true

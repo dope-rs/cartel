@@ -2,6 +2,7 @@
 name = "cartel-pg"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Async PostgreSQL driver for the dope runtime"
 license.workspace = true
 repository.workspace = true
@@ -12,14 +13,21 @@ cartel-core.workspace = true
 o3.workspace = true
 dope.workspace = true
 dope-fiber.workspace = true
-dope-net.workspace = true
 cartel-gen.workspace = true
-sha2 = { version = "0.11", default-features = false }
-hmac = { version = "0.13", default-features = false }
-pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
-base64 = { version = "0.23", default-features = false, features = ["alloc"] }
-stringprep = { version = "0.1" }
-rand = { version = "0.10", default-features = false, features = ["std", "sys_rng"] }
+sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
+hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
+base64 = { version = "0.23", default-features = false }
+stringprep = "0.1.5"
+unicode-normalization = "0.1.25"
+zeroize = "1.8"
+subtle = { version = "2.6", default-features = false }
 pin-project.workspace = true
 
+[dev-dependencies]
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+dope-test.workspace = true
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
+
 [lib]
+test = false
+doctest = false

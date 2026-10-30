@@ -1,109 +1,97 @@
-use std::net::SocketAddr;
-use std::pin::pin;
+use cartel_gen::pg_instance;
+use cartel_pg::api::traits::{Client as _, Status as _};
+use cartel_pg::{api, port, port::config};
+use common::{
+    env::{self, Env},
+    topology,
+};
+use dope::core::driver::life::recovery;
+use dope::runtime::executor::session::Completion;
+use dope::{
+    core::driver::route::Id, manifold::app::env::Bundle, manifold::timing::Throughput,
+    net::tcp::Tcp, net::wire::Identity,
+};
+use dope_fiber::BlockOn as _;
+use dope_test::{harness::GUARD, reclaim::Reports};
+use std::env::var_os;
 use std::time::Duration;
 
-use cartel_gen::pg_instance;
-use cartel_pg::{PgOps, port};
-use dope::driver::token::Token;
-use dope::manifold::Manifold;
-use dope::manifold::connector::source::health::Static;
-use dope::manifold::env::Bundle;
-use dope::runtime::profile::Throughput;
-use dope::{Completion, driver};
-use dope_net::tcp::Tcp;
-use dope_net::wire::identity::Identity;
-use o3::cell;
-
-const ROUTE: u8 = 0;
+pub mod common;
 
 pg_instance! { Probe: }
 
-fn pg_addr() -> SocketAddr {
-    let host = std::env::var("PG_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    let port: u16 = std::env::var("PG_PORT")
-        .unwrap_or_else(|_| "5432".into())
-        .parse()
-        .unwrap();
-    format!("{}:{}", host, port).parse().unwrap()
-}
-
-fn pg_cfg() -> cartel_pg::Config {
-    cartel_pg::Config::new(
-        std::env::var("PG_USER").unwrap_or_else(|_| "bench".into()),
-        std::env::var("PG_PASSWORD").unwrap_or_else(|_| "bench".into()),
-        std::env::var("PG_DATABASE").unwrap_or_else(|_| "bench".into()),
-    )
-}
-
 #[test]
+#[ignore = "requires CARTEL_PG_TEST and PostgreSQL"]
 fn probe_step_by_step() {
-    if std::env::var_os("CARTEL_PG_TEST").is_none() {
-        return;
-    }
-    let addr = pg_addr();
-    let cfg = pg_cfg();
-    let port_config = port::Config::new(port::Capacities {
+    let input = Env::try_load(env::NAMES.map(var_os)).expect("PostgreSQL environment");
+    let settings = config::Config::new(config::Capacities {
         connections: 1,
-        request_entries: 16,
-        request_bytes: 4 * 1024,
-        response_entries: 65_536,
-        response_bytes: 256 * 1024 * 1024,
         inflight: 16,
-        waiters: 16,
-        notifications: 1024,
-    })
-    .expect("port config");
-
-    let exec =
-        dope::runtime::executor::Executor::new(driver::Config::for_tcp_profile::<Throughput>(8))
-            .expect("driver")
-            .with_storage_factory(cartel_pg::Port::<Probe>::factory(cfg, port_config));
-    exec.enter(|mut sess| {
-        let backoff = sess.seed().derive(dope::hash::domain::BACKOFF).state();
-        let upstreams = Static::<Tcp>::new(vec![addr], Duration::from_millis(500), backoff);
-        let (client, connector) =
-            cartel_pg::attach::<ROUTE, Bundle<Tcp, Identity, Throughput>, Probe>(
-                &mut sess, upstreams,
-            )
-            .expect("connector");
-        let pg = pin!(cell::BrandCell::new(connector));
-        let pg = pg.as_ref();
-        let (token, mut driver) = sess.token_and_driver();
-
-        pg.borrow_pin_mut(token).pre_park(&mut driver);
-
-        let mut buf = [const { None }; 64];
-        let mut wake_buf: Vec<Token> = Vec::with_capacity(64);
-        for _ in 0..200 {
-            let n = driver.drain(&mut buf);
-            if n > 0 {
-                for event in &mut buf[..n] {
-                    let Some(ev) = event.take() else {
-                        continue;
-                    };
-                    if ev.route() == ROUTE {
-                        Manifold::dispatch(pg.borrow_pin_mut(token), ev, &mut driver);
-                    }
-                }
-            }
-            wake_buf.clear();
-            driver
-                .driver_ref()
-                .drain_ready(|target| wake_buf.push(target));
-            for t in &wake_buf {
-                if t.route() == ROUTE {
-                    let __typed = dope::manifold::typed::TypedToken::try_new(*t)
-                        .expect("ready target route was checked");
-                    Manifold::activate(pg.borrow_pin_mut(token), __typed, &mut driver);
-                }
-            }
-            pg.borrow_pin_mut(token).pre_park(&mut driver);
-            let live = client.live_count();
-            if live >= 1 {
-                return;
-            }
-            let _ = driver.wait(Some(Duration::from_millis(100)));
-        }
-        panic!("never reached live=1 after 200 iters (20s)");
+        admission_waiters: 16,
+        requests: config::Request {
+            frames: 16,
+            frame_bytes: 4 * 1024,
+        },
+        responses: config::Response {
+            items: 65_536,
+            bytes: 256 * 1024 * 1024,
+            frame_bytes: 16 * 1024 * 1024,
+        },
+        notifications: config::Notification {
+            items: 1024,
+            bytes: 4 * 1024 * 1024,
+        },
     });
+    let settings = settings.expect("port config");
+
+    let ((), events) = {
+        let prepared = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+            port::Port::<Probe>::plan(
+                input.try_config().expect("PostgreSQL credentials"),
+                settings,
+            ),
+            input.address(),
+            Duration::from_millis(500),
+            Duration::from_secs(512),
+        )
+        .expect("topology fixture completed");
+        let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+        let mut report = Completion::new();
+        let scoped = prepared.with_local(
+            |worker| {
+                worker.lend(|node, stage| {
+                    node.install(stage, |host, stage| {
+                        stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+                            let client: api::Client<'_, '_, '_, '_, '_, '_, '_, _, _> =
+                                runtime.root_client();
+
+                            assert!(
+                                matches!(
+                                    runtime.block_on(client.status().wait_ready()),
+                                    Ok(Ok(()))
+                                ),
+                                "PostgreSQL connection ready"
+                            );
+                        })
+                    })
+                })
+            },
+            recovery::Policy::new(|event| reports.push(event), common::recover),
+            |outcome| {
+                assert!(
+                    outcome.is_ok(),
+                    "{:?}",
+                    outcome.as_ref().err().map(|error| error.cause())
+                );
+                outcome.ok().expect("application entry")
+            },
+        );
+
+        let result = scoped.expect("application installation completed");
+        (result.expect("application session completed"), reports)
+    };
+    assert!(
+        events.events().expect("native reclamation").is_empty(),
+        "unexpected events PostgreSQL operations: {events:?}"
+    );
 }

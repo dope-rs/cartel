@@ -2,13 +2,26 @@
 name = "cartel-sqlite"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "SQLite driver for the dope runtime"
+readme = "../README.md"
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+cartel-core.workspace = true
 cartel-gen.workspace = true
-rusqlite = { version = "0.40", features = ["bundled"] }
+dope-core.workspace = true
+dope-fiber.workspace = true
+dope-runtime.workspace = true
+o3.workspace = true
+libsqlite3-sys.workspace = true
+
+[dev-dependencies]
+dope-test.workspace = true
+dope-manifold.workspace = true
 
 [lib]
+test = false
+doctest = false

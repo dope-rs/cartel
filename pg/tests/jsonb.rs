@@ -1,11 +1,11 @@
 use cartel_pg::Jsonb;
 
 #[test]
-fn owned_json_reuses_large_string_storage() {
-    let source = format!("\"{}\"", "x".repeat(1024));
+fn reuses_string_storage() {
+    let mut source = format!("\"{}\"", "x".repeat(1024));
     let ptr = source.as_ptr();
 
-    let json = Jsonb::from_string(source);
+    let json = Jsonb::try_from(&mut source).expect("owned JSON storage must freeze");
 
     assert_eq!(json.as_bytes().as_ptr(), ptr);
 }

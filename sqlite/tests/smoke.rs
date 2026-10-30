@@ -1,54 +1,161 @@
-use cartel_sqlite::{Connection, SqliteTable, sqlite_query};
+use crate::common::plan;
+use cartel_sqlite::runtime::{self, Runtime};
+use cartel_sqlite::{Error, open};
+use common::{assert_reclaimed, assert_retirement, engine::smoke::*};
+use dope_core::driver::life::recovery::Policy;
+use dope_manifold::timing::Throughput;
+use dope_test::fibers;
+use std::sync::OnceLock;
 
-#[derive(SqliteTable)]
-#[table_name("users")]
-struct User {
-    #[pk]
-    id: i64,
-    name: String,
-}
+pub mod common;
 
-#[sqlite_query]
-fn user_by_id(id: i64) -> User {
-    User::filter(|u| u.id == id).one()
-}
+static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
 
-#[sqlite_query]
-fn user_names(min_id: i64) -> Vec<String> {
-    User::filter(|u| u.id >= min_id).select(|u| u.name).all()
-}
-
-#[sqlite_query]
-fn maybe_user(id: i64) -> Option<User> {
-    User::filter(|u| u.id == id).first()
-}
-
-#[sqlite_query]
-fn rename(id: i64, name: String) {
-    User::filter(|u| u.id == id).update(|u| u.name = name)
+#[test]
+fn install_is_idempotent() {
+    assert!(
+        RUNTIME
+            .get_or_init(|| {
+                // SAFETY: no SQLite call can pass this binary's initializer before it returns.
+                // Only Cartel uses installed SQLite; Core handles and allocations remain
+                // exclusively owned by their originating worker.
+                Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+            })
+            .is_ok()
+    );
+    assert!(RUNTIME.get().expect("SQLite runtime initialized").is_ok());
 }
 
 #[test]
-fn round_trip() {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
-        .unwrap();
-    conn.execute(
-        "INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob')",
-        [],
-    )
-    .unwrap();
+fn repeat_open_is_rejected() -> Result<(), plan::Error> {
+    let runtime = (*RUNTIME.get_or_init(|| {
+        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
+        // Only Cartel uses installed SQLite; Core handles and allocations remain
+        // exclusively owned by their originating worker.
+        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+    }))
+    .map_err(plan::Error::Runtime)?;
+    let limits = try_limits()?;
+    let memory = try_memory()?;
+    let (unused, second) = database(runtime)?
+        .plan::<SmokeDatabase>(limits, memory)
+        .map_err(plan::Error::Plan)?
+        .into_parts();
+    drop(unused);
+    database(runtime)?
+        .plan::<SmokeDatabase>(limits, memory)
+        .map_err(plan::Error::Plan)?
+        .for_profile::<Throughput>()
+        .map_err(plan::Error::Claim)?
+        .try_create(
+            |worker| {
+                let mut cleanup = open::Completion::new();
+                assert!(matches!(
+                    worker.install_with(|first, stage| {
+                        drop(first.install(stage, &mut cleanup));
+                        second.install(stage, &mut cleanup)
+                    }),
+                    Err(dope_runtime::topology::InstallError::Install(
+                        cartel_sqlite::open::Error::AlreadyStarted
+                    ))
+                ));
+                assert!(cleanup.take().is_ok(), "unpolled open cleanup");
+            },
+            Policy::new(assert_reclaimed, assert_retirement),
+            |outcome| {
+                outcome
+                    .as_ref()
+                    .map_err(|error| error.cause())
+                    .expect("SQLite scope");
+            },
+        );
+    Ok(())
+}
 
-    let u = user_by_id(&conn, 1).unwrap();
-    assert_eq!(u.id, 1);
-    assert_eq!(u.name, "alice");
+#[test]
+fn exclusive_reusable_lease() -> Result<(), plan::Error> {
+    let runtime = (*RUNTIME.get_or_init(|| {
+        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
+        // Only Cartel uses installed SQLite; Core handles and allocations remain
+        // exclusively owned by their originating worker.
+        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+    }))
+    .map_err(plan::Error::Runtime)?;
+    let result =
+        plan::Plan::<SmokeDatabase>::try_new(database(runtime)?, try_limits()?, try_memory()?)?
+            .try_app(
+                |driver| {
+                    {
+                        let mut first =
+                            driver.client(|ready| ready).map_err(plan::Error::Client)?;
+                        let user = fibers::TEST
+                            .try_run(driver, user_by_id(&mut first, 1))
+                            .map_err(plan::Error::Run)?
+                            .map_err(plan::Error::Call)?;
+                        assert_eq!(user.name, "alice");
+                        let occupied = driver.client(|ready| ready);
+                        assert!(matches!(occupied, Err(Error::LocalConnectionBorrowed)));
+                    }
 
-    let names = user_names(&conn, 1).unwrap();
-    assert_eq!(names, vec!["alice".to_string(), "bob".to_string()]);
+                    let mut next = driver.client(|ready| ready).map_err(plan::Error::Client)?;
+                    let user = fibers::TEST
+                        .try_run(driver, user_by_id(&mut next, 2))
+                        .map_err(plan::Error::Run)?
+                        .map_err(plan::Error::Call)?;
+                    assert_eq!(user.name, "bob");
+                    Ok(())
+                },
+                Policy::new(assert_reclaimed, assert_retirement),
+                |result| result.expect("SQLite scope"),
+            );
+    result.expect("SQLite application scope failed")
+}
 
-    assert!(maybe_user(&conn, 99).unwrap().is_none());
+#[test]
+fn round_trip() -> Result<(), plan::Error> {
+    let runtime = (*RUNTIME.get_or_init(|| {
+        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
+        // Only Cartel uses installed SQLite; Core handles and allocations remain
+        // exclusively owned by their originating worker.
+        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+    }))
+    .map_err(plan::Error::Runtime)?;
+    let result =
+        plan::Plan::<SmokeDatabase>::try_new(database(runtime)?, try_limits()?, try_memory()?)?
+            .try_run(
+                |driver, mut conn| {
+                    let user = fibers::TEST
+                        .try_run(driver, user_by_id(&mut conn, 1))
+                        .map_err(plan::Error::Run)?
+                        .map_err(plan::Error::Call)?;
+                    assert_eq!(user.id, 1);
+                    assert_eq!(user.name, "alice");
 
-    rename(&conn, 2, "carol".into()).unwrap();
-    let u = user_by_id(&conn, 2).unwrap();
-    assert_eq!(u.name, "carol");
+                    let names = fibers::TEST
+                        .try_run(driver, user_names(&mut conn, 1))
+                        .map_err(plan::Error::Run)?
+                        .map_err(plan::Error::Call)?;
+                    assert_eq!(names.as_slice(), &["alice", "bob"]);
+
+                    let missing = fibers::TEST
+                        .try_run(driver, maybe_user(&mut conn, 99))
+                        .map_err(plan::Error::Run)?
+                        .map_err(plan::Error::Call)?;
+                    assert!(missing.is_none());
+
+                    fibers::TEST
+                        .try_run(driver, rename(&mut conn, 2, "carol"))
+                        .map_err(plan::Error::Run)?
+                        .map_err(plan::Error::Call)?;
+                    let user = fibers::TEST
+                        .try_run(driver, user_by_id(&mut conn, 2))
+                        .map_err(plan::Error::Run)?
+                        .map_err(plan::Error::Call)?;
+                    assert_eq!(user.name, "carol");
+                    Ok(())
+                },
+                Policy::new(assert_reclaimed, assert_retirement),
+                |result| result.expect("SQLite scope"),
+            );
+    result.expect("SQLite connection scope failed")
 }

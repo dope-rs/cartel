@@ -1,64 +1,93 @@
-use std::fmt;
-
-mod attach;
-mod client;
-mod decode;
-#[allow(dead_code)]
-mod encode;
+pub mod api;
+pub mod client;
+pub mod init;
 mod port;
+pub use port::Port;
 #[doc(hidden)]
 pub mod protocol;
-mod value;
+pub mod request;
+pub mod value;
 
-pub use attach::{attach, attach_configured};
-pub use client::{
-    Capacities, Config, ConfigError, Connect, DEFAULT_BACKOFF, Factory, GeoCoord,
-    MAX_FRAME_CAPACITY, Ops, Redis, Store,
+mod error;
+pub use error::Error;
+
+pub use cartel_core::deadline::RequestPhase;
+
+use cartel_core::{deadline::Elapsed, queue, reply::recv::attach};
+use dope::core::driver::schedule::clock::timer;
+use dope::core::{Errno, driver::route};
+use dope::manifold::client::{attempt, close, deadline};
+use dope::manifold::service::bindings::endpoint;
+use dope::net::link::{
+    egress::{self, reserve::exact},
+    pool::change::opening,
 };
-pub type ProtocolError = protocol::Error;
-pub use value::{FromValue, Value};
+use dope_fiber::{
+    reply::{order, usage},
+    wait,
+};
+use o3::{
+    alloc,
+    buffer::{hold, write::consume, write::consume::scope},
+    depot::queue::indexed::shared,
+    mem::rc,
+};
+use protocol::parser::limit;
 
+type Owner<'r, 's, 'storage, 'b, 'c, 'd, const ID: u8> = endpoint::State<
+    'r,
+    'd,
+    Port<'s, 'storage, 'b, 'c, 'd, ID>,
+    client::Logic<'s, 'd>,
+    route::KeyTag<ID>,
+    { client::CONNECTOR_CONNECTION_LIMIT },
+>;
+
+#[derive(Clone, Copy, Debug)]
+pub enum Block {
+    Inactive,
+    Pool,
+    Queue(queue::Rejection),
+}
+
+/// Borrows an exact failure without moving its response or wake capabilities.
+///
+/// Wait failures expose their existing cause projection. Their retained wake
+/// capability remains in the original [`Error`].
 #[derive(Debug)]
-pub enum Error {
-    Io(std::io::Error),
-    Closed,
-    Protocol(ProtocolError),
-    Redis(String),
-    Backpressure { inflight: usize, capacity: usize },
-    ResponseBufferCapacity,
-    WaiterCapacity,
-    RequestEntryCapacity,
-    RequestBufferCapacity,
-    ResponseFrameCapacity,
-    ResponseValueCapacity,
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(err) => write!(f, "io error: {err}"),
-            Self::Closed => f.write_str("closed"),
-            Self::Protocol(err) => write!(f, "protocol error: {err}"),
-            Self::Redis(err) => write!(f, "redis error: {err}"),
-            Self::Backpressure { inflight, capacity } => {
-                write!(f, "backpressure: {inflight}/{capacity} requests in flight")
-            }
-            Self::ResponseBufferCapacity => f.write_str("response buffer capacity exceeded"),
-            Self::WaiterCapacity => f.write_str("waiter capacity exhausted"),
-            Self::RequestEntryCapacity => f.write_str("request entry capacity exhausted"),
-            Self::RequestBufferCapacity => f.write_str("request buffer capacity exceeded"),
-            Self::ResponseFrameCapacity => f.write_str("response frame capacity exceeded"),
-            Self::ResponseValueCapacity => f.write_str("response value capacity exceeded"),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::Protocol(error) => Some(error),
-            _ => None,
-        }
-    }
+pub enum Diagnostic<'a, 'd, const ID: u8 = 0> {
+    Input(&'a scope::Error),
+    ParserWait(&'a shared::Bounds),
+    Unavailable,
+    ConnectionExhausted {
+        key: &'a attempt::Id<'d, route::KeyTag<ID>>,
+        cause: &'a opening::Exhaustion,
+    },
+    Closed(&'a close::Reason),
+    Receive(&'a Errno),
+    Timeout(&'a deadline::Kind),
+    RequestTimeout(&'a Elapsed),
+    Protocol(&'a protocol::Error),
+    Allocation,
+    Exhausted(&'a alloc::Exhausted),
+    Handshake(init::Failure<&'a [u8]>),
+    UnexpectedResponse,
+    ReplySlotEmpty,
+    Reply(&'a attach::Error),
+    Dispatch {
+        blocked: &'a Block,
+        wait: wait::Cause,
+    },
+    ResponseCapacity(&'a usage::Capacity),
+    ResponseFront(&'a order::Front),
+    Wait(wait::Cause),
+    Deadline(&'a timer::Exhausted),
+    Request(&'a request::Error),
+    RequestEgress(&'a egress::Rejection),
+    RequestReserve(&'a exact::Failure),
+    ResponseFrameCapacity(&'a limit::Exceeded<limit::Frame>),
+    ResponseRetain(&'a rc::Error),
+    ResponseRetention(&'a hold::Error),
+    ResponseStorageCapacity(&'a consume::Error),
+    ResponseValueCapacity(&'a limit::Exceeded<limit::Value>),
 }
