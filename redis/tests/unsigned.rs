@@ -78,6 +78,16 @@ fn unsigned_domain() {
                             runtime.block_on(redis.scripts().eval::<i64, &[u8], &[u8]>(b"0", &[], &[])),
                             Ok(Ok(i64::MIN))
                         ));
+                        for by in [i64::MIN, i64::MAX] {
+                            assert!(matches!(
+                                runtime.block_on(redis.basic().incr_by(b"key", by)),
+                                Ok(Ok(value)) if value == by
+                            ));
+                        }
+                        assert!(matches!(
+                            runtime.block_on(redis.keyspace().scan(u64::MAX, None, None)),
+                            Ok(Ok(scan)) if scan.cursor() == 0 && scan.keys().is_empty()
+                        ));
                     })
                 })
             })

@@ -35,6 +35,7 @@
 //! # fn main() {}
 //! ```
 
+#[cfg(test)]
 use dope_test::checks::{Error, Suite};
 
 #[test]
@@ -42,16 +43,13 @@ fn contracts() -> Result<(), Error> {
     let suite = Suite::new(
         env!("CARGO_MANIFEST_DIR"),
         file!(),
-        &["cartel-core", "dope-fiber", "dope-test"],
+        &["cartel-core", "dope-fiber"],
     );
     let exe = std::env::current_exe()?;
-    let status = suite.try_build(&exe, env!("CARGO_PKG_NAME"))?.status()?;
-    assert!(status.success(), "build original library: {status}");
-    assert_eq!(
-        suite.try_errors(&exe, include_str!("type_contracts.rs"))?,
-        1
-    );
-    let status = suite.try_rustdoc(&exe)?.status()?;
+    let output = suite.try_build(&exe, env!("CARGO_PKG_NAME"))?.output()?;
+    let suite = suite.try_collect(&exe, output)?;
+    assert_eq!(suite.try_errors(include_str!("type_contracts.rs"))?, 1);
+    let status = suite.try_rustdoc()?.status()?;
     assert!(status.success(), "type contracts: {status}");
     Ok(())
 }

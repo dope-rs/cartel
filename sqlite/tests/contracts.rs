@@ -192,7 +192,7 @@
 //! ```
 
 #[test]
-fn contracts() {
+fn contracts() -> Result<(), dope_test::checks::Error> {
     use std::env;
 
     use dope_test::checks::Suite;
@@ -209,23 +209,11 @@ fn contracts() {
             "libsqlite3-sys",
         ],
     );
-    let exe = env::current_exe().expect("test executable");
-    let status = suite
-        .try_build(&exe, env!("CARGO_PKG_NAME"))
-        .expect("build command")
-        .status()
-        .expect("build original library");
-    assert!(status.success(), "build original library: {status}");
-    assert_eq!(
-        suite
-            .try_errors(&exe, include_str!("contracts.rs"))
-            .expect("exact compiler errors"),
-        12
-    );
-    let status = suite
-        .try_rustdoc(&exe)
-        .expect("rustdoc command")
-        .status()
-        .expect("compiler contracts");
+    let exe = env::current_exe()?;
+    let output = suite.try_build(&exe, env!("CARGO_PKG_NAME"))?.output()?;
+    let artifacts = suite.try_collect(&exe, output)?;
+    assert_eq!(artifacts.try_errors(include_str!("contracts.rs"))?, 12);
+    let status = artifacts.try_rustdoc()?.status()?;
     assert!(status.success(), "compile-time contracts: {status}");
+    Ok(())
 }

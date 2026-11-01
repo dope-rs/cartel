@@ -253,43 +253,32 @@ impl Writer {
     }
 }
 
-fn format_header_into(buffer: &mut [u8; 23], marker: u8, mut value: u64) -> &[u8] {
-    let mut start = buffer.len() - 2;
-    buffer[start] = b'\r';
-    buffer[start + 1] = b'\n';
-    loop {
-        start -= 1;
-        buffer[start] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
-    }
-    start -= 1;
+fn format_header_into(buffer: &mut [u8; 23], marker: u8, value: u64) -> &[u8] {
+    let [_, digits @ .., cr, lf] = buffer;
+    *cr = b'\r';
+    *lf = b'\n';
+    let start = write_digits(digits, value);
     buffer[start] = marker;
     &buffer[start..]
 }
 
 fn format_int_into(buffer: &mut [u8; 21], value: i64) -> &[u8] {
-    let mut index = buffer.len();
-    let negative = value < 0;
-    let mut unsigned = value.unsigned_abs();
-    loop {
-        index -= 1;
-        buffer[index] = b'0' + (unsigned % 10) as u8;
-        unsigned /= 10;
-        if unsigned == 0 {
-            break;
-        }
+    let [_, digits @ ..] = buffer;
+    let mut start = write_digits(digits, value.unsigned_abs());
+    if value < 0 {
+        buffer[start] = b'-';
+    } else {
+        start += 1;
     }
-    if negative {
-        index -= 1;
-        buffer[index] = b'-';
-    }
-    &buffer[index..]
+    &buffer[start..]
 }
 
-fn format_uint_into(buffer: &mut [u8; 20], mut value: u64) -> &[u8] {
+fn format_uint_into(buffer: &mut [u8; 20], value: u64) -> &[u8] {
+    let start = write_digits(buffer, value);
+    &buffer[start..]
+}
+
+fn write_digits(buffer: &mut [u8; 20], mut value: u64) -> usize {
     let mut index = buffer.len();
     loop {
         index -= 1;
@@ -299,7 +288,7 @@ fn format_uint_into(buffer: &mut [u8; 20], mut value: u64) -> &[u8] {
             break;
         }
     }
-    &buffer[index..]
+    index
 }
 
 fn format_float(buffer: &mut ryu::Buffer, value: f64) -> &[u8] {

@@ -92,7 +92,7 @@
 //! ```compile_fail,E0515
 //! use cartel_redis::value::source::ScoredText;
 //!
-//! fn escape<S: ScoredText>(rows: S) -> &'static str {
+//! fn escape<S: ScoredText + 'static>(rows: S) -> &'static str {
 //!     rows.iter().next().expect("member").0
 //! }
 //! ```
@@ -178,7 +178,7 @@
 //!
 //! ```compile_fail,E0515
 //! use cartel_redis::value::source::Coordinates;
-//! fn escape<S: Coordinates>(owner: S) -> impl Iterator<Item = Option<cartel_redis::client::GeoCoord>> + 'static {
+//! fn escape<S: Coordinates + 'static>(owner: S) -> impl Iterator<Item = Option<cartel_redis::client::GeoCoord>> + 'static {
 //!     owner.iter()
 //! }
 //! ```
@@ -204,7 +204,7 @@
 //!
 //! ```compile_fail,E0515
 //! use cartel_redis::value::source::Optional;
-//! fn escape<S: Optional>(owner: S) -> [Option<&'static [u8]>; 2] {
+//! fn escape<S: Optional + 'static>(owner: S) -> [Option<&'static [u8]>; 2] {
 //!     owner.try_array::<2>().ok().expect("pair")
 //! }
 //! ```
@@ -230,14 +230,14 @@
 //!
 //! ```compile_fail,E0515
 //! use cartel_redis::value::source::Exact;
-//! fn escape<A: Exact<3>>(owner: A) -> [&'static [u8]; 3] {
+//! fn escape<A: Exact<3> + 'static>(owner: A) -> [&'static [u8]; 3] {
 //!     owner.as_array()
 //! }
 //! ```
 //!
 //! ```compile_fail
 //! use cartel_redis::value::source::Exact;
-//! fn escape<A: Exact<1>>(owner: A) -> &'static [u8] {
+//! fn escape<A: Exact<1> + 'static>(owner: A) -> &'static [u8] {
 //!     owner.try_map::<_, (), ()>(|[value]| Ok(value)).ok().expect("value")
 //! }
 //! ```
@@ -253,32 +253,42 @@
 //! ```
 
 #[test]
-fn contracts() {
+fn contracts() -> Result<(), dope_test::checks::Error> {
     use std::env;
 
     use dope_test::checks::Suite;
+
     let suite = Suite::new(
         env!("CARGO_MANIFEST_DIR"),
         file!(),
-        &["cartel-redis", "dope-fiber"],
+        &["cartel-redis", "dope-fiber", "dope", "o3"],
     );
-    let exe = env::current_exe().expect("test executable");
-    let status = suite
-        .try_build(&exe, env!("CARGO_PKG_NAME"))
-        .expect("build command")
-        .status()
-        .expect("build original library");
-    assert!(status.success(), "build original library: {status}");
-    assert_eq!(
-        suite
-            .try_errors(&exe, include_str!("contracts.rs"))
-            .expect("exact compiler errors"),
-        14
-    );
-    let status = suite
-        .try_rustdoc(&exe)
-        .expect("rustdoc command")
-        .status()
-        .expect("compiler contracts");
+    let exe = env::current_exe()?;
+    let output = suite.try_build(&exe, env!("CARGO_PKG_NAME"))?.output()?;
+    let artifacts = suite.try_collect(&exe, output)?;
+    assert_eq!(artifacts.try_errors(include_str!("contracts.rs"))?, 14);
+    let status = artifacts.try_rustdoc()?.status()?;
     assert!(status.success(), "compile-time contracts: {status}");
+    for (source, errors, expected) in [
+        (include_str!("common/retired.rs"), 0, &[] as &[&str]),
+        (
+            include_str!("common/retire.rs"),
+            3,
+            &[
+                "self.0.disconnect(ctx);",
+                "let proof: turns::Drained<'d, KeyTag<0>, N> = ctx.into_drained();",
+                "let proof: conn::Retired<'d, KeyTag<0>, A> = proof;",
+            ],
+        ),
+    ] {
+        let output = artifacts.try_compile(source)?;
+        let diag = String::from_utf8(output.stderr).expect("diagnostic UTF-8");
+        assert!(
+            output.status.success() == (errors == 0)
+                && diag.matches("error[E0308]: mismatched types").count() == errors
+                && expected.iter().all(|part| diag.contains(part)),
+            "{source}\n{diag}"
+        );
+    }
+    Ok(())
 }
