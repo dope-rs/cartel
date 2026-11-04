@@ -12,7 +12,7 @@ use o3::{base::marker::ThreadBound, depot::array};
 pub(crate) use retained::Retained;
 pub(crate) use span::Span;
 
-use crate::runtime::{heap, release::Release};
+use crate::runtime::{heap, raw::Memory};
 const UNIT_BYTES: usize = Layout::UNIT_BYTES;
 // Runtime admission bounds physical blocks by MAX_ORDER; Level::mask retains
 // the smallest power-of-two domain containing every admitted block order.
@@ -38,7 +38,7 @@ struct Free<'a> {
 struct State {
     heads: [Option<Index>; ORDERS],
     allocations: usize,
-    release: Option<Release>,
+    release: Option<Memory>,
 }
 
 impl State {
@@ -50,7 +50,7 @@ impl State {
         }
     }
 
-    fn arm(&mut self, release: Release) -> Option<Release> {
+    fn arm(&mut self, release: Memory) -> Option<Memory> {
         if self.is_empty() {
             Some(release)
         } else {
@@ -316,15 +316,14 @@ impl Arena {
         self.units * UNIT_BYTES
     }
 
-    fn arm(&self, release: Release) -> Option<Release> {
+    fn arm(&self, release: Memory) -> Option<Memory> {
         unsafe { (&mut *self.state.get()).arm(release) }
     }
 
     fn release(header: Decoded) {
-        let release = header.with_state(|block| block.release());
-        if let Some(release) = release {
-            release.run();
-        }
+        let memory = header.with_state(|block| block.release());
+        // The allocator-state borrow ends before its backing is reclaimed.
+        drop(memory);
     }
     fn grow(header: Decoded, order: Order) -> *mut u8 {
         header.with_state(|block| block.grow(order))

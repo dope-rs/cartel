@@ -71,8 +71,10 @@ impl Row<'_> {
             for field in &fields.named {
                 let name = &field.ident;
                 let vis = &field.vis;
-                let ty = field.ty.view_type()?;
-                decls.push(quote::quote! { #vis #name: #ty });
+                let ty = &field.ty;
+                decls.push(quote::quote! {
+                    #vis #name: <#ty as ::cartel_pg::schema::Row>::View<'row>
+                });
             }
             let pattern = names.iter().rev().fold(quote::quote! { () }, |tail, name| {
                 quote::quote! { (#name, #tail) }

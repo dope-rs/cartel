@@ -101,7 +101,7 @@ impl<
         &mut self,
         mut cx: Pin<&mut context::Context<'_, 'd>>,
         waiter: Pin<&wait::Waiter<'target, 'd>>,
-        mut prepare: impl FnMut(
+        prepare: impl FnOnce(
             &mut Self,
             api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
             conn::Id<'d, KeyTag<ID>>,
@@ -113,96 +113,73 @@ impl<
         'app: 'target,
         'd: 'target,
     {
-        loop {
-            let (client, conn, request, retry) = match mem::replace(&mut self.state, State::Done) {
-                State::Connecting {
+        let (client, target, request) = match mem::replace(&mut self.state, State::Done) {
+            State::Connecting {
+                client,
+                target,
+                request,
+            } => (client, target, request),
+            State::Admitted(lease, held) => {
+                self.state = State::Admitted(lease, held);
+                return Poll::Ready(Ok(()));
+            }
+            State::Failed(error) => return Poll::Ready(Err(error)),
+            State::Done => return Poll::Ready(Err(crate::Error::Closed.into())),
+        };
+        let conn = match client.select(target, request.boundary) {
+            Ok(Some(conn)) => conn,
+            Ok(None) => {
+                if let Err(error) = client.port.shared.ready.try_register(waiter, cx.as_ref()) {
+                    waiter.unregister();
+                    return Poll::Ready(Err(Error::Wait(error)));
+                }
+                self.state = State::Connecting {
                     client,
                     target,
                     request,
-                } => match client.select(target, request.boundary) {
-                    Ok(Some(conn)) => (client, conn, request, false),
-                    Ok(None) => {
-                        let shared = &client.port.shared;
-                        let error = match shared.signals.failure() {
-                            Some(error) => error,
-                            None => match shared.ready.try_register(waiter, cx.as_ref()) {
-                                Ok(()) => {
-                                    self.state = State::Connecting {
-                                        client,
-                                        target,
-                                        request,
-                                    };
-                                    return Poll::Pending;
-                                }
-                                Err(error) => Error::Wait(error),
-                            },
-                        };
-                        waiter.unregister();
-                        return Poll::Ready(Err(error));
-                    }
-                    Err(error) => {
-                        waiter.unregister();
-                        return Poll::Ready(Err(error));
-                    }
-                },
-                State::Throttled { client, throttle } => {
-                    let shared = &client.port.shared;
-                    if let Some(error) = shared.signals.failure() {
-                        waiter.unregister();
-                        return Poll::Ready(Err(error));
-                    }
-                    if shared
-                        .ready
-                        .connection(throttle.conn)
-                        .is_some_and(|slot| slot.is_receiving())
-                    {
-                        if let Err(error) = shared.ready.try_register(waiter, cx.as_ref()) {
-                            waiter.unregister();
-                            return Poll::Ready(Err(Error::Wait(error)));
-                        }
-                        self.state = State::Throttled { client, throttle };
-                        return Poll::Pending;
-                    }
-                    (client, throttle.conn, throttle.request, true)
-                }
-                State::Admitted(lease, held) => {
-                    self.state = State::Admitted(lease, held);
-                    return Poll::Ready(Ok(()));
-                }
-                State::Failed(error) => return Poll::Ready(Err(error)),
-                State::Done => return Poll::Ready(Err(crate::Error::Closed.into())),
-            };
-            let (error, request) =
-                match prepare(self, client, conn, request, cx.as_mut().region_token()) {
-                    Ok(()) => {
-                        waiter.unregister();
-                        return Poll::Ready(Ok(()));
-                    }
-                    Err(failure) => failure,
                 };
-            let throttle = match api::Throttle::new(conn, error, request) {
-                Ok(throttle) => throttle,
-                Err(error) => {
-                    waiter.unregister();
-                    return Poll::Ready(Err(error.into()));
-                }
-            };
-            if retry {
-                if let Err(error) = client.port.shared.signals.egress.try_register(
-                    &throttle.cause,
-                    waiter,
-                    cx.as_ref(),
-                ) {
-                    let error = throttle.fail(error);
-                    waiter.unregister();
-                    return Poll::Ready(Err(error));
-                }
-                self.state = State::Throttled { client, throttle };
                 return Poll::Pending;
             }
+            Err(error) => {
+                waiter.unregister();
+                return Poll::Ready(Err(error));
+            }
+        };
+        let (error, request) =
+            match prepare(self, client, conn, request, cx.as_mut().region_token()) {
+                Ok(()) => {
+                    waiter.unregister();
+                    return Poll::Ready(Ok(()));
+                }
+                Err(failure) => failure,
+            };
+        let throttle = match api::Throttle::new(conn, error, request) {
+            Ok(throttle) => throttle,
+            Err(error) => {
+                waiter.unregister();
+                return Poll::Ready(Err(error.into()));
+            }
+        };
+        if let Err(error) =
+            client
+                .port
+                .shared
+                .signals
+                .egress
+                .try_register(&throttle.cause, waiter, cx.as_ref())
+        {
+            let error = throttle.fail(error);
             waiter.unregister();
-            self.state = State::Throttled { client, throttle };
+            return Poll::Ready(Err(error));
         }
+        // No order was published: a later poll must revalidate the original
+        // target before selecting a connection that may now belong to a transaction.
+        self.state = State::Connecting {
+            client,
+            target,
+            request: throttle.request,
+        };
+        Poll::Pending
     }
 }
 

@@ -26,9 +26,9 @@ pub(crate) enum Block {
     Unavailable,
 }
 
-pub(crate) enum Reject<A, B = ()> {
+pub(crate) enum Reject<A> {
     Blocked {
-        cause: B,
+        cause: Block,
         frame: encode::Complete,
         admit: A,
     },
@@ -50,7 +50,7 @@ impl<'a, 'app, 's, 'b, 'c, 'd, const ID: u8> Plan<'a, 'app, 's, 'b, 'c, 'd, ID> 
         admit: A,
         reply: &mut impl attach::Attach<'app, 'b, 'c, 'd, frame::Stored<'s, 'd>, client::Failure<'d>>,
         seal: impl FnOnce(A, Id<'d, route::KeyTag<ID>>) -> R,
-    ) -> Result<R, Reject<A, Block>> {
+    ) -> Result<R, Reject<A>> {
         let Self { state, region } = self;
         if state.is_exhausted(region) {
             return Err(Reject::Reply(attach::Error::IdentityExhausted));
@@ -120,7 +120,7 @@ impl<'a, 'app, 's, 'b, 'c, 'd, const ID: u8> Plan<'a, 'app, 's, 'b, 'c, 'd, ID> 
         reply: &mut impl attach::Attach<'app, 'b, 'c, 'd, frame::Stored<'s, 'd>, client::Failure<'d>>,
         token: Id<'d, route::KeyTag<ID>>,
         seal: impl FnOnce(A, Id<'d, route::KeyTag<ID>>) -> R,
-    ) -> Result<R, Reject<A, Block>> {
+    ) -> Result<R, Reject<A>> {
         let Self { state, region } = self;
         let Some((conn, input)) = state.routes.exclusive(token) else {
             return Err(Reject::Unavailable);

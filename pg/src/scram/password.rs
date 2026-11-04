@@ -4,6 +4,8 @@ use stringprep::tables;
 use unicode_normalization::char::{canonical_combining_class, compose, decompose_compatible};
 use zeroize::Zeroizing;
 
+mod bidi;
+
 pub(crate) struct Password(Zeroizing<String>);
 
 struct Decomposed(Zeroizing<Vec<(u8, char)>>);
@@ -43,7 +45,7 @@ fn prepare(value: &str) -> Result<Option<String>, crate::ConfigError> {
     let Some(first) = chars.next() else {
         return Ok(None);
     };
-    let first_right = tables::bidi_r_or_al(first);
+    let first_right = bidi::right(first);
     let mut last_right = first_right;
     let mut right = false;
     let mut left = false;
@@ -52,9 +54,9 @@ fn prepare(value: &str) -> Result<Option<String>, crate::ConfigError> {
         if is_prohibited(ch) || tables::unassigned_code_point(ch) {
             return Ok(None);
         }
-        last_right = tables::bidi_r_or_al(ch);
+        last_right = bidi::right(ch);
         right |= last_right;
-        left |= tables::bidi_l(ch);
+        left |= bidi::left(ch);
         decompose_compatible(ch, |_| length = length.and_then(|len| len.checked_add(1)));
     }
     if right && (left || !first_right || !last_right) {

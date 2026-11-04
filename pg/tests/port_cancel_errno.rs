@@ -1,4 +1,4 @@
-use crate::common::postgres::{Frame, accept::Listener, startup::Stream};
+use crate::common::postgres::{Frame, accept::Listener, read_empty, startup::Stream};
 use cartel_pg::api::traits::{Begin as _, Client as _, Status as _, Transaction as _};
 use cartel_pg::{api, api::tx::control::error::Kind, port};
 use common::{port::*, topology};
@@ -108,8 +108,7 @@ fn refused(listener: TcpListener) -> (thread::JoinHandle<()>, Receiver<()>, mpsc
             Listener::accept_within(&listener, Duration::from_secs(1)).expect("peer connection");
         Stream::try_start(&mut primary, Some((0x1020_3040, 0x5060_7080)))
             .expect("backend key handshake");
-        let mut request = [0_u8; 512];
-        assert!(primary.read(&mut request).expect("BEGIN request") != 0);
+        read_empty(&primary, b'S').expect("BEGIN request");
         primary
             .write_all(&Frame::new(b'C', b"BEGIN\0").encode())
             .expect("BEGIN CommandComplete");
@@ -118,7 +117,7 @@ fn refused(listener: TcpListener) -> (thread::JoinHandle<()>, Receiver<()>, mpsc
             .expect("tx ReadyForQuery");
         drop(listener);
         closed.send(()).expect("listener closure observed");
-        assert!(primary.read(&mut request).expect("ROLLBACK request") != 0);
+        read_empty(&primary, b'S').expect("ROLLBACK request");
         primary
             .write_all(&Frame::new(b'C', b"ROLLBACK\0").encode())
             .expect("ROLLBACK CommandComplete");

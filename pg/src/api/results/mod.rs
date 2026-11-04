@@ -263,7 +263,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             waiter.unregister();
             return Poll::Ready(Ok(n));
         }
-        if let Some(error) = s.signals.failure() {
+        if let Some(error) = s.failure() {
             waiter.unregister();
             return Poll::Ready(Err(error));
         }

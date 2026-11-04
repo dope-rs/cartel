@@ -265,10 +265,7 @@ impl Listener for peer::TcpAcceptor<'static> {
     fn recovery(self) -> Result<(peer::Stream<'static>, peer::Stream<'static>), Error> {
         let mut first = self.accept_within(Duration::from_secs(1))?;
         first.try_start(None)?;
-        let mut request = [0_u8; 512];
-        if first.read(&mut request)? == 0 {
-            return Err(Error::Io(peer::Error::UnexpectedEof));
-        }
+        read_empty(&first, b'S')?;
         let mut next = self.accept_within(Duration::from_secs(1))?;
         next.try_start(None)?;
         let _ =

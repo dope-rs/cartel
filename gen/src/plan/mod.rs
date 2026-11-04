@@ -46,19 +46,6 @@ impl State<'_> {
         }
     }
 
-    pub(super) fn intern(&mut self, ident: syn::Ident) -> usize {
-        if let Some(index) = self
-            .captures
-            .iter()
-            .position(|current| current.unraw() == ident.unraw())
-        {
-            return index;
-        }
-        let index = self.captures.len();
-        self.captures.push(ident);
-        index
-    }
-
     pub(super) fn mark_nonneg(&mut self, ident: syn::Ident, bound: Bound) {
         if self
             .nonnegative

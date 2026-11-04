@@ -1,16 +1,13 @@
 use std::{cell, mem};
 
-use cartel_core::{frame::Buffer, queue, reply, reply::layout::Position};
+use cartel_core::reply::layout::Position;
 use dope::{
     core::driver::{route, schedule::ready},
     manifold::client::{close, conn, session},
-    net::link::egress,
 };
-use o3::base::cell::region;
-use reply::order::Depth;
 
 use crate::port::schedule::routes::{Access, Acquire, Bind, Bound, Closing, State};
-use crate::{client, port::schedule::Release, protocol::parser::frame};
+use crate::{client, port::schedule::Release};
 
 pub(crate) struct Conn<'b, 'd, const ID: u8> {
     pub(super) phase: cell::UnsafeCell<State<'b, 'd, ID>>,
@@ -129,26 +126,20 @@ impl<'b, 'd, const ID: u8> Conn<'b, 'd, ID> {
         }
     }
 
-    /// Queue depth projections have no callbacks and preserve this phase borrow.
-    pub(in crate::port::schedule) fn acquire<'s, 'c>(
+    /// The caller just removed this route from the idle FIFO. Publication checks
+    /// both lanes are empty; shared admission and withdrawal unlink that FIFO.
+    pub(in crate::port::schedule) fn acquire(
         &self,
         token: conn::Id<'d, route::KeyTag<ID>>,
-        reqs: queue::Lane<'_, 'd, egress::NonEmpty<Buffer>>,
-        reps: reply::Lane<'_, 'b, 'c, 'd, frame::Stored<'s, 'd>, client::Failure<'d>>,
-        region: &mut region::Token<region::Identity<'d>>,
     ) -> Acquire {
-        // SAFETY: this private thread-local leaf retains the exclusive phase
-        // borrow through queue admission. Neither depth projection calls user
-        // code or accesses routes, and replacing Shared drops only Copy fields.
+        // SAFETY: this private thread-local leaf invokes no callbacks and
+        // replaces only Copy fields after checking the exact shared generation.
         let phase = unsafe { &mut *self.phase.get() };
         let State::Shared(bound, input) = phase else {
             return Acquire::Stale;
         };
         if bound.position.connection() != token {
             return Acquire::Stale;
-        }
-        if reps.depth(region) != Depth::ZERO || !reqs.is_empty(region) {
-            return Acquire::Blocked;
         }
         *phase = State::Exclusive(*bound, *input);
         Acquire::Acquired

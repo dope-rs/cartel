@@ -51,7 +51,7 @@ impl<'a, 'd, const ID: u8> Backend<'a, 'd, ID> {
         ))
     }
 
-    pub(crate) fn pid(&self, token: conn::Id<'d, KeyTag<ID>>) -> Option<i32> {
+    fn pid(&self, token: conn::Id<'d, KeyTag<ID>>) -> Option<i32> {
         let slot::Phase::Ready { bound, .. } = self.slot.phase.get() else {
             return None;
         };

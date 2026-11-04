@@ -99,7 +99,7 @@ type Response<'app, 'g, 'r, 's, 'b, 'c, 'd, X> = recv::Response<
 fn check_open<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet, const ID: u8>(
     client: Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
 ) -> Result<(), reply::Error<'d, ID>> {
-    client.port.shared.signals.failure().map_or(Ok(()), Err)
+    client.port.shared.failure().map_or(Ok(()), Err)
 }
 
 pub(super) struct ExtractAll<const ID: u8 = 0>;

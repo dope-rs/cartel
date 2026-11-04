@@ -184,6 +184,79 @@ fn detached_partial_preserves_next_request() {
 }
 
 #[test]
+fn half_close_preserves_truncated_response() {
+    use cartel_redis::protocol::{Error, Line, Truncated};
+
+    for partial in [b"+PO".as_slice(), b"$3\r\nx".as_slice()] {
+        let config = config(Positive::from_secs::<1>()).expect("valid redis configuration");
+        AcceptScript::with(
+            move |peer| {
+                let socket = peer.accept()?;
+                socket.read_wait(Some(GUARD))?;
+                let mut request = [0; PING.len()];
+                socket.read_exact(&mut request)?;
+                assert_eq!(request, PING);
+                socket.write_all(partial)?;
+                socket.shutdown(Shutdown::Write)?;
+                assert_eq!(socket.read(&mut request[..1])?, 0);
+                Ok::<_, peer::Error>(())
+            },
+            |server| {
+                let prepared = topology::try_new::<Env>(config, server.addr(), Plan::new())
+                    .expect("Redis topology");
+                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+                let mut report = Completion::new();
+                prepared.with_local(
+                    |worker| {
+                        worker.lend(|node, stage| {
+                            node.install(stage, |host, stage| {
+                                stage.with_quiesce(&mut report, host, GUARD, |mut rt| {
+                                    let redis = rt.root_client();
+                                    let result = fibers::TEST
+                                        .try_run(&mut rt, redis.server().ping())
+                                        .expect("drive truncated response");
+                                    assert!(match (partial[0], result) {
+                                        (
+                                            b'+',
+                                            Err(reply::Failure::Control(
+                                                cartel_redis::Error::Protocol(Error::Truncated(
+                                                    Truncated::Line {
+                                                        kind: Line::Status,
+                                                        start,
+                                                        actual,
+                                                    },
+                                                )),
+                                            )),
+                                        ) => start.get() == 1 && actual.get() == 3,
+                                        (
+                                            b'$',
+                                            Err(reply::Failure::Control(
+                                                cartel_redis::Error::Protocol(Error::Truncated(
+                                                    Truncated::Bulk { actual, required },
+                                                )),
+                                            )),
+                                        ) => actual.get() == 5 && required.get() == 9,
+                                        _ => false,
+                                    });
+                                })
+                            })
+                        })
+                    },
+                    recovery::Policy::new(|event| reports.push(event), recover),
+                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
+                );
+                assert!(reports.events().expect("reclamation events").is_empty());
+                assert!(
+                    matches!(server.finish(), Ok(Ok(()))),
+                    "Redis peer completion"
+                );
+            },
+        )
+        .expect("spawn Redis peer");
+    }
+}
+
+#[test]
 fn inflight_close_drains() {
     let config = config(Positive::from_secs::<1>()).expect("valid redis configuration");
     AcceptScript::with(

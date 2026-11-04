@@ -1,4 +1,4 @@
-use cartel_core::reply::order;
+use cartel_core::{memory, reply::order};
 use dope::{
     core::driver::{self, route},
     manifold::client::{
@@ -235,7 +235,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             | state::Phase::AwaitingReady
             | state::Phase::Sasl { .. }
             | state::Phase::Preparing { .. } => {
-                let (server, class) = match plan.try_build(self.port.shared.config.retention()) {
+                let (server, class) = match plan.try_build(memory::RETENTION) {
                     Ok(built) => built,
                     Err(error) => {
                         failure::Failure::new(

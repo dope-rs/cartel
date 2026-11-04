@@ -134,22 +134,10 @@ impl<'a> Prepare<'a> {
     /// Computes the static wire bound; overflow fails compilation.
     pub const fn fixed_len<I: schema::QuerySet>() -> usize {
         const {
-            let groups = I::QUERIES;
-            let mut total = Self::SYNC.len();
-            if dynamic(groups) & desc::DYNAMIC_LTREE != 0 {
-                total += 16 + 2 * schema::LTREE_PROBE_NAME.len() + LTREE_PROBE_SQL.len();
+            match Self::try_wire_len(I::QUERIES) {
+                Ok(length) => length,
+                Err(_) => panic!("prepare"),
             }
-            let mut group = 0;
-            while group < groups.len() {
-                let mut query = 0;
-                while query < groups[group].len() {
-                    let meta = &groups[group][query];
-                    total += 16 + 2 * meta.name.len() + meta.sql.len() + 4 * meta.param_oids.len();
-                    query += 1;
-                }
-                group += 1;
-            }
-            total
         }
     }
 

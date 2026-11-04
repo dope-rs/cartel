@@ -9,7 +9,7 @@ use branches::Qualifier as _;
 use layouts::ScopeLayout as _;
 use sources::Source as _;
 
-use crate::plan::read::{Filter, Qualify, Select, join_parts};
+use crate::plan::read::{Filter, Project, Qualify, Select, join_parts};
 
 pub(crate) struct Cte<'a>(pub(crate) plan::State<'a>);
 
@@ -23,7 +23,7 @@ impl<'a> Cte<'a> {
         let (source, ids, pred) = shape::QuerySource::parse_chain(after, self.0.cte_map)?;
         let path = &source.primary_path;
         let scope = pred::RowScope::for_source(&source, &ids)?;
-        let quals = Qualify::new(&quals, None, &scope, &self.0)?;
+        let tail = Qualify::new(&quals, None, &scope, &self.0)?;
 
         let (state, ons) = join_parts(self.0, &source)?;
         self.0 = state;
@@ -40,11 +40,15 @@ impl<'a> Cte<'a> {
                 .columns(&syn::parse_quote!(#path), source.qualifier(0))
         };
 
-        let mut sql = vec![self.0.dialect.kw("SELECT_KW"), cols];
+        let mut sql = vec![self.0.dialect.kw("SELECT_KW")];
+        let step = Project(self.0).distinct(&quals, &scope)?;
+        self.0 = step.state;
+        sql.extend(step.value);
+        sql.push(cols);
         sql.extend(Select::from_clause(&source, &ons, self.0.dialect));
         sql.push(self.0.dialect.kw("WHERE_KW"));
         sql.extend(where_);
-        let step = quals.render(self.0);
+        let step = tail.render(self.0);
         self.0 = step.state;
         sql.extend(step.value);
         Ok(plan::Step {

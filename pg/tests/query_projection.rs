@@ -1,6 +1,22 @@
 pub mod common;
 
 #[test]
+fn preserves_subquery_distinct() {
+    use cartel_pg::schema::TypedQuery;
+    use common::types::{ProjectionCteDistinct, ProjectionLateralDistinct};
+
+    assert_eq!(
+        ProjectionCteDistinct::SQL,
+        "WITH \"selected\" AS (SELECT DISTINCT \"id\",\"name\",\"age\" FROM \"users\" AS q0_0 WHERE q0_0.\"id\" >= $1) SELECT \"id\",\"name\",\"age\" FROM \"selected\" AS q0_0"
+    );
+    assert_eq!(
+        ProjectionLateralDistinct::SQL,
+        "SELECT q0_0.\"id\",q0_0.\"name\",q0_0.\"age\",q0_1.\"id\",q0_1.\"name\",q0_1.\"age\" FROM \"users\" AS q0_0 INNER JOIN LATERAL (SELECT DISTINCT ON (((q1_0.\"age\" + q0_0.\"age\") + $1)) q1_0.\"id\",q1_0.\"name\",q1_0.\"age\" FROM \"users\" AS q1_0 WHERE q1_0.\"id\" > q0_0.\"id\") q0_1 ON true"
+    );
+    assert_eq!(ProjectionLateralDistinct::PARAM_OIDS, &[23]);
+}
+
+#[test]
 fn preserves_set_receiver_order() {
     use cartel_pg::schema::TypedQuery;
     use common::types::{ProjectionMixedSet, User};

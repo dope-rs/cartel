@@ -5,6 +5,7 @@ use cartel_core::reply::layout::Position;
 use dope::{
     core::driver::{route, schedule::ready},
     manifold::client::{
+        close,
         conn::Id,
         session::{self, turns},
     },
@@ -99,10 +100,32 @@ impl<'b, 'd, const ID: u8> Routes<'b, 'd, ID> {
     ) -> Option<slot::Bound<'_, 'b, 'd, ID>> {
         let conn = self.get(token.index().into_usize())?;
         let position = {
-            // SAFETY: this thread-local leaf replaces only Copy Bound variants.
+            // SAFETY: this thread-local leaf replaces only Copy Bound variants
+            // or a resource-free remote-close cause refined by EOF validation.
             // No callback runs while phase is borrowed; rejected owners remain untouched.
             let phase = unsafe { &mut *conn.phase.get() };
             let bound = match phase {
+                State::Closing(closing)
+                    if closing.bound.position.connection() == token
+                        && matches!(
+                            closing.failure,
+                            client::Failure::Closed(close::Reason::Remote)
+                        )
+                        && matches!(
+                            fail,
+                            client::Failure::Protocol(
+                                crate::protocol::Error::Truncated(_)
+                                    | crate::protocol::Error::Unparsed { .. }
+                            ) | client::Failure::ResponseFrameCapacity(_)
+                        ) =>
+                {
+                    let position = closing.bound.position;
+                    closing.failure = fail;
+                    return Some(slot::Bound {
+                        slot: conn,
+                        position,
+                    });
+                }
                 State::Initializing(bound) if bound.position.connection() == token => {
                     let bound = *bound;
                     *phase = State::Closing(Closing {
@@ -263,7 +286,6 @@ pub(in crate::port::schedule) enum Bind {
 #[derive(Clone, Copy)]
 pub(in crate::port::schedule) enum Acquire {
     Acquired,
-    Blocked,
     Stale,
 }
 

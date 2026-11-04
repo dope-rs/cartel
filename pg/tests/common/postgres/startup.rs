@@ -1,5 +1,5 @@
 use crate::common::{
-    postgres::{Error, Frame},
+    postgres::{Error, Frame, read_empty},
     wire::queries::DIAGNOSTIC,
 };
 use dope_test::harness::peer;
@@ -48,10 +48,7 @@ impl Stream for peer::Stream<'_> {
     }
 
     fn recover(self) -> Result<(), Error> {
-        let mut request = [0_u8; 512];
-        if self.read(&mut request)? == 0 {
-            return Err(Error::Io(peer::Error::UnexpectedEof));
-        }
+        read_empty(&self, b'S')?;
         self.write_all(&Frame::new(b'C', b"SELECT 1\0").encode())?;
         self.write_all(&Frame::new(b'Z', b"I").encode())
             .map_err(Error::Io)

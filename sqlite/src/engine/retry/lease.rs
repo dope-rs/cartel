@@ -31,9 +31,8 @@ pub(crate) struct Lease<'slot, 'd, R: Role> {
 struct Return<'slot, 'd, R>(marker::PhantomData<(retry::raw::Loan<'slot, 'd>, R)>);
 
 #[derive(Clone, Copy)]
-pub(crate) struct Ref<'slot, 'd, R> {
+pub(crate) struct Ref<'slot, 'd> {
     slot: &'slot retry::Slot<'d>,
-    role: marker::PhantomData<R>,
 }
 
 impl<'slot, 'd, R: Role> Lease<'slot, 'd, R> {
@@ -99,16 +98,11 @@ impl<'slot, 'd, R: Role> mem::Return for Return<'slot, 'd, R> {
     }
 }
 
-impl<'slot, 'd, R> Ref<'slot, 'd, R> {
+impl<'slot, 'd> Ref<'slot, 'd> {
     pub(super) const fn new(slot: &'slot retry::Slot<'d>) -> Self {
-        Self {
-            slot,
-            role: marker::PhantomData,
-        }
+        Self { slot }
     }
-}
 
-impl<'d> Ref<'_, 'd, Cleanup> {
     pub(crate) fn progress(&self) -> schedule::Progress<'d> {
         self.slot.progress()
     }
@@ -147,5 +141,5 @@ const _: () = {
     assert!(size_of::<Lease<'static, 'static, Open>>() == word);
     assert!(size_of::<Lease<'static, 'static, Cleanup>>() == word);
     assert!(size_of::<Lease<'static, 'static, Call>>() == word);
-    assert!(size_of::<Ref<'static, 'static, Cleanup>>() == word);
+    assert!(size_of::<Ref<'static, 'static>>() == word);
 };

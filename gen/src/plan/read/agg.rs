@@ -20,6 +20,12 @@ impl<'a> Agg<'a> {
         agg.qualifiers
             .lock
             .reject("row locking is not supported on aggregate queries")?;
+        if !matches!(agg.qualifiers.distinct, shape::qualify::Distinct::None) {
+            return Err(syn::Error::new(
+                self.0.return_type.span(),
+                "DISTINCT qualifiers are not supported on aggregate queries",
+            ));
+        }
         let explicit = match shape::ReturnShape::parse(self.0.return_type) {
             shape::ReturnShape::Default => {
                 return Err(syn::Error::new(

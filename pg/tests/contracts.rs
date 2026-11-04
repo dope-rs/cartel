@@ -509,16 +509,6 @@
 //! ```
 //!
 //!
-//! ```
-//! # mod common { pub mod types; }
-//! use cartel_pg::schema::TypedQuery;
-//! use common::types::ProjectionShorthand;
-//! fn main() {
-//!     let _: &'static str = ProjectionShorthand::SQL;
-//! }
-//! ```
-//!
-//!
 //! ```compile_fail,E0609
 //! # mod common { pub mod types; }
 //! use common::types::User;
@@ -908,6 +898,34 @@
 //! impl User {
 //!     pub fn wrong_return() -> Option<UserId> {
 //!         User::filter(|row| row.id > 0).delete().returning_first()
+//!     }
+//! }
+//! # fn main() {}
+//! ```
+
+//! ```compile_fail
+//! # mod common { pub mod types; }
+//! use common::types::User;
+//! use cartel_pg::dsl::query::ops::{Arrange as _, Fetch as _, Set as _};
+//! #[cartel_pg::query_group]
+//! impl User {
+//!     pub fn distinct_set() -> Vec<User> {
+//!         User::filter(|row| row.id > 0)
+//!             .union_all(User::filter(|row| row.id > 0))
+//!             .distinct().all()
+//!     }
+//! }
+//! # fn main() {}
+//! ```
+//!
+//! ```compile_fail
+//! # mod common { pub mod types; }
+//! use common::types::User;
+//! use cartel_pg::dsl::query::ops::{Arrange as _, Reduce as _};
+//! #[cartel_pg::query_group]
+//! impl User {
+//!     pub fn distinct_count() -> i64 {
+//!         User::filter(|_row| true).distinct_on(|row| row.age).count()
 //!     }
 //! }
 //! # fn main() {}

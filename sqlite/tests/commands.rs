@@ -369,3 +369,47 @@ fn preserve_authorization() -> Result<(), plan::Error> {
     }
     Ok(())
 }
+
+#[test]
+fn catalog_preserves_authorization() -> Result<(), plan::Error> {
+    let runtime = (*RUNTIME.get_or_init(|| {
+        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
+        // Only Cartel uses installed SQLite; Core handles and allocations remain
+        // exclusively owned by their originating worker.
+        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+    }))
+    .map_err(plan::Error::Runtime)?;
+    for result in [
+        plan::Plan::<Unauthorized<false>>::try_new(
+            cartel_sqlite::OpenOptions::new()
+                .open_memory(runtime)
+                .map_err(plan::Error::Client)?,
+            try_limits()?,
+            try_memory()?,
+        )?
+        .try_install(Policy::new(assert_reclaimed, assert_retirement), |result| {
+            result.expect("SQLite scope")
+        }),
+        plan::Plan::<Unauthorized<true>>::try_new(
+            cartel_sqlite::OpenOptions::new()
+                .open_memory(runtime)
+                .map_err(plan::Error::Client)?,
+            try_limits()?,
+            try_memory()?,
+        )?
+        .try_install(Policy::new(assert_reclaimed, assert_retirement), |result| {
+            result.expect("SQLite scope")
+        }),
+    ] {
+        assert!(matches!(
+            result,
+            Err(plan::Failure::Install(
+                topology::InstallError::Install(open::Error::Step(Error::Sqlite {
+                    action: Action::Prepare,
+                    code,
+                }))
+            )) if code.get() == libsqlite3_sys::SQLITE_AUTH
+        ));
+    }
+    Ok(())
+}

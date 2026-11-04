@@ -7,7 +7,7 @@ use o3::{
     alloc::{self, array},
     buffer::{self, pool},
     depot::{
-        arena::pool::{Shared, Unique, Vacant, recycle, shared},
+        arena::pool::{Shared, Unique, recycle, shared},
         capacity,
     },
     mem::rc,
@@ -51,13 +51,6 @@ pub(crate) struct Access<'g, 'r, 's, 'b, 'c, 'd> {
     limits: (NonZero<usize>, NonZero<usize>),
 }
 
-pub(crate) struct Prepared<'g, 'r, 's, 'b, 'c, 'd> {
-    records: Unique<'r, group::Records<'s>, recycle::Header<group::Records<'s>>>,
-    bytes: pool::Cursor,
-    owner: Vacant<'g, Resident<'r, 's, 'b, 'c, 'd>, Header<'r, 's, 'b, 'c, 'd>>,
-    limits: (NonZero<usize>, NonZero<usize>),
-}
-
 impl<'g, 'r, 's, 'b, 'c, 'd> Access<'g, 'r, 's, 'b, 'c, 'd> {
     pub(crate) const fn new(
         bytes: pool::Pool,
@@ -73,7 +66,7 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Access<'g, 'r, 's, 'b, 'c, 'd> {
         }
     }
 
-    pub(crate) fn prepare(&self) -> Result<Prepared<'g, 'r, 's, 'b, 'c, 'd>, crate::Error> {
+    pub(crate) fn prepare(&self) -> Result<Draft<'g, 'r, 's, 'b, 'c, 'd>, crate::Error> {
         let owner = self
             .owners
             .vacancy()
@@ -87,31 +80,14 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Access<'g, 'r, 's, 'b, 'c, 'd> {
             .cursor()
             .ok_or(crate::Error::GroupBytesCapacity)?;
         records.get_mut().get_mut().clear();
-        Ok(Prepared {
-            records,
-            bytes,
-            owner,
-            limits: self.limits,
-        })
-    }
-}
-
-impl<'g, 'r, 's, 'b, 'c, 'd> Prepared<'g, 'r, 's, 'b, 'c, 'd> {
-    pub(crate) fn commit(self) -> Draft<'g, 'r, 's, 'b, 'c, 'd> {
-        let Self {
-            records,
-            bytes,
-            owner,
-            limits,
-        } = self;
         let active = Cell::new(Some(Active { records, bytes }));
-        Draft(Owner {
+        Ok(Draft(Owner {
             state: owner.reserve().commit(State {
-                limits,
+                limits: self.limits,
                 active,
                 reservation: Cell::new(None),
             }),
-        })
+        }))
     }
 }
 

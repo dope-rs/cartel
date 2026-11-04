@@ -94,7 +94,11 @@ fn validates_timeout() {
         Timeout::new(Duration::from_millis(1)),
         Ok(timeout) if timeout.milliseconds() == 1
     ));
-    let long = Duration::from_millis(u64::from(u32::MAX) + 1);
+    assert!(matches!(
+        Timeout::new(Duration::from_millis(i32::MAX as u64)),
+        Ok(timeout) if timeout.milliseconds() == i32::MAX as u32
+    ));
+    let long = Duration::from_millis(i32::MAX as u64 + 1);
     assert_eq!(Timeout::new(long).err(), Some(Error::Long(long)));
 }
 

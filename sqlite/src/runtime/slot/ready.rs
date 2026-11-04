@@ -1,5 +1,5 @@
 use crate::api::{batches, exec, stmt, work};
-use crate::retry::lease::{Cleanup, Ref};
+use crate::retry::lease::Ref;
 use crate::runtime::slot::{Held, lease};
 use crate::{catalogs, sys};
 use dope_core::driver::schedule::clock;
@@ -61,7 +61,7 @@ impl<'slot, 'd: 'slot, I: catalogs::Catalog> Ready<'slot, 'd, I> {
         self.work().pending.status()
     }
 
-    pub(crate) const fn retry_ref(&self) -> Ref<'_, 'd, Cleanup> {
+    pub(crate) const fn retry_ref(&self) -> Ref<'_, 'd> {
         self.held.lease.cleanup_ref()
     }
 

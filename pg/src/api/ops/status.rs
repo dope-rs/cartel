@@ -1,11 +1,11 @@
 use crate::{api, protocol, reply::Error, schema};
-use api::{ops::Query, task::lease::Target, traits};
+use api::traits;
 use dope_fiber::{abi, context, wait};
 use std::task;
 use traits::sealed::Sealed;
 
 pub struct Status<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0>(
-    pub(in crate::api) Query<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    pub(in crate::api) api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
 )
 where
     I: schema::QuerySet + 'd;
@@ -13,7 +13,6 @@ where
 #[pin_project::pin_project]
 struct Wait<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8> {
     client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-    expected: usize,
     #[pin]
     waiter: wait::Waiter<'app, 'd>,
 }
@@ -32,7 +31,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             waiter.unregister();
             return task::Poll::Ready(Err(error));
         }
-        if shared.ready.count() == *this.expected {
+        if shared.ready.count() == this.client.port.capacity() {
             waiter.unregister();
             return task::Poll::Ready(Ok(()));
         }
@@ -67,37 +66,26 @@ impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Sealed
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
     traits::Status<'d, ID> for Status<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
-    fn backend_pid(self) -> Option<i32> {
-        let target = self.0.target?;
-        self.0
-            .client
-            .port
-            .connection()
-            .backend_pid(target.connection())
-    }
-
     fn is_failed(self) -> bool {
-        self.0.client.port.shared.signals.is_failed()
+        self.0.port.shared.signals.is_failed()
     }
 
     fn is_ready(self) -> bool {
-        self.0.client.port.shared.ready.count() != 0
+        self.0.port.shared.ready.count() != 0
     }
 
     fn live_count(self) -> usize {
-        self.0.client.port.shared.ready.count()
+        self.0.port.shared.ready.count()
     }
 
     fn wait_ready(self) -> impl abi::Fiber<'d, Output = Result<(), Error<'d, ID>>> {
-        let client = self.0.client;
         Wait {
-            client,
-            expected: client.port.capacity(),
+            client: self.0,
             waiter: wait::Waiter::new(),
         }
     }
 
     fn set_policy(self, policy: protocol::PickPolicy) {
-        self.0.client.port.shared.ready.set_policy(policy);
+        self.0.port.shared.ready.set_policy(policy);
     }
 }

@@ -1,6 +1,6 @@
 use crate::{
     catalogs, config, conn, database, retry,
-    runtime::{self, heap, release, slot},
+    runtime::{self, heap, slot},
 };
 use dope_core::driver::storage;
 use heap::layout::Layout;
@@ -133,7 +133,7 @@ impl Drop for Retire {
     fn drop(&mut self) {
         // SAFETY: this unique non-Copy owner moves its initialized prefix once in Drop.
         let Resources { heap, memory } = unsafe { self.0.as_ptr().read() };
-        heap.arm(release::Release::new(memory));
+        heap.arm(memory);
     }
 }
 

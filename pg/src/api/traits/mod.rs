@@ -356,7 +356,6 @@ pub trait Listener<'d, const ID: u8 = 0>: Sealed + Sized {
 }
 
 pub trait Status<'d, const ID: u8 = 0>: Sealed + Copy {
-    fn backend_pid(self) -> Option<i32>;
     fn is_failed(self) -> bool;
     fn is_ready(self) -> bool;
     fn live_count(self) -> usize;

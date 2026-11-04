@@ -70,6 +70,12 @@ impl Qualify {
         quals
             .lock
             .reject("row locking is not supported on set-operation queries")?;
+        if !matches!(quals.distinct, qualify::Distinct::None) {
+            return Err(syn::Error::new(
+                state.return_type.span(),
+                "DISTINCT qualifiers are not supported on set-operation queries",
+            ));
+        }
         let limit = Limit::new(&quals.limit, Some(end), state.fn_params)?;
         let offset = Offset::new(&quals.offset, state.fn_params)?;
         Ok(Self {
@@ -170,7 +176,7 @@ impl Integer {
         match self {
             Self::Literal(value) => value,
             Self::Param(id) => {
-                let idx = state.intern(id.clone());
+                let idx = pred::sql::intern(&mut state.captures, id.clone());
                 state.mark_nonneg(id, bound);
                 let ctx = backend::ParamCtx {
                     captures: &state.captures,

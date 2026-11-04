@@ -8,7 +8,7 @@ pub const ROUNDS: u32 = 32_768;
 
 pub const SALT: &[u8] = b"queue-admission-proof";
 
-pub const PASSWORDS: [(&str, &[u8]); 4] = [
+pub const PASSWORDS: [(&str, &[u8]); 6] = [
     (
         "\u{301}\u{316}|password-password-password-password-password-password-password-\u{2168}|A\u{305}\u{301}|A\u{315}\u{300}|B\u{315}\u{300}|\u{1100}\u{1161}\u{11a8}|\u{ad}",
         "\u{316}\u{301}|password-password-password-password-password-password-password-IX|A\u{305}\u{301}|\u{c0}\u{315}|B\u{300}\u{315}|\u{ac01}|".as_bytes(),
@@ -16,6 +16,14 @@ pub const PASSWORDS: [(&str, &[u8]); 4] = [
     ("\u{ad}", "\u{ad}".as_bytes()),
     ("A\u{0340}", "A\u{0340}".as_bytes()),
     ("\u{1d2c}", "\u{1d2c}".as_bytes()),
+    (
+        "\u{05d0}\u{1885}\u{ff11}\u{05d0}",
+        "\u{05d0}\u{1885}\u{ff11}\u{05d0}".as_bytes(),
+    ),
+    (
+        "\u{05d0}\u{2800}\u{ff11}\u{05d0}",
+        "\u{05d0}\u{2800}1\u{05d0}".as_bytes(),
+    ),
 ];
 
 pub trait Auth {

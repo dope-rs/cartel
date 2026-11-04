@@ -73,11 +73,11 @@ impl<'a> Project<'a> {
             .0
             .dialect
             .columns(&syn::parse_quote!(#table), inner.qualifier(0));
-        let mut sql = vec![
-            self.0.dialect.kw("SUBQUERY_OPEN"),
-            columns,
-            self.0.dialect.kw("FROM_KW"),
-        ];
+        let mut sql = vec![self.0.dialect.kw("SUBQUERY_OPEN")];
+        let step = Project(self.0).distinct(&quals, &scope)?;
+        self.0 = step.state;
+        sql.extend(step.value);
+        sql.extend([columns, self.0.dialect.kw("FROM_KW")]);
         sql.extend(inner.render_base());
         sql.push(self.0.dialect.kw("WHERE_KW"));
         sql.extend(filter);
@@ -117,7 +117,7 @@ impl<'a> Project<'a> {
                 let local = pred::RowScope {
                     vars,
                     agg_var: None,
-                    outer: None,
+                    outer: scope.outer.clone(),
                     alias_depth: scope.alias_depth,
                     unnest_cols: Vec::new(),
                 };

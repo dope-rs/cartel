@@ -19,7 +19,7 @@ use common::{
     topology,
 };
 use dope::{
-    core::driver::route::Id,
+    core::{driver::route::Id, platform::wake::Ends},
     manifold::{app::env::Bundle, timing::Throughput},
     net::{tcp::Tcp, wire::Identity},
     runtime::executor::session::Completion,
@@ -31,6 +31,80 @@ use o3::base::time::Positive;
 type Env = Bundle<Tcp, Identity, Throughput>;
 
 pub mod common;
+
+#[test]
+fn throttled_query_cannot_enter_later_transaction() {
+    let (wait, release) = Ends::blocking().expect("first reply gate").split();
+    peer::AcceptScript::with(
+        move |listener| common::transaction::throttled(listener, wait),
+        |server| {
+            let mut capacity = Queries::try_cancel().expect("PG capacity").capacities();
+            capacity.inflight = 1;
+            let prepared = topology::Prepare::try_new::<Env>(
+                port::Port::<Queries>::plan(
+                    Queries::try_config().expect("database config"),
+                    config::Config::new(capacity).expect("single reply"),
+                ),
+                server.addr(),
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+            )
+            .expect("transaction topology");
+            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+            let mut report = Completion::new();
+            prepared.with_local(
+                |worker| {
+                    worker.lend(|node, stage| {
+                        node.install(stage, |host, stage| {
+                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+                                let client = runtime.root_client();
+                                assert!(matches!(
+                                    runtime.block_on(client.status().wait_ready()),
+                                    Ok(Ok(()))
+                                ));
+                                let mut first =
+                                    pin!(Task::new(client.unchecked().command("SELECT 1")));
+                                assert!(matches!(
+                                    runtime.block_on(fibers::TEST.poll_once(first.as_mut())),
+                                    Ok(None)
+                                ));
+                                let mut waiting =
+                                    pin!(Task::new(client.unchecked().command("SELECT 2")));
+                                assert!(matches!(
+                                    runtime.block_on(fibers::TEST.poll_once(waiting.as_mut())),
+                                    Ok(None)
+                                ));
+                                release.notify().expect("complete first query");
+                                assert!(matches!(runtime.block_on(first.as_mut()), Ok(Ok(()))));
+                                let tx = runtime
+                                    .block_on(client.transaction().begin())
+                                    .expect("begin driver")
+                                    .ok()
+                                    .expect("exclusive transaction");
+                                assert!(matches!(
+                                    runtime.block_on(waiting.as_mut()),
+                                    Ok(Err(reply::Error::Driver(
+                                        cartel_pg::Error::Backpressure { .. }
+                                    )))
+                                ));
+                                assert!(matches!(runtime.block_on(tx.commit()), Ok(Ok(()))));
+                                assert!(matches!(
+                                    runtime.block_on(client.unchecked().command("SELECT 1")),
+                                    Ok(Ok(()))
+                                ));
+                            })
+                        })
+                    })
+                },
+                recovery::Policy::new(|event| reports.push(event), common::recover),
+                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "transaction scope"),
+            );
+            assert!(reports.events().expect("reclamation").is_empty());
+            assert!(matches!(server.finish(), Ok(Ok(()))), "transaction peer");
+        },
+    )
+    .expect("spawn transaction peer");
+}
 
 #[test]
 fn transaction_status_rejects_stale_guard() {
@@ -99,6 +173,75 @@ fn transaction_status_rejects_stale_guard() {
                                         Ok(Ok(()))
                                     ));
                                     drop(stale);
+                                    assert!(matches!(
+                                        runtime.block_on(client.unchecked().command("SELECT 1")),
+                                        Ok(Ok(()))
+                                    ));
+                                })
+                            })
+                        })
+                    },
+                    recovery::Policy::new(|event| reports.push(event), common::recover),
+                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "transaction scope"),
+                );
+                assert!(reports.events().expect("reclamation").is_empty());
+                assert!(matches!(server.finish(), Ok(Ok(()))), "transaction peer");
+            },
+        )
+        .expect("spawn transaction peer");
+    }
+}
+
+#[test]
+fn finalizer_preserves_status_error() {
+    for rejected in [false, true] {
+        peer::AcceptScript::with(
+            move |listener| common::transaction::unfinished(listener, rejected),
+            |server| {
+                let prepared = topology::Prepare::try_new::<Env>(
+                    port::Port::<Queries>::plan(
+                        Queries::try_config().expect("database config"),
+                        Queries::try_cancel().expect("transaction capacity"),
+                    ),
+                    server.addr(),
+                    Duration::from_millis(1),
+                    Duration::from_secs(1),
+                )
+                .expect("transaction topology");
+                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+                let mut report = Completion::new();
+                prepared.with_local(
+                    |worker| {
+                        worker.lend(|node, stage| {
+                            node.install(stage, |host, stage| {
+                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+                                    let client = runtime.root_client();
+                                    let tx = runtime
+                                        .block_on(client.transaction().begin())
+                                        .expect("begin driver")
+                                        .ok()
+                                        .expect("transaction");
+                                    let error = runtime
+                                        .block_on(tx.commit())
+                                        .expect("commit driver")
+                                        .expect_err("transaction remained open");
+                                    if rejected {
+                                        let fields = error
+                                            .as_server()
+                                            .expect("original server error")
+                                            .fields();
+                                        assert_eq!(
+                                            (fields.code().as_str(), fields.message()),
+                                            ("23505", "duplicate")
+                                        );
+                                    } else {
+                                        assert!(matches!(
+                                            error,
+                                            reply::Error::Driver(cartel_pg::Error::Protocol(
+                                                cartel_pg::protocol::Reason::TransactionOpen
+                                            ))
+                                        ));
+                                    }
                                     assert!(matches!(
                                         runtime.block_on(client.unchecked().command("SELECT 1")),
                                         Ok(Ok(()))

@@ -15,10 +15,7 @@ use dope::{
 pub use error::Error;
 use o3::{
     base::{num::bounded, time::Positive},
-    buffer::{
-        hold::{self, limits},
-        pool,
-    },
+    buffer::{hold::limits, pool},
     depot::{capacity, queue::pool::fair},
 };
 use reply::{layout, usage};
@@ -33,7 +30,6 @@ pub struct Config {
     capacities: Bounds,
     pub(super) operation_window: Positive,
     memory_bound: Memory,
-    response_retention: Layout,
     runtime: Runtime,
 }
 
@@ -269,7 +265,6 @@ impl Config {
                 notifications: caps.notifications,
             },
             operation_window: window,
-            response_retention: retained,
             memory_bound: Memory {
                 request_bytes: request,
                 cancel_bytes: cancel,
@@ -349,10 +344,6 @@ impl Config {
 
     pub const fn memory_bound(&self) -> &Memory {
         &self.memory_bound
-    }
-
-    pub(crate) const fn retention(&self) -> hold::Policy {
-        self.response_retention.policy()
     }
 
     pub(crate) const fn frame_limit(&self) -> u32 {

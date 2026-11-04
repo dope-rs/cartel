@@ -73,10 +73,6 @@ impl<'p, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8>
         backend::Backend::new(slot).try_install(token, key)
     }
 
-    pub(crate) fn backend_pid(&self, token: conn::Id<'d, KeyTag<ID>>) -> Option<i32> {
-        backend::Backend::new(self.port.conn(token)?).pid(token)
-    }
-
     pub(crate) fn cancel(
         &self,
         token: conn::Id<'d, KeyTag<ID>>,

@@ -73,6 +73,14 @@ impl<'d, const ID: u8> Shared<'d, ID> {
 }
 
 impl<'d, const ID: u8> Shared<'d, ID> {
+    /// Operations can use prepared peers while another connection is opening.
+    pub(crate) fn failure(&self) -> Option<crate::reply::Error<'d, ID>> {
+        match self.signals.failure() {
+            Some(crate::reply::Error::Open(_)) if self.ready.count() != 0 => None,
+            failure => failure,
+        }
+    }
+
     pub(crate) fn reject(&self, reason: close::Reason) {
         self.fail(crate::Error::Connection(reason));
     }

@@ -1,6 +1,6 @@
 use std::{num::NonZero, ptr};
 
-use crate::runtime::{heap, release::Release};
+use crate::runtime::{heap, raw::Memory};
 
 /// One complete physical block retaining the arena whose extent admitted it.
 pub(super) struct Segment<'a> {
@@ -81,7 +81,7 @@ impl Vacant<'_> {
 impl Occupied<'_> {
     /// This capability owns one native-admitted live block in this exact state.
     /// Consuming it removes that counted allocation exactly once.
-    pub(super) fn release(self) -> Option<Release> {
+    pub(super) fn release(self) -> Option<Memory> {
         self.source.allocations -= 1;
         self.source.recycle(self.block.into_segment());
         if self.source.is_empty() {

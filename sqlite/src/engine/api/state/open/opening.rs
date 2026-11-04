@@ -18,7 +18,6 @@ enum Phase {
     Settings(Settings),
     Verify(Verify),
     Commands,
-    Ready,
 }
 
 #[derive(Clone, Copy)]
@@ -97,11 +96,9 @@ impl<'local, 'd: 'local, I: catalogs::Catalog> Opening<'local, 'd, I> {
             Phase::Configure(step) => return Ok(self.configure(step)?),
             Phase::Settings(step) => return Ok(self.settings(step)?),
             Phase::Verify(step) => return Ok(self.verify(step)?),
-            Phase::Ready => return Ok(Progress::Ready),
             Phase::Commands => {}
         }
         let Some((sql, tail)) = self.commands.split_first() else {
-            self.phase = Phase::Ready;
             return Ok(Progress::Ready);
         };
         self.resources.call().execute(sql)?;

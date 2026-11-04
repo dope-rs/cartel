@@ -8,6 +8,18 @@ enum Part {
 
 pub(crate) struct Sql(Vec<Part>);
 
+pub(crate) fn intern(captures: &mut Vec<syn::Ident>, ident: syn::Ident) -> usize {
+    if let Some(index) = captures
+        .iter()
+        .position(|current| current.unraw() == ident.unraw())
+    {
+        return index;
+    }
+    let index = captures.len();
+    captures.push(ident);
+    index
+}
+
 impl Sql {
     pub(crate) const fn new() -> Self {
         Self(Vec::new())
@@ -71,17 +83,7 @@ impl Sql {
             match part {
                 Part::Token(token) => tokens.push(token),
                 Part::Capture(ident) => {
-                    let index = match captures
-                        .iter()
-                        .position(|capture| capture.unraw() == ident.unraw())
-                    {
-                        Some(index) => index,
-                        None => {
-                            let index = captures.len();
-                            captures.push(ident);
-                            index
-                        }
-                    };
+                    let index = intern(captures, ident);
                     let context = backend::ParamCtx {
                         captures,
                         param_ids: ids,

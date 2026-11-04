@@ -6,7 +6,7 @@ pub fn user_by_id(id: i64) -> User {
 }
 
 #[cartel_sqlite::query]
-pub fn maybe_user_by_id(id: i64) -> Option<User> {
+pub fn r#maybe_user_by_id(id: i64) -> Option<User> {
     User::filter(|u| u.id == id).rows().first()
 }
 

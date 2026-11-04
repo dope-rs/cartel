@@ -266,10 +266,10 @@ impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, const ID: u8>
     fn clear_recv<'turn>(
         owner: &Owner<'r, 's, 'storage, 'b, 'c, 'd, ID>,
         conn: conn::Id<'d, route::KeyTag<ID>>,
-        reason: close::Reason,
+        _: close::Reason,
         ctx: &mut turns::Retirement<'_, 'turn, 'd>,
     ) -> egress::Cleared {
-        owner.root().schedule.clear_recv(conn, reason, ctx)
+        owner.root().schedule.clear_recv(conn, ctx)
     }
     fn fence(
         owner: &Owner<'r, 's, 'storage, 'b, 'c, 'd, ID>,

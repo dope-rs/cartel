@@ -56,12 +56,10 @@ impl<I: catalogs::Catalog> Local<I> {
 
     pub(crate) fn lease<'slot, 'd: 'slot>(
         &'slot mut self,
-        mut retry: retry::raw::Loan<'slot, 'd>,
+        retry: retry::raw::Loan<'slot, 'd>,
         report: &'slot mut crate::open::Completion,
     ) -> Result<Vacant<'slot, 'd, I>, crate::Error> {
         self.owned.enter()?;
-        self.work.reset();
-        retry.finish();
         let arena = batches::Arena::from_span(&mut self.arena);
         let owned = ptr::NonNull::from(&mut self.owned);
         let lease = Lease::new(owned, retry, &self.work, report);

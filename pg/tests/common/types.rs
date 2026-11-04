@@ -215,6 +215,15 @@ impl Projection {
             .all()
     }
 
+    pub fn lateral_distinct(shift: i32) -> Vec<(User, User)> {
+        User::lateral_join::<User>(|outer| {
+            User::filter(|inner| inner.id > outer.id)
+                .distinct_on(|inner| inner.age + outer.age + shift)
+        })
+        .filter(|_outer, _inner| true)
+        .all()
+    }
+
     pub fn legacy(r#row10: i64) -> Vec<(i64, String)> {
         User::filter(|r#row| row10 <= row.id)
             .order_by(|row| row.id)
@@ -251,6 +260,11 @@ impl Projection {
     pub fn cte_short(r#id: i64) -> Vec<User> {
         let r#selected = User::filter(User::id >= id).for_update().cte();
         selected.filter(|r#row| row.age > 0).all()
+    }
+
+    pub fn cte_distinct(id: i64) -> Vec<User> {
+        let selected = User::filter(|row| row.id >= id).distinct().cte();
+        selected.all()
     }
 
     pub fn mixed_set() -> Vec<User> {

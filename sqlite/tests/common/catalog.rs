@@ -46,6 +46,22 @@ impl<const TAIL: bool, const UTF8: bool> Catalog for Malformed<TAIL, UTF8> {
     const STATEMENTS: &[Entry<'_>] = &[Entry::of::<Self>()];
 }
 
+pub struct Unauthorized<const SAVEPOINT: bool>;
+
+impl<const SAVEPOINT: bool> TypedQuery for Unauthorized<SAVEPOINT> {
+    const SQL: &str = if SAVEPOINT {
+        "SAVEPOINT \"__cartel\""
+    } else {
+        "COMMIT"
+    };
+    const PARAMETERS: usize = 0;
+    const COLUMNS: usize = 0;
+}
+
+impl<const SAVEPOINT: bool> Catalog for Unauthorized<SAVEPOINT> {
+    const STATEMENTS: &[Entry<'_>] = &[Entry::of::<Self>()];
+}
+
 pub fn try_limits() -> Result<Limits, plan::Error> {
     Ok(Limits {
         parameters: Parameters {

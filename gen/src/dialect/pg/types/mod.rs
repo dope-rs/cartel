@@ -4,7 +4,6 @@ mod tag;
 pub(super) trait TypeExt {
     fn bind(&self) -> syn::Result<Bind>;
     fn row_read(&self) -> syn::Result<proc_macro2::TokenStream>;
-    fn view_type(&self) -> syn::Result<proc_macro2::TokenStream>;
     fn format(&self) -> u16;
     fn slice_type(&self) -> Option<proc_macro2::TokenStream>;
     fn formats(&self) -> Option<proc_macro2::TokenStream>;
@@ -17,10 +16,6 @@ impl TypeExt for syn::Type {
 
     fn row_read(&self) -> syn::Result<proc_macro2::TokenStream> {
         kind::Kind::new(self).row_read()
-    }
-
-    fn view_type(&self) -> syn::Result<proc_macro2::TokenStream> {
-        kind::Kind::new(self).view_type()
     }
 
     fn format(&self) -> u16 {

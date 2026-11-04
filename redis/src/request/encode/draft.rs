@@ -53,8 +53,7 @@ impl mem::Return for Draft {
     type Item = ();
 
     fn return_item(self, (): Self::Item) {
-        let (mut cursor, kind) = self.out.into_parts();
-        kind.clear(cursor.as_mut());
+        drop(self.finish());
     }
 }
 

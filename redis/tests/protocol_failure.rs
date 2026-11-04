@@ -206,10 +206,12 @@ fn retains_invalid_facts() {
         ));
     })
     .expect("protocol fixture");
-    for (bytes, offset, expected) in [
-        (b"$1\r\nx!\n".as_slice(), 5, b'\r'),
-        (b"$1\r\nx!!".as_slice(), 5, b'\r'),
-        (b"$1\r\nx\r!".as_slice(), 6, b'\n'),
+    for (bytes, offset, expected, actual) in [
+        (b"$1\r\nx!\n".as_slice(), 5, b'\r', b'!'),
+        (b"$1\r\nx!!".as_slice(), 5, b'\r', b'!'),
+        (b"$1\r\nx\r!".as_slice(), 6, b'\n', b'!'),
+        (b"+a\n".as_slice(), 2, b'\r', b'\n'),
+        (b"-ERR a\r!".as_slice(), 7, b'\n', b'!'),
     ] {
         with_reply(bytes, 16, 1, |decoded| {
             assert!(matches!(
@@ -218,9 +220,9 @@ fn retains_invalid_facts() {
                     protocol::Error::Terminator {
                         offset: found,
                         expected: marker,
-                        actual: b'!',
+                        actual: byte,
                     }
-                ))) if found == offset && marker == expected
+                ))) if found == offset && marker == expected && byte == actual
             ));
         })
         .expect("protocol fixture");

@@ -25,14 +25,6 @@ impl<'query, 'connection: 'query, 'd: 'connection, I: catalogs::Catalog>
     }
 }
 
-impl<'query, 'connection: 'query, 'd: 'connection, I: catalogs::Catalog>
-    IntoQuery<'query, 'connection, 'd, I> for &'query mut State<'connection, 'd, I>
-{
-    fn into_query(self) -> exec::Query<'query, 'connection, 'd, I> {
-        self.query()
-    }
-}
-
 impl<'query, 'database: 'query, 'connection: 'database, 'd: 'connection, I: catalogs::Catalog>
     IntoQuery<'query, 'connection, 'd, I>
     for &'query mut tx::Transaction<'database, 'connection, 'd, I>

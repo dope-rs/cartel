@@ -231,15 +231,40 @@ impl State {
                     self.mode.line(kind, end, slot);
                 }
                 Mode::Line { kind, pending } => {
-                    let Some(line) = limit::Line::find(bytes, pending.start, self.scan) else {
-                        self.scan = bytes.len().saturating_sub(1).max(pending.start.get());
-                        self.mode = Mode::Line { kind, pending };
-                        return match byte_max.check(bytes.len()) {
-                            Ok(()) => parser::Scan::Pending,
-                            Err(error) => Self::consumed(buf, byte_max.consumed(), |consumed| {
-                                parser::Scan::FrameCapacity(error, consumed)
-                            }),
-                        };
+                    let line = match limit::Line::find(bytes, pending.start, self.scan, kind) {
+                        Ok(Some(line)) => line,
+                        Ok(None) => {
+                            self.scan = bytes.len().saturating_sub(1).max(pending.start.get());
+                            self.mode = Mode::Line { kind, pending };
+                            return match byte_max.check(bytes.len()) {
+                                Ok(()) => parser::Scan::Pending,
+                                Err(error) => {
+                                    Self::consumed(buf, byte_max.consumed(), |consumed| {
+                                        parser::Scan::FrameCapacity(error, consumed)
+                                    })
+                                }
+                            };
+                        }
+                        Err((offset, expected, actual)) => {
+                            self.mode = Mode::Line { kind, pending };
+                            return match byte_max.next(offset) {
+                                Ok(end) => Self::consumed(buf, end.consumed(), |consumed| {
+                                    parser::Scan::Invalid(
+                                        protocol::Error::Terminator {
+                                            offset: end.count().get() - 1,
+                                            expected,
+                                            actual,
+                                        },
+                                        consumed,
+                                    )
+                                }),
+                                Err(error) => {
+                                    Self::consumed(buf, byte_max.consumed(), |consumed| {
+                                        parser::Scan::FrameCapacity(error, consumed)
+                                    })
+                                }
+                            };
+                        }
                     };
                     let (end, body) = match byte_max.line(line) {
                         Ok(found) => found,

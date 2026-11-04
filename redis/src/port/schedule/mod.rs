@@ -179,26 +179,18 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Schedule<'s, 'storage, 'b, 'c, 'd, 
     pub(crate) fn clear_recv(
         &self,
         token: Id<'d, route::KeyTag<ID>>,
-        reason: close::Reason,
         ctx: &mut turns::Retirement<'_, '_, 'd>,
     ) -> egress::Cleared {
         use dope_fiber::reply::{Progress, Retirement};
 
         let (work, region) = ctx.parts();
-        self.quarantine(token, reason, region);
         let Some((conn, cause)) = self.routes.failure(token) else {
             return egress::Cleared::Done;
         };
         let reps = self.lane(conn.position());
         match Retirement::new(region).fail(work, reps, &cause) {
-            Progress::Pending(_) => return egress::Cleared::Retry,
-            Progress::Complete(_) => {}
-        }
-        let reqs = self.requests(conn.position());
-        if reqs.is_empty(region) && reps.depth(region) == Depth::ZERO {
-            egress::Cleared::Done
-        } else {
-            egress::Cleared::Retry
+            Progress::Pending(_) => egress::Cleared::Retry,
+            Progress::Complete(_) => egress::Cleared::Done,
         }
     }
 
@@ -233,17 +225,11 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Schedule<'s, 'storage, 'b, 'c, 'd, 
         for _ in 0..self.routes.len() {
             let conn = self.routes.pop::<0>()?;
             let token = conn.connection();
-            let reps = self.lane(conn.position());
-            let reqs = self.requests(conn.position());
-            match conn.acquire(token, reqs, reps, region) {
+            match conn.acquire(token) {
                 Acquire::Acquired => {}
-                Acquire::Blocked => {
-                    conn.schedule::<1>(conn.position());
-                    continue;
-                }
                 Acquire::Stale => continue,
             }
-            reps.control().deactivate(region);
+            self.lane(conn.position()).control().deactivate(region);
             return Some(Lease::new(redis, conn));
         }
         None

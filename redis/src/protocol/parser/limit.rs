@@ -1,3 +1,4 @@
+use crate::protocol;
 use o3::depot::capacity::Limit;
 use std::{marker, mem, num};
 
@@ -204,16 +205,44 @@ impl Body {
 }
 
 impl<'a> Line<'a> {
-    pub(super) fn find(bytes: &'a [u8], start: End, scan: usize) -> Option<Self> {
+    pub(super) fn find(
+        bytes: &'a [u8],
+        start: End,
+        scan: usize,
+        kind: protocol::Line,
+    ) -> Result<Option<Self>, (usize, u8, u8)> {
         let begin = start.get();
         let scan = scan.max(begin);
-        let tail = bytes.get(scan..)?;
-        let offset = tail.windows(2).position(|pair| pair == b"\r\n")?;
-        let stop = scan + offset;
-        Some(Self {
-            value: bytes.get(begin..stop)?,
-            start,
-        })
+        let Some(tail) = bytes.get(scan..) else {
+            return Ok(None);
+        };
+        let offset = match kind {
+            protocol::Line::Status | protocol::Line::Server => {
+                let Some(offset) = tail.iter().position(|byte| matches!(byte, b'\r' | b'\n'))
+                else {
+                    return Ok(None);
+                };
+                if tail[offset] == b'\n' {
+                    return Err((scan + offset, b'\r', b'\n'));
+                }
+                let Some(&actual) = tail.get(offset + 1) else {
+                    return Ok(None);
+                };
+                if actual != b'\n' {
+                    return Err((scan + offset + 1, b'\n', actual));
+                }
+                offset
+            }
+            protocol::Line::Integer | protocol::Line::Bulk | protocol::Line::Array => {
+                let Some(offset) = tail.windows(2).position(|pair| pair == b"\r\n") else {
+                    return Ok(None);
+                };
+                offset
+            }
+        };
+        Ok(bytes
+            .get(begin..scan + offset)
+            .map(|value| Self { value, start }))
     }
 
     pub(super) const fn value(self) -> &'a [u8] {

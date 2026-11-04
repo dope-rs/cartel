@@ -72,7 +72,7 @@ impl<'d, I: catalogs::Catalog> Lease<'_, 'd, I, Ready> {
         self.inner.item_mut().retry.cleanup()
     }
 
-    pub(super) const fn cleanup_ref(&self) -> lease::Ref<'_, 'd, lease::Cleanup> {
+    pub(super) const fn cleanup_ref(&self) -> lease::Ref<'_, 'd> {
         self.inner.item().retry.cleanup_ref()
     }
 }

@@ -13,7 +13,7 @@ pub mod common;
 
 #[test]
 fn resumes_nested() {
-    let bytes = b"*2\r\n$3\r\nfoo\r\n:7\r\n";
+    let bytes = b"*4\r\n+OK\r\n-ERR fixture\r\n$3\r\n\r\n\0\r\n:7\r\n";
     let parts = ((1..bytes.len())
         .map(|end| Shared::try_copy(&bytes[..end]))
         .collect::<Result<Vec<_>, _>>())
@@ -39,24 +39,29 @@ fn resumes_nested() {
                 _ => None,
             }
             .expect("complete reply must decode");
-            assert_eq!(frame.value_count().get(), 3);
+            assert_eq!(frame.value_count().get(), 5);
             let mut partial = frame.reader();
             assert!(matches!(
                 partial.next_event(),
-                Some(value::Event::Array { len: 2 })
+                Some(value::Event::Array { len: 4 })
             ));
             assert!(matches!(
                 partial.finish(),
-                Err(protocol::Error::Values { remaining: rest }) if rest.get() == 2
+                Err(protocol::Error::Values { remaining: rest }) if rest.get() == 4
             ));
             let mut reader = frame.reader();
             assert!(matches!(
                 reader.next_event(),
-                Some(value::Event::Array { len: 2 })
+                Some(value::Event::Array { len: 4 })
+            ));
+            assert!(matches!(reader.next_event(), Some(value::Event::Ok)));
+            assert!(matches!(
+                reader.next_event(),
+                Some(value::Event::Error(b"ERR fixture"))
             ));
             assert!(matches!(
                 reader.next_event(),
-                Some(value::Event::Bulk(value)) if value == b"foo"
+                Some(value::Event::Bulk(value)) if value == b"\r\n\0"
             ));
             assert!(matches!(
                 reader.next_event(),

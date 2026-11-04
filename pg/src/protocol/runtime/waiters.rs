@@ -19,13 +19,6 @@ pub(in crate::protocol) struct Queue<'d> {
     remaining: cell::Cell<usize>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-#[repr(u8)]
-enum Phase {
-    Idle,
-    Pending,
-}
-
 impl<'d> Queue<'d> {
     pub(in crate::protocol) fn new(driver: driver::Reference<'d>, capacity: Capacity) -> Self {
         Self {
@@ -55,14 +48,10 @@ impl<'d> Queue<'d> {
     }
 }
 
-const _: () = {
-    assert!(mem::size_of::<Phase>() == mem::size_of::<bool>());
-    assert!(mem::align_of::<Phase>() == mem::align_of::<bool>());
-    assert!(
-        mem::size_of::<Queue<'static>>()
-            == mem::size_of::<wait::Queue<'static>>() + mem::size_of::<usize>()
-    );
-};
+const _: () = assert!(
+    mem::size_of::<Queue<'static>>()
+        == mem::size_of::<wait::Queue<'static>>() + mem::size_of::<usize>()
+);
 
 impl<'d> ops::Deref for Queue<'d> {
     type Target = wait::Queue<'d>;
@@ -154,8 +143,7 @@ impl<'d, const ID: u8> Table<'d, ID> {
 
 pub(crate) struct Egress<'d> {
     full: Queue<'d>,
-    lanes: shared::Fifo<reply::LaneIndex, Queue<'d>>,
-    scan: cell::Cell<Phase>,
+    lanes: shared::Fifo<(), Queue<'d>>,
 }
 
 impl<'d> Egress<'d> {
@@ -167,7 +155,6 @@ impl<'d> Egress<'d> {
         Ok(Self {
             full: Queue::new(driver, capacity),
             lanes: shared::Fifo::try_with(slots.entries().get(), || Queue::new(driver, capacity))?,
-            scan: cell::Cell::new(Phase::Idle),
         })
     }
 
@@ -194,51 +181,44 @@ impl<'d> Egress<'d> {
         let lane = released.index();
         let slot = self.lanes.try_entry(lane.get())?;
         self.full.wake();
-        slot.state().wake();
-        if slot.get::<0>().is_none() {
-            slot.push::<0>(lane);
-        }
+        Self::wake_lane(slot);
         Ok(())
     }
 
     fn flush(&self, work: app::Work<'_, 'd>) {
         self.full.flush(work);
-        if let Some((slot, lane)) = self.lanes.next::<0>() {
+        if let Some((slot, ())) = self.lanes.next::<0>() {
             let queue = slot.state();
             queue.flush(work);
             if queue.is_pending() {
-                slot.push::<0>(lane);
-            }
-        }
-        if self.scan.replace(Phase::Idle) == Phase::Pending {
-            for slot in self.lanes.iter() {
-                let queue = slot.state();
-                queue.flush(work);
-                if queue.is_pending() {
-                    self.scan.set(Phase::Pending);
-                }
+                slot.push::<0>(());
             }
         }
     }
 
     fn is_pending(&self) -> bool {
-        self.full.is_pending() || !self.lanes.is_empty::<0>() || self.scan.get() == Phase::Pending
+        self.full.is_pending() || !self.lanes.is_empty::<0>()
     }
 
     fn wake_all(&self) {
         self.full.wake();
         for slot in self.lanes.iter() {
-            slot.state().wake();
+            Self::wake_lane(slot);
         }
-        self.scan.set(Phase::Pending);
+    }
+
+    fn wake_lane(slot: shared::Slot<'_, (), Queue<'d>>) {
+        let queue = slot.state();
+        queue.wake();
+        if queue.is_pending() && slot.get::<0>().is_none() {
+            slot.push::<0>(());
+        }
     }
 }
 
 const _: () = assert!(
     mem::size_of::<Egress<'static>>()
-        == mem::size_of::<Queue<'static>>()
-            + mem::size_of::<shared::Fifo<reply::LaneIndex, Queue<'static>>>()
-            + mem::size_of::<usize>()
+        == mem::size_of::<Queue<'static>>() + mem::size_of::<shared::Fifo<(), Queue<'static>>>()
 );
 
 pub(crate) struct Set<'a, 'd, const ID: u8> {

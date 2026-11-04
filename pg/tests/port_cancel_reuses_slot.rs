@@ -1,4 +1,4 @@
-use crate::common::postgres::{Frame, accept::Listener, startup::Stream};
+use crate::common::postgres::{Frame, accept::Listener, read_empty, startup::Stream};
 use cartel_pg::api::traits::{Begin as _, Client as _, Status as _, Transaction as _};
 use cartel_pg::{api, api::tx::control::error::Kind, port};
 use common::{port::*, topology};
@@ -102,8 +102,7 @@ fn queued_cancel_reuse(listener: TcpListener) -> thread::JoinHandle<()> {
             Listener::accept_within(&listener, Duration::from_secs(1)).expect("peer connection");
         Stream::try_start(&mut primary, Some((PID, SECRET))).expect("backend key handshake");
 
-        let mut request = [0_u8; 512];
-        assert!(primary.read(&mut request).expect("BEGIN request") != 0);
+        read_empty(&primary, b'S').expect("BEGIN request");
         primary
             .write_all(&Frame::new(b'C', b"BEGIN\0").encode())
             .expect("BEGIN CommandComplete");
@@ -152,7 +151,7 @@ fn queued_cancel_reuse(listener: TcpListener) -> thread::JoinHandle<()> {
             );
         }
 
-        assert!(primary.read(&mut request).expect("ROLLBACK request") != 0);
+        read_empty(&primary, b'S').expect("ROLLBACK request");
         primary
             .write_all(&Frame::new(b'C', b"ROLLBACK\0").encode())
             .expect("ROLLBACK CommandComplete");

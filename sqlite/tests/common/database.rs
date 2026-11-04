@@ -84,7 +84,7 @@ cartel_sqlite::catalog! {
 pub IntegrationDatabase;
 
 queries! {
-    query::dispatch::user_by_id,
+    query::dispatch::r#user_by_id,
     query::dispatch::maybe_user_by_id,
     query::dispatch::all_users,
     query::dispatch::user_names_min_id,

@@ -2,14 +2,62 @@ use crate::common::plan;
 use cartel_sqlite::runtime::{self, Runtime};
 use common::{assert_reclaimed, assert_retirement, wal::*};
 use dope_core::driver::life::recovery::Policy;
+use dope_runtime::topology;
 use dope_test::fibers;
 use dope_test::harness::support::file::Directory;
-use std::{env, sync::OnceLock};
+use std::{env, num::NonZero, path::Path, sync::OnceLock};
 use std::{sync::mpsc, thread, time::Duration};
 
 pub mod common;
 
 static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
+
+#[test]
+fn checkpoint_pages_fit_native_range() -> Result<(), plan::Error> {
+    let runtime = (*RUNTIME.get_or_init(|| {
+        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
+        // Only Cartel uses installed SQLite; Core handles and allocations remain
+        // exclusively owned by their originating worker.
+        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+    }))
+    .map_err(plan::Error::Runtime)?;
+    let dir = Directory::try_with(
+        Path::new(env!("CARGO_TARGET_TMPDIR")),
+        "cartel-sqlite-checkpoint-pages",
+        |removed| removed.expect("temporary directory cleanup"),
+    )
+    .expect("temporary directory");
+    let path = dir.path().join("database.db");
+    let maximum = i32::MAX as u32;
+    for value in [maximum, maximum + 1] {
+        let mut wal = cartel_sqlite::Wal::new();
+        wal.checkpoint(cartel_sqlite::Checkpoint::Pages(
+            NonZero::new(value).expect("positive checkpoint threshold"),
+        ));
+        let target = cartel_sqlite::OpenOptions::new()
+            .journal(cartel_sqlite::Journal::Wal(wal))
+            .open(runtime, &path)
+            .map_err(plan::Error::Client)?;
+        let result =
+            plan::Plan::<common::catalog::Commands>::try_new(target, try_limits()?, try_memory()?)?
+                .try_install(Policy::new(assert_reclaimed, assert_retirement), |result| {
+                    result.expect("SQLite scope")
+                });
+        if value == maximum {
+            result.expect("maximum native checkpoint threshold");
+        } else {
+            assert!(matches!(
+                result,
+                Err(plan::Failure::Install(topology::InstallError::Install(
+                    cartel_sqlite::open::Error::Step(cartel_sqlite::Error::CheckpointPages {
+                        value: actual,
+                    })
+                ))) if actual == value
+            ));
+        }
+    }
+    Ok(())
+}
 
 #[test]
 fn reader_sees_wal_commit() -> Result<(), plan::Error> {

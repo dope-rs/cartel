@@ -79,15 +79,6 @@
 //! # fn main() {}
 //! ```
 //!
-//! ```
-//! # pub mod common;
-//! use cartel_sqlite::Catalog;
-//! use common::engine::mutation::Commands;
-//! fn main() {
-//!     let _: &[cartel_sqlite::Entry<'_>] = Commands::STATEMENTS;
-//! }
-//! ```
-//!
 //! Qualified fields and aggregate shorthand retain the Rust field proof; text bindings may borrow while assignments retain field types.
 //!
 //! ```compile_fail,E0609
@@ -187,6 +178,18 @@
 //! fn cte_delete() {
 //!     let users = User::filter(|row| row.active).cte();
 //!     users.filter(|row| row.id > 0).delete()
+//! }
+//! # fn main() {}
+//! ```
+
+//! ```compile_fail
+//! # pub mod common;
+//! use common::schema::User;
+//! #[cartel_sqlite::query]
+//! fn distinct_set() -> Vec<User> {
+//!     User::filter(|row| row.id > 0)
+//!         .union_all(User::filter(|row| row.id > 0))
+//!         .rows().distinct().all()
 //! }
 //! # fn main() {}
 //! ```

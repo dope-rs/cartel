@@ -64,7 +64,7 @@ impl<'slot, 'd> Loan<'slot, 'd> {
         lease::Lease::new(self.reborrow())
     }
 
-    pub(crate) const fn cleanup_ref(&self) -> lease::Ref<'_, 'd, lease::Cleanup> {
+    pub(crate) const fn cleanup_ref(&self) -> lease::Ref<'_, 'd> {
         lease::Ref::new(self.slot())
     }
 

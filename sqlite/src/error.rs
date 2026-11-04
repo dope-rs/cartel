@@ -181,6 +181,9 @@ pub enum Error {
     JournalBytes {
         value: u64,
     },
+    CheckpointPages {
+        value: u32,
+    },
     MappedBytes {
         value: u64,
     },

@@ -73,6 +73,14 @@ pub(super) fn deliver<'e, 's, 'b, 'c, 'd, const ID: u8>(
             conn::ClosePhase::Requested | conn::ClosePhase::Quarantining,
             _,
         ) => {}
+        conn::CloseStatus::Closing(conn::ClosePhase::Retiring, directive)
+            if matches!(directive.reason(), close::Reason::Remote) =>
+        {
+            if let Ok(protocol::Decoded::Rejected(failure)) = decoded {
+                fail(port, client::Failure::protocol(failure), ctx);
+            }
+            return None;
+        }
         conn::CloseStatus::Closing(
             conn::ClosePhase::Retiring
             | conn::ClosePhase::Settled

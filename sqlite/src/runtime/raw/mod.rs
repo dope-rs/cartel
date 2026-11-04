@@ -83,6 +83,8 @@ impl Setup {
         unsafe {
             libsqlite3_sys::sqlite3_config(libsqlite3_sys::SQLITE_CONFIG_URI, 0);
             libsqlite3_sys::sqlite3_config(libsqlite3_sys::SQLITE_CONFIG_MEMSTATUS, 0);
+            // Each connection receives its owned lookaside before its first SQL.
+            libsqlite3_sys::sqlite3_config(libsqlite3_sys::SQLITE_CONFIG_LOOKASIDE, 0, 0);
             libsqlite3_sys::sqlite3_config(
                 libsqlite3_sys::SQLITE_CONFIG_PAGECACHE,
                 ptr::null_mut::<std::ffi::c_void>(),

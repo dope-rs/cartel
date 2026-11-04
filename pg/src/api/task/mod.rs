@@ -43,10 +43,6 @@ where
         lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>,
         H,
     ),
-    Throttled {
-        client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-        throttle: api::Throttle<'d, ID, S>,
-    },
     Connecting {
         client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         target: Option<api::Target<'d, ID>>,

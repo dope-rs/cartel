@@ -15,7 +15,7 @@ impl Timeout {
         if millis == 0 && !duration.is_zero() {
             return Err(error::Error::Short(duration));
         }
-        if millis > u128::from(u32::MAX) {
+        if millis > i32::MAX as u128 {
             return Err(error::Error::Long(duration));
         }
         Ok(Self(millis as u32))

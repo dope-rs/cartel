@@ -1,6 +1,9 @@
 use std::mem;
 
-use cartel_core::reply::{order::Front, usage};
+use cartel_core::{
+    memory,
+    reply::{order::Front, usage},
+};
 use dope::{core::driver::route::KeyTag, manifold::client::conn};
 use o3::{
     base::cell::region,
@@ -187,9 +190,10 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                 match status {
                     poll::Status::Transaction => {
                         match self.port.shared.transaction().current(self.conn) {
-                            access::Current::Reserved(_)
-                            | access::Current::Held(_)
-                            | access::Current::Finalizing(_) => {}
+                            access::Current::Reserved(_) | access::Current::Held(_) => {}
+                            access::Current::Finalizing(_) => {
+                                return Err(crate::Error::Protocol(Reason::TransactionOpen));
+                            }
                             access::Current::Stale
                             | access::Current::Handshaking
                             | access::Current::Shared
@@ -256,10 +260,7 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                 | Completion::Commit,
             ) => {}
         }
-        match selected.try_build(replies::RowPlan::row(
-            data,
-            self.port.shared.config.retention(),
-        )) {
+        match selected.try_build(replies::RowPlan::row(data, memory::RETENTION)) {
             Ok(()) => Ok(None),
             Err(usage::PushError::Backpressure { builder: build, .. }) => {
                 match build.into_pending() {
@@ -364,7 +365,7 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
             }
         };
         let scope = plan.scope();
-        let (server, class) = match plan.try_build(self.port.shared.config.retention()) {
+        let (server, class) = match plan.try_build(memory::RETENTION) {
             Ok(built) => built,
             Err(error) => return Err(crate::Error::ResponseRetention(error)),
         };

@@ -20,7 +20,7 @@ use dope::{
     core::driver::{route::Id, schedule::LIMIT},
     core::platform::wake::{Ends, Wait},
     manifold::{app::env::Bundle, timing::Throughput},
-    net::{tcp::Tcp, wire::Identity},
+    net::{link::event, tcp::Tcp, wire::Identity},
     runtime::executor::session::Completion,
 };
 use dope_fiber::{
@@ -40,6 +40,97 @@ use crate::common::postgres::{self, accept::Listener as _, startup::Stream as _}
 type Env = Bundle<Tcp, Identity, Throughput>;
 
 pub mod common;
+
+#[test]
+fn failed_reconnect_preserves_healthy_connection() {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener");
+    let addr = listener.local_addr().expect("listener address");
+    let (closed, release) = Ends::<Wait>::blocking()
+        .expect("connection retirement gate")
+        .split();
+    let server = thread::spawn(move || postgres::retire::partial_pool(listener, closed));
+    let mut capacity = Queries::try_reply()
+        .expect("PostgreSQL capacity")
+        .capacities();
+    capacity.connections = 2;
+    let config = config::Config::new(capacity).expect("two connection capacity");
+    let prepared = topology::Prepare::try_new::<Env>(
+        port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config),
+        addr,
+        Duration::from_millis(1),
+        Duration::from_secs(1),
+    )
+    .expect("PostgreSQL topology");
+    let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+    let mut report = Completion::new();
+    prepared.with_local(
+        |worker| {
+            worker.lend(|node, stage| {
+                node.install(stage, |host, stage| {
+                    stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+                        let client = runtime.root_client();
+                        assert!(matches!(
+                            runtime.block_on(client.status().wait_ready()),
+                            Ok(Ok(()))
+                        ));
+                        release.notify().expect("close second connection");
+                        fibers::TEST
+                            .try_run(&mut runtime, poll_fn(|context| {
+                                if client.status().live_count() == 1
+                                    && client.status().is_failed()
+                                {
+                                    Poll::Ready(())
+                                } else {
+                                    context.wake();
+                                    Poll::Pending
+                                }
+                            }))
+                            .expect("one healthy connection and one refused reconnect");
+                        assert!(matches!(
+                            runtime.block_on(client.status().wait_ready()),
+                            Ok(Err(reply::Error::Open(reply::Open::Transport {
+                                cause: event::ConnectFault::Transport(event::ConnectError::Connect(errno)),
+                                ..
+                            }))) if errno.is_refused()
+                        ));
+                        assert!(matches!(
+                            runtime.block_on(client.unchecked().command("SELECT 1")),
+                            Ok(Ok(()))
+                        ));
+                        release.notify().expect("close final connection");
+                        fibers::TEST
+                            .try_run(&mut runtime, poll_fn(|context| {
+                                if client.status().live_count() == 0 {
+                                    Poll::Ready(())
+                                } else {
+                                    context.wake();
+                                    Poll::Pending
+                                }
+                            }))
+                            .expect("all connections closed");
+                        assert!(matches!(
+                            runtime.block_on(client.unchecked().command("SELECT 1")),
+                            Ok(Err(reply::Error::Open(reply::Open::Transport {
+                                cause: event::ConnectFault::Transport(event::ConnectError::Connect(errno)),
+                                ..
+                            }))) if errno.is_refused()
+                        ));
+                    })
+                })
+            })
+        },
+        recovery::Policy::new(|event| reports.push(event), common::recover),
+        |result| assert!(matches!(result, Ok(Ok(Ok(())))), "PostgreSQL scope"),
+    );
+    assert!(
+        matches!(reports.events(), Ok(events) if events.is_empty()),
+        "unexpected reclamation"
+    );
+    server
+        .join()
+        .expect("PostgreSQL peer")
+        .expect("partial pool");
+}
 
 #[test]
 fn stalled_partial_reconnects_idle_connection() {

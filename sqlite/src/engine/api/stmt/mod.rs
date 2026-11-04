@@ -79,8 +79,7 @@ impl<'connection, I: catalogs::Catalog> Prepare<'connection, I> {
         mut self,
         guard: &guard::Guard<'connection, open::Open>,
     ) -> result::Result<Progress<Self, Engine<'connection, I>>, (Self, crate::Error)> {
-        let result = guard.work().control().run(|| self.insert(guard));
-        match result {
+        match self.insert(guard) {
             Ok(true) => {
                 // SAFETY: insertion completed the exact catalog's entire backing slice.
                 let stmts = unsafe { self.statements.finish() };
@@ -99,22 +98,29 @@ impl<'connection, I: catalogs::Catalog> Prepare<'connection, I> {
         guard: &guard::Guard<'connection, open::Open>,
     ) -> result::Result<bool, crate::Error> {
         let index = self.statements.live;
-        let (sql, params, columns) = if let Some(control) = Control::ALL.get(index) {
-            (control.sql(), 0, 0)
+        let call = guard.call(self.connection);
+        let prepare = |sql, params, columns| {
+            call.check(Prepared::new(
+                call.inner(),
+                guard.work(),
+                sql,
+                params,
+                columns,
+            ))
+        };
+        // Native authorization runs during preparation; transaction authority
+        // belongs only to these fixed controls, never to catalog SQL.
+        let stmt = if let Some(control) = Control::ALL.get(index) {
+            guard
+                .work()
+                .control()
+                .run(|| prepare(control.sql(), 0, 0))?
         } else {
             // SAFETY: the branded storage has exactly the controls and I's entries;
             // this preparation still owns its next vacant position.
             let meta = unsafe { I::STATEMENTS.get_unchecked(index - Control::ALL.len()) };
-            (meta.sql(), meta.parameters(), meta.columns())
+            prepare(meta.sql(), meta.parameters(), meta.columns())?
         };
-        let call = guard.call(self.connection);
-        let stmt = call.check(Prepared::new(
-            call.inner(),
-            guard.work(),
-            sql,
-            params,
-            columns,
-        ))?;
         let bytes = stmt.bytes();
         let required = self.used + bytes;
         let limit = self.capacity.get();

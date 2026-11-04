@@ -48,6 +48,9 @@ impl OpenOptions {
                 Checkpoint::Pages(pages) => pages.get(),
                 Checkpoint::Manual => 0,
             };
+            if pages > i32::MAX as u32 {
+                return Err(crate::Error::CheckpointPages { value: pages });
+            }
             call.pragma("wal_autocheckpoint", i64::from(pages))?;
         }
         Ok(())

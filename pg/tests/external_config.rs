@@ -18,10 +18,15 @@ fn views_keep_owner_layout() {
     use api::ops;
 
     fn check<B: 'static, const ID: u8>() {
-        use std::mem::{align_of, size_of};
+        use std::alloc::Layout;
+
+        let client = Layout::new::<
+            Client<'static, 'static, 'static, 'static, 'static, 'static, 'static, B, Queries, ID>,
+        >();
+        assert_eq!(client, Layout::new::<&'static ()>());
         assert_eq!(
-            size_of::<
-                Client<
+            Layout::new::<
+                ops::Status<
                     'static,
                     'static,
                     'static,
@@ -34,11 +39,25 @@ fn views_keep_owner_layout() {
                     ID,
                 >,
             >(),
-            size_of::<&'static ()>()
+            client
         );
-        let expected = (
-            size_of::<
-                ops::Query<
+        let query = Layout::new::<
+            ops::Query<
+                'static,
+                'static,
+                'static,
+                'static,
+                'static,
+                'static,
+                'static,
+                B,
+                Queries,
+                ID,
+            >,
+        >();
+        for layout in [
+            Layout::new::<
+                ops::Unchecked<
                     'static,
                     'static,
                     'static,
@@ -51,8 +70,8 @@ fn views_keep_owner_layout() {
                     ID,
                 >,
             >(),
-            align_of::<
-                ops::Query<
+            Layout::new::<
+                ops::Transfer<
                     'static,
                     'static,
                     'static,
@@ -65,131 +84,22 @@ fn views_keep_owner_layout() {
                     ID,
                 >,
             >(),
-        );
-        let layouts = [
-            (
-                size_of::<
-                    ops::Unchecked<
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        B,
-                        Queries,
-                        ID,
-                    >,
-                >(),
-                align_of::<
-                    ops::Unchecked<
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        B,
-                        Queries,
-                        ID,
-                    >,
-                >(),
-            ),
-            (
-                size_of::<
-                    ops::Transfer<
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        B,
-                        Queries,
-                        ID,
-                    >,
-                >(),
-                align_of::<
-                    ops::Transfer<
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        B,
-                        Queries,
-                        ID,
-                    >,
-                >(),
-            ),
-            (
-                size_of::<
-                    ops::Notify<
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        B,
-                        Queries,
-                        ID,
-                    >,
-                >(),
-                align_of::<
-                    ops::Notify<
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        B,
-                        Queries,
-                        ID,
-                    >,
-                >(),
-            ),
-            (
-                size_of::<
-                    ops::Status<
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        B,
-                        Queries,
-                        ID,
-                    >,
-                >(),
-                align_of::<
-                    ops::Status<
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        'static,
-                        B,
-                        Queries,
-                        ID,
-                    >,
-                >(),
-            ),
-        ];
-        for layout in layouts {
-            assert_eq!(layout, expected);
+            Layout::new::<
+                ops::Notify<
+                    'static,
+                    'static,
+                    'static,
+                    'static,
+                    'static,
+                    'static,
+                    'static,
+                    B,
+                    Queries,
+                    ID,
+                >,
+            >(),
+        ] {
+            assert_eq!(layout, query);
         }
     }
     check::<

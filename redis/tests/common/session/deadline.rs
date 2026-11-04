@@ -12,10 +12,9 @@ where
 {
     let mut held = Some(held);
     PollFn::admitted(move |admit| {
-        let (outcome, context) = admit.poll(fiber.as_mut());
+        let (outcome, _) = admit.poll(fiber.as_mut());
         if outcome.is_pending() && held.is_some() {
             drop(held.take());
-            context.as_ref().waker().wake();
         }
         outcome
     })

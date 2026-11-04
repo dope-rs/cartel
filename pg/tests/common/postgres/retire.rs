@@ -2,9 +2,14 @@ use dope::core::platform::wake::Wait;
 use dope::manifold::timing::{Policy, Throughput};
 use dope_test::harness::{GUARD, peer};
 use o3::base::time::Positive;
+use std::net::TcpListener;
 
 use crate::common::postgres::{
-    Error, Frame, accept::DATA_ROW, group::COMMAND_ERROR, read_empty, startup::Stream as _,
+    Error, Frame,
+    accept::{DATA_ROW, Listener as _},
+    group::COMMAND_ERROR,
+    read_empty,
+    startup::Stream as _,
 };
 
 pub struct ShortIdle;
@@ -13,6 +18,25 @@ impl Policy for ShortIdle {
     const CONNECT_DEADLINE: Positive = Throughput::CONNECT_DEADLINE;
     const IDLE_WINDOW: Positive = Positive::from_millis::<250>();
     const SEND_DEADLINE: Positive = Throughput::SEND_DEADLINE;
+}
+
+pub fn partial_pool(listener: TcpListener, release: Wait) -> Result<(), Error> {
+    let listener = peer::TcpAcceptor::try_adopt(listener.into())?;
+    let mut first = listener.accept_within(GUARD)?;
+    first.try_start(None)?;
+    first.read_wait(Some(GUARD))?;
+    let mut second = listener.accept_within(GUARD)?;
+    second.try_start(None)?;
+    release
+        .wait_timeout(GUARD)
+        .expect("release second connection");
+    drop(listener);
+    drop(second);
+    reply(&first, false)?;
+    release
+        .wait_timeout(GUARD)
+        .expect("release final connection");
+    Ok(())
 }
 
 pub fn stalled_partial(listener: &mut peer::TcpAcceptor<'_>) -> Result<(), Error> {

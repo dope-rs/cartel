@@ -6,7 +6,6 @@ pub(crate) mod heap;
 mod layout;
 pub mod local;
 pub mod raw;
-mod release;
 pub(crate) mod slot;
 
 pub use layout::Layout;

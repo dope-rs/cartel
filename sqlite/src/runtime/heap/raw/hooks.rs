@@ -35,9 +35,8 @@ unsafe extern "C" fn malloc(bytes: std::ffi::c_int) -> *mut std::ffi::c_void {
 }
 
 unsafe extern "C" fn free(pointer: *mut std::ffi::c_void) {
-    if let Some(pointer) = ptr::NonNull::new(pointer) {
-        unsafe { Block::read(pointer.cast()) }.release();
-    }
+    // SAFETY: sqlite3_free rejects NULL before dispatching this live allocation.
+    unsafe { Block::read(ptr::NonNull::new_unchecked(pointer.cast())) }.release();
 }
 
 /// Native zero-size requests are already freed; rejected rounding preserves the old allocation.
@@ -45,13 +44,13 @@ unsafe extern "C" fn realloc(
     pointer: *mut std::ffi::c_void,
     bytes: std::ffi::c_int,
 ) -> *mut std::ffi::c_void {
-    let Some(pointer) = ptr::NonNull::new(pointer) else {
-        return unsafe { malloc(bytes) };
-    };
     let Some(bytes) = Len::new(bytes) else {
         return ptr::null_mut();
     };
-    unsafe { Block::read(pointer.cast()) }.resize(bytes).cast()
+    // SAFETY: sqlite3Realloc routes NULL to sqlite3Malloc before dispatching this live allocation.
+    unsafe { Block::read(ptr::NonNull::new_unchecked(pointer.cast())) }
+        .resize(bytes)
+        .cast()
 }
 
 unsafe extern "C" fn size(pointer: *mut std::ffi::c_void) -> std::ffi::c_int {

@@ -443,9 +443,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         token: &mut region::Token<region::Identity<'d>>,
         cause: Failure,
     ) -> reply::Progress {
-        let progress = reply::Retirement::new(token).fail(work, self.lane, &cause);
-        self.port.shared.reindex(self.conn, progress.depth());
-        progress
+        reply::Retirement::new(token).fail(work, self.lane, &cause)
     }
 
     pub(crate) fn front<'turn>(

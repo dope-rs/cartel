@@ -207,7 +207,7 @@ impl<'a> Update<'a> {
         let mut params: Vec<proc_macro2::TokenStream> = Vec::with_capacity(data.len());
         for ds in data {
             let captured = self.0.fn_params.resolve_ref(ds)?;
-            let idx = self.0.intern(captured);
+            let idx = pred::sql::intern(&mut self.0.captures, captured);
             let ctx = backend::ParamCtx {
                 captures: &self.0.captures,
                 param_ids: self.0.fn_params,

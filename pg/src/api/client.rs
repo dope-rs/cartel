@@ -127,7 +127,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 
     fn status(self) -> impl traits::Status<'d, ID> {
-        ops::Status(self.query())
+        ops::Status(self)
     }
 }
 
@@ -188,7 +188,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         match next {
             api::TxOutcome::NoConn { request: req } => {
                 let shared = &self.port.shared;
-                if let Some(error) = shared.signals.failure() {
+                if let Some(error) = shared.failure() {
                     return api::TxRetry::Failed(error);
                 }
                 match shared.ready.try_register(waiter, ctx.as_ref()) {
@@ -199,7 +199,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             api::TxOutcome::Enqueued { lease } => api::TxRetry::Enqueued { lease },
             api::TxOutcome::Throttled { throttle } => {
                 let shared = &self.port.shared;
-                if let Some(error) = shared.signals.failure() {
+                if let Some(error) = shared.failure() {
                     return api::TxRetry::Failed(error);
                 }
                 match shared

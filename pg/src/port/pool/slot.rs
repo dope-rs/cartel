@@ -161,7 +161,6 @@ pub(crate) struct Permit<'a> {
     current: replies::Batch,
     boundary: requests::Boundary,
     pending: &'a cell::Cell<Pending>,
-    queued: Pending,
 }
 
 impl Permit<'_> {
@@ -180,17 +179,17 @@ impl Permit<'_> {
                 Change::Unchanged
             };
         self.sync.set(self.next);
-        let queued = match self.boundary {
+        match self.boundary {
             requests::Boundary::Close | requests::Boundary::Commit | requests::Boundary::Group => {
                 self.batch.set(self.current.next());
-                let count = self.queued.get() + 1;
+                let count = self.pending.get().get() + 1;
                 // SAFETY: consumed Sync admission retains at most one pending Sync
                 // per live order plus the single currently parsed Sync.
-                unsafe { bounded::raw::Proof::assume(count).retain() }
+                self.pending
+                    .set(unsafe { bounded::raw::Proof::assume(count).retain() });
             }
-            requests::Boundary::Open | requests::Boundary::External => self.queued,
-        };
-        self.pending.set(queued);
+            requests::Boundary::Open | requests::Boundary::External => {}
+        }
         change
     }
 }
@@ -261,7 +260,6 @@ impl<'d, const ID: u8> Slot<'d, ID> {
     ) -> Result<(), protocol::Reason> {
         match self.phase.get() {
             Phase::Handshaking(bound) if bound.token == token => {
-                self.sync.set(Sync::Synced);
                 self.phase.set(Phase::Ready {
                     bound,
                     access: access::State::Shared(access::Sequence::INITIAL),
@@ -437,7 +435,6 @@ impl<'d, const ID: u8> Slot<'d, ID> {
             current,
             boundary,
             pending: &self.pending,
-            queued: self.pending.get(),
         }
     }
 }

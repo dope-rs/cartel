@@ -222,7 +222,7 @@ impl<'g, 'r, 's, 'b, 'c, 'd, const N: usize> Ready<'g, 'r, 's, 'b, 'c, 'd, N> {
         access: &groups::Access<'g, 'r, 's, 'b, 'c, 'd>,
     ) -> Result<Self, crate::Error> {
         const { assert!(N > 0 && N < u32::MAX as usize) };
-        let owner = access.prepare()?.commit();
+        let owner = access.prepare()?;
         let mut storage = MaybeUninit::uninit();
         let mut guard = init::Guard::<_, N>::new(&mut storage);
         let commands = loop {
