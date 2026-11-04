@@ -10,7 +10,7 @@ use cartel_pg::{
     schema::{array::Element as _, result},
 };
 use common::port::Reply;
-use common::wire::checked::{ArrayQuery, Database, MixedQuery, TextQuery, TextRow};
+use common::wire::checked::{ArrayQuery, Database, MixedQuery, MixedRow, TextQuery, TextRow};
 use common::{topology, wire::checked::Group};
 use dope::core::driver::life::recovery;
 use dope::{
@@ -122,8 +122,8 @@ fn retains_source() {
 
 #[test]
 fn collects_multiple_rows() {
-    let first = TextRow::wire(3, b"first");
-    let second = TextRow::wire(7, b"second");
+    let first = MixedRow::wire(3, 4, 0, b"\x01[]", 5);
+    let second = MixedRow::wire(7, 8, 1, b"\x01{}", 9);
     TcpScript::with(
         |socket| Database::serve_batch(socket, [first.as_slice(), second.as_slice()]),
         |server| {
@@ -152,7 +152,7 @@ fn collects_multiple_rows() {
                                         .ok()
                                         .expect("PostgreSQL ready");
                                     let rows = app
-                                        .block_on(traits::Query::run_all::<TextQuery>(
+                                        .block_on(traits::Query::run_all::<MixedQuery>(
                                             client.query(),
                                             (),
                                         ))
@@ -163,12 +163,33 @@ fn collects_multiple_rows() {
                                         rows.as_ref().err().map(Reply::from)
                                     );
                                     let rows = rows.ok().expect("query rows");
-                                    let rows = rows.validate().expect("validated rows");
+                                    let (rows, count) = Tracker::count(|| rows.validate());
+                                    let rows = rows.expect("validated rows");
                                     let mut rows = rows.iter();
-                                    let first = rows.next().expect("first row");
-                                    assert_eq!((first.lease, first.name), (3, "first"));
+                                    let (first, read) = Tracker::count(|| rows.next());
+                                    let first = first.expect("first row");
+                                    assert_eq!((count, read), (0, 0));
+                                    assert_eq!(
+                                        (
+                                            first.low,
+                                            first.middle,
+                                            first.active,
+                                            first.tags,
+                                            first.high
+                                        ),
+                                        (3, 4, false, "[]", 5)
+                                    );
                                     let second = rows.next().expect("second row");
-                                    assert_eq!((second.lease, second.name), (7, "second"));
+                                    assert_eq!(
+                                        (
+                                            second.low,
+                                            second.middle,
+                                            second.active,
+                                            second.tags,
+                                            second.high
+                                        ),
+                                        (7, 8, true, "{}", 9)
+                                    );
                                     assert!(rows.next().is_none());
                                 })
                             })
@@ -349,23 +370,18 @@ fn rejects_truncated_text() {
 
 #[test]
 fn retains_mixed_widths() {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&3u16.to_be_bytes());
-    bytes.extend_from_slice(&8i32.to_be_bytes());
-    bytes.extend_from_slice(&i64::MIN.to_be_bytes());
-    bytes.extend_from_slice(&4i32.to_be_bytes());
-    bytes.extend_from_slice(&i32::MIN.to_be_bytes());
-    bytes.extend_from_slice(&8i32.to_be_bytes());
-    bytes.extend_from_slice(&i64::MAX.to_be_bytes());
+    let mut bytes = MixedRow::wire(i64::MIN, i32::MIN, 1, "\x01[\"여름\"]".as_bytes(), i64::MAX);
     with_row::<MixedQuery, _>(&bytes, |row| {
+        let ptr = row.decode().expect("decoded row").tags.as_ptr();
         let (row, count) = Tracker::count(|| row.validate());
         let row = row.expect("mixed scalar fields");
         let (view, read) = Tracker::count(|| row.view());
         assert_eq!((count, read), (0, 0));
         assert_eq!(
-            (view.low, view.middle, view.high),
-            (i64::MIN, i32::MIN, i64::MAX)
+            (view.low, view.middle, view.active, view.tags, view.high),
+            (i64::MIN, i32::MIN, true, "[\"여름\"]", i64::MAX)
         );
+        assert_eq!(view.tags.as_ptr(), ptr);
     });
     bytes[14..18].copy_from_slice(&3i32.to_be_bytes());
     with_row::<MixedQuery, _>(&bytes, |row| {
@@ -375,6 +391,38 @@ fn retains_mixed_widths() {
                 column: 1,
                 ..
             }))
+        ));
+    });
+}
+
+#[test]
+fn rejects_invalid_mixed_fields() {
+    let bytes = MixedRow::wire(3, 4, 2, b"\x01[]", 5);
+    with_row::<MixedQuery, _>(&bytes, |row| {
+        assert!(matches!(
+            row.validate(),
+            Err(cartel_pg::Error::Protocol(Reason::Bool {
+                column: 2,
+                actual: 2
+            }))
+        ));
+    });
+    let bytes = MixedRow::wire(3, 4, 1, b"\x02[]", 5);
+    with_row::<MixedQuery, _>(&bytes, |row| {
+        assert!(matches!(
+            row.validate(),
+            Err(cartel_pg::Error::Protocol(Reason::JsonVersion {
+                column: 3,
+                actual: 2
+            }))
+        ));
+    });
+    let bytes = MixedRow::wire(3, 4, 1, b"\x01[\xff]", 5);
+    with_row::<MixedQuery, _>(&bytes, |row| {
+        assert!(matches!(
+            row.validate(),
+            Err(cartel_pg::Error::Protocol(Reason::JsonUtf8 { column: 3, valid, error }))
+                if valid.get() == 1 && error == cartel_pg::protocol::Utf8::One
         ));
     });
 }

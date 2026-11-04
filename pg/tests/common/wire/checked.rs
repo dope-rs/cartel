@@ -19,6 +19,8 @@ pub struct TextRow {
 pub struct MixedRow {
     pub low: i64,
     pub middle: i32,
+    pub active: bool,
+    pub tags: cartel_pg::Jsonb,
     pub high: i64,
 }
 
@@ -56,7 +58,7 @@ impl schema::TypedQuery for MixedQuery {
     const SQL: &str = "SELECT 1";
     const PARAM_OIDS: &[u32] = &[];
     const N_PARAMS: i16 = 0;
-    const N_RESULT_COLS: u16 = 3;
+    const N_RESULT_COLS: u16 = 5;
     fn encode(_: (), _: &mut BindWriter<'_, '_>) -> Result<(), encode::Error> {
         Ok(())
     }
@@ -184,6 +186,24 @@ impl TextRow {
     }
 }
 
+impl MixedRow {
+    pub fn wire(low: i64, middle: i32, active: u8, tags: &[u8], high: i64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&5i16.to_be_bytes());
+        for value in [
+            low.to_be_bytes().as_slice(),
+            middle.to_be_bytes().as_slice(),
+            &[active],
+            tags,
+            high.to_be_bytes().as_slice(),
+        ] {
+            bytes.extend_from_slice(&(value.len() as i32).to_be_bytes());
+            bytes.extend_from_slice(value);
+        }
+        bytes
+    }
+}
+
 impl ArrayQuery {
     pub fn wire(values: &[&[u8]], trailing: &[u8]) -> Vec<u8> {
         let length =
@@ -272,7 +292,7 @@ impl Database {
                     } else if body.get(1..) == Some(b"namearray\0") {
                         &[1009]
                     } else {
-                        &[20, 23, 20]
+                        &[20, 23, 16, 3802, 20]
                     };
                     socket.write_all(&Frame::new(b't', &0u16.to_be_bytes()).encode())?;
                     socket.write_all(&Frame::new(b'T', &description(oids)).encode())?;

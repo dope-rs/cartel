@@ -1,6 +1,6 @@
 [package]
 name = "cartel-pg"
-version.workspace = true
+version = "0.23.1"
 edition.workspace = true
 rust-version.workspace = true
 description = "Async PostgreSQL driver for the dope runtime"

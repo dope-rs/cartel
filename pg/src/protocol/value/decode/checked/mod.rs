@@ -2,7 +2,7 @@ use crate::{
     protocol::{Wire, value::decode},
     schema,
 };
-use std::{marker, str};
+use std::marker;
 
 mod cursor;
 mod sealed;
@@ -64,6 +64,15 @@ impl<A: Fields, B: Fields> Fields for (A, B) {
     }
 }
 
+impl Fields for bool {
+    fn read<'row>(cursor: &mut Cursor<'row>) -> bool {
+        // SAFETY: the closed field sequence validated a nonnull byte equal to zero or one.
+        let value = unsafe { *cursor.bytes.get_unchecked(4) };
+        cursor.bytes = unsafe { cursor.bytes.get_unchecked(5..) };
+        value != 0
+    }
+}
+
 impl Fields for i32 {
     fn read<'row>(cursor: &mut Cursor<'row>) -> i32 {
         // SAFETY: the closed field sequence validated this nonnull four-byte scalar.
@@ -99,10 +108,13 @@ impl Fields for i64 {
 impl Fields for String {
     fn read<'row>(cursor: &mut Cursor<'row>) -> &'row str {
         // SAFETY: validation proved the length prefix, complete nonnull payload and UTF-8.
-        let length = unsafe { cursor.bytes.as_ptr().cast::<[u8; 4]>().read_unaligned() };
-        let length = i32::from_be_bytes(length) as usize;
-        let text = unsafe { cursor.bytes.get_unchecked(4..4 + length) };
-        cursor.bytes = unsafe { cursor.bytes.get_unchecked(4 + length..) };
-        unsafe { str::from_utf8_unchecked(text) }
+        unsafe { cursor.text::<0>() }
+    }
+}
+
+impl Fields for crate::Jsonb {
+    fn read<'row>(cursor: &mut Cursor<'row>) -> &'row str {
+        // SAFETY: validation also proved the version byte and UTF-8 after that byte.
+        unsafe { cursor.text::<1>() }
     }
 }
