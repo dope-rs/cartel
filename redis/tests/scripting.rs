@@ -2,12 +2,7 @@ use cartel_redis::api::Client as _;
 use cartel_redis::value::source::{Reader as _, Reply as _};
 use dope::core::driver::life::recovery;
 use dope::runtime::executor::session::Completion;
-use std::{
-    io::{Read as _, Write as _},
-    iter,
-    num::NonZero,
-    time::Duration,
-};
+use std::{iter, num::NonZero, time::Duration};
 
 use cartel_redis::{
     client::{ops::scripts::Invocation as _, settings::init::Plan},

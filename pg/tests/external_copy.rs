@@ -2,6 +2,7 @@ use cartel_pg::api::traits::{Client as _, Notify as _, Status as _, Unchecked as
 use common::env::{self, Env};
 use common::{external::runtime::check, recover};
 use dope_fiber::BlockOn as _;
+use dope_test::harness::peer;
 use std::env::var_os;
 use std::{
     net::{Ipv4Addr, TcpListener},
@@ -29,7 +30,11 @@ pub mod common;
 fn rejected_copy_recovers() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("listener");
     let address = listener.local_addr().expect("listener address");
-    let peer = thread::spawn(move || listener.copy_recover());
+    let peer = thread::spawn(move || {
+        peer::TcpAcceptor::try_adopt(listener.into())
+            .expect("listener admission")
+            .copy_recover()
+    });
     Session::<Queries>::new(
         address,
         Queries::try_config().expect("database config"),

@@ -147,6 +147,17 @@ impl<'d, const ID: u8> Set<'d, ID> {
         self.index.reindex(id, depth)
     }
 
+    pub(crate) fn set_receiving(
+        &self,
+        id: conn::Id<'d, route::KeyTag<ID>>,
+        receiving: bool,
+        depth: impl FnOnce() -> Depth,
+    ) {
+        if self.index.set_receiving(id, receiving, depth) {
+            self.waiters.wake();
+        }
+    }
+
     pub(crate) fn count(&self) -> usize {
         self.index.count()
     }

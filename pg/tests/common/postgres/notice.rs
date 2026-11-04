@@ -1,5 +1,6 @@
 use crate::common::postgres::{Error, Frame, read_empty};
-use std::{io, ops::Range};
+use dope_test::harness::peer;
+use std::ops::Range;
 
 pub const COMMAND: &str = "SELECT 1";
 pub const SEED: [(u32, &str, &str); 3] = [(23, "é", "🦀"), (37, "", "body"), (41, "", "")];
@@ -29,7 +30,10 @@ pub const BATCHES: [Batch; 2] = [
 ];
 pub const BUDGET: [(u32, &str, &str); 1] = [(73, "", "0123456789")];
 
-pub fn try_write(socket: &mut impl io::Write, cases: &[(u32, &str, &str)]) -> io::Result<()> {
+pub fn try_write(
+    socket: &peer::Stream<'_>,
+    cases: &[(u32, &str, &str)],
+) -> Result<(), peer::Error> {
     for &(pid, channel, payload) in cases {
         let mut body = Vec::from(pid.to_be_bytes());
         body.extend_from_slice(channel.as_bytes());
@@ -41,10 +45,7 @@ pub fn try_write(socket: &mut impl io::Write, cases: &[(u32, &str, &str)]) -> io
     Ok(())
 }
 
-pub fn try_batch(
-    socket: &mut (impl io::Read + io::Write),
-    cases: &[(u32, &str, &str)],
-) -> Result<(), Error> {
+pub fn try_batch(socket: &peer::Stream<'_>, cases: &[(u32, &str, &str)]) -> Result<(), Error> {
     read_empty(socket, b'S')?;
     socket.write_all(&Frame::new(b'1', &[]).encode())?;
     socket.write_all(&Frame::new(b'2', &[]).encode())?;

@@ -263,11 +263,17 @@ fn contracts() -> Result<(), dope_test::checks::Error> {
         file!(),
         &["cartel-redis", "dope-fiber", "dope", "o3"],
     );
-    let exe = env::current_exe()?;
-    let output = suite.try_build(&exe, env!("CARGO_PKG_NAME"))?.output()?;
+    let exe = env::current_exe().expect("current test executable");
+    let output = suite
+        .try_build(&exe, env!("CARGO_PKG_NAME"))?
+        .output()
+        .expect("run cargo");
     let artifacts = suite.try_collect(&exe, output)?;
-    assert_eq!(artifacts.try_errors(include_str!("contracts.rs"))?, 14);
-    let status = artifacts.try_rustdoc()?.status()?;
+    assert_eq!(
+        artifacts.try_errors(include_str!("contracts.rs"), compile)?,
+        14
+    );
+    let status = artifacts.try_rustdoc()?.status().expect("run rustdoc");
     assert!(status.success(), "compile-time contracts: {status}");
     for (source, errors, expected) in [
         (include_str!("common/retired.rs"), 0, &[] as &[&str]),
@@ -281,7 +287,7 @@ fn contracts() -> Result<(), dope_test::checks::Error> {
             ],
         ),
     ] {
-        let output = artifacts.try_compile(source)?;
+        let output = compile(&mut artifacts.compiler(), source);
         let diag = String::from_utf8(output.stderr).expect("diagnostic UTF-8");
         assert!(
             output.status.success() == (errors == 0)
@@ -291,4 +297,17 @@ fn contracts() -> Result<(), dope_test::checks::Error> {
         );
     }
     Ok(())
+}
+
+fn compile(command: &mut std::process::Command, source: &str) -> std::process::Output {
+    let mut child = command.spawn().expect("start compiler");
+    let written = child
+        .stdin
+        .take()
+        .map(|mut input| std::io::Write::write_all(&mut input, source.as_bytes()));
+    let output = child.wait_with_output().expect("reap compiler");
+    written
+        .expect("compiler stdin")
+        .expect("write compiler source");
+    output
 }

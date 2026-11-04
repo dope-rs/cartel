@@ -1,6 +1,7 @@
 use crate::api::{Client, decode};
 use crate::client::nonempty;
 use crate::request::encode::write::value::sorted;
+use std::num::NonZero;
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
@@ -21,6 +22,18 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Sorted<C, ID> {
     pub fn range(self, key: &[u8], start: i64, stop: i64) -> C::Call<decode::Bulks> {
         self.0
             .encode::<decode::Bulks>(move |out| sorted::Writer::new(out).range(key, start, stop))
+    }
+
+    /// Returns the cursor and interleaved member/score bulk strings.
+    /// `count` is a server work hint, not a response-size limit.
+    pub fn scan(
+        self,
+        key: &[u8],
+        cursor: u64,
+        count: Option<NonZero<u64>>,
+    ) -> C::Call<decode::Scan> {
+        self.0
+            .encode::<decode::Scan>(move |out| sorted::Writer::new(out).scan(key, cursor, count))
     }
 
     pub fn rev_range(self, key: &[u8], start: i64, stop: i64) -> C::Call<decode::Scored> {

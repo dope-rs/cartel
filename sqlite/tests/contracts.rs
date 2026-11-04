@@ -209,11 +209,30 @@ fn contracts() -> Result<(), dope_test::checks::Error> {
             "libsqlite3-sys",
         ],
     );
-    let exe = env::current_exe()?;
-    let output = suite.try_build(&exe, env!("CARGO_PKG_NAME"))?.output()?;
+    let exe = env::current_exe().expect("current test executable");
+    let output = suite
+        .try_build(&exe, env!("CARGO_PKG_NAME"))?
+        .output()
+        .expect("run cargo");
     let artifacts = suite.try_collect(&exe, output)?;
-    assert_eq!(artifacts.try_errors(include_str!("contracts.rs"))?, 12);
-    let status = artifacts.try_rustdoc()?.status()?;
+    assert_eq!(
+        artifacts.try_errors(include_str!("contracts.rs"), compile)?,
+        12
+    );
+    let status = artifacts.try_rustdoc()?.status().expect("run rustdoc");
     assert!(status.success(), "compile-time contracts: {status}");
     Ok(())
+}
+
+fn compile(command: &mut std::process::Command, source: &str) -> std::process::Output {
+    let mut child = command.spawn().expect("start compiler");
+    let written = child
+        .stdin
+        .take()
+        .map(|mut input| std::io::Write::write_all(&mut input, source.as_bytes()));
+    let output = child.wait_with_output().expect("reap compiler");
+    written
+        .expect("compiler stdin")
+        .expect("write compiler source");
+    output
 }

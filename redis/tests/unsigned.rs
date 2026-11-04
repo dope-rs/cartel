@@ -1,7 +1,6 @@
 use cartel_redis::api::Client as _;
 use cartel_redis::value::source::{Bulks as _, Bytes as _, Scan as _};
 use dope::core::driver::life::recovery;
-use std::io::{Read as _, Write as _};
 
 use cartel_redis::{client::settings::init::Plan, value::reply};
 use common::{

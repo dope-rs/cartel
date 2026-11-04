@@ -142,6 +142,14 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         api::check_open(self)?;
         let shared = &self.port.shared;
         if let Some(conn) = shared.pick_request(target, boundary) {
+            if target.is_some()
+                && shared
+                    .ready
+                    .connection(conn)
+                    .is_some_and(|slot| slot.is_receiving())
+            {
+                return Ok(None);
+            }
             return Ok(Some(conn));
         }
         if let Some(target) = target {

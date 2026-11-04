@@ -3,7 +3,7 @@ use dope::{
     core::driver::{self, route},
     manifold::client::{
         self, conn,
-        session::{response::Delivery, turns},
+        session::{Input, response::Delivery, turns},
     },
     net::link::egress::{self, data},
 };
@@ -111,7 +111,30 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         }
     }
 
-    pub(super) fn try_flush(mut self) -> Result<(), crate::Error> {
+    pub(super) fn try_flush(mut self, input: Input) -> Result<(), crate::Error> {
+        if matches!(
+            self.state.phase,
+            state::Phase::Ready | state::Phase::CopyInActive | state::Phase::CopyOutActive
+        ) {
+            let lane = self
+                .port
+                .responses(self.conn)
+                .ok_or(crate::Error::Protocol(Reason::ResponseUnknown))?;
+            let receiving = match input {
+                Input::Empty => false,
+                Input::Partial => lane
+                    .front(self.state.batch, self.driver.region_token())?
+                    .0
+                    .is_none(),
+                Input::Yield | Input::Blocked => true,
+            };
+            self.port
+                .shared
+                .ready
+                .set_receiving(self.conn, receiving, || {
+                    lane.depth(self.driver.region_token())
+                });
+        }
         match &mut self.state.phase {
             state::Phase::Sasl { scram } => {
                 Self::drive_scram(self.port, &self.sink, self.driver.region_token(), scram)?

@@ -1,15 +1,9 @@
-use cartel_redis::api::Client as _;
+use cartel_redis::api::{Client as _, Connection as _};
 use cartel_redis::value::source::Bulks as _;
 use dope::core::driver::life::recovery;
 use dope::runtime::executor::session::Completion;
-use std::{
-    fmt, io,
-    io::{Read as _, Write as _},
-    mem,
-    net::Shutdown,
-    sync::mpsc,
-    time::Duration,
-};
+use dope_test::harness::peer;
+use std::{fmt, mem, net::Shutdown, sync::mpsc, time::Duration};
 
 use cartel_redis::{
     client::{
@@ -57,11 +51,144 @@ fn assert_committed_close<T, B>(result: Result<T, reply::Failure<cartel_redis::E
 }
 
 #[test]
+fn unsolicited_partial_cannot_bind_next_request() {
+    let config = config(Positive::from_secs::<1>()).expect("valid redis configuration");
+    AcceptScript::with(
+        |peer| {
+            let socket = peer.accept()?;
+            socket.read_wait(Some(GUARD))?;
+            let mut request = [0; PING.len()];
+            socket.read_exact(&mut request)?;
+            assert_eq!(request, PING);
+            socket.write_all(b"+PONG\r\n+PO")?;
+            match socket.read(&mut request[..1])? {
+                0 => Ok::<_, peer::Error>(()),
+                _ => {
+                    socket.read_exact(&mut request[1..])?;
+                    assert_eq!(request, PING);
+                    socket.write_all(b"NG\r\n")
+                }
+            }
+        },
+        |server| {
+            let prepared = topology::try_new::<Env>(config, server.addr(), Plan::new())
+                .expect("Redis topology");
+            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+            let mut report = Completion::new();
+            prepared.with_local(
+                |worker| {
+                    worker.lend(|node, stage| {
+                        node.install(stage, |host, stage| {
+                            stage.with_quiesce(&mut report, host, GUARD, |mut rt| {
+                                let redis = rt.root_client();
+                                let mut connection = fibers::TEST
+                                    .try_run(&mut rt, redis.connection())
+                                    .expect("acquire connection")
+                                    .ok()
+                                    .expect("lease connection");
+                                assert!(matches!(
+                                    fibers::TEST.try_run(&mut rt, connection.ping()),
+                                    Ok(Ok(()))
+                                ));
+                                fibers::TEST
+                                    .try_pause(&mut rt, Duration::from_millis(20))
+                                    .expect("process unsolicited partial response");
+                                assert!(
+                                    matches!(
+                                        fibers::TEST.try_run(&mut rt, connection.ping()),
+                                        Ok(Err(value::reply::Failure::Control(
+                                            cartel_redis::Error::Unavailable
+                                        )))
+                                    ),
+                                    "an unsolicited partial response must not belong to the next request"
+                                );
+                            })
+                        })
+                    })
+                },
+                recovery::Policy::new(|event| reports.push(event), recover),
+                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
+            );
+            assert!(
+                matches!(reports.events(), Ok(events) if events.is_empty()),
+                "unexpected reclamation"
+            );
+            assert!(matches!(server.finish(), Ok(Ok(()))), "Redis peer completion");
+        },
+    )
+    .expect("spawn Redis peer");
+}
+
+#[test]
+fn detached_partial_preserves_next_request() {
+    const CLIENT_ID: &[u8] = b"*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n";
+    let config = config(Positive::from_secs::<1>()).expect("valid redis configuration");
+    AcceptScript::with(
+        |peer| {
+            let socket = peer.accept()?;
+            socket.read_wait(Some(GUARD))?;
+            let mut ping = [0; PING.len()];
+            socket.read_exact(&mut ping)?;
+            assert_eq!(ping, PING);
+            socket.write_all(b"+PO")?;
+            let mut request = [0; CLIENT_ID.len()];
+            socket.read_exact(&mut request)?;
+            assert_eq!(request, CLIENT_ID);
+            socket.write_all(b"NG\r\n:7\r\n")
+        },
+        |server| {
+            let prepared = topology::try_new::<Env>(config, server.addr(), Plan::new())
+                .expect("Redis topology");
+            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+            let mut report = Completion::new();
+            prepared.with_local(
+                |worker| {
+                    worker.lend(|node, stage| {
+                        node.install(stage, |host, stage| {
+                            stage.with_quiesce(&mut report, host, GUARD, |mut rt| {
+                                let redis = rt.root_client();
+                                let mut connection = fibers::TEST
+                                    .try_run(&mut rt, redis.connection())
+                                    .expect("acquire connection")
+                                    .ok()
+                                    .expect("lease connection");
+                                assert!(matches!(
+                                    rt.block_on(fibers::TEST.poll_once(connection.ping())),
+                                    Ok(None)
+                                ));
+                                fibers::TEST
+                                    .try_pause(&mut rt, Duration::from_millis(20))
+                                    .expect("process detached partial response");
+                                assert!(matches!(
+                                    fibers::TEST.try_run(&mut rt, connection.client_id()),
+                                    Ok(Ok(7))
+                                ));
+                            })
+                        })
+                    })
+                },
+                recovery::Policy::new(|event| reports.push(event), recover),
+                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
+            );
+            assert!(
+                matches!(reports.events(), Ok(events) if events.is_empty()),
+                "unexpected reclamation"
+            );
+            assert!(
+                matches!(server.finish(), Ok(Ok(()))),
+                "Redis peer completion"
+            );
+        },
+    )
+    .expect("spawn Redis peer");
+}
+
+#[test]
 fn inflight_close_drains() {
     let config = config(Positive::from_secs::<1>()).expect("valid redis configuration");
     AcceptScript::with(
         |peer| {
-            let mut failed = peer.accept()?;
+            let failed = peer.accept()?;
             failed.read_wait(Some(Duration::from_secs(1)))?;
             let mut buf = [0_u8; PING.len() * 2];
             failed.read_exact(&mut buf)?;
@@ -134,7 +261,7 @@ fn mixed_close_drains() {
     let bytes = wire.len();
     AcceptScript::with(
         move |peer| {
-            let mut failed = peer.accept()?;
+            let failed = peer.accept()?;
             failed.read_wait(Some(Duration::from_secs(1)))?;
             let mut buf = vec![0_u8; PING.len() + wire.len()];
             failed.read_exact(&mut buf)?;
@@ -233,7 +360,7 @@ fn bulk_admission() {
 
     AcceptScript::with(
         move |peer| {
-            let mut socket = peer.accept()?;
+            let socket = peer.accept()?;
             socket.read_wait(Some(Duration::from_secs(2)))?;
             let mut received = vec![0_u8; wire.len()];
             socket.read_exact(&mut received)?;
@@ -404,14 +531,14 @@ fn waiter_slot_reclaims() {
     let (stop, done) = mpsc::channel();
     AcceptScript::with(
         move |peer| {
-            let mut socket = peer.accept()?;
+            let socket = peer.accept()?;
             socket.read_wait(Some(Duration::from_secs(1)))?;
             let mut buf = [0_u8; 128];
             assert_ne!(socket.read(&mut buf)?, 0);
             (gate.recv_timeout(GUARD)).expect("allow AUTH response");
             socket.write_all(b"+OK\r\n")?;
             (done.recv_timeout(GUARD)).expect("finish active connection");
-            Ok::<_, io::Error>(())
+            Ok::<_, peer::Error>(())
         },
         |server| {
             let addr = server.addr();
@@ -514,14 +641,14 @@ fn parser_lane_waits_for_retained_replies() {
             let right = peer.accept()?;
             let mut sockets = [&left, &right];
             let first = first_request(&mut sockets, REQUEST)?;
-            let (mut a, b) = if first == 0 {
+            let (a, b) = if first == 0 {
                 (&left, &right)
             } else {
                 (&right, &left)
             };
             b.read_wait(Some(GUARD))?;
             a.write_all(b"*2\r\n$3\r\none\r\n$3\r\nuno\r\n")?;
-            for (mut socket, reply) in [
+            for (socket, reply) in [
                 (b, b"*2\r\n$3\r\ntwo\r\n$3\r\ndos\r\n".as_slice()),
                 (a, b"*2\r\n$3\r\ntri\r\n$4\r\ntres\r\n".as_slice()),
             ] {

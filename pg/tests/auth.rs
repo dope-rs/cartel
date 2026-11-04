@@ -15,14 +15,15 @@ use dope::{
     net::tcp::Tcp, net::wire::Identity, runtime::executor::session::Completion,
 };
 use dope_fiber::BlockOn as _;
+use dope_test::harness::peer;
 use dope_test::{harness::GUARD, reclaim::Reports};
 use sha2::{Digest as _, Sha256};
-use std::{io::Read as _, io::Write as _, net::TcpStream, str};
+use std::str;
 use std::{net::Ipv4Addr, net::TcpListener, sync::mpsc, thread, time::Duration};
 
 pub mod common;
 
-fn read(socket: &mut TcpStream, tag: Option<u8>) -> Vec<u8> {
+fn read(socket: &peer::Stream<'_>, tag: Option<u8>) -> Vec<u8> {
     if let Some(expected) = tag {
         let mut actual = [0];
         socket.read_exact(&mut actual).expect("frontend tag");
@@ -32,16 +33,17 @@ fn read(socket: &mut TcpStream, tag: Option<u8>) -> Vec<u8> {
 }
 
 fn serve(listener: TcpListener, done: mpsc::Receiver<()>, password: &[u8], connections: usize) {
+    let listener = peer::TcpAcceptor::try_adopt(listener.into()).expect("listener admission");
     let mut peers: Vec<_> = (0..connections)
         .map(|_| {
-            let mut socket =
-                Listener::try_accept(&listener, Duration::from_secs(10)).expect("peer connection");
+            let mut socket = Listener::accept_within(&listener, Duration::from_secs(10))
+                .expect("peer connection");
             socket.set_nodelay(true).expect("TCP_NODELAY");
             socket
-                .set_read_timeout(Some(Duration::from_secs(10)))
+                .read_wait(Some(Duration::from_secs(10)))
                 .expect("read timeout");
             socket
-                .set_write_timeout(Some(Duration::from_secs(10)))
+                .write_wait(Some(Duration::from_secs(10)))
                 .expect("write timeout");
             let startup = read(&mut socket, None);
             assert_eq!(&startup[..4], &196608_u32.to_be_bytes());

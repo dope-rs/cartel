@@ -1,5 +1,5 @@
 use dope::{
-    core::driver::route::KeyTag,
+    core::driver::{result::SubmitCause, route::KeyTag},
     manifold::client::{conn, session::turns},
 };
 use o3::base::cell::region;
@@ -73,6 +73,11 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
 
     pub(super) fn apply(self, error: crate::Error) {
         let class = match &error {
+            crate::Error::Transmit(conn::Transmit::Rejected(failure))
+                if failure.into_error().cause() == SubmitCause::IdentityExhausted =>
+            {
+                reply::Class::Permanent
+            }
             crate::Error::Input(_)
             | crate::Error::Retirement { .. }
             | crate::Error::Scram(
@@ -144,6 +149,7 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
             | crate::Error::Closed
             | crate::Error::Connection(_)
             | crate::Error::Receive(_)
+            | crate::Error::Transmit(_)
             | crate::Error::Timeout(_)
             | crate::Error::RequestTimeout(_)
             | crate::Error::Random(_)

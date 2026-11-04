@@ -1,10 +1,12 @@
 //! Fixtures shared by the independently compiled integration tests.
 
+pub mod counted;
 pub mod env;
 pub mod external;
 pub mod port;
 pub mod postgres;
 pub mod topology;
+pub mod transaction;
 pub mod types;
 pub mod wire;
 

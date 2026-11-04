@@ -2,15 +2,12 @@ use cartel_pg::api::traits::{
     Begin as _, Client as _, Notify as _, Query as _, Status as _, Transaction as _, Unchecked as _,
 };
 use dope::core::driver::life::recovery;
+use dope_test::harness::peer;
 use std::{
-    io::{self, ErrorKind, Write as _},
     net::{SocketAddr, TcpListener},
     num::NonZero,
     pin::pin,
-    sync::{
-        mpsc,
-        mpsc::{RecvTimeoutError, TryRecvError},
-    },
+    sync::{mpsc, mpsc::TryRecvError},
     task::Poll,
     thread,
     time::Duration,
@@ -31,7 +28,11 @@ use dope_fiber::{
     abi::{Join, PollFn, Task, poll_fn},
     task::done,
 };
-use dope_test::{fibers, harness::GUARD, reclaim::Reports};
+use dope_test::{
+    fibers,
+    harness::{GUARD, peer::AcceptScript},
+    reclaim::Reports,
+};
 use o3::base::time::Positive;
 
 use crate::common::postgres::{self, accept::Listener as _, startup::Stream as _};
@@ -41,13 +42,287 @@ type Env = Bundle<Tcp, Identity, Throughput>;
 pub mod common;
 
 #[test]
+fn stalled_partial_reconnects_idle_connection() {
+    AcceptScript::with(postgres::retire::stalled_partial, |server| {
+        let config = config::Config::with_window(
+            Queries::try_reply()
+                .expect("PostgreSQL capacity")
+                .capacities(),
+            Positive::from_secs::<2>(),
+        )
+        .expect("PostgreSQL admission deadline");
+        let prepared = topology::Prepare::try_new::<
+            Bundle<Tcp, Identity, Throughput, postgres::retire::ShortIdle>,
+        >(
+            port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config),
+            server.addr(),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+        )
+        .expect("PostgreSQL topology");
+        let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+        let mut report = Completion::new();
+        prepared.with_local(
+            |worker| {
+                worker.lend(|node, stage| {
+                    node.install(stage, |host, stage| {
+                        stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+                            let client = runtime.root_client();
+                            for _ in 0..2 {
+                                assert!(matches!(
+                                    runtime.block_on(client.unchecked().command("SELECT 1")),
+                                    Ok(Ok(()))
+                                ));
+                            }
+                        })
+                    })
+                })
+            },
+            recovery::Policy::new(|event| reports.push(event), common::recover),
+            |result| assert!(matches!(result, Ok(Ok(Ok(())))), "PostgreSQL scope"),
+        );
+        assert!(
+            matches!(reports.events(), Ok(events) if events.is_empty()),
+            "unexpected reclamation"
+        );
+        assert!(
+            matches!(server.finish(), Ok(Ok(()))),
+            "PostgreSQL peer completion"
+        );
+    })
+    .expect("spawn PostgreSQL peer");
+}
+
+#[test]
+fn unsolicited_partial_cannot_bind_next_request() {
+    for throttled in [false, true] {
+        let mut capacity = Queries::try_reply()
+            .expect("PostgreSQL capacity")
+            .capacities();
+        capacity.inflight = 1;
+        let config = config::Config::with_window(capacity, Positive::from_millis::<100>())
+            .expect("PostgreSQL admission deadline");
+        let (ready, release) = Ends::<Wait>::blocking()
+            .expect("command response gate")
+            .split();
+        AcceptScript::with(
+            move |peer| postgres::retire::unsolicited_partial(peer.accept()?, ready),
+            |server| {
+                let prepared = topology::Prepare::try_new::<Env>(
+                    port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config),
+                    server.addr(),
+                    Duration::from_millis(1),
+                    Duration::from_secs(1),
+                )
+                .expect("PostgreSQL topology");
+                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+                let mut report = Completion::new();
+                prepared.with_local(
+                    |worker| {
+                        worker.lend(|node, stage| {
+                            node.install(stage, |host, stage| {
+                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+                                    let client = runtime.root_client();
+                                    assert!(matches!(
+                                        runtime.block_on(client.status().wait_ready()),
+                                        Ok(Ok(()))
+                                    ));
+                                    let mut first = pin!(Task::new(client.unchecked().command("SELECT 1")));
+                                    assert!(matches!(
+                                        runtime.block_on(fibers::TEST.poll_once(first.as_mut())),
+                                        Ok(None)
+                                    ));
+                                    let mut second = pin!(Task::new(client.unchecked().command("SELECT 1")));
+                                    if throttled {
+                                        assert!(matches!(
+                                            runtime.block_on(fibers::TEST.poll_once(second.as_mut())),
+                                            Ok(None)
+                                        ));
+                                    }
+                                    release.notify().expect("release command response");
+                                    assert!(matches!(runtime.block_on(first.as_mut()), Ok(Ok(()))));
+                                    fibers::TEST
+                                        .try_pause(&mut runtime, Duration::from_millis(20))
+                                        .expect("process unsolicited partial response");
+                                    assert!(
+                                        matches!(
+                                            runtime.block_on(second.as_mut()),
+                                            Ok(Err(reply::Error::Driver(cartel_pg::Error::RequestTimeout(timeout))))
+                                                if timeout.phase() == cartel_pg::RequestPhase::Admission
+                                        ),
+                                        "an unsolicited partial response must not admit the next request; throttled={throttled}"
+                                    );
+                                })
+                            })
+                        })
+                    },
+                    recovery::Policy::new(|event| reports.push(event), common::recover),
+                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "PostgreSQL scope"),
+                );
+                assert!(
+                    matches!(reports.events(), Ok(events) if events.is_empty()),
+                    "unexpected reclamation"
+                );
+                assert!(
+                    matches!(server.finish(), Ok(Ok(()))),
+                    "PostgreSQL peer completion"
+                );
+            },
+        )
+        .expect("spawn PostgreSQL peer");
+    }
+}
+
+#[test]
+fn asynchronous_partial_resumes_pinned_request() {
+    let (ready, release) = Ends::<Wait>::blocking()
+        .expect("asynchronous tail gate")
+        .split();
+    AcceptScript::with(
+        move |peer| postgres::retire::asynchronous_partial(peer.accept()?, ready),
+        |server| {
+            let prepared = topology::Prepare::try_new::<Env>(
+                port::Port::<Queries>::plan(
+                    Queries::try_config().expect("database config"),
+                    Queries::try_reply().expect("PostgreSQL capacity"),
+                ),
+                server.addr(),
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+            )
+            .expect("PostgreSQL topology");
+            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+            let mut report = Completion::new();
+            prepared.with_local(
+                |worker| {
+                    worker.lend(|node, stage| {
+                        node.install(stage, |host, stage| {
+                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+                                let client = runtime.root_client();
+                                let tx = runtime
+                                    .block_on(client.transaction().begin())
+                                    .expect("begin driver")
+                                    .ok()
+                                    .expect("transaction");
+                                for _ in 0..3 {
+                                    fibers::TEST
+                                        .try_pause(&mut runtime, Duration::from_millis(20))
+                                        .expect("process asynchronous prefix");
+                                    let mut command =
+                                        pin!(Task::new(tx.unchecked().command("SELECT 1")));
+                                    assert!(matches!(
+                                        runtime.block_on(fibers::TEST.poll_once(command.as_mut())),
+                                        Ok(None)
+                                    ));
+                                    release.notify().expect("release asynchronous tail");
+                                    assert!(matches!(
+                                        runtime.block_on(command.as_mut()),
+                                        Ok(Ok(()))
+                                    ));
+                                }
+                                let notice = runtime
+                                    .block_on(client.notify().next())
+                                    .expect("notification driver")
+                                    .ok()
+                                    .expect("asynchronous notification");
+                                assert_eq!(
+                                    (notice.pid(), notice.channel(), notice.payload()),
+                                    (7, "partial", "ready")
+                                );
+                                assert!(matches!(runtime.block_on(tx.commit()), Ok(Ok(()))));
+                            })
+                        })
+                    })
+                },
+                recovery::Policy::new(|event| reports.push(event), common::recover),
+                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "PostgreSQL scope"),
+            );
+            assert!(
+                matches!(reports.events(), Ok(events) if events.is_empty()),
+                "unexpected reclamation"
+            );
+            assert!(
+                matches!(server.finish(), Ok(Ok(()))),
+                "PostgreSQL peer completion"
+            );
+        },
+    )
+    .expect("spawn PostgreSQL peer");
+}
+
+#[test]
+fn detached_partial_preserves_pipelined_request() {
+    AcceptScript::with(
+        |peer| postgres::retire::detached_partial(peer.accept()?),
+        |server| {
+            let prepared = topology::Prepare::try_new::<Env>(
+                port::Port::<Queries>::plan(
+                    Queries::try_config().expect("database config"),
+                    Queries::try_reply().expect("PostgreSQL capacity"),
+                ),
+                server.addr(),
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+            )
+            .expect("PostgreSQL topology");
+            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+            let mut report = Completion::new();
+            prepared.with_local(
+                |worker| {
+                    worker.lend(|node, stage| {
+                        node.install(stage, |host, stage| {
+                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+                                let client = runtime.root_client();
+                                assert!(matches!(
+                                    runtime.block_on(client.status().wait_ready()),
+                                    Ok(Ok(()))
+                                ));
+                                assert!(matches!(
+                                    runtime.block_on(
+                                        fibers::TEST
+                                            .poll_once(client.unchecked().command("SELECT 1"))
+                                    ),
+                                    Ok(None)
+                                ));
+                                fibers::TEST
+                                    .try_pause(&mut runtime, Duration::from_millis(20))
+                                    .expect("process detached partial response");
+                                assert!(matches!(
+                                    runtime.block_on(client.unchecked().command("SELECT 2")),
+                                    Ok(Ok(()))
+                                ));
+                            })
+                        })
+                    })
+                },
+                recovery::Policy::new(|event| reports.push(event), common::recover),
+                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "PostgreSQL scope"),
+            );
+            assert!(
+                matches!(reports.events(), Ok(events) if events.is_empty()),
+                "unexpected reclamation"
+            );
+            assert!(
+                matches!(server.finish(), Ok(Ok(()))),
+                "PostgreSQL peer completion"
+            );
+        },
+    )
+    .expect("spawn PostgreSQL peer");
+}
+
+#[test]
 fn pending_ready_settles() {
     const COMMANDS: usize = LIMIT + 1;
     const CAPACITY: usize = COMMANDS + 4;
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener");
     let address = listener.local_addr().expect("listener address");
     let (ready, release) = Ends::<Wait>::blocking().expect("settlement pipe").split();
-    let server = thread::spawn(move || listener.group_settle(ready));
+    let server = thread::spawn(move || {
+        peer::TcpAcceptor::try_adopt(listener.into())
+            .expect("listener admission")
+            .group_settle(ready)
+    });
     let mut server = Some(server);
     let config = config::Config::new(config::Capacities {
         connections: 1,
@@ -188,13 +463,11 @@ fn late_error_keeps_batch() {
     let addr = listener.local_addr().expect("listener address");
     let (release, ready) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
+        let listener = peer::TcpAcceptor::try_adopt(listener.into()).expect("listener admission");
         let stream = listener.reply_settle()?;
         ready
             .recv_timeout(Duration::from_secs(1))
-            .map_err(|error| match error {
-                RecvTimeoutError::Timeout => io::Error::new(ErrorKind::TimedOut, error),
-                RecvTimeoutError::Disconnected => io::Error::new(ErrorKind::BrokenPipe, error),
-            })?;
+            .expect("ready signal");
         stream.ready()
     });
     let config = Queries::try_cancel().expect("pipeline config");
@@ -301,12 +574,14 @@ fn response_reconnects() {
         let (notify, ready) = mpsc::sync_channel(1);
         let server = thread::spawn(
             move || -> Result<Result<(), mpsc::SendError<()>>, postgres::Error> {
+                let listener =
+                    peer::TcpAcceptor::try_adopt(listener.into()).expect("listener admission");
                 let (first, next) = if idle {
-                    let mut first = listener.try_accept(Duration::from_secs(1))?;
+                    let mut first = listener.accept_within(Duration::from_secs(1))?;
                     first.try_start(None)?;
                     first.write_all(&postgres::Frame::new(b'Z', b"I").encode())?;
                     first.read_closed()?;
-                    let mut next = listener.try_accept(Duration::from_secs(1))?;
+                    let mut next = listener.accept_within(Duration::from_secs(1))?;
                     next.try_start(None)?;
                     (first, next)
                 } else {

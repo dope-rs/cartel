@@ -2,6 +2,7 @@ use cartel_pg::api::traits::{
     Begin as _, Client as _, Notify as _, Status as _, Transaction as _, Unchecked as _,
 };
 use dope::core::driver::life::recovery;
+use dope_test::harness::peer;
 use std::{
     net::{SocketAddr, TcpListener},
     pin::pin,
@@ -32,11 +33,101 @@ type Env = Bundle<Tcp, Identity, Throughput>;
 pub mod common;
 
 #[test]
+fn transaction_status_rejects_stale_guard() {
+    for invalid_begin in [false, true] {
+        peer::AcceptScript::with(
+            move |listener| common::transaction::ended(listener, invalid_begin),
+            |server| {
+                let prepared = topology::Prepare::try_new::<Env>(
+                    port::Port::<Queries>::plan(
+                        Queries::try_config().expect("database config"),
+                        Queries::try_cancel().expect("two in-flight replies"),
+                    ),
+                    server.addr(),
+                    Duration::from_millis(1),
+                    Duration::from_secs(1),
+                )
+                .expect("transaction topology");
+                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+                let mut report = Completion::new();
+                prepared.with_local(
+                    |worker| {
+                        worker.lend(|node, stage| {
+                            node.install(stage, |host, stage| {
+                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+                                    let client = runtime.root_client();
+                                    assert!(matches!(
+                                        runtime.block_on(client.status().wait_ready()),
+                                        Ok(Ok(()))
+                                    ));
+                                    assert!(matches!(
+                                        runtime.block_on(
+                                            fibers::TEST
+                                                .poll_once(client.unchecked().command("SELECT 1"))
+                                        ),
+                                        Ok(None)
+                                    ));
+                                    let started = runtime
+                                        .block_on(client.transaction().begin())
+                                        .expect("begin driver");
+                                    let stale = if invalid_begin {
+                                        assert!(matches!(
+                                            started,
+                                            Err(reply::Error::Driver(cartel_pg::Error::Protocol(
+                                                cartel_pg::protocol::Reason::TransactionLease
+                                            )))
+                                        ));
+                                        None
+                                    } else {
+                                        let tx = started.ok().expect("pipelined transaction");
+                                        assert!(matches!(
+                                            runtime.block_on(tx.unchecked().command("ROLLBACK")),
+                                            Ok(Err(reply::Error::Driver(
+                                                cartel_pg::Error::Protocol(
+                                                    cartel_pg::protocol::Reason::TransactionLease
+                                                )
+                                            )))
+                                        ));
+                                        assert!(matches!(
+                                            runtime.block_on(tx.unchecked().command("SELECT 1")),
+                                            Ok(Err(reply::Error::Pinned(_)))
+                                        ));
+                                        Some(tx)
+                                    };
+                                    assert!(matches!(
+                                        runtime.block_on(client.unchecked().command("SELECT 1")),
+                                        Ok(Ok(()))
+                                    ));
+                                    drop(stale);
+                                    assert!(matches!(
+                                        runtime.block_on(client.unchecked().command("SELECT 1")),
+                                        Ok(Ok(()))
+                                    ));
+                                })
+                            })
+                        })
+                    },
+                    recovery::Policy::new(|event| reports.push(event), common::recover),
+                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "transaction scope"),
+                );
+                assert!(reports.events().expect("reclamation").is_empty());
+                assert!(matches!(server.finish(), Ok(Ok(()))), "transaction peer");
+            },
+        )
+        .expect("spawn transaction peer");
+    }
+}
+
+#[test]
 fn finalizer_keeps_error() {
     for reject in [false, true] {
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener");
         let address = listener.local_addr().expect("listener address");
-        let server = thread::spawn(move || listener.finalizer());
+        let server = thread::spawn(move || {
+            peer::TcpAcceptor::try_adopt(listener.into())
+                .expect("listener admission")
+                .finalizer()
+        });
         let mut capacity = Queries::try_cancel()
             .expect("bounded PostgreSQL config")
             .capacities();
@@ -157,7 +248,8 @@ fn retains_next_owner() {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener");
     let address = listener.local_addr().expect("listener address");
     let server = thread::spawn(move || {
-        let mut socket = listener.try_accept(Duration::from_secs(1))?;
+        let listener = peer::TcpAcceptor::try_adopt(listener.into()).expect("listener admission");
+        let mut socket = listener.accept_within(Duration::from_secs(1))?;
         socket.try_start(None)?;
         retire::finalize(&mut socket)
     });
@@ -248,8 +340,10 @@ fn transaction_frees_slot() {
         let (release, permit) = mpsc::sync_channel(1);
         let (done, drained) = mpsc::sync_channel(1);
         let server = thread::spawn(move || {
-            let mut socket =
-                Listener::try_accept(&listener, Duration::from_secs(1)).expect("peer connection");
+            let listener =
+                peer::TcpAcceptor::try_adopt(listener.into()).expect("listener admission");
+            let mut socket = Listener::accept_within(&listener, Duration::from_secs(1))
+                .expect("peer connection");
             Stream::try_start(&mut socket, None).expect("peer handshake");
             permit.recv().expect("detached response release");
             retire::reply(&mut socket, failed).expect("detached response");

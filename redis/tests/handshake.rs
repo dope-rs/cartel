@@ -18,13 +18,14 @@ use dope::{
     manifold::timing::Throughput, net::tcp::Tcp, net::wire::Identity,
 };
 use dope_fiber::BlockOn;
+use dope_test::harness::peer;
 use dope_test::{
     fibers::{self, TEST},
     harness::{GUARD, peer::AcceptScript},
     reclaim::Reports,
 };
 use o3::base::time::Positive;
-use std::{io, io::Read as _, io::Write as _, net::Shutdown, sync::mpsc, time::Duration};
+use std::{net::Shutdown, sync::mpsc, time::Duration};
 
 type Env = Bundle<Tcp, Identity, Throughput>;
 
@@ -45,7 +46,7 @@ fn reconnect_replays_init() {
     AcceptScript::with(
         move |peer| {
             {
-                let mut socket = peer.accept()?;
+                let socket = peer.accept()?;
                 assert_eq!(socket.read(&mut [0])?, 0, "AUTH needs a free request frame");
             }
             for epoch in 0..2 {
@@ -65,7 +66,7 @@ fn reconnect_replays_init() {
                         .expect("finish replacement connection");
                 }
             }
-            Ok::<_, io::Error>(())
+            Ok::<_, peer::Error>(())
         },
         |server| {
             let init = Plan::new()
@@ -181,12 +182,12 @@ fn rejection_stops_init() {
                         socket.nonblock(true);
                         let mut byte = [0; 1];
                         match socket.read(&mut byte) {
-                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                            Err(peer::Error::Syscall(error)) if error.is_block() => {}
                             outcome => {
                                 assert_eq!(outcome?, 0, "a command followed rejected {expected:?}")
                             }
                         }
-                        return Ok::<_, io::Error>(Some(step));
+                        return Ok::<_, peer::Error>(Some(step));
                     }
                     socket.write_all(b"+OK\r\n")?;
                 }
@@ -268,8 +269,8 @@ fn lane_failure_survives() {
         let (close, stop) = mpsc::channel();
         AcceptScript::with(
         move |peer| {
-            let mut bad = peer.accept()?;
-            let mut good = peer.accept()?;
+            let bad = peer.accept()?;
+            let good = peer.accept()?;
             bad.read_wait(Some(Duration::from_secs(1)))?;
             good.read_wait(Some(Duration::from_secs(1)))?;
             let mut buf = [0_u8; 128];
@@ -290,7 +291,7 @@ fn lane_failure_survives() {
             } else {
                 good.shutdown(Shutdown::Write)?;
             }
-            Ok::<_, io::Error>(())
+            Ok::<_, peer::Error>(())
         },
         |server| {
             let addr = server.addr();

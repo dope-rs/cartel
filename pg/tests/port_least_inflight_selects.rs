@@ -16,6 +16,7 @@ use dope_fiber::{
     abi::{Task, poll_fn},
 };
 use dope_test::fibers;
+use dope_test::harness::peer;
 use dope_test::{harness::GUARD, reclaim::Reports};
 use std::{
     iter,
@@ -42,6 +43,8 @@ fn least_inflight_selects() {
         let (report, selected) = mpsc::channel();
         let server = thread::spawn(
             move || -> Result<Result<(), mpsc::SendError<usize>>, Error> {
+                let listener =
+                    peer::TcpAcceptor::try_adopt(listener.into()).expect("listener admission");
                 let (mut sockets, choices) = listener.least_loaded(initial)?;
                 for choice in choices {
                     if let Err(error) = report.send(choice) {

@@ -3,7 +3,7 @@ use std::{cell, mem};
 use cartel_core::{frame::Buffer, queue, reply, reply::layout::Position};
 use dope::{
     core::driver::{route, schedule::ready},
-    manifold::client::{close, conn},
+    manifold::client::{close, conn, session},
     net::link::egress,
 };
 use o3::base::cell::region;
@@ -91,21 +91,40 @@ impl<'b, 'd, const ID: u8> Conn<'b, 'd, ID> {
         token: conn::Id<'d, route::KeyTag<ID>>,
     ) -> Option<Position<'b, 'd, route::KeyTag<ID>>> {
         self.transition(|phase| match phase {
-            State::Initializing(bound) if bound.position.connection() == token => {
-                (State::Shared(bound), Some(bound.position))
-            }
+            State::Initializing(bound) if bound.position.connection() == token => (
+                State::Shared(bound, session::Input::Empty),
+                Some(bound.position),
+            ),
             phase => (phase, None),
         })
     }
 
     pub(in crate::port::schedule) fn access(
         &self,
-    ) -> Option<(Position<'b, 'd, route::KeyTag<ID>>, Access)> {
+    ) -> Option<(Position<'b, 'd, route::KeyTag<ID>>, Access, session::Input)> {
         // SAFETY: this thread-local leaf only returns Copy fields;
         // no callback runs and the phase reference stays within this match.
         match unsafe { &*self.phase.get() } {
-            State::Shared(bound) => Some((bound.position, Access::Shared)),
-            State::Exclusive(bound) => Some((bound.position, Access::Exclusive)),
+            State::Shared(bound, input) => Some((bound.position, Access::Shared, *input)),
+            State::Exclusive(bound, input) => Some((bound.position, Access::Exclusive, *input)),
+            _ => None,
+        }
+    }
+
+    pub(in crate::port::schedule) fn set_input(
+        &self,
+        token: conn::Id<'d, route::KeyTag<ID>>,
+        input: session::Input,
+    ) -> Option<Position<'b, 'd, route::KeyTag<ID>>> {
+        // SAFETY: this thread-local leaf updates only the matching generation's
+        // Copy input state; no callback runs or phase reference escapes.
+        match unsafe { &mut *self.phase.get() } {
+            State::Shared(bound, stored) | State::Exclusive(bound, stored)
+                if bound.position.connection() == token =>
+            {
+                *stored = input;
+                Some(bound.position)
+            }
             _ => None,
         }
     }
@@ -122,7 +141,7 @@ impl<'b, 'd, const ID: u8> Conn<'b, 'd, ID> {
         // borrow through queue admission. Neither depth projection calls user
         // code or accesses routes, and replacing Shared drops only Copy fields.
         let phase = unsafe { &mut *self.phase.get() };
-        let State::Shared(bound) = phase else {
+        let State::Shared(bound, input) = phase else {
             return Acquire::Stale;
         };
         if bound.position.connection() != token {
@@ -131,7 +150,7 @@ impl<'b, 'd, const ID: u8> Conn<'b, 'd, ID> {
         if reps.depth(region) != Depth::ZERO || !reqs.is_empty(region) {
             return Acquire::Blocked;
         }
-        *phase = State::Exclusive(*bound);
+        *phase = State::Exclusive(*bound, *input);
         Acquire::Acquired
     }
 
@@ -141,8 +160,8 @@ impl<'b, 'd, const ID: u8> Conn<'b, 'd, ID> {
         token: conn::Id<'d, route::KeyTag<ID>>,
     ) -> Release {
         self.transition(|phase| match phase {
-            State::Exclusive(bound) if bound.position.connection() == token => {
-                (State::Shared(bound), Release::Shared)
+            State::Exclusive(bound, input) if bound.position.connection() == token => {
+                (State::Shared(bound, input), Release::Shared)
             }
             phase => (phase, Release::Retired),
         })

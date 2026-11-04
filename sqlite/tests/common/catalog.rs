@@ -149,6 +149,9 @@ pub const AGGREGATE_WORK_COMMANDS: &[&str] = &[
     ) INSERT INTO aggregate_work SELECT x + 1001 FROM count",
 ];
 
+pub const SHORT_WORK_COMMANDS: &[&str] =
+    &["CREATE TABLE IF NOT EXISTS short_work (id INTEGER PRIMARY KEY)"; 32_768];
+
 pub const OVERSIZED_COMMANDS: &[&str] = &[
     "CREATE TABLE local_install (payload BLOB NOT NULL)",
     "INSERT INTO local_install (payload) VALUES (zeroblob(16777216))",

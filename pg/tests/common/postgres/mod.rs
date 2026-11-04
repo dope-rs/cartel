@@ -1,3 +1,4 @@
+use dope_test::harness::peer;
 pub mod accept;
 mod frame;
 pub use frame::Frame;
@@ -8,11 +9,7 @@ pub mod startup;
 
 use dope::core::platform::wake::{Notify, NotifyError, WaitError};
 use dope::runtime::executor::root;
-use std::{
-    io::{self, ErrorKind},
-    pin::Pin,
-    task::Poll,
-};
+use std::{pin::Pin, task::Poll};
 
 pub struct Quarantine<F, C> {
     query: Option<Pin<Box<F>>>,
@@ -59,42 +56,39 @@ impl<'d, F, C: FnOnce() + Unpin> root::Root<'d> for Quarantine<F, C> {
 
 #[derive(Debug)]
 pub enum Error {
-    Io(io::Error),
+    Io(peer::Error),
+    InvalidLength(u32),
+    Utf8(std::str::Utf8Error),
     NonemptyFrame,
     UnexpectedRequest,
 }
 
-impl From<io::Error> for Error {
-    fn from(error: io::Error) -> Self {
+impl From<peer::Error> for Error {
+    fn from(error: peer::Error) -> Self {
         Self::Io(error)
     }
 }
 
 #[derive(Debug)]
 pub enum SettleError {
-    Connect(io::Error),
-    Startup(io::Error),
+    Connect(peer::Error),
+    Startup(Error),
     Begin(Error),
     Group(Error),
     Release(WaitError),
     Close(Error),
-    Reconnect(io::Error),
-    Restart(io::Error),
+    Reconnect(peer::Error),
+    Restart(Error),
     Command(Error),
     Stop(Error),
 }
 
-fn read_empty(stream: &mut impl io::Read, expected: u8) -> Result<(), Error> {
+pub(crate) fn read_empty(stream: &peer::Stream<'_>, expected: u8) -> Result<(), Error> {
     loop {
         let mut header = [0_u8; 5];
         stream.read_exact(&mut header)?;
-        let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-        let mut body = vec![
-            0;
-            length
-                .checked_sub(4)
-                .ok_or(io::Error::from(ErrorKind::InvalidData))?
-        ];
+        let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+        let mut body = vec![0; length.checked_sub(4).ok_or(Error::InvalidLength(length))? as usize];
         stream.read_exact(&mut body)?;
         if header[0] == expected {
             if !body.is_empty() {

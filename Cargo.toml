@@ -5,24 +5,24 @@ members = ["core", "gen", "pg", "redis", "sqlite"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.98"
-version = "0.21.0"
+version = "0.22.0"
 license = "MIT"
 repository = "https://github.com/dope-rs/cartel"
 authors = ["inq <gofiri@gmail.com>"]
 
 [workspace.dependencies]
-dope-test = "0.21"
-dope = "0.21"
-dope-core = "0.21"
-dope-fiber = "0.21"
-dope-manifold = "0.21"
-dope-runtime = "0.21"
-o3 = "0.20"
+dope-test = "0.23"
+dope = "0.23"
+dope-core = "0.23"
+dope-fiber = "0.23"
+dope-manifold = "0.23"
+dope-runtime = "0.23"
+o3 = "0.21"
 pin-project = "1"
 ryu = "1"
-cartel-core = { path = "core", version = "0.21.0" }
-cartel-gen = { path = "gen", version = "0.21.0" }
-libsqlite3-sys = { version = "=0.39.1", features = ["bundled"] }
+cartel-core = { path = "core", version = "0.22.0" }
+cartel-gen = { path = "gen", version = "0.22.0" }
+libsqlite3-sys = { version = "=0.38.1", features = ["bundled"] }
 
 [profile.release]
 panic = "abort"

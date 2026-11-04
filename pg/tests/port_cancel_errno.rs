@@ -9,8 +9,9 @@ use dope::{
     manifold::timing::Throughput, net::link::oneshot, net::tcp::Tcp, net::wire::Identity,
 };
 use dope_fiber::BlockOn as _;
+use dope_test::harness::peer;
 use dope_test::{harness::GUARD, reclaim::Reports};
-use std::{io::Read as _, io::Write as _, thread};
+use std::thread;
 use std::{net::SocketAddr, net::TcpListener, time::Duration};
 use std::{sync::mpsc, sync::mpsc::Receiver};
 
@@ -102,8 +103,9 @@ fn refused(listener: TcpListener) -> (thread::JoinHandle<()>, Receiver<()>, mpsc
     let (closed, ready) = mpsc::channel();
     let (settled, observed) = mpsc::channel();
     let server = thread::spawn(move || {
+        let listener = peer::TcpAcceptor::try_adopt(listener.into()).expect("listener admission");
         let mut primary =
-            Listener::try_accept(&listener, Duration::from_secs(1)).expect("peer connection");
+            Listener::accept_within(&listener, Duration::from_secs(1)).expect("peer connection");
         Stream::try_start(&mut primary, Some((0x1020_3040, 0x5060_7080)))
             .expect("backend key handshake");
         let mut request = [0_u8; 512];

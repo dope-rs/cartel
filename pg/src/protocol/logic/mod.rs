@@ -9,7 +9,7 @@ use dope::{
         client::{
             app::{self, admit::Registered, connect::Full, failure::Observed, request},
             attempt, close, conn,
-            session::{app::drain::Application, codec, policy, protocol, response, turns},
+            session::{self, app::drain::Application, codec, policy, protocol, response, turns},
         },
         service::bindings,
     },
@@ -134,20 +134,24 @@ impl<
         CONNECTOR_CONNECTION_LIMIT,
     > for Session
 {
-    fn flush() -> impl for<'a, 'x, 'y, 'z> Call<(
-        &'a mut Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
-        &'x mut Context<'y, 'z, 'life, 'd, I, ID>,
-    )> {
-        output::Flush::<Infallible, _>::Context(
-            |(owner, ctx): (
+    fn flush() -> Option<
+        impl for<'a, 'x, 'y, 'z> Call<(
+            &'a mut Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
+            &'x mut Context<'y, 'z, 'life, 'd, I, ID>,
+            session::Input,
+        )>,
+    > {
+        Some(output::Flush::<Infallible, _>::Context(
+            |(owner, ctx, input): (
                 &mut Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
                 &mut Context<'_, '_, 'life, 'd, I, ID>,
+                session::Input,
             )| {
-                if let Err(error) = turn::Turn::new(owner.root(), ctx).try_flush() {
+                if let Err(error) = turn::Turn::new(owner.root(), ctx).try_flush(input) {
                     failure::Failure::in_context(owner.root(), ctx).apply(error);
                 }
             },
-        )
+        ))
     }
 }
 impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
@@ -257,6 +261,27 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
     > for Session
 {
     type Drain = Application;
+
+    fn transmit_failed(
+        owner: &Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
+        conn: conn::Id<'d, KeyTag<ID>>,
+        failure: conn::Transmit,
+        _: &mut region::Token<region::Identity<'d>>,
+    ) -> Option<conn::Transmit> {
+        let cause = replies::Failure::from_error(crate::Error::Transmit(failure));
+        let mode = match cause.close_reason() {
+            close::Reason::Capacity(close::Capacity::IdentityExhausted) => Disposition::Permanent,
+            _ => Disposition::Reconnect,
+        };
+        let shared = &owner.root().shared;
+        if let Some(cause) = shared.try_close(conn, cause, mode) {
+            if matches!(mode, Disposition::Permanent) {
+                shared.fail(cause.into_error());
+            }
+            owner.root().connection().wake(conn);
+        }
+        None
+    }
 
     fn io_fail(
         owner: &mut Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
@@ -400,6 +425,17 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         idle: Positive,
         region: &mut region::Token<region::Identity<'d>>,
     ) -> app::Inbound {
-        state.inbound(owner.root().load(conn, region), idle)
+        let port = owner.root();
+        let load = port.load(conn, region);
+        if load == Some(0)
+            && port
+                .shared
+                .ready
+                .connection(conn)
+                .is_some_and(|slot| slot.is_receiving())
+        {
+            return app::Inbound::Awaiting(idle);
+        }
+        state.inbound(load, idle)
     }
 }

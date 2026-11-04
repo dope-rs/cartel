@@ -162,7 +162,13 @@ impl<'lease, 'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Target<'app, '
                 frame,
                 admit,
             }) => Attempt::Blocked {
-                cause: crate::Block::Queue(cause),
+                cause: match cause {
+                    schedule::Block::Pool => crate::Block::Pool,
+                    schedule::Block::Queue(cause) => crate::Block::Queue(cause),
+                    schedule::Block::Unavailable => {
+                        return Attempt::Failed(crate::Error::Unavailable);
+                    }
+                },
                 target: admit,
                 frame,
             },

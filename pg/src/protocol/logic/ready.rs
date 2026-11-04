@@ -199,7 +199,14 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                             }
                         }
                     }
-                    poll::Status::Idle => {}
+                    poll::Status::Idle => {
+                        if matches!(
+                            self.port.shared.transaction().current(self.conn),
+                            access::Current::Held(_)
+                        ) {
+                            return Err(crate::Error::Protocol(Reason::TransactionLease));
+                        }
+                    }
                 }
                 if copy {
                     self.state.phase = state::Phase::Ready;

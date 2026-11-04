@@ -6,7 +6,7 @@ use dope::{
         app::{self, request},
         close,
         conn::{Activation, Id},
-        session::turns,
+        session::{self, turns},
     },
     net::link::egress,
 };
@@ -121,6 +121,24 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Schedule<'s, 'storage, 'b, 'c, 'd, 
     ) -> Option<reply::Lane<'_, 'b, 'c, 'd, frame::Stored<'s, 'd>, client::Failure<'d>>> {
         let conn = self.routes.bound(token)?;
         Some(self.lane(conn.position()))
+    }
+
+    pub(crate) fn try_input(
+        &self,
+        token: Id<'d, route::KeyTag<ID>>,
+        input: session::Input,
+        region: &mut region::Token<region::Identity<'d>>,
+    ) -> Result<(), client::Failure<'d>> {
+        let Some(conn) = self.routes.get(token.index().into_usize()) else {
+            return Ok(());
+        };
+        let Some(position) = conn.set_input(token, input) else {
+            return Ok(());
+        };
+        if input == session::Input::Partial && self.lane(position).depth(region) == Depth::ZERO {
+            return Err(client::Failure::UnexpectedResponse);
+        }
+        Ok(())
     }
 
     pub(super) fn fail(
@@ -311,7 +329,7 @@ fn refresh<'s, 'storage, 'b, 'c, 'd, const ID: u8>(
             return;
         };
         let token = conn.connection();
-        if !matches!(conn.access(), Some((position, Access::Shared)) if position.connection() == token)
+        if !matches!(conn.access(), Some((position, Access::Shared, _)) if position.connection() == token)
         {
             continue;
         }

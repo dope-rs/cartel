@@ -53,6 +53,28 @@ impl<'s, 'b, 'c, 'd, const ID: u8> Control<'_, 's, 'b, 'c, 'd, ID> {
         self.port.fail(token, cause, reqs.region());
     }
 
+    pub(super) fn flush(
+        self,
+        ctx: &mut session::turns::Context<
+            '_,
+            '_,
+            'd,
+            protocol::ConnState,
+            frame::Buffer,
+            route::KeyTag<ID>,
+        >,
+        input: session::Input,
+    ) {
+        match self
+            .port
+            .schedule
+            .try_input(ctx.conn_id, input, ctx.region())
+        {
+            Ok(()) => self.port.activity.wake_send(),
+            Err(cause) => super::reply::fail(self.port, cause, ctx),
+        }
+    }
+
     pub(super) fn blocked(
         self,
         conn: conn::Id<'d, route::KeyTag<ID>>,

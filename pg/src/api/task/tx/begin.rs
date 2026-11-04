@@ -124,6 +124,17 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                         }
                         task::Poll::Ready(Ok(())) => {
                             guard.as_ref().complete();
+                            let target = lease.target();
+                            if !matches!(
+                                client.port.shared.transaction().current(target.conn),
+                                crate::port::pool::access::Current::Held(current) if current == target
+                            ) {
+                                let error = crate::Error::Protocol(
+                                    crate::protocol::Reason::TransactionLease,
+                                );
+                                lease.abort(error);
+                                return task::Poll::Ready(Err(error.into()));
+                            }
                             return task::Poll::Ready(Ok(lease));
                         }
                         task::Poll::Ready(Err(error)) => {

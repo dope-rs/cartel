@@ -15,7 +15,7 @@ use dope::{
 };
 use dope_fiber::BlockOn as _;
 use dope_test::{harness::GUARD, harness::peer::TcpScript, reclaim::Reports};
-use std::{io::Read as _, io::Write as _, mem, time::Duration};
+use std::{mem, time::Duration};
 use value::source::{self, ScoredText as _};
 
 type Failure<'b, 'c, 'd> = reply::Failure<cartel_redis::Error<'d>, value::Bytes<'b, 'c, 'd>>;

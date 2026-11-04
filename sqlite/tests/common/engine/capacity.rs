@@ -57,6 +57,16 @@ pub fn try_settings(
     bytes: usize,
     quanta: u64,
 ) -> Result<(Limits, Memory), plan::Error> {
+    let mut work = Work::uniform(Budget {
+        progress: Progress::new(NonZero::new(quanta).ok_or(plan::Error::Progress)?),
+        busy: Busy {
+            window: Duration::from_millis(1),
+            interval: Duration::from_millis(1),
+            retries: NonZero::<u32>::MIN,
+        },
+    });
+    // The varying quota targets calls and cleanup, after this fixed catalog opens.
+    work.open.progress = Progress::new(NonZero::new(100).ok_or(plan::Error::Progress)?);
     Ok((
         Limits {
             parameters: Parameters {
@@ -69,14 +79,7 @@ pub fn try_settings(
             },
             savepoints: 16,
             program: Program::new(NonZero::new(1_000_000).ok_or(plan::Error::Program)?),
-            work: Work::uniform(Budget {
-                progress: Progress::new(NonZero::new(quanta).ok_or(plan::Error::Progress)?),
-                busy: Busy {
-                    window: Duration::from_millis(1),
-                    interval: Duration::from_millis(1),
-                    retries: NonZero::<u32>::MIN,
-                },
-            }),
+            work,
         },
         Memory {
             sqlite_bytes: 4 << 20,

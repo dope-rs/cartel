@@ -1,7 +1,10 @@
 use std::mem;
 
 use cartel_core::{handoff, queue, reply};
-use dope::{core::driver::route, manifold::client::conn::Id};
+use dope::{
+    core::driver::route,
+    manifold::client::{conn::Id, session::Input},
+};
 use o3::base::cell::region;
 use reply::recv::attach;
 
@@ -59,7 +62,8 @@ impl<'a, 'app, 's, 'b, 'c, 'd, const ID: u8> Plan<'a, 'app, 's, 'b, 'c, 'd, ID> 
             let Some(conn) = state.routes.next() else {
                 break;
             };
-            let Some((position, Access::Shared)) = conn.access() else {
+            let Some((position, Access::Shared, Input::Empty | Input::Partial)) = conn.access()
+            else {
                 continue;
             };
             let token = position.connection();
@@ -116,11 +120,18 @@ impl<'a, 'app, 's, 'b, 'c, 'd, const ID: u8> Plan<'a, 'app, 's, 'b, 'c, 'd, ID> 
         reply: &mut impl attach::Attach<'app, 'b, 'c, 'd, frame::Stored<'s, 'd>, client::Failure<'d>>,
         token: Id<'d, route::KeyTag<ID>>,
         seal: impl FnOnce(A, Id<'d, route::KeyTag<ID>>) -> R,
-    ) -> Result<R, Reject<A, queue::Rejection>> {
+    ) -> Result<R, Reject<A, Block>> {
         let Self { state, region } = self;
-        let Some(conn) = state.routes.exclusive(token) else {
+        let Some((conn, input)) = state.routes.exclusive(token) else {
             return Err(Reject::Unavailable);
         };
+        if matches!(input, Input::Yield | Input::Blocked) {
+            return Err(Reject::Blocked {
+                cause: Block::Pool,
+                frame,
+                admit,
+            });
+        }
         let reps = state.lane(conn.position());
         match handoff::Lane::new(&state.queue, reps).try_publish(
             region,
@@ -135,7 +146,7 @@ impl<'a, 'app, 's, 'b, 'c, 'd, const ID: u8> Plan<'a, 'app, 's, 'b, 'c, 'd, ID> 
                 Ok(done)
             }
             Err((handoff::Failure::Queue(cause), (frame, admit))) => Err(Reject::Blocked {
-                cause,
+                cause: Block::Queue(cause),
                 frame,
                 admit,
             }),

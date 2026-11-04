@@ -30,38 +30,35 @@ pub(crate) mod schedule;
 
 struct Signal<'d> {
     waiters: wait::Queue<'d>,
-    notice: cell::Cell<Notice>,
-}
-
-#[derive(Clone, Copy)]
-#[repr(u8)]
-enum Notice {
-    Idle,
-    Pending,
+    remaining: cell::Cell<usize>,
 }
 
 impl<'d> Signal<'d> {
     fn notify(&self) {
-        self.notice.set(Notice::Pending);
+        self.remaining.set(self.waiters.len().get());
     }
 
     fn flush(&self, work: app::Work<'_, 'd>) {
-        if matches!(self.notice.replace(Notice::Idle), Notice::Idle) {
+        let remaining = self.remaining.get();
+        if remaining == 0 {
             return;
         }
-        let notice = match self.waiters.wake_one(work) {
-            wait::WakeStatus::Complete if self.waiters.len() == wait::Length::ZERO => Notice::Idle,
-            wait::WakeStatus::Complete | wait::WakeStatus::Pending => Notice::Pending,
-        };
-        self.notice.set(notice);
+        if self.waiters.wake_one(work) == wait::WakeStatus::Complete {
+            // Re-registering callers cannot extend this notification round.
+            self.remaining
+                .set((remaining - 1).min(self.waiters.len().get()));
+        }
     }
 
     fn is_pending(&self) -> bool {
-        matches!(self.notice.get(), Notice::Pending)
+        self.remaining.get() != 0
     }
 }
 
-const _: [(); 1] = [(); mem::size_of::<Notice>()];
+const _: () = assert!(
+    mem::size_of::<Signal<'static>>()
+        == mem::size_of::<wait::Queue<'static>>() + mem::size_of::<usize>()
+);
 
 pub(super) struct Activity<'b, 'd, const ID: u8> {
     dispatch: Signal<'d>,
@@ -260,11 +257,11 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Port<'s, 'storage, 'b, 'c, 'd, ID> 
                     activity: Activity {
                         dispatch: Signal {
                             waiters: send,
-                            notice: cell::Cell::new(Notice::Idle),
+                            remaining: cell::Cell::new(0),
                         },
                         leases: Signal {
                             waiters: lease,
-                            notice: cell::Cell::new(Notice::Idle),
+                            remaining: cell::Cell::new(0),
                         },
                         failures: driver.region_token().bind(failures),
                         terminal: cell::Cell::new(None),

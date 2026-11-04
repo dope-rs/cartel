@@ -2,7 +2,7 @@ use cartel_pg::api::traits::{
     Begin as _, Client as _, Notify as _, Query as _, Status as _, Transaction as _,
 };
 use dope::core::driver::life::recovery;
-use std::{io, num::NonZero, pin::pin, sync::mpsc, time::Duration};
+use std::{num::NonZero, pin::pin, sync::mpsc, time::Duration};
 
 use cartel_pg::{
     api::{
@@ -95,7 +95,7 @@ fn rows_outlive_group() {
             group::delay_ready(socket)?;
             ready
                 .recv_timeout(Duration::from_secs(1))
-                .map_err(io::Error::other)?;
+                .expect("group release");
             group::resume_ready(socket)
         },
         |server| {

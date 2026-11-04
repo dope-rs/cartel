@@ -174,7 +174,9 @@ impl<'d, const ID: u8> Index<'d, ID> {
         };
         match access::Access::new(entry.slot()).release(proof) {
             access::Release::Released => {
-                entry.insert(depth);
+                if !entry.slot().is_receiving() {
+                    entry.insert(depth);
+                }
                 // SAFETY: the exact Reserved -> Shared transition consumes one
                 // counted blocker; stale generations never reach this branch.
                 let left = self.blockers.get().get() - 1;
@@ -222,13 +224,17 @@ impl<'d, const ID: u8> Index<'d, ID> {
             return (poll::Readiness::Ready, None);
         };
         let id = match (access::Access::new(entry.slot()).current(slot), status) {
-            (access::Current::Reserved(id) | access::Current::Held(id), _) => id,
+            (access::Current::Reserved(proof), poll::Status::Idle) => proof.id(),
+            (access::Current::Reserved(proof), poll::Status::Transaction) => proof.activate(),
+            (access::Current::Held(id), _) => id,
             (access::Current::Finalizing(_), poll::Status::Transaction) => {
                 return (poll::Readiness::Pending, None);
             }
             (access::Current::Finalizing(proof), poll::Status::Idle) => {
                 let id = proof.finish();
-                entry.insert(depth);
+                if !entry.slot().is_receiving() {
+                    entry.insert(depth);
+                }
                 id
             }
             (
@@ -315,6 +321,34 @@ impl<'d, const ID: u8> Index<'d, ID> {
             | access::Current::Finalizing(_)
             | access::Current::Closing => None,
         }
+    }
+
+    pub(in crate::protocol::runtime::ready) fn set_receiving(
+        &self,
+        id: conn::Id<'d, route::KeyTag<ID>>,
+        receiving: bool,
+        depth: impl FnOnce() -> Depth,
+    ) -> bool {
+        let Some(entry) = self.entry(id.index().into_usize()) else {
+            return false;
+        };
+        let slot = entry.slot();
+        if !slot.set_receiving(id, receiving) {
+            return false;
+        }
+        if receiving {
+            if let Some(listed) = entry.listed() {
+                listed.remove();
+            }
+            return false;
+        }
+        if matches!(
+            access::Access::new(slot).current(id),
+            access::Current::Shared
+        ) {
+            entry.insert(depth().get() + slot.barriers());
+        }
+        true
     }
 
     pub(in crate::protocol::runtime::ready) fn count(&self) -> usize {

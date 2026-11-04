@@ -146,9 +146,22 @@ impl<
                     }
                 },
                 State::Throttled { client, throttle } => {
-                    if let Some(error) = client.port.shared.signals.failure() {
+                    let shared = &client.port.shared;
+                    if let Some(error) = shared.signals.failure() {
                         waiter.unregister();
                         return Poll::Ready(Err(error));
+                    }
+                    if shared
+                        .ready
+                        .connection(throttle.conn)
+                        .is_some_and(|slot| slot.is_receiving())
+                    {
+                        if let Err(error) = shared.ready.try_register(waiter, cx.as_ref()) {
+                            waiter.unregister();
+                            return Poll::Ready(Err(Error::Wait(error)));
+                        }
+                        self.state = State::Throttled { client, throttle };
+                        return Poll::Pending;
                     }
                     (client, throttle.conn, throttle.request, true)
                 }

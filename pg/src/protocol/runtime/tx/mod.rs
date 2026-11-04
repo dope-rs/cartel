@@ -55,11 +55,10 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
 
     pub(crate) fn settled(&self, target: access::Transaction<'d, ID>) -> poll::Settlement {
         match self.current(target.conn) {
-            access::Current::Reserved(current) | access::Current::Held(current)
-                if current == target =>
-            {
+            access::Current::Reserved(current) if current.id() == target => {
                 poll::Settlement::Pending
             }
+            access::Current::Held(current) if current == target => poll::Settlement::Pending,
             access::Current::Finalizing(current) if current.id() == target => {
                 poll::Settlement::Pending
             }
@@ -92,8 +91,8 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
         'd: 'target,
     {
         match self.current(target.conn) {
-            access::Current::Reserved(current) | access::Current::Held(current)
-                if current == target => {}
+            access::Current::Reserved(current) if current.id() == target => {}
+            access::Current::Held(current) if current == target => {}
             access::Current::Finalizing(current) if current.id() == target => {}
             access::Current::Stale
             | access::Current::Handshaking

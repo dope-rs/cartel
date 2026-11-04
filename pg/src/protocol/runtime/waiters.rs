@@ -16,7 +16,7 @@ fn index_error<'d>(cause: shared::Bounds) -> wait::Error<'d> {
 
 pub(in crate::protocol) struct Queue<'d> {
     inner: wait::Queue<'d>,
-    phase: cell::Cell<Phase>,
+    remaining: cell::Cell<usize>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -30,29 +30,28 @@ impl<'d> Queue<'d> {
     pub(in crate::protocol) fn new(driver: driver::Reference<'d>, capacity: Capacity) -> Self {
         Self {
             inner: wait::Queue::new(driver, capacity),
-            phase: cell::Cell::new(Phase::Idle),
+            remaining: cell::Cell::new(0),
         }
     }
 
     pub(in crate::protocol) fn wake(&self) {
-        self.phase.set(Phase::Pending);
+        self.remaining.set(self.inner.len().get());
     }
 
     pub(in crate::protocol) fn flush(&self, work: app::Work<'_, 'd>) {
-        if self.phase.replace(Phase::Idle) == Phase::Idle {
+        let remaining = self.remaining.get();
+        if remaining == 0 {
             return;
         }
-        match self.inner.wake_one(work) {
-            wait::WakeStatus::Complete if self.inner.len() != wait::Length::ZERO => {
-                self.phase.set(Phase::Pending);
-            }
-            wait::WakeStatus::Complete => {}
-            wait::WakeStatus::Pending => self.phase.set(Phase::Pending),
+        if self.inner.wake_one(work) == wait::WakeStatus::Complete {
+            // Re-registering callers cannot extend this notification round.
+            self.remaining
+                .set((remaining - 1).min(self.inner.len().get()));
         }
     }
 
     pub(in crate::protocol) fn is_pending(&self) -> bool {
-        self.phase.get() == Phase::Pending
+        self.remaining.get() != 0
     }
 }
 

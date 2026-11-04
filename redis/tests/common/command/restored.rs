@@ -1,4 +1,4 @@
-pub const SCRIPT: [(&[u8], &[u8]); 45] = [
+pub const SCRIPT: [(&[u8], &[u8]); 46] = [
     (
         b"*5\r\n$3\r\nSET\r\n$3\r\nkey\r\n$3\r\nval\r\n$2\r\nPX\r\n$4\r\n1250\r\n",
         b"+OK\r\n",
@@ -106,6 +106,10 @@ pub const SCRIPT: [(&[u8], &[u8]); 45] = [
     (
         b"*6\r\n$4\r\nSCAN\r\n$2\r\n17\r\n$5\r\nMATCH\r\n$2\r\na*\r\n$5\r\nCOUNT\r\n$3\r\n100\r\n",
         b"*2\r\n$1\r\n0\r\n*0\r\n",
+    ),
+    (
+        b"*5\r\n$5\r\nZSCAN\r\n$5\r\nboard\r\n$2\r\n17\r\n$5\r\nCOUNT\r\n$3\r\n100\r\n",
+        b"*2\r\n$2\r\n23\r\n*4\r\n$1\r\na\r\n$3\r\n2.5\r\n$1\r\nb\r\n$2\r\n-1\r\n",
     ),
     (b"*1\r\n$4\r\nPING\r\n", b"*2\r\n*0\r\n*2\r\n$-1\r\n:7\r\n"),
     (

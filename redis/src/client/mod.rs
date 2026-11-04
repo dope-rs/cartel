@@ -3,7 +3,7 @@
 //! Driver storage cannot mint a client before attachment:
 //!
 
-use dope::core::Errno;
+use dope::core::{Errno, driver::result::SubmitCause};
 
 use o3::buffer::write::consume::scope;
 use o3::buffer::{hold, resident};
@@ -23,7 +23,7 @@ use cartel_core::{
 };
 use dope::manifold::{
     app::receive,
-    client::{close, deadline},
+    client::{close, conn::Transmit, deadline},
 };
 use dope::net::link::egress::{self, reserve::exact};
 use dope::runtime::client;
@@ -54,6 +54,7 @@ pub(crate) enum Failure<'d> {
     ParserWait(shared::Bounds),
     Closed(close::Reason),
     Receive(Errno),
+    Transmit(Transmit),
     Timeout(deadline::Kind),
     RequestTimeout(Elapsed),
     Protocol(protocol::Error),
@@ -90,6 +91,13 @@ impl<'d> Failure<'d> {
         match self {
             Self::Closed(reason) => *reason,
             Self::Receive(_) => close::Reason::Transport,
+            Self::Transmit(Transmit::Rejected(failure)) => match failure.into_error().cause() {
+                SubmitCause::Full => close::Reason::Capacity(close::Capacity::Transport),
+                SubmitCause::IdentityExhausted => {
+                    close::Reason::Capacity(close::Capacity::IdentityExhausted)
+                }
+            },
+            Self::Transmit(Transmit::Io(_) | Transmit::Invalid(_)) => close::Reason::Transport,
             Self::Timeout(kind) => close::Reason::Timeout(*kind),
             Self::RequestTimeout(_) => close::Reason::Timeout(deadline::Kind::Inbound),
             Self::Input(_)
@@ -121,8 +129,14 @@ impl<'d> Failure<'d> {
         }
     }
 
-    pub(crate) const fn start_policy(&self) -> close::Policy {
+    pub(crate) fn start_policy(&self) -> close::Policy {
         match self {
+            Self::Transmit(_) => match self.close_reason() {
+                close::Reason::Capacity(close::Capacity::IdentityExhausted) => {
+                    close::Policy::Permanent
+                }
+                _ => close::Policy::Reconnect,
+            },
             Self::Request(request::Error::Entries { .. }) => close::Policy::Reconnect,
             Self::Input(_)
             | Self::ParserWait(_)
@@ -161,6 +175,7 @@ impl<'d> Failure<'d> {
             Self::ParserWait(cause) => crate::Error::ParserWait(cause),
             Self::Closed(reason) => crate::Error::Closed(reason),
             Self::Receive(error) => crate::Error::Receive(error),
+            Self::Transmit(error) => crate::Error::Transmit(error),
             Self::Timeout(kind) => crate::Error::Timeout(kind),
             Self::RequestTimeout(due) => crate::Error::RequestTimeout(due),
             Self::Protocol(error) => crate::Error::Protocol(error),
@@ -197,6 +212,7 @@ impl<'d> From<&Failure<'d>> for Failure<'d> {
             Self::ParserWait(error) => Self::ParserWait(*error),
             Self::Closed(reason) => Self::Closed(*reason),
             Self::Receive(error) => Self::Receive(*error),
+            Self::Transmit(error) => Self::Transmit(*error),
             Self::Timeout(kind) => Self::Timeout(*kind),
             Self::RequestTimeout(error) => Self::RequestTimeout(*error),
             Self::Protocol(error) => Self::Protocol(*error),

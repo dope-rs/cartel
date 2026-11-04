@@ -1,6 +1,4 @@
 use std::{
-    io,
-    io::{Read as _, Write as _},
     pin,
     task::Poll,
     time::{Duration, Instant},
@@ -10,18 +8,33 @@ use dope_fiber::{
     abi::{Fiber, PollFn, Task},
     context,
 };
-use dope_test::harness::{GUARD, peer::Stream};
+use dope_test::harness::{
+    GUARD,
+    peer::{self, Stream},
+};
+
+#[derive(Debug)]
+pub enum Error {
+    Peer(peer::Error),
+    Request([u8; PING.len()]),
+}
+
+impl From<peer::Error> for Error {
+    fn from(error: peer::Error) -> Self {
+        Self::Peer(error)
+    }
+}
 
 pub const PING: &[u8] = b"*1\r\n$4\r\nPING\r\n";
 
-pub fn pong_once(mut socket: &Stream<'_>) -> io::Result<()> {
+pub fn pong_once(socket: &Stream<'_>) -> Result<(), Error> {
     socket.read_wait(Some(Duration::from_secs(1)))?;
     let mut buf = [0_u8; PING.len()];
     socket.read_exact(&mut buf)?;
     if buf != PING {
-        return Err(io::ErrorKind::InvalidData.into());
+        return Err(Error::Request(buf));
     }
-    socket.write_all(b"+PONG\r\n")
+    socket.write_all(b"+PONG\r\n").map_err(Error::Peer)
 }
 
 pub struct Held<F>(pin::Pin<Box<Task<F>>>);
@@ -63,7 +76,10 @@ where
     })
 }
 
-pub fn first_request(sockets: &mut [&Stream<'_>; 2], expected: &[u8]) -> io::Result<usize> {
+pub fn first_request(
+    sockets: &mut [&Stream<'_>; 2],
+    expected: &[u8],
+) -> Result<usize, peer::Error> {
     for socket in sockets.iter() {
         socket.read_wait(Some(Duration::from_millis(1)))?;
     }
@@ -72,19 +88,19 @@ pub fn first_request(sockets: &mut [&Stream<'_>; 2], expected: &[u8]) -> io::Res
     loop {
         for (index, socket) in sockets.iter_mut().enumerate() {
             match socket.read(&mut request[..1]) {
-                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(0) => return Err(peer::Error::UnexpectedEof),
                 Ok(_) => {
                     socket.read_wait(Some(GUARD))?;
                     socket.read_exact(&mut request[1..])?;
                     assert_eq!(request, expected);
                     return Ok(index);
                 }
-                Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+                Err(peer::Error::TimedOut) => {}
                 Err(error) => return Err(error),
             }
         }
         if started.elapsed() >= GUARD {
-            return Err(io::ErrorKind::TimedOut.into());
+            return Err(peer::Error::TimedOut);
         }
     }
 }

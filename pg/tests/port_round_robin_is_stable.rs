@@ -3,6 +3,7 @@ use cartel_pg::{api, port, port::config, protocol::PickPolicy};
 use common::{
     port::*, postgres::Frame, postgres::accept::Listener, postgres::startup::Stream, topology,
 };
+use dope::core::dope_sys::io::poll::Poll as _;
 use dope::core::driver::life::recovery;
 use dope::runtime::executor::session::Completion;
 use dope::{
@@ -10,10 +11,11 @@ use dope::{
     net::tcp::Tcp, net::wire::Identity,
 };
 use dope_fiber::BlockOn as _;
+use dope_test::harness::peer;
 use dope_test::{harness::GUARD, reclaim::Reports};
+use std::os::fd::AsFd as _;
 use std::{
-    io::Read as _, io::Write as _, net::SocketAddr, net::TcpListener, sync::mpsc,
-    sync::mpsc::Receiver, thread, time::Duration,
+    net::SocketAddr, net::TcpListener, sync::mpsc, sync::mpsc::Receiver, thread, time::Duration,
 };
 
 type Env = Bundle<Tcp, Identity, Throughput>;
@@ -116,36 +118,36 @@ fn round_robin_is_stable() {
 pub(crate) fn round_robin(listener: TcpListener) -> (thread::JoinHandle<()>, Receiver<usize>) {
     let (report, picks) = mpsc::channel();
     let server = thread::spawn(move || {
+        let listener = peer::TcpAcceptor::try_adopt(listener.into()).expect("listener admission");
         let mut sockets = Vec::with_capacity(2);
         for _ in 0..2 {
-            let mut socket =
-                Listener::try_accept(&listener, Duration::from_secs(1)).expect("peer connection");
+            let mut socket = Listener::accept_within(&listener, Duration::from_secs(1))
+                .expect("peer connection");
             Stream::try_start(&mut socket, None).expect("peer handshake");
             sockets.push(socket);
         }
 
-        let workers = sockets
-            .into_iter()
-            .enumerate()
-            .map(|(index, mut socket)| {
-                let report = report.clone();
-                thread::spawn(move || {
-                    let mut request = [0_u8; 512];
-                    for _ in 0..2 {
-                        assert!(socket.read(&mut request).expect("round-robin request") != 0);
-                        report.send(index).expect("round-robin choice receiver");
-                        socket
-                            .write_all(&Frame::new(b'C', b"SELECT 1\0").encode())
-                            .expect("round-robin CommandComplete");
-                        socket
-                            .write_all(&Frame::new(b'Z', b"I").encode())
-                            .expect("round-robin ReadyForQuery");
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        for worker in workers {
-            worker.join().expect("round-robin worker");
+        let mut entries = [
+            dope::core::dope_sys::io::poll::Entry::readable(sockets[0].as_fd()),
+            dope::core::dope_sys::io::poll::Entry::readable(sockets[1].as_fd()),
+        ];
+        for _ in 0..4 {
+            let events = dope::core::Backend::wait::<_, dope::core::Errno>(&mut entries, 1_000)
+                .expect("round-robin readiness");
+            let index = events
+                .entries()
+                .iter()
+                .position(|entry| entry.is_readable())
+                .expect("round-robin request");
+            let socket = &sockets[index];
+            common::postgres::read_empty(socket, b'S').expect("round-robin request");
+            report.send(index).expect("round-robin choice receiver");
+            socket
+                .write_all(&Frame::new(b'C', b"SELECT 1\0").encode())
+                .expect("round-robin CommandComplete");
+            socket
+                .write_all(&Frame::new(b'Z', b"I").encode())
+                .expect("round-robin ReadyForQuery");
         }
     });
     (server, picks)

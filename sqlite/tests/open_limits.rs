@@ -1,6 +1,6 @@
 use crate::common::{assert_reclaimed, assert_retirement, plan};
 use cartel_sqlite::runtime::{self, Runtime};
-use cartel_sqlite::{Action, Error, Progress, RequestPhase, open};
+use cartel_sqlite::{Action, Error, OpenOptions, Progress, RequestPhase, open};
 use common::catalog::*;
 use dope_core::driver::life::recovery::Policy;
 use dope_core::driver::settings::demands::slots::Slots;
@@ -69,7 +69,7 @@ fn open_work_is_aggregate() -> Result<(), plan::Error> {
     }))
     .map_err(plan::Error::Runtime)?;
     let mut bounded = try_limits()?;
-    bounded.work.open.progress = Progress::new(NonZero::new(35).ok_or(plan::Error::Progress)?);
+    bounded.work.open.progress = Progress::new(NonZero::new(70).ok_or(plan::Error::Progress)?);
 
     let one = Directory::try_with(base, "cartel-sqlite-single-open-work", |removed| {
         removed.expect("temporary directory cleanup")
@@ -113,6 +113,42 @@ fn open_work_is_aggregate() -> Result<(), plan::Error> {
             .expect("SQLite count scope")?,
         1001
     );
+    Ok(())
+}
+
+#[test]
+fn short_commands_exhaust_open_work() -> Result<(), plan::Error> {
+    let runtime = (*RUNTIME.get_or_init(|| {
+        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
+        // Only Cartel uses installed SQLite; Core handles and allocations remain
+        // exclusively owned by their originating worker.
+        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+    }))
+    .map_err(plan::Error::Runtime)?;
+    for (commands, fits) in [
+        (&SHORT_WORK_COMMANDS[..2], true),
+        (SHORT_WORK_COMMANDS, false),
+    ] {
+        let target = OpenOptions::new()
+            .open_memory(runtime)
+            .map_err(plan::Error::Client)?
+            .commands(commands)
+            .map_err(plan::Error::Client)?;
+        let result = plan::Plan::<Commands>::try_new(target, try_limits()?, try_memory()?)?
+            .try_install(Policy::new(assert_reclaimed, assert_retirement), |result| {
+                result.expect("SQLite scope")
+            });
+        if fits {
+            result.expect("short command prefix fits the open work budget");
+        } else {
+            assert!(matches!(
+                result,
+                Err(plan::Failure::Install(topology::InstallError::Install(
+                    open::Error::Step(Error::WorkExhausted)
+                )))
+            ));
+        }
+    }
     Ok(())
 }
 

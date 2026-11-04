@@ -125,7 +125,7 @@ pub(crate) enum Current<'a, 'd, const ID: u8> {
     Stale,
     Handshaking,
     Shared,
-    Reserved(Transaction<'d, ID>),
+    Reserved(Reservation<'a, 'd, ID>),
     Held(Transaction<'d, ID>),
     Finalizing(Finalizing<'a, 'd, ID>),
     Draining,
@@ -142,12 +142,17 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
     }
 
     pub(crate) fn is_current<const FINAL: bool>(&self, value: Generation) -> bool {
-        let state = if FINAL {
-            State::Finalizing(value)
-        } else {
-            State::Held(value)
-        };
-        matches!(self.slot.phase.get(), slot::Phase::Ready { access, .. } if access == state)
+        match self.slot.phase.get() {
+            slot::Phase::Ready {
+                access: State::Finalizing(current),
+                ..
+            } => FINAL && current == value,
+            slot::Phase::Ready {
+                access: State::Reserved(current) | State::Held(current),
+                ..
+            } => !FINAL && current == value,
+            _ => false,
+        }
     }
 
     pub(crate) fn listed(
@@ -227,10 +232,11 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
                 ..
             } => Current::Shared,
             slot::Phase::Ready {
+                bound,
                 access: State::Reserved(value),
-                ..
-            } => Current::Reserved(Transaction {
-                conn: token,
+            } => Current::Reserved(Reservation {
+                slot: self.slot,
+                bound,
                 generation: value,
             }),
             slot::Phase::Ready {

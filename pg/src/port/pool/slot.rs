@@ -221,6 +221,14 @@ impl<'a, 'd, const ID: u8> Ready<'a, 'd, ID> {
 }
 
 impl<'d, const ID: u8> Slot<'d, ID> {
+    pub(crate) fn is_receiving(&self) -> bool {
+        self.phase.is_receiving()
+    }
+
+    pub(crate) fn set_receiving(&self, token: conn::Id<'d, KeyTag<ID>>, receiving: bool) -> bool {
+        self.phase.set_receiving(token, receiving)
+    }
+
     pub(crate) fn is_synced(&self) -> bool {
         matches!(self.sync.get(), Sync::Synced)
     }

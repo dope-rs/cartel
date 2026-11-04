@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use cartel_core::reply::{self, order, retain, usage};
 use dope::{
-    core::driver::{route::KeyTag, schedule::app},
+    core::driver::{result::SubmitCause, route::KeyTag, schedule::app},
     manifold::client::{close, conn},
 };
 use o3::{
@@ -181,10 +181,21 @@ impl Failure {
         Self(crate::Error::Connection(reason))
     }
 
-    pub(crate) const fn close_reason(self) -> close::Reason {
+    pub(crate) fn close_reason(self) -> close::Reason {
         match self.0 {
             crate::Error::Connection(reason) => reason,
             crate::Error::Receive(_) => close::Reason::Transport,
+            crate::Error::Transmit(conn::Transmit::Rejected(failure)) => {
+                match failure.into_error().cause() {
+                    SubmitCause::Full => close::Reason::Capacity(close::Capacity::Transport),
+                    SubmitCause::IdentityExhausted => {
+                        close::Reason::Capacity(close::Capacity::IdentityExhausted)
+                    }
+                }
+            }
+            crate::Error::Transmit(conn::Transmit::Io(_) | conn::Transmit::Invalid(_)) => {
+                close::Reason::Transport
+            }
             crate::Error::Closed => close::Reason::Local(close::LocalOrigin::ApiRequest),
             crate::Error::Timeout(kind) => close::Reason::Timeout(kind),
             crate::Error::Protocol(_)

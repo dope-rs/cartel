@@ -13,6 +13,7 @@ pub struct Limits {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Work {
     /// One aggregate bound for configuration, initialization, and statement preparation.
+    /// Charges a final quantum per preparation and execution to bound partial intervals.
     pub open: Budget,
     /// One bound for a query or transaction-control call, including busy retries.
     pub call: Budget,

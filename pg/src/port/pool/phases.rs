@@ -1,5 +1,6 @@
 use std::{cell::Cell, mem::MaybeUninit};
 
+use dope::{core::driver::route::KeyTag, manifold::client::conn};
 use o3::depot::{self, index::Initialized};
 
 use crate::port::{
@@ -12,7 +13,10 @@ use crate::port::{
 enum Lifecycle {
     Vacant,
     Handshaking,
-    Ready(access::State),
+    Ready {
+        access: access::State,
+        receiving: bool,
+    },
     Closing {
         failure: replies::Failure,
         disposition: Disposition,
@@ -44,7 +48,7 @@ impl<'d, const ID: u8> State<'d, ID> {
         match phase {
             Lifecycle::Vacant => Phase::Vacant,
             Lifecycle::Handshaking => Phase::Handshaking(bound),
-            Lifecycle::Ready(access) => Phase::Ready { bound, access },
+            Lifecycle::Ready { access, .. } => Phase::Ready { bound, access },
             Lifecycle::Closing {
                 failure,
                 disposition: fate,
@@ -63,7 +67,14 @@ impl<'d, const ID: u8> State<'d, ID> {
                 return;
             }
             Phase::Handshaking(bound) => (bound, Lifecycle::Handshaking),
-            Phase::Ready { bound, access } => (bound, Lifecycle::Ready(access)),
+            Phase::Ready { bound, access } => (
+                bound,
+                Lifecycle::Ready {
+                    access,
+                    // Ready-to-Ready transitions preserve this connection's input admission.
+                    receiving: self.is_receiving(),
+                },
+            ),
             Phase::Closing {
                 bound,
                 failure,
@@ -79,6 +90,37 @@ impl<'d, const ID: u8> State<'d, ID> {
         self.bound.set(MaybeUninit::new(bound));
         self.phase.set(phase);
     }
+
+    pub(super) fn is_receiving(&self) -> bool {
+        matches!(
+            self.phase.get(),
+            Lifecycle::Ready {
+                receiving: true,
+                ..
+            }
+        )
+    }
+
+    pub(super) fn set_receiving(&self, token: conn::Id<'d, KeyTag<ID>>, receiving: bool) -> bool {
+        let Lifecycle::Ready {
+            access,
+            receiving: current,
+        } = self.phase.get()
+        else {
+            return false;
+        };
+        if current == receiving {
+            return false;
+        }
+        // SAFETY: every live lifecycle retains the binding initialized by set.
+        let bound = unsafe { self.bound.get().assume_init() };
+        if bound.token != token {
+            return false;
+        }
+        self.phase.set(Lifecycle::Ready { access, receiving });
+        true
+    }
+
     pub(super) fn listed(
         proof: depot::raw::Proof<&slot::Slot<'d, ID>, Initialized<slot::Bound<'d, ID>>>,
     ) -> slot::Bound<'d, ID> {

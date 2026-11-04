@@ -9,6 +9,7 @@ use dope::{
     net::tcp::Tcp, net::wire::Identity,
 };
 use dope_fiber::BlockOn as _;
+use dope_test::harness::peer;
 use dope_test::{harness::GUARD, reclaim::Reports};
 use std::{iter, net::SocketAddr, net::TcpListener, sync::mpsc, thread, time::Duration};
 
@@ -21,7 +22,8 @@ fn retains_fields_and_pid() {
     let address = (peer.local_addr()).expect("the notification peer must expose its bound address");
     let (release, done) = mpsc::sync_channel(0);
     let server = thread::spawn(move || {
-        let mut socket = Listener::try_accept(&peer, Duration::from_secs(3))
+        let peer = peer::TcpAcceptor::try_adopt(peer.into()).expect("listener admission");
+        let mut socket = Listener::accept_within(&peer, Duration::from_secs(3))
             .expect("notification peer connection");
         Stream::try_start(&mut socket, None).expect("peer handshake");
         notice::try_write(&mut socket, &notice::SEED).expect("notification frames");

@@ -1,4 +1,4 @@
-use std::io;
+use dope_test::harness::peer;
 
 use cartel_redis::client::settings::init::Step;
 use dope_fiber::abi::Fiber;
@@ -21,7 +21,7 @@ pub const REQUESTS: [(&[u8], Step); 3] = [
     (SETNAME, Step::SetClientName),
 ];
 
-pub fn read_request(mut socket: impl io::Read, len: usize) -> io::Result<Vec<u8>> {
+pub fn read_request(socket: &peer::Stream<'_>, len: usize) -> Result<Vec<u8>, peer::Error> {
     let mut bytes = vec![0; len];
     socket.read_exact(&mut bytes)?;
     Ok(bytes)

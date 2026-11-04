@@ -1,4 +1,4 @@
-use std::{io, io::Write as _, net::Shutdown};
+use std::net::Shutdown;
 
 use cartel_pg::api::results::group::Position;
 use dope_test::harness::peer;
@@ -25,7 +25,7 @@ pub const SCOPES: [(&[u8], bool, Position); 3] = [
     ),
 ];
 
-fn complete(socket: &mut impl io::Write, id: i64, name: &[u8]) -> io::Result<()> {
+fn complete(socket: &peer::Stream<'_>, id: i64, name: &[u8]) -> Result<(), peer::Error> {
     socket.write_all(&Frame::new(b'2', &[]).encode())?;
     socket.write_all(&Frame::new(b'D', &TextRow::wire(id, name)).encode())?;
     socket.write_all(&Frame::new(b'C', b"SELECT 1\0").encode())

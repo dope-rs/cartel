@@ -40,10 +40,15 @@ impl<'connection, 'guard, 'work> Call<'connection, 'guard, 'work> {
     }
 
     pub(crate) fn check<T>(&self, result: Result<T, crate::Error>) -> Result<T, crate::Error> {
+        // Every preparation starts a fresh native progress interval. Charge its
+        // final partial quantum against the same aggregate opening budget.
+        self.guard.work().control().tick();
         self.guard.check(result)
     }
 
     fn complete<T>(&self, done: sys::Completion<T>) -> Result<T, crate::Error> {
+        // Executed startup statements also have an independent VM interval.
+        self.guard.work().control().tick();
         match (done.result, done.cleanup) {
             (Ok(_), Some(fault)) => self.check(Err(fault.into_error())),
             (Err(error), Some(fault)) => {

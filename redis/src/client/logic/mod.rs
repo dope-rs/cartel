@@ -91,11 +91,20 @@ impl<'r, 's: 'r, 'storage: 'r, 'b: 'r, 'c: 'r, 'd: 'r, const ID: u8>
         Sent::<_>::Ready(|owner: &mut State<Port<ID>, _, _, _>| owner.root().activity.wake_send())
     }
 
-    fn flush() -> impl for<'a, 'x, 'y, 'z> Call<(
-        &'a mut Owner<'r, 's, 'storage, 'b, 'c, 'd, ID>,
-        &'x mut turns::Context<'y, 'z, 'd, Self::ConnState, Self::Send, route::KeyTag<ID>>,
-    )> {
-        Flush::<_>::Ready(|owner: &mut State<Port<ID>, _, _, _>| owner.root().activity.wake_send())
+    fn flush() -> Option<
+        impl for<'a, 'x, 'y, 'z> Call<(
+            &'a mut Owner<'r, 's, 'storage, 'b, 'c, 'd, ID>,
+            &'x mut turns::Context<'y, 'z, 'd, Self::ConnState, Self::Send, route::KeyTag<ID>>,
+            session::Input,
+        )>,
+    > {
+        Some(Flush::<Infallible, _>::Context(
+            |(owner, ctx, input): (
+                &mut Owner<'r, 's, 'storage, 'b, 'c, 'd, ID>,
+                &mut turns::Context<'_, '_, 'd, Self::ConnState, Self::Send, route::KeyTag<ID>>,
+                session::Input,
+            )| Control { port: owner.root() }.flush(ctx, input),
+        ))
     }
 
     fn cancel() -> impl for<'a, 'x> Call<(
@@ -196,6 +205,18 @@ impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, const ID: u8>
     > for Logic<'s, 'd>
 {
     type Drain = Application;
+
+    fn transmit_failed(
+        owner: &Owner<'r, 's, 'storage, 'b, 'c, 'd, ID>,
+        conn: conn::Id<'d, route::KeyTag<ID>>,
+        failure: conn::Transmit,
+        region: &mut region::Token<region::Identity<'d>>,
+    ) -> Option<conn::Transmit> {
+        owner
+            .root()
+            .fail(conn, client::Failure::Transmit(failure), region);
+        None
+    }
 
     fn io_fail<'e>(
         owner: &mut Owner<'r, 's, 'storage, 'b, 'c, 'd, ID>,

@@ -10,7 +10,7 @@ use o3::{
 use crate::{init, protocol, protocol::parser::limit, request};
 use cartel_core::{deadline::Elapsed, reply::recv::attach};
 use dope::core::driver::schedule::clock::timer;
-use dope::manifold::client::{attempt, close, deadline};
+use dope::manifold::client::{attempt, close, conn, deadline};
 use dope::net::link::{
     egress::{self, reserve::exact},
     pool::change::opening,
@@ -33,6 +33,7 @@ pub enum Error<'d, const ID: u8 = 0> {
     },
     Closed(close::Reason),
     Receive(Errno),
+    Transmit(conn::Transmit),
     Timeout(deadline::Kind),
     RequestTimeout(Elapsed),
     Protocol(protocol::Error),
@@ -78,6 +79,7 @@ impl<'d, const ID: u8> source::Control for Error<'d, ID> {
             }
             Self::Closed(error) => Diagnostic::Closed(error),
             Self::Receive(error) => Diagnostic::Receive(error),
+            Self::Transmit(error) => Diagnostic::Transmit(error),
             Self::Timeout(error) => Diagnostic::Timeout(error),
             Self::RequestTimeout(error) => Diagnostic::RequestTimeout(error),
             Self::Protocol(error) => Diagnostic::Protocol(error),

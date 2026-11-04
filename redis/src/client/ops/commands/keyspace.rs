@@ -59,7 +59,8 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Keyspace<C, ID> {
         pattern: Option<&[u8]>,
         count: Option<NonZero<u64>>,
     ) -> C::Call<decode::Scan> {
-        self.0
-            .encode::<decode::Scan>(move |out| space::Writer::new(out).scan(cursor, pattern, count))
+        self.0.encode::<decode::Scan>(move |out| {
+            space::Writer::new(out).scan(&[b"SCAN"], cursor, pattern, count)
+        })
     }
 }

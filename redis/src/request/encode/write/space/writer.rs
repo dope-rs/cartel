@@ -71,8 +71,9 @@ impl Writer {
         self.0.command(&[b"DBSIZE"])
     }
 
-    pub(crate) fn scan(
+    pub(crate) fn scan<const N: usize>(
         self,
+        prefix: &[&[u8]; N],
         cursor: u64,
         pattern: Option<&[u8]>,
         count: Option<NonZero<u64>>,
@@ -82,12 +83,12 @@ impl Writer {
         let mut buf = [0; 20];
         let count = count.map(|value| encode::format_uint_into(&mut buf, value.get()));
         match (pattern, count) {
-            (None, None) => self.0.command(&[b"SCAN", cursor]),
-            (Some(pattern), None) => self.0.command(&[b"SCAN", cursor, b"MATCH", pattern]),
-            (None, Some(count)) => self.0.command(&[b"SCAN", cursor, b"COUNT", count]),
+            (None, None) => self.0.slices(prefix, [cursor]),
+            (Some(pattern), None) => self.0.slices(prefix, [cursor, b"MATCH", pattern]),
+            (None, Some(count)) => self.0.slices(prefix, [cursor, b"COUNT", count]),
             (Some(pattern), Some(count)) => self
                 .0
-                .command(&[b"SCAN", cursor, b"MATCH", pattern, b"COUNT", count]),
+                .slices(prefix, [cursor, b"MATCH", pattern, b"COUNT", count]),
         }
     }
 }

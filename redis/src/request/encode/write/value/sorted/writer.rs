@@ -1,4 +1,5 @@
 use crate::request::encode;
+use std::num::NonZero;
 
 #[repr(transparent)]
 pub(crate) struct Writer(encode::Encoder);
@@ -32,6 +33,15 @@ impl Writer {
         stop: i64,
     ) -> Result<encode::Complete, crate::request::Error> {
         self.range_with(b"ZRANGE", &[], key, start, stop)
+    }
+
+    pub(crate) fn scan(
+        self,
+        key: &[u8],
+        cursor: u64,
+        count: Option<NonZero<u64>>,
+    ) -> Result<encode::Complete, crate::request::Error> {
+        encode::write::space::Writer::new(self.0).scan(&[b"ZSCAN", key], cursor, None, count)
     }
 
     pub(crate) fn rev_range(

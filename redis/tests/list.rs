@@ -5,12 +5,7 @@ use cartel_redis::value::source::{
 };
 use dope::core::driver::life::recovery;
 use dope::runtime::executor::session::Completion;
-use std::{
-    convert,
-    io::{Read as _, Write as _},
-    mem,
-    time::Duration,
-};
+use std::{convert, mem, time::Duration};
 
 use cartel_redis::{
     client::{nonempty::Slice, settings::init::Plan},

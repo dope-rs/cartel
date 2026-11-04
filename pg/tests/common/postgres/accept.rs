@@ -6,16 +6,7 @@ use crate::common::wire::{
 use cartel_pg::protocol::{Number, Reason};
 use dope::core::platform::wake::Wait;
 use dope_test::harness::peer;
-use std::{
-    io,
-    io::ErrorKind,
-    io::{Read as _, Write as _},
-    net::TcpListener,
-    net::TcpStream,
-    thread,
-    time::Duration,
-    time::Instant,
-};
+use std::time::{Duration, Instant};
 
 pub const DATA_ROW: Frame<'static> = Frame::new(b'D', b"\0\x01\0\0\0\x011");
 
@@ -85,8 +76,11 @@ pub fn fatal(
     buffered: bool,
     release: Wait,
 ) -> Result<(), SettleError> {
-    socket.prepare().map_err(SettleError::Startup)?;
-    Database::start(&mut *socket).map_err(SettleError::Startup)?;
+    socket
+        .prepare()
+        .map_err(Error::Io)
+        .map_err(SettleError::Startup)?;
+    Database::start(socket).map_err(SettleError::Startup)?;
     read_empty(socket, b'S').map_err(SettleError::Command)?;
     if buffered {
         socket
@@ -105,40 +99,30 @@ pub fn fatal(
 }
 
 pub trait Listener {
-    fn try_accept(&self, timeout: Duration) -> io::Result<TcpStream>;
+    fn accept_within(&self, timeout: Duration) -> Result<peer::Stream<'static>, peer::Error>;
     fn group_settle(self, ready: Wait) -> Result<(), SettleError>;
-    fn reply_settle(self) -> Result<TcpStream, Error>;
+    fn reply_settle(self) -> Result<peer::Stream<'static>, Error>;
     fn finalizer(self) -> Result<(), Error>;
     fn copy_recover(self) -> Result<(), Error>;
-    fn recovery(self) -> io::Result<(TcpStream, TcpStream)>;
-    fn least_loaded(self, initial: usize) -> Result<([TcpStream; 2], Vec<usize>), Error>;
+    fn recovery(self) -> Result<(peer::Stream<'static>, peer::Stream<'static>), Error>;
+    fn least_loaded(
+        self,
+        initial: usize,
+    ) -> Result<([peer::Stream<'static>; 2], Vec<usize>), Error>;
 }
 
-impl Listener for TcpListener {
-    fn try_accept(&self, timeout: Duration) -> io::Result<TcpStream> {
-        self.set_nonblocking(true)?;
-        let started = Instant::now();
-        let socket = loop {
-            match self.accept() {
-                Ok((socket, _)) => break Ok(socket),
-                Err(error)
-                    if error.kind() == ErrorKind::WouldBlock && started.elapsed() < timeout =>
-                {
-                    thread::yield_now();
-                }
-                Err(error) => break Err(error),
-            }
-        }?;
-        socket.set_nonblocking(false)?;
-        Ok(socket)
+impl Listener for peer::TcpAcceptor<'static> {
+    fn accept_within(&self, timeout: Duration) -> Result<peer::Stream<'static>, peer::Error> {
+        self.accept_for(timeout)?.ok_or(peer::Error::TimedOut)
     }
 
     fn group_settle(self, ready: Wait) -> Result<(), SettleError> {
         let mut stream = self
-            .try_accept(Duration::from_secs(1))
+            .accept_within(Duration::from_secs(1))
             .map_err(SettleError::Connect)?;
         stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
+            .read_wait(Some(Duration::from_secs(1)))
+            .map_err(Error::Io)
             .map_err(SettleError::Startup)?;
         Database::start(&stream).map_err(SettleError::Startup)?;
         read_empty(&mut stream, b'S').map_err(SettleError::Begin)?;
@@ -170,10 +154,11 @@ impl Listener for TcpListener {
         stream.read_closed().map_err(SettleError::Close)?;
 
         let mut stream = self
-            .try_accept(Duration::from_secs(1))
+            .accept_within(Duration::from_secs(1))
             .map_err(SettleError::Reconnect)?;
         stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
+            .read_wait(Some(Duration::from_secs(1)))
+            .map_err(Error::Io)
             .map_err(SettleError::Restart)?;
         Database::start(&stream).map_err(SettleError::Restart)?;
         read_empty(&mut stream, b'S').map_err(SettleError::Command)?;
@@ -190,8 +175,8 @@ impl Listener for TcpListener {
         stream.read_closed().map_err(SettleError::Stop)
     }
 
-    fn reply_settle(self) -> Result<TcpStream, Error> {
-        let mut stream = self.try_accept(Duration::from_secs(1))?;
+    fn reply_settle(self) -> Result<peer::Stream<'static>, Error> {
+        let mut stream = self.accept_within(Duration::from_secs(1))?;
         stream.try_start(None)?;
 
         for _ in 0..2 {
@@ -219,7 +204,7 @@ impl Listener for TcpListener {
     }
 
     fn finalizer(self) -> Result<(), Error> {
-        let mut stream = self.try_accept(Duration::from_secs(1))?;
+        let mut stream = self.accept_within(Duration::from_secs(1))?;
         stream.try_start(None)?;
         read_empty(&mut stream, b'S')?;
         stream.write_all(
@@ -239,7 +224,7 @@ impl Listener for TcpListener {
         )?;
         stream.read_closed()?;
 
-        let mut stream = self.try_accept(Duration::from_secs(1))?;
+        let mut stream = self.accept_within(Duration::from_secs(1))?;
         stream.try_start(None)?;
         read_empty(&mut stream, b'S')?;
         stream.write_all(
@@ -253,7 +238,7 @@ impl Listener for TcpListener {
     }
 
     fn copy_recover(self) -> Result<(), Error> {
-        let mut stream = self.try_accept(Duration::from_secs(1))?;
+        let mut stream = self.accept_within(Duration::from_secs(1))?;
         stream.try_start(None)?;
         for _ in 0..2 {
             read_empty(&mut stream, b'd')?;
@@ -264,7 +249,7 @@ impl Listener for TcpListener {
             .concat();
             stream.write_all(&rejected)?;
             stream.read_closed()?;
-            stream = self.try_accept(Duration::from_secs(1))?;
+            stream = self.accept_within(Duration::from_secs(1))?;
             stream.try_start(None)?;
             read_empty(&mut stream, b'S')?;
             let reply = [
@@ -277,14 +262,14 @@ impl Listener for TcpListener {
         stream.read_closed()
     }
 
-    fn recovery(self) -> io::Result<(TcpStream, TcpStream)> {
-        let mut first = self.try_accept(Duration::from_secs(1))?;
+    fn recovery(self) -> Result<(peer::Stream<'static>, peer::Stream<'static>), Error> {
+        let mut first = self.accept_within(Duration::from_secs(1))?;
         first.try_start(None)?;
         let mut request = [0_u8; 512];
         if first.read(&mut request)? == 0 {
-            return Err(io::Error::from(ErrorKind::UnexpectedEof));
+            return Err(Error::Io(peer::Error::UnexpectedEof));
         }
-        let mut next = self.try_accept(Duration::from_secs(1))?;
+        let mut next = self.accept_within(Duration::from_secs(1))?;
         next.try_start(None)?;
         let _ =
             first.write_all(&Frame::new(b'E', b"SERROR\0CXX000\0Mstale generation\0\0").encode());
@@ -292,16 +277,19 @@ impl Listener for TcpListener {
         Ok((first, next))
     }
 
-    fn least_loaded(self, initial: usize) -> Result<([TcpStream; 2], Vec<usize>), Error> {
+    fn least_loaded(
+        self,
+        initial: usize,
+    ) -> Result<([peer::Stream<'static>; 2], Vec<usize>), Error> {
         let mut selected = Vec::new();
-        let mut first = self.try_accept(Duration::from_secs(1))?;
+        let mut first = self.accept_within(Duration::from_secs(1))?;
         first.try_start(None)?;
         for _ in 0..initial {
             read_empty(&mut first, b'S')?;
             selected.push(0);
         }
 
-        let mut second = self.try_accept(Duration::from_secs(1))?;
+        let mut second = self.accept_within(Duration::from_secs(1))?;
         second.try_start(None)?;
         read_empty(&mut second, b'S')?;
         selected.push(1);
@@ -317,21 +305,22 @@ impl Listener for TcpListener {
 
         let mut sockets = [first, second];
         for socket in &sockets {
-            socket.set_read_timeout(Some(Duration::from_millis(20)))?;
+            socket.read_wait(Some(Duration::from_millis(20)))?;
         }
         let started = Instant::now();
         let last = 'selection: loop {
             for (index, socket) in sockets.iter_mut().enumerate() {
                 match socket.peek(&mut [0_u8; 1]) {
-                    Ok(0) => return Err(Error::Io(io::Error::from(ErrorKind::UnexpectedEof))),
+                    Ok(0) => return Err(Error::Io(peer::Error::UnexpectedEof)),
                     Ok(_) => {
-                        socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+                        socket.read_wait(Some(Duration::from_secs(1)))?;
                         read_empty(socket, b'S')?;
                         selected.push(index);
                         break 'selection index;
                     }
                     Err(error)
-                        if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+                        if (matches!(error, peer::Error::TimedOut)
+                            || matches!(error, peer::Error::Syscall(error) if error.is_block()))
                             && started.elapsed() < Duration::from_secs(1) => {}
                     Err(error) => return Err(Error::Io(error)),
                 }
@@ -343,7 +332,7 @@ impl Listener for TcpListener {
             for _ in 0..count {
                 socket.write_all(&response)?;
             }
-            socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+            socket.read_wait(Some(Duration::from_secs(1)))?;
         }
         Ok((sockets, selected))
     }

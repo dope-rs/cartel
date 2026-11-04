@@ -1,11 +1,9 @@
 use cartel_redis::api::Client as _;
-use cartel_redis::value::source::{Bulks as _, Bytes as _, Coordinates as _, Scored as _};
-use dope::core::driver::life::recovery;
-use std::{
-    io::{Read as _, Write as _},
-    num::NonZero,
-    time::Duration,
+use cartel_redis::value::source::{
+    Bulks as _, Bytes as _, Coordinates as _, Scan as _, Scored as _,
 };
+use dope::core::driver::life::recovery;
+use std::{num::NonZero, time::Duration};
 
 use cartel_redis::{
     client::{
@@ -154,6 +152,14 @@ fn preserves_wire_and_geo() {
                             assert!(matches!(runtime.block_on(redis.keyspace().scan(
                                 17, Some(b"a*"), NonZero::new(100)
                             )), Ok(Ok(_))));
+                            let scan = runtime.block_on(redis.sorted_sets().scan(
+                                b"board", 17, NonZero::new(100)
+                            )).expect("ZSCAN operation").ok().expect("ZSCAN reply");
+                            assert_eq!(scan.cursor(), 23);
+                            assert!(scan.keys().iter().eq([
+                                b"a".as_slice(), b"2.5", b"b", b"-1"
+                            ]));
+                            drop(scan);
                             assert!(matches!(runtime.block_on(redis.server().ping()), Ok(Ok(()))));
                             let error = runtime.block_on(redis.server().ping())
                                 .expect("nested error operation").expect_err("nested server error");

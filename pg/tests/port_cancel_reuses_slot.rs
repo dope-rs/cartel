@@ -10,9 +10,8 @@ use dope::{
 };
 use dope_fiber::{BlockOn as _, abi::Join};
 use dope_test::fibers;
+use dope_test::harness::peer;
 use dope_test::{harness::GUARD, reclaim::Reports};
-use std::io::ErrorKind;
-use std::{io::Read as _, io::Write as _};
 use std::{net::SocketAddr, net::TcpListener, thread, time::Duration};
 
 type Env = Bundle<Tcp, Identity, Throughput>;
@@ -95,11 +94,12 @@ fn cancel_reuses_slot() {
 
 fn queued_cancel_reuse(listener: TcpListener) -> thread::JoinHandle<()> {
     thread::spawn(move || {
+        let listener = peer::TcpAcceptor::try_adopt(listener.into()).expect("listener admission");
         const PID: i32 = 0x1020_3040;
         const SECRET: i32 = 0x5060_7080;
 
         let mut primary =
-            Listener::try_accept(&listener, Duration::from_secs(1)).expect("peer connection");
+            Listener::accept_within(&listener, Duration::from_secs(1)).expect("peer connection");
         Stream::try_start(&mut primary, Some((PID, SECRET))).expect("backend key handshake");
 
         let mut request = [0_u8; 512];
@@ -112,8 +112,8 @@ fn queued_cancel_reuse(listener: TcpListener) -> thread::JoinHandle<()> {
             .expect("tx ReadyForQuery");
 
         {
-            let mut cancel =
-                Listener::try_accept(&listener, Duration::from_secs(1)).expect("peer connection");
+            let cancel = Listener::accept_within(&listener, Duration::from_secs(1))
+                .expect("peer connection");
             let mut frame = [0_u8; 16];
             cancel
                 .read_exact(&mut frame)
@@ -163,8 +163,9 @@ fn queued_cancel_reuse(listener: TcpListener) -> thread::JoinHandle<()> {
         thread::sleep(Duration::from_millis(25));
         assert!(
             listener
-                .accept()
-                .is_err_and(|error| error.kind() == ErrorKind::WouldBlock),
+                .try_accept()
+                .expect("cancel admission probe")
+                .is_none(),
             "dropped queued cancel must not open an auxiliary socket"
         );
     })

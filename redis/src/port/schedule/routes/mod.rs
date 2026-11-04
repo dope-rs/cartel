@@ -4,7 +4,10 @@ use cartel_core::reply::layout::Position;
 
 use dope::{
     core::driver::{route, schedule::ready},
-    manifold::client::{conn::Id, session::turns},
+    manifold::client::{
+        conn::Id,
+        session::{self, turns},
+    },
 };
 use o3::{
     alloc, depot,
@@ -111,7 +114,7 @@ impl<'b, 'd, const ID: u8> Routes<'b, 'd, ID> {
                         position: bound.position,
                     });
                 }
-                State::Shared(bound) | State::Exclusive(bound)
+                State::Shared(bound, _) | State::Exclusive(bound, _)
                     if bound.position.connection() == token =>
                 {
                     *bound
@@ -142,7 +145,7 @@ impl<'b, 'd, const ID: u8> Routes<'b, 'd, ID> {
             // The phase borrow ends before the external wake or rejected failure drop.
             let phase = unsafe { &mut *conn.phase.get() };
             let bound = match phase {
-                State::Shared(bound) | State::Exclusive(bound)
+                State::Shared(bound, _) | State::Exclusive(bound, _)
                     if bound.position.connection() == token =>
                 {
                     *bound
@@ -199,7 +202,7 @@ impl<'b, 'd, const ID: u8> Routes<'b, 'd, ID> {
         token: Id<'d, route::KeyTag<ID>>,
     ) -> Option<slot::Bound<'_, 'b, 'd, ID>> {
         let conn = self.get(token.index().into_usize())?;
-        let (position, access) = conn.access()?;
+        let (position, access, _) = conn.access()?;
         (position.connection() == token && access == Access::Shared).then_some(slot::Bound {
             slot: conn,
             position,
@@ -209,13 +212,16 @@ impl<'b, 'd, const ID: u8> Routes<'b, 'd, ID> {
     pub(super) fn exclusive(
         &self,
         token: Id<'d, route::KeyTag<ID>>,
-    ) -> Option<slot::Bound<'_, 'b, 'd, ID>> {
+    ) -> Option<(slot::Bound<'_, 'b, 'd, ID>, session::Input)> {
         let conn = self.get(token.index().into_usize())?;
-        let (position, access) = conn.access()?;
-        (position.connection() == token && access == Access::Exclusive).then_some(slot::Bound {
-            slot: conn,
-            position,
-        })
+        let (position, access, input) = conn.access()?;
+        (position.connection() == token && access == Access::Exclusive).then_some((
+            slot::Bound {
+                slot: conn,
+                position,
+            },
+            input,
+        ))
     }
 
     pub(super) fn failure(
@@ -270,8 +276,8 @@ pub(in crate::port::schedule) enum Access {
 enum State<'b, 'd, const ID: u8> {
     Vacant,
     Initializing(Bound<'b, 'd, ID>),
-    Shared(Bound<'b, 'd, ID>),
-    Exclusive(Bound<'b, 'd, ID>),
+    Shared(Bound<'b, 'd, ID>, session::Input),
+    Exclusive(Bound<'b, 'd, ID>, session::Input),
     Closing(Closing<'b, 'd, ID>),
     Reconnecting(Closing<'b, 'd, ID>),
 }
@@ -280,7 +286,7 @@ impl<'b, 'd, const ID: u8> State<'b, 'd, ID> {
     fn bound(&self) -> Option<Bound<'b, 'd, ID>> {
         match self {
             State::Vacant => None,
-            State::Initializing(bound) | State::Shared(bound) | State::Exclusive(bound) => {
+            State::Initializing(bound) | State::Shared(bound, _) | State::Exclusive(bound, _) => {
                 Some(*bound)
             }
             State::Closing(closing) | State::Reconnecting(closing) => Some(closing.bound),

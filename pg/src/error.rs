@@ -12,7 +12,7 @@ use dope::core::Errno;
 use dope::core::driver::route;
 use dope::{
     core::driver::schedule::clock::timer,
-    manifold::client::{close, deadline},
+    manifold::client::{close, conn, deadline},
     net::link::egress::{self, load, reserve::exact},
 };
 use o3::base::num::bounded;
@@ -35,6 +35,7 @@ pub enum Error {
     },
     Connection(close::Reason),
     Receive(Errno),
+    Transmit(conn::Transmit),
     Timeout(deadline::Kind),
     RequestTimeout(Elapsed),
     Auth(Reason),

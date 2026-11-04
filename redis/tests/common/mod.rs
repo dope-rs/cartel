@@ -12,6 +12,7 @@ pub use attempts::Attempts;
 pub mod session;
 
 pub mod command;
+pub mod counted;
 
 pub fn recover(failure: Recovery<'_, '_>) -> Infallible {
     panic!("native recovery failed: {:?}", failure.cause())

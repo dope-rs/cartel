@@ -1,6 +1,6 @@
 use crate::common::postgres::{self, Frame, startup, startup::Stream as _};
 use dope_test::harness::peer;
-use std::{io, io::Read as _, str};
+use std::str;
 
 pub const CONNECTIONS: usize = 8;
 
@@ -19,11 +19,11 @@ pub const PASSWORDS: [(&str, &[u8]); 4] = [
 ];
 
 pub trait Auth {
-    fn try_auth(&mut self, code: u32, body: &[u8]) -> io::Result<()>;
+    fn try_auth(&self, code: u32, body: &[u8]) -> Result<(), peer::Error>;
 }
 
-impl<T: io::Write> Auth for T {
-    fn try_auth(&mut self, code: u32, body: &[u8]) -> io::Result<()> {
+impl Auth for peer::Stream<'_> {
+    fn try_auth(&self, code: u32, body: &[u8]) -> Result<(), peer::Error> {
         let mut message = Vec::from(code.to_be_bytes());
         message.extend_from_slice(body);
         self.write_all(&Frame::new(b'R', &message).encode())
@@ -76,8 +76,7 @@ pub fn reject(socket: &mut &peer::Stream<'_>, message: &str) -> Result<(), postg
         .and_then(|body| body.get(4..))
         .and_then(|body| body.strip_prefix(b"n,,n=,r="))
         .ok_or(postgres::Error::UnexpectedRequest)?;
-    let nonce =
-        str::from_utf8(nonce).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let nonce = str::from_utf8(nonce).map_err(postgres::Error::Utf8)?;
     socket.try_auth(11, message.replace("{nonce}", nonce).as_bytes())?;
     socket.read_closed()
 }

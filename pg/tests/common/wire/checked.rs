@@ -5,7 +5,6 @@ use cartel_pg::{
 };
 use dope_test::harness::peer;
 use std::cell::Cell;
-use std::io;
 use std::iter;
 
 #[derive(PgRow)]
@@ -145,7 +144,6 @@ impl schema::HasGroup<CommandGroup> for Mismatch {}
 impl Mismatch {
     pub fn serve(socket: &mut &peer::Stream<'_>) -> Result<(), Error> {
         use startup::Stream as _;
-        use std::io::Write as _;
 
         socket.prepare()?;
         startup::read(socket)?;
@@ -153,15 +151,9 @@ impl Mismatch {
         socket.write_all(&Frame::new(b'Z', b"I").encode())?;
         let (tag, _) = match try_frame(socket) {
             Ok(frame) => frame,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-                ) =>
-            {
-                return Ok(());
-            }
-            Err(error) => return Err(error.into()),
+            Err(Error::Io(peer::Error::UnexpectedEof)) => return Ok(()),
+            Err(Error::Io(peer::Error::Syscall(error))) if error.is_reset() => return Ok(()),
+            Err(error) => return Err(error),
         };
         if tag != b'P' {
             return Err(Error::UnexpectedRequest);
@@ -228,40 +220,43 @@ pub fn description(oids: &[u32]) -> Vec<u8> {
     bytes
 }
 
-fn try_frame(socket: &mut impl io::Read) -> io::Result<(u8, Vec<u8>)> {
+fn try_frame(socket: &peer::Stream<'_>) -> Result<(u8, Vec<u8>), Error> {
     let mut tag = [0];
     socket.read_exact(&mut tag)?;
+    Ok((tag[0], try_body(socket)?))
+}
+
+fn try_body(socket: &peer::Stream<'_>) -> Result<Vec<u8>, Error> {
     let mut length = [0; 4];
     socket.read_exact(&mut length)?;
-    let size = u32::from_be_bytes(length)
-        .checked_sub(4)
-        .ok_or(io::ErrorKind::InvalidData)?;
+    let length = u32::from_be_bytes(length);
+    let size = length.checked_sub(4).ok_or(Error::InvalidLength(length))?;
     let mut body = vec![0; size as usize];
     socket.read_exact(&mut body)?;
-    Ok((tag[0], body))
+    Ok(body)
 }
 
 impl Database {
     pub fn serve_rows<'a>(
-        socket: impl io::Read + io::Write,
+        socket: &peer::Stream<'_>,
         rows: impl IntoIterator<Item = &'a [u8]>,
-    ) -> io::Result<()> {
+    ) -> Result<(), Error> {
         Self::serve(socket, rows.into_iter().map(iter::once))
     }
 
     pub fn serve_batch<'a>(
-        socket: impl io::Read + io::Write,
+        socket: &peer::Stream<'_>,
         rows: impl IntoIterator<Item = &'a [u8]>,
-    ) -> io::Result<()> {
+    ) -> Result<(), Error> {
         Self::serve(socket, [rows])
     }
 
-    pub(in crate::common) fn start(mut socket: impl io::Read + io::Write) -> io::Result<()> {
-        startup::read(&mut socket)?;
+    pub(in crate::common) fn start(socket: &peer::Stream<'_>) -> Result<(), Error> {
+        startup::read(socket)?;
         socket.write_all(&Frame::new(b'R', &0u32.to_be_bytes()).encode())?;
         socket.write_all(&Frame::new(b'Z', b"I").encode())?;
         loop {
-            let (tag, body) = try_frame(&mut socket)?;
+            let (tag, body) = try_frame(socket)?;
             match tag {
                 b'P' => socket.write_all(&Frame::new(b'1', &[]).encode())?,
                 b'D' => {
@@ -283,7 +278,7 @@ impl Database {
                     socket.write_all(&Frame::new(b'T', &description(oids)).encode())?;
                 }
                 b'S' => break,
-                _ => return Err(io::ErrorKind::InvalidData.into()),
+                _ => return Err(Error::UnexpectedRequest),
             }
         }
         socket.write_all(&Frame::new(b'Z', b"I").encode())?;
@@ -291,17 +286,17 @@ impl Database {
     }
 
     fn serve<'a, R: IntoIterator<Item = &'a [u8]>>(
-        mut socket: impl io::Read + io::Write,
+        socket: &peer::Stream<'_>,
         queries: impl IntoIterator<Item = R>,
-    ) -> io::Result<()> {
-        Self::start(&mut socket)?;
+    ) -> Result<(), Error> {
+        Self::start(socket)?;
         for rows in queries {
             loop {
-                let (tag, _) = try_frame(&mut socket)?;
+                let (tag, _) = try_frame(socket)?;
                 match tag {
                     b'B' | b'E' => {}
                     b'S' => break,
-                    _ => return Err(io::ErrorKind::InvalidData.into()),
+                    _ => return Err(Error::UnexpectedRequest),
                 }
             }
             socket.write_all(&Frame::new(b'2', &[]).encode())?;
@@ -403,8 +398,7 @@ impl Bind {
         \0\0\0\x19\0\0\0\x01\0\0\0\0\0\0\0\x19\
         \0\0\0\x01\0\0\0\x01\0\0\0\x01x\0\x01\0\x01";
 
-    pub fn serve(socket: &mut &peer::Stream<'_>) -> io::Result<Vec<Vec<u8>>> {
-        use std::io::{Read as _, Write as _};
+    pub fn serve(socket: &mut &peer::Stream<'_>) -> Result<Vec<Vec<u8>>, Error> {
         Database::start(&mut *socket)?;
         let mut received = Vec::new();
         loop {
@@ -412,15 +406,16 @@ impl Bind {
             if socket.read(&mut tag)? == 0 {
                 return Ok(received);
             }
-            let (tag, body) = try_frame(&mut tag.as_slice().chain(&mut *socket))?;
+            let body = try_body(socket)?;
+            let tag = tag[0];
             if tag != b'B' {
-                return Err(io::ErrorKind::InvalidData.into());
+                return Err(Error::UnexpectedRequest);
             }
             received.push(body);
             for (expected, bytes) in [(b'E', &b"\0\0\0\0\0"[..]), (b'S', &b""[..])] {
                 let (tag, body) = try_frame(socket)?;
                 if tag != expected || body != bytes {
-                    return Err(io::ErrorKind::InvalidData.into());
+                    return Err(Error::UnexpectedRequest);
                 }
             }
             socket.write_all(

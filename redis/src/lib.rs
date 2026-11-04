@@ -16,7 +16,7 @@ pub use cartel_core::deadline::RequestPhase;
 use cartel_core::{deadline::Elapsed, queue, reply::recv::attach};
 use dope::core::driver::schedule::clock::timer;
 use dope::core::{Errno, driver::route};
-use dope::manifold::client::{attempt, close, deadline};
+use dope::manifold::client::{attempt, close, conn, deadline};
 use dope::manifold::service::bindings::endpoint;
 use dope::net::link::{
     egress::{self, reserve::exact},
@@ -65,6 +65,7 @@ pub enum Diagnostic<'a, 'd, const ID: u8 = 0> {
     },
     Closed(&'a close::Reason),
     Receive(&'a Errno),
+    Transmit(&'a conn::Transmit),
     Timeout(&'a deadline::Kind),
     RequestTimeout(&'a Elapsed),
     Protocol(&'a protocol::Error),

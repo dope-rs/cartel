@@ -66,7 +66,9 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         lease: mem::Lease<Self, lease::Open>,
     ) -> Held<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID> {
         let (this, ()) = lease.into_parts();
-        let target = this.proof.activate();
+        // Earlier pipelined requests may still report Idle. The BEGIN reply
+        // promotes this reservation only after the server enters a transaction.
+        let target = this.proof.id();
         Held::new(this.client, target)
     }
 }
