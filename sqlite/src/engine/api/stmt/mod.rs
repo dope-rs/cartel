@@ -133,9 +133,7 @@ impl<'connection, I: catalogs::Catalog> Prepare<'connection, I> {
         // SAFETY: pending preparation retains its bounded initialized prefix and
         // the next empty slot; completion consumes it before another insertion.
         let slot = unsafe { self.statements.slots.get_unchecked_mut(index) };
-        *slot = Slot {
-            statement: Some(stmt),
-        };
+        *slot = Some(stmt);
         self.used = required;
         self.statements.live = index + 1;
         Ok(self.statements.live == self.statements.slots.len())
@@ -162,17 +160,7 @@ pub(crate) struct Retirement<'connection> {
     slots: &'connection mut [Slot<'connection>],
 }
 
-pub(super) struct Slot<'connection> {
-    statement: Option<Prepared<'connection>>,
-}
-
-impl Slot<'_> {
-    pub(super) const EMPTY: Self = Self { statement: None };
-
-    pub(super) fn clear(&mut self) {
-        self.statement = None;
-    }
-}
+pub(super) type Slot<'connection> = Option<Prepared<'connection>>;
 
 impl<'connection, I: catalogs::Catalog> Set<'connection, I> {
     fn lease<Q: catalogs::TypedQuery>(
@@ -189,7 +177,6 @@ impl<'connection, I: catalogs::Catalog> Set<'connection, I> {
         unsafe {
             self.slots
                 .get_unchecked_mut(index)
-                .statement
                 .as_mut_slice()
                 .get_unchecked_mut(0)
         }
@@ -230,7 +217,7 @@ impl<'connection, I: catalogs::Catalog> Prefix<'connection, I> {
             return Inventory::Empty;
         };
         self.live = rest.len();
-        slot.clear();
+        *slot = None;
         match self.live {
             0 => Inventory::Empty,
             _ => Inventory::Populated,
@@ -251,14 +238,14 @@ impl Retirement<'_> {
     pub(crate) fn retire_one(&mut self) -> Inventory {
         if let Some((slot, rest)) = mem::take(&mut self.slots).split_last_mut() {
             self.slots = rest;
-            slot.clear();
+            *slot = None;
         }
         self.inventory()
     }
 
     pub(crate) fn retire_all(&mut self) {
         for slot in mem::take(&mut self.slots).iter_mut().rev() {
-            slot.clear();
+            *slot = None;
         }
     }
 
@@ -410,17 +397,13 @@ impl<'connection> Prepared<'connection> {
         // libsqlite3-sys 0.38.1's native clear only fails its null-handle check.
         unsafe { libsqlite3_sys::sqlite3_clear_bindings(self.statement.as_ptr()) };
     }
-
-    fn dispose(stmt: ptr::NonNull<libsqlite3_sys::sqlite3_stmt>, work: &work::Work) {
-        if let Some(fault) = sys::finalize(stmt) {
-            work.finalized(fault);
-        }
-    }
 }
 
 impl Drop for Prepared<'_> {
     fn drop(&mut self) {
-        Self::dispose(self.statement, self.work);
+        if let Some(fault) = sys::finalize(self.statement) {
+            self.work.finalized(fault);
+        }
     }
 }
 

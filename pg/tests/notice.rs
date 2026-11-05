@@ -67,7 +67,7 @@ fn retains_fields_and_pid() {
     );
     let login = login.expect("valid PostgreSQL credentials");
     let ((), events) = {
-        let prepared = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+        let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
             port::Port::<Queries>::plan(login, limits),
             address,
             Duration::from_millis(1),

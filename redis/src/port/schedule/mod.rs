@@ -13,7 +13,7 @@ use dope::{
 use dope_fiber::reply::{layout::Position, order::Depth};
 pub(crate) use lease::Lease;
 use o3::base::cell::region;
-pub(crate) use plan::{Block, Plan, Reject};
+pub(crate) use plan::{Block, Reject};
 pub(crate) use routes::Routes;
 use routes::{Access, Acquire, Bind};
 

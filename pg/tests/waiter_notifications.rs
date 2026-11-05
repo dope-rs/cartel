@@ -42,7 +42,7 @@ fn notification_waiters_finish_each_wake_round() {
                 responses: config::Response { items: 2, bytes: 2_048, frame_bytes: 1_024 },
                 notifications: config::Notification { items: 3, bytes: 128 },
             }).expect("PG configuration");
-            let prepared = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+            let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
                 port::Port::<Queries>::plan(Queries::try_config().expect("PG login"), capacity),
                 server.addr(), Duration::from_millis(1), Duration::from_secs(1),
             ).expect("PG topology");

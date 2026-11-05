@@ -3,14 +3,12 @@ use crate::emit;
 use crate::plan;
 use crate::plan::row;
 use crate::pred;
-use crate::pred::layouts;
 use crate::shape;
 use crate::shape::qualify;
 
 use syn::spanned::Spanned as _;
 
 use crate::ext::ExprExt as _;
-use layouts::ScopeLayout as _;
 
 use crate::plan::read::{Filter, Project, Qualify, join_parts};
 

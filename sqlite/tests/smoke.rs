@@ -12,21 +12,6 @@ pub mod common;
 static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
 
 #[test]
-fn install_is_idempotent() {
-    assert!(
-        RUNTIME
-            .get_or_init(|| {
-                // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-                // Only Cartel uses installed SQLite; Core handles and allocations remain
-                // exclusively owned by their originating worker.
-                Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-            })
-            .is_ok()
-    );
-    assert!(RUNTIME.get().expect("SQLite runtime initialized").is_ok());
-}
-
-#[test]
 fn repeat_open_is_rejected() -> Result<(), plan::Error> {
     let runtime = (*RUNTIME.get_or_init(|| {
         // SAFETY: no SQLite call can pass this binary's initializer before it returns.

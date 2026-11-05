@@ -5,25 +5,16 @@ use o3::base::marker::ThreadBound;
 use crate::runtime::heap;
 use heap::scopes::Scope;
 
-#[repr(transparent)]
-pub(in crate::runtime) struct Hooks(libsqlite3_sys::sqlite3_mem_methods);
-
-impl Hooks {
-    pub(in crate::runtime) fn new() -> Self {
-        Self(libsqlite3_sys::sqlite3_mem_methods {
-            xMalloc: Some(malloc),
-            xFree: Some(free),
-            xRealloc: Some(realloc),
-            xSize: Some(size),
-            xRoundup: Some(roundup),
-            xInit: Some(initialize),
-            xShutdown: None,
-            pAppData: ptr::null_mut(),
-        })
-    }
-
-    pub(in crate::runtime) const fn as_ptr(&self) -> *const libsqlite3_sys::sqlite3_mem_methods {
-        &raw const self.0
+pub(in crate::runtime) fn methods() -> libsqlite3_sys::sqlite3_mem_methods {
+    libsqlite3_sys::sqlite3_mem_methods {
+        xMalloc: Some(malloc),
+        xFree: Some(free),
+        xRealloc: Some(realloc),
+        xSize: Some(size),
+        xRoundup: Some(roundup),
+        xInit: Some(initialize),
+        xShutdown: None,
+        pAppData: ptr::null_mut(),
     }
 }
 

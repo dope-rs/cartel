@@ -1,4 +1,4 @@
-use o3::alloc::{self, VecExt as _, array};
+use o3::alloc::VecExt as _;
 use std::ptr;
 use stringprep::tables;
 use unicode_normalization::char::{canonical_combining_class, compose, decompose_compatible};
@@ -110,11 +110,9 @@ fn mapped(value: &str) -> impl Iterator<Item = char> + '_ {
 }
 
 fn compose_all(input: &Decomposed) -> Result<Composed, crate::ConfigError> {
-    let mut output = Composed(Zeroizing::new(Vec::new()));
-    output
-        .0
-        .try_grow(input.0.len())
-        .map_err(crate::ConfigError::Allocation)?;
+    let mut output = Composed(Zeroizing::new(
+        Vec::try_new(input.0.len()).map_err(crate::ConfigError::Allocation)?,
+    ));
     let mut written = 0;
     {
         let mut source = input.0.iter();
@@ -168,10 +166,7 @@ fn encode(value: &Composed) -> Result<String, crate::ConfigError> {
             .checked_add(ch.len_utf8())
             .ok_or(crate::ConfigError::PasswordCapacity)
     })?;
-    let mut output = array::Plan::try_new(bytes)
-        .map_err(alloc::Error::from)
-        .and_then(|plan| plan.try_vec().map_err(alloc::Error::from))
-        .map_err(crate::ConfigError::Allocation)?;
+    let mut output = Vec::try_new(bytes).map_err(crate::ConfigError::Allocation)?;
     let mut cursor = output.as_mut_ptr();
     for ch in value.0.iter() {
         let mut encoded = Zeroizing::new([0; 4]);

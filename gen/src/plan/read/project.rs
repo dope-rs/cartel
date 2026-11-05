@@ -1,14 +1,10 @@
-use crate::parse::{branches, sources};
 use crate::plan;
-use crate::pred::{self, layouts, var};
+use crate::pred::{self, var};
 use crate::shape::{self, qualify};
 
 use syn::spanned::Spanned as _;
 
-use branches::Qualifier as _;
-use layouts::ScopeLayout as _;
 use shape::join;
-use sources::Source as _;
 
 use crate::plan::read::window::Window;
 use crate::plan::read::{Filter, Qualify};

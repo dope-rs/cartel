@@ -75,12 +75,6 @@ impl Meter {
         self.mode.set(Mode::Idle);
     }
 
-    pub(super) fn stop(&self) {
-        if matches!(self.mode.get(), Mode::Cleanup) {
-            self.mode.set(Mode::Idle);
-        }
-    }
-
     pub(crate) fn run<T>(
         &self,
         op: impl FnOnce() -> Result<T, crate::Error>,

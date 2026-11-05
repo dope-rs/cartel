@@ -42,7 +42,7 @@ where
     I: schema::QuerySet + 'd,
     X: recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>,
 {
-    pub(in crate::api) fn from_outcome(
+    pub(in crate::api) fn new(
         client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         target: Option<api::Target<'d, ID>>,
         reply: recv::Stream<
@@ -55,10 +55,10 @@ where
             replies::ReplyFailure<'d>,
             replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
         >,
-        next: api::Outcome<'d, ID, ()>,
+        next: Result<api::Pending<'d>, crate::Error>,
     ) -> Self {
         Self {
-            core: Core::from_outcome(client, target, reply, next),
+            core: Core::new(client, target, reply, next),
         }
     }
 }

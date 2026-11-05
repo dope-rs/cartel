@@ -40,7 +40,7 @@ fn throttled_query_cannot_enter_later_transaction() {
         |server| {
             let mut capacity = Queries::try_cancel().expect("PG capacity").capacities();
             capacity.inflight = 1;
-            let prepared = topology::Prepare::try_new::<Env>(
+            let prepared = topology::try_new::<_, Env>(
                 port::Port::<Queries>::plan(
                     Queries::try_config().expect("database config"),
                     config::Config::new(capacity).expect("single reply"),
@@ -112,7 +112,7 @@ fn transaction_status_rejects_stale_guard() {
         peer::AcceptScript::with(
             move |listener| common::transaction::ended(listener, invalid_begin),
             |server| {
-                let prepared = topology::Prepare::try_new::<Env>(
+                let prepared = topology::try_new::<_, Env>(
                     port::Port::<Queries>::plan(
                         Queries::try_config().expect("database config"),
                         Queries::try_cancel().expect("two in-flight replies"),
@@ -198,7 +198,7 @@ fn finalizer_preserves_status_error() {
         peer::AcceptScript::with(
             move |listener| common::transaction::unfinished(listener, rejected),
             |server| {
-                let prepared = topology::Prepare::try_new::<Env>(
+                let prepared = topology::try_new::<_, Env>(
                     port::Port::<Queries>::plan(
                         Queries::try_config().expect("database config"),
                         Queries::try_cancel().expect("transaction capacity"),
@@ -277,7 +277,7 @@ fn finalizer_keeps_error() {
         capacity.inflight = 1;
         let config = config::Config::with_window(capacity, Positive::from_millis::<100>())
             .expect("finalizer deadline");
-        let prepared = topology::Prepare::try_new::<Env>(
+        let prepared = topology::try_new::<_, Env>(
             port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config),
             address,
             Duration::from_millis(1),
@@ -396,7 +396,7 @@ fn retains_next_owner() {
         socket.try_start(None)?;
         retire::finalize(&mut socket)
     });
-    let prepared = topology::Prepare::try_new::<Env>(
+    let prepared = topology::try_new::<_, Env>(
         port::Port::<Queries>::plan(
             Queries::try_config().expect("database config"),
             Queries::try_cancel().expect("two in-flight replies on one connection"),
@@ -515,7 +515,7 @@ fn transaction_frees_slot() {
             Positive::from_millis::<20>(),
         )
         .expect("valid pg configuration");
-        let prepared = topology::Prepare::try_new::<Env>(
+        let prepared = topology::try_new::<_, Env>(
             port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config),
             addr,
             Duration::from_millis(1),

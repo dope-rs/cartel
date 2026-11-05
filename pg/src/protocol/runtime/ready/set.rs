@@ -25,12 +25,6 @@ pub(crate) enum Bind {
     Rejected,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) enum Blocking {
-    Clear,
-    Held(num::NonZero<usize>),
-}
-
 impl<'d, const ID: u8> Set<'d, ID> {
     pub(crate) fn try_new(
         plan: plan::Plan,
@@ -162,19 +156,11 @@ impl<'d, const ID: u8> Set<'d, ID> {
         self.index.count()
     }
 
-    pub(crate) fn blocking(&self) -> Blocking {
-        match self.index.blockers() {
-            Some(count) => Blocking::Held(count),
-            None => Blocking::Clear,
-        }
+    pub(crate) fn blocking(&self) -> Option<num::NonZero<usize>> {
+        self.index.blockers()
     }
 
     pub(crate) fn set_policy(&self, policy: protocol::PickPolicy) {
         self.policy.set(policy);
     }
 }
-
-const _: () = {
-    assert!(std::mem::size_of::<Blocking>() == std::mem::size_of::<usize>());
-    assert!(std::mem::align_of::<Blocking>() == std::mem::align_of::<usize>());
-};

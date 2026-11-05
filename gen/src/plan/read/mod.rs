@@ -6,8 +6,6 @@ mod select;
 mod set;
 pub(in crate::plan) mod window;
 
-use crate::pred::layouts::ScopeLayout as _;
-
 pub(in crate::plan) use agg::Agg;
 pub(in crate::plan) use filter::Filter;
 pub(in crate::plan) use project::Project;

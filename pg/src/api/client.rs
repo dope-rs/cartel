@@ -1,4 +1,3 @@
-use crate::protocol::runtime::ready::Blocking;
 use crate::reply::group::Ledger;
 use crate::{api, port, port::replies, schema};
 use api::results::copy;
@@ -155,9 +154,9 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         if let Some(target) = target {
             return Err(crate::reply::Error::Pinned(target));
         }
-        match shared.transaction().blocking() {
-            Blocking::Held(count) => Err(self.port.backpressure(count).into()),
-            Blocking::Clear => Ok(None),
+        match shared.ready.blocking() {
+            Some(count) => Err(self.port.backpressure(count).into()),
+            None => Ok(None),
         }
     }
 
@@ -237,11 +236,8 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             replies::ReplyFailure<'_>,
             replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
         >::with(context);
-        let next = match api::Pending::typed::<Q, I, ID>(self.port, params, X::BOUNDARY) {
-            Ok(req) => api::Outcome::NoConn { request: req },
-            Err(error) => api::Outcome::Failed(error.into()),
-        };
-        task::Call::from_core(task::Core::from_outcome(self, target, reply, next))
+        let next = api::Pending::typed::<Q, I, ID>(self.port, params, X::BOUNDARY);
+        task::Call::from_core(task::Core::new(self, target, reply, next))
     }
 
     pub(in crate::api) fn group<Q, const N: usize>(
@@ -254,11 +250,8 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        let next = match api::Pending::group::<Q, I, ID, N>(self.port, params) {
-            Ok(request) => api::Outcome::NoConn { request },
-            Err(error) => api::Outcome::Failed(error.into()),
-        };
-        group::Group::from_outcome(self, target, next)
+        let next = api::Pending::group::<Q, I, ID, N>(self.port, params);
+        group::Group::new(self, target, next)
     }
 
     pub(in crate::api) fn raw<X>(
@@ -321,11 +314,8 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             replies::ReplyFailure<'_>,
             replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
         >::new();
-        let next = match api::Pending::raw(self.port, req) {
-            Ok(req) => api::Outcome::NoConn { request: req },
-            Err(error) => api::Outcome::Failed(error.into()),
-        };
-        task::Core::from_outcome(self, target, reply, next)
+        let next = api::Pending::raw(self.port, req);
+        task::Core::new(self, target, reply, next)
     }
 
     pub(in crate::api) fn pending<X, S, A, P>(
@@ -367,7 +357,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             replies::ReplyFailure<'_>,
             replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
         >::new();
-        task::Core::from_outcome(self, target, reply, api::Outcome::NoConn { request: req })
+        task::Core::new(self, target, reply, Ok(req))
     }
 
     pub(in crate::api) fn stream<Q, X>(
@@ -395,11 +385,8 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             replies::ReplyFailure<'_>,
             replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
         >::new();
-        let next = match api::Pending::typed::<Q, I, ID>(self.port, params, X::BOUNDARY) {
-            Ok(req) => api::Outcome::NoConn { request: req },
-            Err(error) => api::Outcome::Failed(error.into()),
-        };
-        Stream::from_outcome(self, target, reply, next)
+        let next = api::Pending::typed::<Q, I, ID>(self.port, params, X::BOUNDARY);
+        Stream::new(self, target, reply, next)
     }
 
     pub(in crate::api) fn stream_raw<X>(
@@ -424,10 +411,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             replies::ReplyFailure<'_>,
             replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
         >::new();
-        let next = match api::Pending::raw(self.port, req) {
-            Ok(req) => api::Outcome::NoConn { request: req },
-            Err(error) => api::Outcome::Failed(error.into()),
-        };
-        Stream::from_outcome(self, target, reply, next)
+        let next = api::Pending::raw(self.port, req);
+        Stream::new(self, target, reply, next)
     }
 }

@@ -3,7 +3,6 @@ use crate::pred;
 use std::collections;
 use syn::ext::IdentExt as _;
 
-use pred::expr::Expr as _;
 use pred::sql::Sql;
 
 mod cte;

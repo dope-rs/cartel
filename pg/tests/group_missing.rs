@@ -33,7 +33,7 @@ fn missing_keeps_rows() {
     TcpScript::with(group::missing, |server| {
         let config = Queries::try_groups(NonZero::<usize>::MIN, NonZero::<usize>::MIN)
             .expect("group config");
-        let prepared = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+        let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
             port::Port::<Database>::plan(Queries::try_config().expect("credentials"), config),
             server.addr(),
             Duration::from_millis(1),

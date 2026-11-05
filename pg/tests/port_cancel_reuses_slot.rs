@@ -25,7 +25,7 @@ fn cancel_reuses_slot() {
     let server = queued_cancel_reuse(listener);
     let config = Queries::try_cancel().expect("cancel config");
     let ((), events) = {
-        let prepared = topology::Prepare::try_new::<Env>(
+        let prepared = topology::try_new::<_, Env>(
             port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config),
             addr,
             Duration::from_millis(1),

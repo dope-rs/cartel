@@ -1,12 +1,10 @@
 use crate::emit;
 use crate::parse::assign;
 use crate::plan;
-use crate::pred::{self, layouts};
+use crate::pred;
 use crate::shape;
 
 use syn::spanned::Spanned as _;
-
-use layouts::ScopeLayout as _;
 
 use crate::ext::SqlIdent as _;
 

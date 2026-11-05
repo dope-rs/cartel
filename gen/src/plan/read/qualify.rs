@@ -1,11 +1,9 @@
 use crate::backend;
 use crate::plan;
-use crate::pred::{self, layouts, sql::Sql};
+use crate::pred::{self, sql::Sql};
 use crate::shape::{self, bound, qualify};
 
 use syn::{ext::IdentExt as _, spanned::Spanned as _};
-
-use layouts::ScopeLayout as _;
 
 pub(in crate::plan) struct Qualify {
     clauses: Vec<Clause>,

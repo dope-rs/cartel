@@ -14,8 +14,7 @@ pub trait Invocation {
     fn arguments(&self) -> &[Self::Argument];
 
     fn wire_len(&self) -> Result<usize, request::Error> {
-        script::Writer::length(self.script(), self.keys(), self.arguments())
-            .map(encode::Length::get)
+        script::length(self.script(), self.keys(), self.arguments()).map(encode::Length::get)
     }
 }
 
@@ -32,10 +31,9 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Calls<C, ID> {
         K: AsRef<[u8]>,
         A: request::Bulk,
     {
-        let len = script::Writer::length(script, keys, args);
-        self.0.encode_sized::<R>(len, move |out| {
-            script::Writer::new(out).eval(script, keys, args)
-        })
+        let len = script::length(script, keys, args);
+        self.0
+            .encode_sized::<R>(len, move |out| script::eval(out, script, keys, args))
     }
 
     /// Borrows one invocation's views once before eager length validation and encoding.

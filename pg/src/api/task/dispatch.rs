@@ -60,15 +60,15 @@ impl<
     pub(super) fn new(
         client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         target: Option<api::Target<'d, ID>>,
-        next: api::Outcome<'d, ID, S>,
+        next: Result<api::Pending<'d, S>, crate::Error>,
     ) -> Self {
         let state = match next {
-            api::Outcome::NoConn { request } => State::Connecting {
+            Ok(request) => State::Connecting {
                 client,
                 target,
                 request,
             },
-            api::Outcome::Failed(error) => State::Failed(error),
+            Err(error) => State::Failed(error.into()),
         };
         let (timer, window) = client.port.lifecycle.deadline.into_parts();
         Self {

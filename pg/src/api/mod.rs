@@ -333,11 +333,6 @@ const _: () = {
     );
 };
 
-enum Outcome<'d, const ID: u8, S> {
-    NoConn { request: Pending<'d, S> },
-    Failed(reply::Error<'d, ID>),
-}
-
 enum TxOutcome<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8>
 where
     I: schema::QuerySet + 'd,

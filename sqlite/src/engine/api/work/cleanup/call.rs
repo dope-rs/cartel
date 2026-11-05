@@ -34,7 +34,7 @@ impl<'source> Call<'source> {
         source.pending.complete(self.cleanup, &source.depth);
         let status = source.pending.status();
         if let cleanup::Status::Idle = status {
-            source.meter.stop();
+            source.meter.finish();
         }
         Ok(status)
     }

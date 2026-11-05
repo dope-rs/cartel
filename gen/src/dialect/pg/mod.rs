@@ -17,7 +17,6 @@ impl backend::Backend for PgBackend {
     fn dialect() -> backend::Dialect {
         backend::Dialect {
             rt_crate: syn::parse_quote! { ::cartel_pg },
-            placeholder: backend::Placeholder::Dollar,
             kind: backend::Kind::Pg,
         }
     }

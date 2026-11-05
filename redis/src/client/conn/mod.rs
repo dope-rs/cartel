@@ -25,7 +25,7 @@ impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Connection<'app, 's, '
         R: value::Decode<'s, 'b, 'c, 'd, ID, Output = R> + 'lease,
     {
         let frame = self.lease.redis().port.encode(encode);
-        command::Command::<_, R, ID>::new(command::Leased::new(&mut self.lease), frame)
+        command::Command::<_, R, ID>::new(&mut self.lease, frame)
     }
 }
 

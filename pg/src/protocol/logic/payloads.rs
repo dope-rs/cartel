@@ -3,7 +3,7 @@ use o3::buffer::{self, hold};
 
 use crate::{
     protocol::{
-        Length, Offset, Reason, Text, TextError, Utf8, Wire, frame, messages,
+        Length, Offset, Reason, Text, TextError, Wire, frame, messages,
         runtime::{notify, tx::poll},
         scram,
     },
@@ -102,21 +102,14 @@ struct Terminator {
 #[derive(Clone, Copy)]
 enum Cstring {
     Terminator(Terminator),
-    Utf8 { valid: Length, error: Utf8 },
+    Utf8(TextError),
 }
 
 impl Cstring {
-    fn utf8(error: TextError) -> Self {
-        Self::Utf8 {
-            valid: error.valid,
-            error: error.error,
-        }
-    }
-
     fn into_sasl(self) -> crate::Error {
         let reason = match self {
             Self::Terminator(Terminator { actual }) => Reason::SaslMechanismTerminator { actual },
-            Self::Utf8 { valid, error } => Reason::SaslMechanismUtf8 { valid, error },
+            Self::Utf8(TextError { valid, error }) => Reason::SaslMechanismUtf8 { valid, error },
         };
         crate::Error::Protocol(reason)
     }
@@ -126,7 +119,7 @@ impl Cstring {
             Self::Terminator(Terminator { actual }) => {
                 Reason::NotificationTerminator { field, actual }
             }
-            Self::Utf8 { valid, error } => Reason::NotificationUtf8 {
+            Self::Utf8(TextError { valid, error }) => Reason::NotificationUtf8 {
                 field,
                 valid,
                 error,
@@ -144,10 +137,7 @@ fn cstr_bytes(bytes: Wire<'_>) -> Result<(Wire<'_>, Wire<'_>), Terminator> {
 
 fn cstr(bytes: Wire<'_>) -> Result<(Text<'_>, Wire<'_>), Cstring> {
     let (value, rest) = cstr_bytes(bytes).map_err(Cstring::Terminator)?;
-    match value.try_text() {
-        Ok(value) => Ok((value, rest)),
-        Err(error) => Err(Cstring::utf8(error)),
-    }
+    Ok((value.try_text().map_err(Cstring::Utf8)?, rest))
 }
 
 pub(super) enum AuthRequest<'a> {
@@ -205,45 +195,31 @@ impl<'a> AuthRequest<'a> {
     }
 }
 
-pub(super) struct Plan<'input, 'd, R: buffer::Cursor> {
-    pid: u32,
-    fields: reply::raw::Fields<'input, 'd, R>,
-}
-
-impl<'input, 'd, R: buffer::Cursor> Plan<'input, 'd, R> {
-    pub(super) fn retain(
-        self,
-        queue: &notify::Queue<'d>,
-        token: &mut region::Token<region::Identity<'d>>,
-    ) -> Result<(), crate::Error> {
-        queue.try_push(self.fields, self.pid, token)
+pub(super) fn notification<'input, 'd, R: buffer::Cursor + hold::raw::Retain<'d>>(
+    source: frame::Payload<'input, 'd, R>,
+    queue: &notify::Queue<'d>,
+    token: &mut region::Token<region::Identity<'d>>,
+) -> Result<(), crate::Error> {
+    let bytes = source.wire();
+    let Some((pid, body)) = bytes.split_array::<4>() else {
+        return Err(crate::Error::Protocol(Reason::NotificationTruncated {
+            actual: bytes.length(),
+        }));
+    };
+    let pid = u32::from_be_bytes(*pid);
+    let (name, rest) = cstr(body).map_err(|error| error.into_note(0))?;
+    let start = bytes.len() - rest.len();
+    let (data, tail) = cstr(rest).map_err(|error| error.into_note(1))?;
+    if !tail.is_empty() {
+        return Err(crate::Error::Protocol(Reason::NotificationTrailing {
+            actual: tail.length(),
+        }));
     }
-
-    pub(super) fn decode(source: frame::Payload<'input, 'd, R>) -> Result<Self, crate::Error>
-    where
-        R: hold::raw::Retain<'d>,
-    {
-        let bytes = source.wire();
-        let Some((pid, body)) = bytes.split_array::<4>() else {
-            return Err(crate::Error::Protocol(Reason::NotificationTruncated {
-                actual: bytes.length(),
-            }));
-        };
-        let pid = u32::from_be_bytes(*pid);
-        let (name, rest) = cstr(body).map_err(|error| error.into_note(0))?;
-        let start = bytes.len() - rest.len();
-        let (data, tail) = cstr(rest).map_err(|error| error.into_note(1))?;
-        if !tail.is_empty() {
-            return Err(crate::Error::Protocol(Reason::NotificationTrailing {
-                actual: tail.length(),
-            }));
-        }
-        let first = 4 + name.bytes().len();
-        let last = start + data.bytes().len();
-        let ranges = [4..first, start..last];
-        // SAFETY: parsing proves ordered in-bounds UTF-8 ranges, and the source
-        // admitted frame length bounds every endpoint and their combined length.
-        let fields = unsafe { reply::raw::Fields::new(source.into_inner(), ranges) };
-        Ok(Self { pid, fields })
-    }
+    let first = 4 + name.bytes().len();
+    let last = start + data.bytes().len();
+    let ranges = [4..first, start..last];
+    // SAFETY: parsing proves ordered in-bounds UTF-8 ranges, and the source
+    // admitted frame length bounds every endpoint and their combined length.
+    let fields = unsafe { reply::raw::Fields::new(source.into_inner(), ranges) };
+    queue.try_push(fields, pid, token)
 }

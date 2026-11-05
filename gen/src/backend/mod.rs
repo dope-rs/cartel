@@ -1,10 +1,7 @@
 use crate::emit;
 use crate::ext::SqlIdent as _;
-use crate::parse::{self, ctes};
 use crate::plan;
 use crate::shape;
-use ctes::Binding as _;
-use parse::Shape as _;
 use std::collections;
 
 use syn::{ext::IdentExt as _, spanned::Spanned as _};
@@ -260,12 +257,6 @@ impl TableSpec<'_> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum Placeholder {
-    Dollar,
-    Question,
-}
-
-#[derive(Clone, Copy)]
 pub(super) enum Cast {
     Ltree,
 }
@@ -308,18 +299,8 @@ impl Kind {
     }
 }
 
-impl Placeholder {
-    fn render(self, n: usize) -> String {
-        match self {
-            Self::Dollar => format!("${n}"),
-            Self::Question => format!("?{n}"),
-        }
-    }
-}
-
 pub(super) struct Dialect {
     pub(super) rt_crate: syn::Path,
-    pub(super) placeholder: Placeholder,
     pub(super) kind: Kind,
 }
 
@@ -366,7 +347,11 @@ impl Dialect {
     }
 
     pub(super) fn placeholder(&self, idx0: usize, ctx: &ParamCtx<'_>) -> proc_macro2::TokenStream {
-        let base = self.placeholder.render(idx0 + 1);
+        let index = idx0 + 1;
+        let base = match self.kind {
+            Kind::Pg => format!("${index}"),
+            Kind::Sqlite => format!("?{index}"),
+        };
         let s = match self.lookup_cast(idx0, ctx) {
             Some(cast) => cast.apply(base),
             None => base,

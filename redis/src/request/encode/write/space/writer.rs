@@ -9,50 +9,6 @@ impl Writer {
         Self(out)
     }
 
-    pub(crate) fn replace(
-        self,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<encode::Complete, crate::request::Error> {
-        self.0.command(&[b"GETSET", key, value])
-    }
-
-    pub(crate) fn take(self, key: &[u8]) -> Result<encode::Complete, crate::request::Error> {
-        self.0.command(&[b"GETDEL", key])
-    }
-
-    pub(crate) fn append(
-        self,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<encode::Complete, crate::request::Error> {
-        self.0.command(&[b"APPEND", key, value])
-    }
-
-    pub(crate) fn len(self, key: &[u8]) -> Result<encode::Complete, crate::request::Error> {
-        self.0.command(&[b"STRLEN", key])
-    }
-
-    pub(crate) fn kind(self, key: &[u8]) -> Result<encode::Complete, crate::request::Error> {
-        self.0.command(&[b"TYPE", key])
-    }
-
-    pub(crate) fn rename(
-        self,
-        src: &[u8],
-        dst: &[u8],
-    ) -> Result<encode::Complete, crate::request::Error> {
-        self.0.command(&[b"RENAME", src, dst])
-    }
-
-    pub(crate) fn persist(self, key: &[u8]) -> Result<encode::Complete, crate::request::Error> {
-        self.0.command(&[b"PERSIST", key])
-    }
-
-    pub(crate) fn ttl(self, key: &[u8]) -> Result<encode::Complete, crate::request::Error> {
-        self.0.command(&[b"TTL", key])
-    }
-
     pub(crate) fn expire(
         self,
         key: &[u8],
@@ -61,14 +17,6 @@ impl Writer {
         let mut buffer = [0; 20];
         let seconds = encode::format_uint_into(&mut buffer, seconds);
         self.0.command(&[b"EXPIRE", key, seconds])
-    }
-
-    pub(crate) fn unlink(self, keys: &[&[u8]]) -> Result<encode::Complete, crate::request::Error> {
-        self.0.slices(&[b"UNLINK"], keys)
-    }
-
-    pub(crate) fn db_len(self) -> Result<encode::Complete, crate::request::Error> {
-        self.0.command(&[b"DBSIZE"])
     }
 
     pub(crate) fn scan<const N: usize>(

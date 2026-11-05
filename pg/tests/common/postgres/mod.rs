@@ -85,12 +85,10 @@ pub enum SettleError {
 
 pub(crate) fn read_empty(stream: &peer::Stream<'_>, expected: u8) -> Result<(), Error> {
     loop {
-        let mut header = [0_u8; 5];
-        stream.read_exact(&mut header)?;
-        let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
-        let mut body = vec![0; length.checked_sub(4).ok_or(Error::InvalidLength(length))? as usize];
-        stream.read_exact(&mut body)?;
-        if header[0] == expected {
+        let mut tag = [0_u8; 1];
+        stream.read_exact(&mut tag)?;
+        let body = startup::read(stream)?;
+        if tag[0] == expected {
             if !body.is_empty() {
                 return Err(Error::NonemptyFrame);
             }

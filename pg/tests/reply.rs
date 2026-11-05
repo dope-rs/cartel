@@ -45,7 +45,7 @@ fn startup_closes_live() {
             Ok::<_, Error>(closed.send(()))
         },
         |server| {
-            let prepared = topology::Prepare::try_new::<Env>(
+            let prepared = topology::try_new::<_, Env>(
                 port::Port::<Queries>::plan(
                     cartel_pg::Config::new("user".into(), "password".into(), "database".into())
                         .expect("database configuration"),
@@ -128,7 +128,7 @@ fn catalog_mismatch() {
     use common::wire::checked::Mismatch;
 
     let ready = TcpScript::with(Mismatch::serve, |server| {
-        let prepared = topology::Prepare::try_new::<Env>(
+        let prepared = topology::try_new::<_, Env>(
             port::Port::<Mismatch>::plan(
                 Queries::try_config().expect("database configuration"),
                 Queries::try_reply().expect("port configuration"),
@@ -196,7 +196,7 @@ fn request_errors() {
         let (reply, alloc) = TcpScript::with(
             move |socket| accept::reply(socket, frame),
             |server| {
-                let prepared = topology::Prepare::try_new::<Env>(
+                let prepared = topology::try_new::<_, Env>(
                     port::Port::<Queries>::plan(
                         Queries::try_config().expect("database configuration"),
                         Queries::try_reply().expect("test configuration"),
@@ -331,7 +331,7 @@ fn connection_errors_preserve_pending_diagnostics() {
                 let mut caps = Queries::try_reply().expect("reply capacity").capacities();
                 caps.inflight = 1;
                 caps.responses.items = 1;
-                let prepared = topology::Prepare::try_new::<Env>(
+                let prepared = topology::try_new::<_, Env>(
                     port::Port::<Database>::plan(
                         Queries::try_config().expect("database configuration"),
                         port::config::Config::new(caps).expect("one retained value"),

@@ -1,25 +1,11 @@
-use cartel_core::reply::recv::attach;
-use cartel_pg::{api, port::config, reply, reply::server, schema, schema::groups};
-use dope::{core::driver::route::KeyTag, manifold::client::conn};
+use cartel_pg::{port::config, reply, schema, schema::groups};
 use dope_fiber::wait;
 use std::num::NonZero;
 
 #[derive(Debug)]
-pub enum Reply<'a, 'd> {
-    Driver(&'a cartel_pg::Error),
-    Wait {
-        cause: wait::Cause,
-        wake: Option<(NonZero<u16>, u32)>,
-    },
-    Admission {
-        conn: &'a conn::Id<'d, KeyTag<0>>,
-        cause: &'a attach::Error,
-        error: wait::Cause,
-        wake: Option<(NonZero<u16>, u32)>,
-    },
-    Open(&'a reply::Open<'d, 0>),
-    Pinned(&'a api::Target<'d, 0>),
-    Server(server::Fields<'a>),
+pub struct Reply<'a, 'd> {
+    pub kind: reply::Kind<'a, 'd>,
+    pub wake: Option<(NonZero<u16>, u32)>,
 }
 
 impl<'a, 'd> From<&'a reply::Error<'d>> for Reply<'a, 'd> {
@@ -33,21 +19,9 @@ impl<'a, 'd> From<&'a reply::Error<'d>> for Reply<'a, 'd> {
             },
             _ => None,
         };
-        match error {
-            reply::Error::Driver(cause) => Self::Driver(cause),
-            reply::Error::Wait(error) => Self::Wait {
-                cause: error.cause(),
-                wake,
-            },
-            reply::Error::Admission { conn, cause, error } => Self::Admission {
-                conn,
-                cause,
-                error: error.cause(),
-                wake,
-            },
-            reply::Error::Open(cause) => Self::Open(cause),
-            reply::Error::Pinned(target) => Self::Pinned(target),
-            reply::Error::Server(cause) => Self::Server(cause.fields()),
+        Self {
+            kind: error.kind(),
+            wake,
         }
     }
 }

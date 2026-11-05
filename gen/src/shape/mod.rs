@@ -457,13 +457,6 @@ impl<'a> ReturnShape<'a> {
         })
     }
 
-    pub(super) fn parts(&self) -> Option<(&'a syn::Type, Return)> {
-        match self {
-            Self::Default => None,
-            Self::Explicit(explicit) => Some((explicit.row, explicit.kind.kind())),
-        }
-    }
-
     pub(super) fn is_unit(&self) -> bool {
         match self {
             Self::Default => true,

@@ -1,13 +1,11 @@
 use crate::backend;
 use crate::pred;
 use crate::pred::literal::Literal;
-use crate::pred::{layouts, sql, subquery};
+use crate::pred::sql;
 use crate::shape;
 use std::collections;
 
 use crate::ext::ExprExt as _;
-use layouts::ScopeLayout as _;
-use subquery::Subquery as _;
 use syn::ext::IdentExt as _;
 
 enum Operator {
@@ -258,21 +256,8 @@ impl Parsed {
     }
 }
 
-pub(crate) trait Expr {
-    fn has_column(&self, expr: &syn::Expr) -> bool;
-
-    fn parse(
-        &self,
-        expr: &syn::Expr,
-        params: Option<&[syn::Ident]>,
-        types: &[syn::Type],
-        dialect: &backend::Dialect,
-        cte_map: &collections::HashMap<String, syn::Path>,
-    ) -> syn::Result<Parsed>;
-}
-
-impl Expr for pred::RowScope {
-    fn has_column(&self, expr: &syn::Expr) -> bool {
+impl pred::RowScope {
+    pub(super) fn has_column(&self, expr: &syn::Expr) -> bool {
         if self.column_ref(expr).is_some() || self.unnest_ref(expr).is_some() {
             return true;
         }
@@ -294,7 +279,7 @@ impl Expr for pred::RowScope {
         false
     }
 
-    fn parse(
+    pub(crate) fn parse(
         &self,
         expr: &syn::Expr,
         params: Option<&[syn::Ident]>,

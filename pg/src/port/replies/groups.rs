@@ -190,7 +190,6 @@ pub(crate) struct Layout {
     groups: capacity::Count,
     records: array::Plan<group::Record, NonZero<usize>>,
     bytes: pool::Layout,
-    allocated_bytes: usize,
 }
 
 /// The exact admitted group partition and its original uninitialized backing.
@@ -234,7 +233,7 @@ impl Layout {
     }
 
     pub(crate) const fn allocated(self) -> usize {
-        self.allocated_bytes
+        self.bytes.bytes()
     }
 
     pub(crate) fn try_records(self) -> Result<Backing, alloc::Exhausted> {
@@ -255,12 +254,14 @@ impl Layout {
                     records: limits.records,
                 })?;
         let records = array::Plan::try_new(records).map_err(Error::GroupRecordsLayout)?;
-        let total = limits.active.get().checked_mul(limits.bytes.get()).ok_or(
-            Error::GroupBytesOverflow {
+        limits
+            .active
+            .get()
+            .checked_mul(limits.bytes.get())
+            .ok_or(Error::GroupBytesOverflow {
                 groups: limits.active,
                 bytes: limits.bytes,
-            },
-        )?;
+            })?;
         let bytes =
             pool::Layout::new(limits.active.get(), limits.bytes.get()).map_err(Error::GroupPool)?;
         Ok(Self {
@@ -268,7 +269,6 @@ impl Layout {
             groups,
             records,
             bytes,
-            allocated_bytes: total,
         })
     }
 }

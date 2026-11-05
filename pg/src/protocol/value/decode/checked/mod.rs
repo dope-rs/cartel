@@ -21,14 +21,10 @@ pub(crate) struct Row<'row, T: Fields> {
 }
 
 impl<'row, T: Fields> Row<'row, T> {
-    pub(crate) fn validate(bytes: Wire<'row>, columns: u16) -> Result<Self, crate::Error> {
+    pub(crate) fn validate(bytes: Wire<'row>, columns: u16) -> Result<(), crate::Error> {
         let mut reader = decode::RowReader::new(bytes, columns)?;
         T::decode(&mut reader)?;
-        reader.finish()?;
-        Ok(Self {
-            bytes: bytes.as_slice(),
-            fields: marker::PhantomData,
-        })
+        reader.finish()
     }
 
     /// # Safety
@@ -67,8 +63,7 @@ impl<A: Fields, B: Fields> Fields for (A, B) {
 impl Fields for bool {
     fn read<'row>(cursor: &mut Cursor<'row>) -> bool {
         // SAFETY: the closed field sequence validated a nonnull byte equal to zero or one.
-        let value = unsafe { *cursor.bytes.get_unchecked(4) };
-        cursor.bytes = unsafe { cursor.bytes.get_unchecked(5..) };
+        let [value] = unsafe { cursor.fixed() };
         value != 0
     }
 }
@@ -76,32 +71,14 @@ impl Fields for bool {
 impl Fields for i32 {
     fn read<'row>(cursor: &mut Cursor<'row>) -> i32 {
         // SAFETY: the closed field sequence validated this nonnull four-byte scalar.
-        let bytes = unsafe {
-            cursor
-                .bytes
-                .as_ptr()
-                .add(4)
-                .cast::<[u8; 4]>()
-                .read_unaligned()
-        };
-        cursor.bytes = unsafe { cursor.bytes.get_unchecked(8..) };
-        i32::from_be_bytes(bytes)
+        i32::from_be_bytes(unsafe { cursor.fixed() })
     }
 }
 
 impl Fields for i64 {
     fn read<'row>(cursor: &mut Cursor<'row>) -> i64 {
         // SAFETY: the closed field sequence validated this nonnull eight-byte scalar.
-        let bytes = unsafe {
-            cursor
-                .bytes
-                .as_ptr()
-                .add(4)
-                .cast::<[u8; 8]>()
-                .read_unaligned()
-        };
-        cursor.bytes = unsafe { cursor.bytes.get_unchecked(12..) };
-        i64::from_be_bytes(bytes)
+        i64::from_be_bytes(unsafe { cursor.fixed() })
     }
 }
 

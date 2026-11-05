@@ -325,10 +325,10 @@ impl<
     const N: usize,
 > Group<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, N>
 {
-    pub(in crate::api) fn from_outcome(
+    pub(in crate::api) fn new(
         client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         target: Option<api::Target<'d, ID>>,
-        next: api::Outcome<'d, ID, Ready<'g, 'r, 's, 'b, 'c, 'd, N>>,
+        next: Result<api::Pending<'d, Ready<'g, 'r, 's, 'b, 'c, 'd, N>>, crate::Error>,
     ) -> Self {
         let admit = Dispatch::new(client, target, next);
         let deadline = admit.deadline.guard();

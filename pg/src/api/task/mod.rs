@@ -119,11 +119,11 @@ where
     A: lease::Target<'d, ID>,
     P: lease::Policy,
 {
-    pub(super) fn from_outcome(
+    pub(super) fn new(
         client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         target: Option<api::Target<'d, ID>>,
         reply: R,
-        next: api::Outcome<'d, ID, S>,
+        next: Result<api::Pending<'d, S>, crate::Error>,
     ) -> Self {
         Self {
             admission: Dispatch::new(client, target, next),

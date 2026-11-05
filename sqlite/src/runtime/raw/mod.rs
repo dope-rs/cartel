@@ -112,11 +112,11 @@ impl Setup {
         unsafe {
             libsqlite3_sys::sqlite3_config(libsqlite3_sys::SQLITE_CONFIG_PCACHE2, &raw const cache);
         }
-        let hooks = raw::Hooks::new();
+        let hooks = raw::methods();
         // SAFETY: the same phase is retained; MALLOC copies this complete table by
         // value and returns SQLITE_OK without invoking its callbacks.
         unsafe {
-            libsqlite3_sys::sqlite3_config(libsqlite3_sys::SQLITE_CONFIG_MALLOC, hooks.as_ptr());
+            libsqlite3_sys::sqlite3_config(libsqlite3_sys::SQLITE_CONFIG_MALLOC, &raw const hooks);
         }
         let scope = raw::Foreign::enter();
         let code = unsafe { libsqlite3_sys::sqlite3_initialize() };

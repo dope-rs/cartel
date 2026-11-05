@@ -39,10 +39,6 @@ where
 
     pub fn try_collect(self) -> Result<Vec<T::Owned>, crate::Error> {
         let Self { mut bytes, len, .. } = self;
-        if len == 0 {
-            finish(bytes)?;
-            return Ok(Vec::new());
-        }
         let values = array::Block::<mem::MaybeUninit<T::Owned>, usize>::try_new(len, ())
             .map_err(crate::Error::Allocation)?
             .try_init(|_| T::__read(&mut bytes)?.__own())?;

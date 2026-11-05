@@ -22,7 +22,7 @@ fn rejects_wire() {
         TcpScript::with(
             |socket| auth::reject(socket, bytes),
             |server| {
-                let prepared = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+                let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
                     port::Port::<Queries>::plan(
                         Queries::try_config().expect("database configuration"),
                         Queries::try_cancel().expect("port configuration"),

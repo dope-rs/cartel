@@ -1,5 +1,4 @@
 use crate::pred::{self, cmp, expr, sql};
-use expr::Expr as _;
 use syn::spanned::Spanned as _;
 
 pub(super) enum Op<'a> {

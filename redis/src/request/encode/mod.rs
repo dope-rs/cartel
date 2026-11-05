@@ -27,7 +27,7 @@ pub struct Writer {
 #[derive(Clone, Copy)]
 struct Number(u64);
 
-trait Arguments {
+pub(crate) trait Arguments {
     const WIDTH: num::NonZero<usize>;
 
     fn values(&self) -> impl Iterator<Item = &[u8]>;
@@ -109,7 +109,7 @@ impl Encoder {
         out.complete()
     }
 
-    fn sequence<I, const P: usize>(
+    pub(crate) fn sequence<I, const P: usize>(
         self,
         prefix: &[&[u8]; P],
         declared: usize,
@@ -177,13 +177,7 @@ impl Length {
     }
 
     fn add(self, amount: usize) -> Result<Self, request::Error> {
-        self.0
-            .checked_add(amount)
-            .map(Self)
-            .ok_or(request::Error::Add {
-                left: self.0,
-                right: amount,
-            })
+        add_count(self.0, amount).map(Self)
     }
 
     pub(crate) const fn get(self) -> usize {
@@ -262,7 +256,7 @@ fn format_header_into(buffer: &mut [u8; 23], marker: u8, value: u64) -> &[u8] {
     &buffer[start..]
 }
 
-fn format_int_into(buffer: &mut [u8; 21], value: i64) -> &[u8] {
+pub(crate) fn format_int_into(buffer: &mut [u8; 21], value: i64) -> &[u8] {
     let [_, digits @ ..] = buffer;
     let mut start = write_digits(digits, value.unsigned_abs());
     if value < 0 {
@@ -273,7 +267,7 @@ fn format_int_into(buffer: &mut [u8; 21], value: i64) -> &[u8] {
     &buffer[start..]
 }
 
-fn format_uint_into(buffer: &mut [u8; 20], value: u64) -> &[u8] {
+pub(crate) fn format_uint_into(buffer: &mut [u8; 20], value: u64) -> &[u8] {
     let start = write_digits(buffer, value);
     &buffer[start..]
 }
@@ -291,7 +285,7 @@ fn write_digits(buffer: &mut [u8; 20], mut value: u64) -> usize {
     index
 }
 
-fn format_float(buffer: &mut ryu::Buffer, value: f64) -> &[u8] {
+pub(crate) fn format_float(buffer: &mut ryu::Buffer, value: f64) -> &[u8] {
     if value == 0.0 {
         return b"0";
     }

@@ -3,14 +3,11 @@ use crate::emit;
 use crate::parse::assign;
 use crate::plan;
 use crate::pred;
-use crate::pred::layouts;
 use crate::shape;
 use std::slice;
 
 use syn::spanned::Spanned as _;
 use syn::visit::{self, Visit as _};
-
-use layouts::ScopeLayout as _;
 
 use crate::ext::FnParamsExt as _;
 use crate::ext::SqlIdent as _;

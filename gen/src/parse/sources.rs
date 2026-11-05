@@ -5,21 +5,10 @@ use syn::{ext::IdentExt as _, spanned::Spanned as _};
 
 use crate::ext::ExprExt as _;
 use crate::ext::PathExt as _;
-use crate::parse;
-use parse::Shape as _;
 use shape::join;
 
-pub(crate) trait Source: Sized {
-    fn parse_chain(
-        expr: &syn::Expr,
-        cte_map: &collections::HashMap<String, syn::Path>,
-    ) -> syn::Result<(Self, Vec<syn::Ident>, syn::Expr)>;
-    fn parse_joins(expr: &syn::Expr) -> syn::Result<Self>;
-    fn parse_call(call: &syn::ExprCall) -> syn::Result<(syn::Path, syn::Ident, syn::Expr)>;
-}
-
-impl Source for shape::QuerySource {
-    fn parse_chain(
+impl shape::QuerySource {
+    pub(crate) fn parse_chain(
         expr: &syn::Expr,
         cte_map: &collections::HashMap<String, syn::Path>,
     ) -> syn::Result<(Self, Vec<syn::Ident>, syn::Expr)> {
@@ -163,7 +152,9 @@ impl Source for shape::QuerySource {
         }
     }
 
-    fn parse_call(call: &syn::ExprCall) -> syn::Result<(syn::Path, syn::Ident, syn::Expr)> {
+    pub(crate) fn parse_call(
+        call: &syn::ExprCall,
+    ) -> syn::Result<(syn::Path, syn::Ident, syn::Expr)> {
         let syn::Expr::Path(function) = call.func.as_ref() else {
             return Err(syn::Error::new(
                 call.func.span(),
@@ -207,16 +198,8 @@ impl Source for shape::QuerySource {
     }
 }
 
-pub(super) trait Conflict: Sized {
-    fn parse_shape(
-        expr: &syn::Expr,
-        cte_map: &collections::HashMap<String, syn::Path>,
-    ) -> syn::Result<(Self, shape::QueryShape)>;
-    fn parse_cols(arg: &syn::Ident, body: &syn::Expr) -> syn::Result<Vec<String>>;
-}
-
-impl Conflict for shape::Target {
-    fn parse_shape(
+impl shape::Target {
+    pub(super) fn parse_shape(
         expr: &syn::Expr,
         cte_map: &collections::HashMap<String, syn::Path>,
     ) -> syn::Result<(Self, shape::QueryShape)> {

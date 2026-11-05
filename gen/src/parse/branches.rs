@@ -5,18 +5,9 @@ use std::collections;
 use syn::spanned::Spanned as _;
 
 use crate::ext::ExprExt as _;
-use crate::parse::sources;
-use sources::Source as _;
 
-pub(super) trait Select: Sized {
-    fn parse_set(
-        expr: &syn::Expr,
-        cte_map: &collections::HashMap<String, syn::Path>,
-    ) -> syn::Result<shape::SetQuery>;
-}
-
-impl Select for shape::SelectBranch {
-    fn parse_set(
+impl shape::SelectBranch {
+    pub(super) fn parse_set(
         expr: &syn::Expr,
         cte_map: &collections::HashMap<String, syn::Path>,
     ) -> syn::Result<shape::SetQuery> {
@@ -65,12 +56,8 @@ impl Select for shape::SelectBranch {
     }
 }
 
-pub(crate) trait Qualifier {
-    fn peel<'a>(&mut self, expr: &'a syn::Expr) -> syn::Result<&'a syn::Expr>;
-}
-
-impl Qualifier for qualify::State {
-    fn peel<'a>(&mut self, expr: &'a syn::Expr) -> syn::Result<&'a syn::Expr> {
+impl qualify::State {
+    pub(crate) fn peel<'a>(&mut self, expr: &'a syn::Expr) -> syn::Result<&'a syn::Expr> {
         enum Method {
             Rows,
             Order(qualify::Dir),

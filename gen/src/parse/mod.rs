@@ -11,18 +11,8 @@ pub(super) mod branches;
 pub(super) mod ctes;
 pub(super) mod sources;
 
-use branches::{Qualifier as _, Select as _};
-use sources::{Conflict as _, Source as _};
-
-pub(super) trait Shape: Sized {
-    fn parse(
-        expr: &syn::Expr,
-        cte_map: &collections::HashMap<String, syn::Path>,
-    ) -> syn::Result<Self>;
-}
-
-impl Shape for shape::QueryShape {
-    fn parse(
+impl shape::QueryShape {
+    pub(crate) fn parse(
         expr: &syn::Expr,
         cte_map: &collections::HashMap<String, syn::Path>,
     ) -> syn::Result<Self> {

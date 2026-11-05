@@ -1,13 +1,7 @@
-use crate::parse::{branches, sources};
 use crate::plan;
 use crate::pred;
-use crate::pred::layouts;
 use crate::shape;
 use crate::shape::qualify;
-
-use branches::Qualifier as _;
-use layouts::ScopeLayout as _;
-use sources::Source as _;
 
 use crate::plan::read::{Filter, Project, Qualify, Select, join_parts};
 

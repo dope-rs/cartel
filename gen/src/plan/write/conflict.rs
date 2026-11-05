@@ -2,7 +2,6 @@ use crate::ext::SqlIdent as _;
 use crate::parse::assign;
 use crate::plan;
 use crate::pred;
-use crate::pred::layouts::ScopeLayout as _;
 use crate::shape;
 
 use std::slice;

@@ -41,7 +41,7 @@ where
             let login = cartel_pg::Config::new("user".into(), "password".into(), "database".into())
                 .expect("database credentials");
             let config = Database::config().expect("bounded PostgreSQL config");
-            let ready = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+            let ready = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
                 port::Port::<Database>::plan(login, config),
                 server.addr(),
                 Duration::from_millis(1),
@@ -130,7 +130,7 @@ fn collects_multiple_rows() {
             let login = cartel_pg::Config::new("user".into(), "password".into(), "database".into())
                 .expect("database credentials");
             let config = Database::config().expect("bounded PostgreSQL config");
-            let ready = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+            let ready = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
                 port::Port::<Database>::plan(login, config),
                 server.addr(),
                 Duration::from_millis(1),
@@ -231,7 +231,7 @@ fn owned_batch_failure() {
             let login = cartel_pg::Config::new("user".into(), "password".into(), "database".into())
                 .expect("database credentials");
             let config = Database::config().expect("bounded PostgreSQL config");
-            let ready = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+            let ready = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
                 port::Port::<Database>::plan(login, config),
                 server.addr(),
                 Duration::from_millis(1),

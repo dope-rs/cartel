@@ -1,25 +1,25 @@
-use crate::protocol::encode::{self, number};
+use crate::protocol::encode;
 
-fn wire_length(value: usize) -> Result<number::Length, encode::Error> {
+fn wire_length(value: usize) -> Result<i32, encode::Error> {
     const MAXIMUM: usize = i32::MAX as usize;
     if value > MAXIMUM {
         Err(encode::Error::ValueLength { actual: value })
     } else {
-        Ok(number::Length(value as i32))
+        Ok(value as i32)
     }
 }
 
-fn count32(value: usize) -> Result<number::Count32, encode::Error> {
+fn count32(value: usize) -> Result<i32, encode::Error> {
     const MAXIMUM: usize = i32::MAX as usize;
     if value > MAXIMUM {
         Err(encode::Error::ArrayElements { actual: value })
     } else {
-        Ok(number::Count32(value as i32))
+        Ok(value as i32)
     }
 }
 
 fn write_with_len(out: &mut encode::Writer<'_>, payload: &[u8]) -> Result<(), encode::Error> {
-    out.write_slices([&wire_length(payload.len())?.0.to_be_bytes(), payload])
+    out.write_slices([&wire_length(payload.len())?.to_be_bytes(), payload])
 }
 
 fn write_array(
@@ -36,7 +36,7 @@ fn write_array(
                 &1i32.to_be_bytes(),
                 &0i32.to_be_bytes(),
                 &element.to_be_bytes(),
-                &count.0.to_be_bytes(),
+                &count.to_be_bytes(),
                 &1i32.to_be_bytes(),
             ])?;
             write(out)
@@ -206,11 +206,7 @@ impl Data<'_, '_, '_> {
     pub fn write_jsonb(&mut self, value: &str) -> Result<(), encode::Error> {
         self.0.write(3802, 1, |out| {
             let len = value.len() + 1;
-            out.write_slices([
-                &wire_length(len)?.0.to_be_bytes(),
-                &[0x01],
-                value.as_bytes(),
-            ])
+            out.write_slices([&wire_length(len)?.to_be_bytes(), &[0x01], value.as_bytes()])
         })
     }
 

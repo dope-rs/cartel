@@ -1,6 +1,9 @@
 use crate::api::{Client, decode};
 use crate::client::nonempty;
-use crate::request::encode::write::{key, space, value::bits};
+use crate::request::encode::{
+    self,
+    write::{key, space},
+};
 use std::num;
 
 #[derive(Clone, Copy)]
@@ -10,29 +13,29 @@ pub struct Basic<C, const ID: u8 = 0>(pub(crate) C);
 impl<'d, C: Client<'d, ID>, const ID: u8> Basic<C, ID> {
     pub fn get(self, key: &[u8]) -> C::Call<decode::MaybeBytes> {
         self.0
-            .encode::<decode::MaybeBytes>(move |out| key::Writer::new(out).get(key))
+            .encode::<decode::MaybeBytes>(move |out| out.command(&[b"GET", key]))
     }
 
     pub fn set(self, key: &[u8], value: &[u8]) -> C::Call<()> {
         self.0
-            .encode::<()>(move |out| key::Writer::new(out).set(key, value))
+            .encode::<()>(move |out| out.command(&[b"SET", key, value]))
     }
 
     pub fn set_seconds(self, key: &[u8], value: &[u8], ttl: num::NonZero<u64>) -> C::Call<()> {
         let seconds = ttl.get();
         self.0
-            .encode::<()>(move |out| key::Writer::new(out).set_ex(key, value, seconds))
+            .encode::<()>(move |out| key::Writer::new(out).set_ttl(key, value, b"EX", seconds))
     }
 
     pub fn set_millis(self, key: &[u8], value: &[u8], ttl: num::NonZero<u64>) -> C::Call<()> {
         let millis = ttl.get();
         self.0
-            .encode::<()>(move |out| key::Writer::new(out).set_px(key, value, millis))
+            .encode::<()>(move |out| key::Writer::new(out).set_ttl(key, value, b"PX", millis))
     }
 
     pub fn set_absent(self, key: &[u8], value: &[u8]) -> C::Call<bool> {
         self.0
-            .encode::<bool>(move |out| key::Writer::new(out).set_nx(key, value))
+            .encode::<bool>(move |out| out.command(&[b"SET", key, value, b"NX"]))
     }
 
     pub fn del(self, keys: nonempty::Slice<'_, &[u8]>) -> C::Call<u64> {
@@ -54,17 +57,17 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Basic<C, ID> {
     pub fn exists(self, keys: nonempty::Slice<'_, &[u8]>) -> C::Call<u64> {
         let keys = keys.as_slice();
         self.0
-            .encode::<u64>(move |out| key::Writer::new(out).exists(keys))
+            .encode::<u64>(move |out| out.slices(&[b"EXISTS"], keys))
     }
 
     pub fn incr(self, key: &[u8]) -> C::Call<i64> {
         self.0
-            .encode::<i64>(move |out| key::Writer::new(out).incr(key))
+            .encode::<i64>(move |out| out.command(&[b"INCR", key]))
     }
 
     pub fn decr(self, key: &[u8]) -> C::Call<i64> {
         self.0
-            .encode::<i64>(move |out| key::Writer::new(out).decr(key))
+            .encode::<i64>(move |out| out.command(&[b"DECR", key]))
     }
 
     pub fn incr_by(self, key: &[u8], by: i64) -> C::Call<i64> {
@@ -84,14 +87,13 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Basic<C, ID> {
     }
 
     pub fn ttl(self, key: &[u8]) -> C::Call<i64> {
-        self.0
-            .encode::<i64>(move |out| space::Writer::new(out).ttl(key))
+        self.0.encode::<i64>(move |out| out.command(&[b"TTL", key]))
     }
 
     pub fn mget(self, keys: nonempty::Slice<'_, &[u8]>) -> C::Call<decode::Optional> {
         let keys = keys.as_slice();
         self.0
-            .encode::<decode::Optional>(move |out| key::Writer::new(out).mget(keys))
+            .encode::<decode::Optional>(move |out| out.slices(&[b"MGET"], keys))
     }
 
     pub fn mset(self, kv: nonempty::Slice<'_, (&[u8], &[u8])>) -> C::Call<()> {
@@ -126,24 +128,36 @@ pub struct Bits<C, const ID: u8 = 0>(pub(crate) C);
 impl<'d, C: Client<'d, ID>, const ID: u8> Bits<C, ID> {
     pub fn count(self, key: &[u8]) -> C::Call<u64> {
         self.0
-            .encode::<u64>(move |out| bits::Writer::new(out).count(key))
+            .encode::<u64>(move |out| out.command(&[b"BITCOUNT", key]))
     }
 
     /// Counts set bits in the inclusive byte range.
     pub fn count_range(self, key: &[u8], start: i64, end: i64) -> C::Call<u64> {
-        self.0
-            .encode::<u64>(move |out| bits::Writer::new(out).count_range(key, start, end))
+        self.0.encode::<u64>(move |out| {
+            let mut first = [0; 21];
+            let start = encode::format_int_into(&mut first, start);
+            let mut last = [0; 21];
+            let end = encode::format_int_into(&mut last, end);
+            out.command(&[b"BITCOUNT", key, start, end])
+        })
     }
 
     /// Sets one bit and returns its previous value.
     pub fn set(self, key: &[u8], offset: u64, value: bool) -> C::Call<decode::Changed> {
-        self.0
-            .encode::<decode::Changed>(move |out| bits::Writer::new(out).set(key, offset, value))
+        self.0.encode::<decode::Changed>(move |out| {
+            let mut buffer = [0; 20];
+            let offset = encode::format_uint_into(&mut buffer, offset);
+            let value: &[u8] = if value { b"1" } else { b"0" };
+            out.command(&[b"SETBIT", key, offset, value])
+        })
     }
 
     pub fn get(self, key: &[u8], offset: u64) -> C::Call<decode::Changed> {
-        self.0
-            .encode::<decode::Changed>(move |out| bits::Writer::new(out).get(key, offset))
+        self.0.encode::<decode::Changed>(move |out| {
+            let mut buffer = [0; 20];
+            let offset = encode::format_uint_into(&mut buffer, offset);
+            out.command(&[b"GETBIT", key, offset])
+        })
     }
 
     pub fn combine(
@@ -154,17 +168,18 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Bits<C, ID> {
     ) -> C::Call<u64> {
         let sources = sources.as_slice();
         self.0
-            .encode::<u64>(move |out| bits::Writer::new(out).combine(op.as_bytes(), dest, sources))
+            .encode::<u64>(move |out| out.slices(&[b"BITOP", op.as_bytes(), dest], sources))
     }
 
     pub fn not(self, dest: &[u8], source: &[u8]) -> C::Call<u64> {
         self.0
-            .encode::<u64>(move |out| bits::Writer::new(out).not(dest, source))
+            .encode::<u64>(move |out| out.command(&[b"BITOP", b"NOT", dest, source]))
     }
 
     pub fn position(self, key: &[u8], value: bool) -> C::Call<i64> {
-        self.0
-            .encode::<i64>(move |out| bits::Writer::new(out).position(key, value))
+        self.0.encode::<i64>(move |out| {
+            out.command(&[b"BITPOS", key, if value { b"1" } else { b"0" }])
+        })
     }
 }
 

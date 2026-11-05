@@ -1,6 +1,6 @@
 use crate::api::{Client, decode};
 use crate::client::nonempty;
-use crate::request::encode::write::value::hash;
+use crate::request::encode;
 use std::num;
 
 #[derive(Clone, Copy)]
@@ -15,14 +15,14 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Hashes<C, ID> {
 
     pub fn set(self, key: &[u8], field: &[u8], value: &[u8]) -> C::Call<decode::Changed> {
         self.0.encode::<decode::Changed>(move |out| {
-            hash::Writer::new(out).set(key, 1, [(field, value)].into_iter())
+            out.sequence(&[b"HSET", key], 1, [(field, value)].into_iter())
         })
     }
 
     pub fn set_many(self, key: &[u8], fv: nonempty::Slice<'_, (&[u8], &[u8])>) -> C::Call<u64> {
         let fv = fv.as_slice();
         self.0
-            .encode::<u64>(move |out| hash::Writer::new(out).set(key, fv.len(), fv.iter().copied()))
+            .encode::<u64>(move |out| out.sequence(&[b"HSET", key], fv.len(), fv.iter().copied()))
     }
 
     /// Encodes a repeatable field projection directly into its admitted frame.
@@ -36,7 +36,7 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Hashes<C, ID> {
         V: AsRef<[u8]>,
     {
         self.0
-            .encode::<u64>(move |out| hash::Writer::new(out).set(key, count.get(), pairs))
+            .encode::<u64>(move |out| out.sequence(&[b"HSET", key], count.get(), pairs))
     }
 
     pub fn values(
@@ -71,7 +71,10 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Hashes<C, ID> {
     }
 
     pub fn increment(self, key: &[u8], field: &[u8], by: i64) -> C::Call<i64> {
-        self.0
-            .encode::<i64>(move |out| hash::Writer::new(out).incr_by(key, field, by))
+        self.0.encode::<i64>(move |out| {
+            let mut buffer = [0; 21];
+            let by = encode::format_int_into(&mut buffer, by);
+            out.command(&[b"HINCRBY", key, field, by])
+        })
     }
 }

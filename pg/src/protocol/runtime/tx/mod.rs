@@ -1,6 +1,5 @@
 use crate::port::Disposition;
 use crate::port::{pool::access, replies};
-use crate::protocol::runtime::ready;
 use dope::core::driver::route;
 use dope::manifold::client::conn;
 use dope_fiber::context;
@@ -121,9 +120,5 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
             self.shared.wake_tx(id);
         }
         state
-    }
-
-    pub(crate) fn blocking(&self) -> ready::Blocking {
-        self.shared.ready.blocking()
     }
 }

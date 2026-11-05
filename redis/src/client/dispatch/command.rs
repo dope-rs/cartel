@@ -19,12 +19,6 @@ const _: () = {
         mem::size_of::<Pooled<'static, 'static, 'static, 'static, 'static, (), 0>>()
             == mem::size_of::<client::Redis<'static, 'static, 'static, 'static, 'static, (), 0>>()
     );
-    assert!(
-        mem::size_of::<Leased<'static, 'static, 'static, 'static, 'static, 'static, (), 0>>()
-            == mem::size_of::<
-                &mut schedule::Lease<'static, 'static, 'static, 'static, 'static, (), 0>,
-            >()
-    );
 };
 
 #[doc(hidden)]
@@ -32,23 +26,9 @@ pub struct Pooled<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>(
     client::Redis<'app, 's, 'b, 'c, 'd, B, ID>,
 );
 
-pub(in crate::client) struct Leased<'lease, 'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>(
-    &'lease mut schedule::Lease<'app, 's, 'b, 'c, 'd, B, ID>,
-);
-
 impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Pooled<'app, 's, 'b, 'c, 'd, B, ID> {
     pub(in crate::client) const fn new(redis: client::Redis<'app, 's, 'b, 'c, 'd, B, ID>) -> Self {
         Self(redis)
-    }
-}
-
-impl<'lease, 'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>
-    Leased<'lease, 'app, 's, 'b, 'c, 'd, B, ID>
-{
-    pub(in crate::client) const fn new(
-        lease: &'lease mut schedule::Lease<'app, 's, 'b, 'c, 'd, B, ID>,
-    ) -> Self {
-        Self(lease)
     }
 }
 
@@ -83,11 +63,13 @@ impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Target<'app, 's, 'b, '
         region: &mut region::Token<region::Identity<'d>>,
     ) -> Attempt<'d, Self, ID> {
         let redis = self.0;
-        let plan = schedule::Plan::new(&redis.port.schedule, region);
-        match plan.try_pool(frame, self, reply, |target, token| Committed {
-            target,
-            token,
-        }) {
+        match redis
+            .port
+            .schedule
+            .try_pool(region, frame, self, reply, |target, token| Committed {
+                target,
+                token,
+            }) {
             Ok(sent) => Attempt::Sent(sent),
             Err(schedule::Reject::Blocked {
                 cause: schedule::Block::Pool,
@@ -126,12 +108,12 @@ impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Target<'app, 's, 'b, '
 }
 
 impl<'lease, 'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Target<'app, 's, 'b, 'c, 'd, ID>
-    for Leased<'lease, 'app, 's, 'b, 'c, 'd, B, ID>
+    for &'lease mut schedule::Lease<'app, 's, 'b, 'c, 'd, B, ID>
 {
     type Provider = B;
 
     fn redis(&self) -> client::Redis<'app, 's, 'b, 'c, 'd, B, ID> {
-        self.0.redis()
+        schedule::Lease::redis(self)
     }
 
     fn try_admit(
@@ -140,13 +122,16 @@ impl<'lease, 'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Target<'app, '
         reply: &mut replies::Admitted<'app, 'b, 'c, 's, 'd, ID>,
         region: &mut region::Token<region::Identity<'d>>,
     ) -> Attempt<'d, Self, ID> {
-        let redis = self.0.redis();
-        let token = self.0.target();
-        let plan = schedule::Plan::new(&redis.port.schedule, region);
-        match plan.try_lease(frame, self, reply, token, |target, token| Committed {
-            target,
+        let redis = schedule::Lease::redis(self);
+        let token = self.target();
+        match redis.port.schedule.try_dispatch_lease(
+            region,
+            frame,
+            self,
+            reply,
             token,
-        }) {
+            |target, token| Committed { target, token },
+        ) {
             Ok(sent) => Attempt::Sent(sent),
             Err(schedule::Reject::Blocked {
                 cause,

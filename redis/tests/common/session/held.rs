@@ -1,13 +1,5 @@
-use std::{
-    pin,
-    task::Poll,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
-use dope_fiber::{
-    abi::{Fiber, PollFn, Task},
-    context,
-};
 use dope_test::harness::{
     GUARD,
     peer::{self, Stream},
@@ -35,45 +27,6 @@ pub fn pong_once(socket: &Stream<'_>) -> Result<(), Error> {
         return Err(Error::Request(buf));
     }
     socket.write_all(b"+PONG\r\n").map_err(Error::Peer)
-}
-
-pub struct Held<F>(pin::Pin<Box<Task<F>>>);
-
-impl<F> Held<F> {
-    pub fn poll_pending<'a, 'd: 'a>(&'a mut self) -> impl Fiber<'d, Output = bool> + 'a
-    where
-        F: Fiber<'d> + 'a,
-    {
-        PollFn::admitted(move |admit| Poll::Ready(admit.poll(self.0.as_mut()).0.is_pending()))
-    }
-}
-
-impl<'d, F> Fiber<'d> for Held<F>
-where
-    F: Fiber<'d>,
-{
-    type Output = F::Output;
-
-    fn poll(call: context::PollCall<'_, '_, 'd, Self>) -> Poll<Self::Output> {
-        let (this, admit) = call.into_admit();
-        admit.poll(this.get_mut().0.as_mut()).0
-    }
-}
-
-pub fn retain_after_pending<'a, 'd: 'a, F>(
-    fiber: F,
-) -> impl Fiber<'d, Output = (Held<F>, bool)> + 'a
-where
-    F: Fiber<'d> + 'a,
-{
-    let mut fiber = Some(Held(Box::pin(Task::new(fiber))));
-    PollFn::admitted(move |admit| {
-        let Some(mut child) = fiber.take() else {
-            return Poll::Pending;
-        };
-        let (poll, _) = admit.poll(child.0.as_mut());
-        Poll::Ready((child, poll.is_pending()))
-    })
 }
 
 pub fn first_request(

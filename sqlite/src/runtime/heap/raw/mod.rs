@@ -6,7 +6,7 @@ mod span;
 use std::{cell, cmp, mem, num, ptr};
 
 use heap::layout::Layout;
-pub(in crate::runtime) use hooks::{Foreign, Hooks};
+pub(in crate::runtime) use hooks::{Foreign, methods};
 pub(crate) use local::Local;
 use o3::{base::marker::ThreadBound, depot::array};
 pub(crate) use retained::Retained;

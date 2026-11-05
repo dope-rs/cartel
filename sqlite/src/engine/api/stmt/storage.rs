@@ -33,7 +33,7 @@ impl<I: catalogs::Catalog> Storage<I> {
         };
         let pointer = storage.units.as_ptr().cast::<stmt::Slot<'_>>();
         for index in 0..items {
-            unsafe { pointer.add(index).write(stmt::Slot::EMPTY) };
+            unsafe { pointer.add(index).write(None) };
         }
         Ok(storage)
     }
@@ -48,10 +48,10 @@ impl<I: catalogs::Catalog> Storage<I> {
     /// Reclaims statements left behind by a forgotten exclusive catalog owner.
     pub(crate) fn retire_all<'a>(&'a mut self, work: &'a work::Work) {
         for slot in self.slots() {
-            if let Some(prepared) = slot.statement.as_mut() {
+            if let Some(prepared) = slot.as_mut() {
                 prepared.work = work;
             }
-            slot.clear();
+            *slot = None;
         }
     }
 }

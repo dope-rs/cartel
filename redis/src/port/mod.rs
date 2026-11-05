@@ -148,6 +148,7 @@ impl<'b, 'd, const ID: u8> Activity<'b, 'd, ID> {
             }
             None => self.terminal.set(Some(err)),
         }
+        self.wake_all();
     }
 
     pub(super) fn wake_send(&self) {
@@ -156,10 +157,6 @@ impl<'b, 'd, const ID: u8> Activity<'b, 'd, ID> {
 
     pub(super) fn wake_lease(&self) {
         self.leases.notify();
-    }
-
-    pub(super) fn release(&self, _: reply::Released<'_>) {
-        self.wake_all();
     }
 
     pub(super) fn wake_all(&self) {

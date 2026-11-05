@@ -30,13 +30,10 @@ use crate::{
     port,
     protocol::parser::Parser,
 };
-mod control;
 mod pending;
 pub(super) use pending::Pending;
 pub(in crate::client) mod init;
 pub(in crate::client) mod reply;
-
-use control::Control;
 
 pub struct Logic<'s, 'd> {
     pub(in crate::client) codec: crate::protocol::Codec<'s, 'd>,
@@ -103,7 +100,13 @@ impl<'r, 's: 'r, 'storage: 'r, 'b: 'r, 'c: 'r, 'd: 'r, const ID: u8>
                 &mut Owner<'r, 's, 'storage, 'b, 'c, 'd, ID>,
                 &mut turns::Context<'_, '_, 'd, Self::ConnState, Self::Send, route::KeyTag<ID>>,
                 session::Input,
-            )| Control { port: owner.root() }.flush(ctx, input),
+            )| {
+                let port = owner.root();
+                match port.schedule.try_input(ctx.conn_id, input, ctx.region()) {
+                    Ok(()) => port.activity.wake_send(),
+                    Err(cause) => reply::fail(port, cause, ctx),
+                }
+            },
         ))
     }
 
@@ -133,7 +136,13 @@ impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, const ID: u8>
         reqs: &mut request::Requests<'_, '_, 'e, 'd, Self::Send, route::KeyTag<ID>>,
         _: &mut region::Token<region::Identity<'d, 1>>,
     ) {
-        Control { port: owner.root() }.drain(reqs);
+        let port = owner.root();
+        let token = reqs.connection();
+        let Err(cause) = port.schedule.drain(reqs) else {
+            return;
+        };
+        reqs.close(close::Directive::cut_retry(cause.close_reason()));
+        port.fail(token, cause, reqs.region());
     }
 }
 impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, const ID: u8>
@@ -149,7 +158,17 @@ impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, const ID: u8>
         owner: &Owner<'r, 's, 'storage, 'b, 'c, 'd, ID>,
         entry: &conn::Activation<'_, 'd, route::KeyTag<ID>>,
     ) -> app::Admission {
-        Control { port: owner.root() }.register(entry)
+        let port = owner.root();
+        match port.schedule.activate(entry) {
+            Ok(()) => app::Admission::Attached,
+            Err(reason) => {
+                port.activity
+                    .record_stop(port::Stop::Failed(client::Failure::from_close(
+                        reason.reason(),
+                    )));
+                app::Admission::Rejected(reason)
+            }
+        }
     }
 }
 impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, const ID: u8>
@@ -189,7 +208,7 @@ impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, const ID: u8>
         cause: opening::Exhaustion,
         _: &mut driver::Context<'_, 'd>,
     ) {
-        Control { port: owner.root() }.stop(port::Stop::Exhausted {
+        owner.root().activity.record_stop(port::Stop::Exhausted {
             key: key.id(),
             cause,
         });
@@ -277,7 +296,12 @@ impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, const ID: u8>
         _: &Self::ConnState,
         region: &mut region::Token<region::Identity<'d>>,
     ) -> app::Fence {
-        Control { port: owner.root() }.fence(conn, region)
+        use cartel_core::reply::order::Depth;
+
+        match owner.root().schedule.responses(conn) {
+            Some(reps) if reps.depth(region) != Depth::ZERO => app::Fence::Pending,
+            Some(_) | None => app::Fence::Ready,
+        }
     }
 }
 impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, const ID: u8>
@@ -314,7 +338,11 @@ impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, const ID: u8>
             region::Token<region::Identity<'d, 1>>,
         ),
     ) {
-        Control { port: owner.root() }.park(work, &mut region.0);
+        let port = owner.root();
+        if let Some(_released) = port.schedule.maintain(work, &mut region.0) {
+            port.activity.wake_all();
+        }
+        port.activity.flush(work);
     }
     fn shutdown(owner: &mut Owner<'r, 's, 'storage, 'b, 'c, 'd, ID>) {
         owner.root().activity.wake_all();
@@ -324,7 +352,14 @@ impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, const ID: u8>
         _: &region::Token<region::Identity<'d>>,
         _clock: clock::Clock<'_, 'd>,
     ) -> Progress<'d> {
-        Control { port: owner.root() }.progress()
+        use cartel_core::reply::Work;
+
+        let port = owner.root();
+        match port.schedule.work() {
+            Work::Pending => Progress::Runnable,
+            Work::Idle if port.activity.is_pending() => Progress::Runnable,
+            Work::Idle => Progress::Quiescent,
+        }
     }
     fn inbound(
         owner: &Owner<'r, 's, 'storage, 'b, 'c, 'd, ID>,
@@ -333,7 +368,16 @@ impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, const ID: u8>
         base: Positive,
         region: &mut region::Token<region::Identity<'d>>,
     ) -> app::Inbound {
-        Control { port: owner.root() }.inbound(conn, state, base, region)
+        use crate::protocol::Phase;
+        use cartel_core::reply::order::Depth;
+
+        match state.phase() {
+            Phase::Init(_) => app::Inbound::Awaiting(base),
+            Phase::Offline | Phase::Ready => match owner.root().schedule.responses(conn) {
+                Some(reps) if reps.depth(region) != Depth::ZERO => app::Inbound::Awaiting(base),
+                Some(_) | None => app::Inbound::Quiescent,
+            },
+        }
     }
 }
 
@@ -351,7 +395,19 @@ impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, const ID: u8>
         conn: conn::Id<'d, route::KeyTag<ID>>,
         state: &mut <Self::Codec as codec::Stateful>::State<'d>,
     ) -> session::Blocking {
-        Control { port: owner.root() }.blocked(conn, state)
+        let port = owner.root();
+        if let Some(target) = port.schedule.routes.target(conn) {
+            match state.builder.access.wait(conn, target) {
+                Ok(()) => session::Blocking::Registered,
+                Err(cause) => {
+                    port.activity
+                        .record_stop(port::Stop::Failed(client::Failure::ParserWait(cause)));
+                    session::Blocking::Unsupported
+                }
+            }
+        } else {
+            session::Blocking::Unsupported
+        }
     }
 
     fn decode<S>(

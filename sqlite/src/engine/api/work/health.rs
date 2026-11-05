@@ -25,17 +25,6 @@ impl Health {
         }
     }
 
-    /// A new owner can reopen an empty poisoned state; retained errors remain closed.
-    pub(super) fn reset(&self) {
-        let native = self.native.take();
-        let cleanup = self.cleanup.take();
-        if native.is_none() && cleanup.is_none() {
-            self.mode.set(Mode::Healthy);
-        }
-        self.native.set(native);
-        self.cleanup.set(cleanup);
-    }
-
     pub(super) fn check(&self) -> Result<(), crate::Error> {
         match self.mode.get() {
             Mode::Healthy => Ok(()),

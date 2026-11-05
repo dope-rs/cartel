@@ -46,7 +46,6 @@ impl<'a, 'connection> Controls<'a, 'connection> {
         unsafe {
             slots
                 .get_unchecked_mut(control.index())
-                .statement
                 .as_mut_slice()
                 .get_unchecked_mut(0)
         }

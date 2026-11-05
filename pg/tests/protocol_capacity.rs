@@ -82,7 +82,7 @@ fn header_rejects_oversize() {
 #[test]
 fn bind_failures_recover() {
     TcpScript::with(Bind::serve, |server| {
-        let prepared = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+        let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
             port::Port::<Bind>::plan(
                 Queries::try_config().expect("database credentials"),
                 Database::config().expect("one request frame"),

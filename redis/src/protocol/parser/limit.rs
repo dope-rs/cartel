@@ -123,11 +123,7 @@ impl Bound<Frame> {
     }
 
     pub(super) fn line(self, line: Line<'_>) -> Result<(End, Body), Exceeded<Frame>> {
-        let last = line.end() - 1;
-        if last >= self.value.get() {
-            return Err(self.exceeded(last as u64, false));
-        }
-        let end = End(num::NonZero::<u32>::MIN.saturating_add(last as u32));
+        let end = self.next(line.stop() + 1)?;
         let body = Body::new(line.start, line.stop() as u32);
         Ok((end, body))
     }
@@ -247,10 +243,6 @@ impl<'a> Line<'a> {
 
     pub(super) const fn value(self) -> &'a [u8] {
         self.value
-    }
-
-    pub(super) const fn end(self) -> usize {
-        self.stop() + 2
     }
 
     const fn stop(self) -> usize {

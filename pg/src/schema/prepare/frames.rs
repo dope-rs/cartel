@@ -63,24 +63,6 @@ const fn parse_message_len(name: &str, sql: &str, oids: &[u32]) -> Result<usize,
     Ok(len)
 }
 
-const fn describe_message_len(name: &str) -> Result<usize, encode::Error> {
-    if let Some(position) = schema::nul(name) {
-        return Err(encode::Error::StatementNameNul { position });
-    }
-    let name = match add(encode::Scope::Frame, name.len(), 1) {
-        Ok(name) => name,
-        Err(error) => return Err(error),
-    };
-    let len = match add(encode::Scope::Frame, 5, name) {
-        Ok(len) => len,
-        Err(error) => return Err(error),
-    };
-    if len > i32::MAX as usize {
-        return Err(encode::Error::FrameLength { actual: len });
-    }
-    Ok(len)
-}
-
 pub(super) const fn statement_lengths(
     name: &str,
     sql: &str,
@@ -90,26 +72,13 @@ pub(super) const fn statement_lengths(
         Ok(parse) => parse,
         Err(error) => return Err(error),
     };
-    let describe = match describe_message_len(name) {
-        Ok(describe) => describe,
-        Err(error) => return Err(error),
-    };
-    let wire = match add(encode::Scope::Preparation, 1, parse) {
-        Ok(wire) => wire,
-        Err(error) => return Err(error),
-    };
-    let wire = match add(encode::Scope::Preparation, wire, 1) {
-        Ok(wire) => wire,
-        Err(error) => return Err(error),
-    };
-    let wire = match add(encode::Scope::Preparation, wire, describe) {
-        Ok(wire) => wire,
-        Err(error) => return Err(error),
-    };
+    // Parse already admits the name and n + sql.len() + 4 * oids.len() + 8 <= i32::MAX.
+    // Describe is n + 6 <= parse - 2, so both frames plus tags fit 2 * i32::MAX.
+    let describe = name.len() + 6;
     Ok(Lengths {
         parse: parse as i32,
         describe: describe as i32,
-        wire,
+        wire: parse + describe + 2,
     })
 }
 

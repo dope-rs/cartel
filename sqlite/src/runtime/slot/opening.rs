@@ -27,7 +27,10 @@ impl<'slot, 'd, I: catalogs::Catalog> Opening<'slot, 'd, I> {
     }
 
     pub(crate) fn authorize(&self) {
-        work::Hook::new(self.held.value.work()).authorizer(self.held.lease.connection)
+        self.held
+            .value
+            .work()
+            .authorizer(self.held.lease.connection)
     }
 
     pub(crate) fn install(&mut self) -> Result<(), crate::Error> {

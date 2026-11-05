@@ -1,32 +1,11 @@
-use crate::parse::sources;
 use crate::pred;
-use crate::pred::{expr, layouts, sql};
+use crate::pred::sql;
 use crate::shape;
 
 use syn::spanned::Spanned as _;
 
-use expr::Expr as _;
-use layouts::ScopeLayout as _;
-use sources::Source as _;
-
-pub(super) trait Subquery {
-    fn exists(
-        &self,
-        input: &syn::Expr,
-        negate: bool,
-        context: &pred::WhereContext<'_>,
-    ) -> syn::Result<sql::Sql>;
-
-    fn scalar_agg(
-        &self,
-        input: &syn::ExprCall,
-        kind: &shape::Aggregation,
-        context: &pred::WhereContext<'_>,
-    ) -> syn::Result<sql::Sql>;
-}
-
-impl Subquery for pred::RowScope {
-    fn exists(
+impl pred::RowScope {
+    pub(super) fn exists(
         &self,
         input: &syn::Expr,
         negate: bool,
@@ -58,7 +37,7 @@ impl Subquery for pred::RowScope {
         Ok(out)
     }
 
-    fn scalar_agg(
+    pub(super) fn scalar_agg(
         &self,
         input: &syn::ExprCall,
         kind: &shape::Aggregation,

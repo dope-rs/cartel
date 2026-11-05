@@ -92,10 +92,6 @@ impl Pending {
         }
     }
 
-    pub(crate) fn reset(&self) {
-        self.0.set(NONE);
-    }
-
     /// Existing scopes cannot schedule more work after cleanup has lost its native depth.
     pub(in crate::engine::api::work) fn fail(&self) {
         self.0.set(FAILED);

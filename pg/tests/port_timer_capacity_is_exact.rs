@@ -44,7 +44,7 @@ fn timer_capacity_is_exact() {
     let config = config::Config::new(capacity);
     let config = config.expect("valid pg configuration");
     let ((), events) = {
-        let prepared = topology::Prepare::try_new::<Env>(
+        let prepared = topology::try_new::<_, Env>(
             port::Port::<Database>::plan(Queries::try_config().expect("database config"), config),
             SocketAddr::from(([127, 0, 0, 1], 0)),
             Duration::from_millis(1),
@@ -135,7 +135,7 @@ fn typed_queries_free_timer() {
         |server| {
             let login = cartel_pg::Config::new("user".into(), "password".into(), "database".into())
                 .expect("database credentials");
-            let prepared = topology::Prepare::try_new::<Env>(
+            let prepared = topology::try_new::<_, Env>(
                 port::Port::<Database>::plan(login, Database::config().expect("database config")),
                 server.addr(),
                 Duration::from_millis(1),

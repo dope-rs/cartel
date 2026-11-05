@@ -102,7 +102,7 @@ impl<'a> Reply<'a> {
                 }
             }
             kind => {
-                let Some((row_ty, actual)) = output.parts() else {
+                let shape::ReturnShape::Explicit(explicit) = output else {
                     return Err(syn::Error::new(
                         self.0.return_type.span(),
                         format!(
@@ -112,9 +112,10 @@ impl<'a> Reply<'a> {
                         ),
                     ));
                 };
+                let actual = explicit.kind();
                 if actual != kind.expected() {
                     return Err(syn::Error::new(
-                        row_ty.span(),
+                        explicit.row().span(),
                         format!(
                             "return type {} does not match `.returning_{}()`; expected {}",
                             actual.syntax(),
@@ -123,12 +124,6 @@ impl<'a> Reply<'a> {
                         ),
                     ));
                 }
-                let shape::ReturnShape::Explicit(explicit) = output else {
-                    return Err(syn::Error::new(
-                        self.0.return_type.span(),
-                        "RETURNING requires an explicit output",
-                    ));
-                };
                 let (output, row, actual) = explicit.into_parts();
                 let dispatch = match actual {
                     shape::RowReturn::Plain => emit::Kind::One(row.clone()),

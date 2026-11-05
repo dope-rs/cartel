@@ -18,14 +18,6 @@ impl Writer {
         self.float(b"ZADD", key, score, member)
     }
 
-    pub(crate) fn remove(
-        self,
-        key: &[u8],
-        members: &[&[u8]],
-    ) -> Result<encode::Complete, crate::request::Error> {
-        self.0.slices(&[b"ZREM", key], members)
-    }
-
     pub(crate) fn range(
         self,
         key: &[u8],
@@ -73,34 +65,6 @@ impl Writer {
         let mut upper = ryu::Buffer::new();
         let max = encode::format_float(&mut upper, max);
         self.0.command(&[b"ZRANGEBYSCORE", key, min, max])
-    }
-
-    pub(crate) fn rank(
-        self,
-        key: &[u8],
-        member: &[u8],
-    ) -> Result<encode::Complete, crate::request::Error> {
-        self.0.command(&[b"ZRANK", key, member])
-    }
-
-    pub(crate) fn rev_rank(
-        self,
-        key: &[u8],
-        member: &[u8],
-    ) -> Result<encode::Complete, crate::request::Error> {
-        self.0.command(&[b"ZREVRANK", key, member])
-    }
-
-    pub(crate) fn score(
-        self,
-        key: &[u8],
-        member: &[u8],
-    ) -> Result<encode::Complete, crate::request::Error> {
-        self.0.command(&[b"ZSCORE", key, member])
-    }
-
-    pub(crate) fn len(self, key: &[u8]) -> Result<encode::Complete, crate::request::Error> {
-        self.0.command(&[b"ZCARD", key])
     }
 
     pub(crate) fn incr_by(

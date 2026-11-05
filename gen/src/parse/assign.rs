@@ -1,6 +1,5 @@
 use crate::backend;
 use crate::pred;
-use crate::pred::expr::Expr as _;
 use crate::pred::sql;
 use std::collections;
 use syn::spanned::Spanned as _;

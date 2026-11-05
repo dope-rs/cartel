@@ -18,7 +18,6 @@ impl backend::Backend for Backend {
     fn dialect() -> backend::Dialect {
         backend::Dialect {
             rt_crate: syn::parse_quote! { ::cartel_sqlite },
-            placeholder: backend::Placeholder::Question,
             kind: backend::Kind::Sqlite,
         }
     }

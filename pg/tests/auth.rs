@@ -136,7 +136,7 @@ fn authenticates_peers() {
         let login = cartel_pg::Config::new("user".into(), password.into(), "database".into())
             .expect("valid PostgreSQL credentials");
         let ((), events) = {
-            let prepared = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+            let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
                 port::Port::<Queries>::plan(login, limits),
                 address,
                 Duration::from_millis(1),

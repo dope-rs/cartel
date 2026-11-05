@@ -1,12 +1,9 @@
 use crate::emit;
 use crate::plan;
 use crate::pred;
-use crate::pred::layouts;
 use crate::shape;
 
 use syn::spanned::Spanned as _;
-
-use layouts::ScopeLayout as _;
 
 use crate::plan::read::{Filter, Qualify, Select, join_parts};
 

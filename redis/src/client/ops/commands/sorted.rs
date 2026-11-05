@@ -16,7 +16,7 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Sorted<C, ID> {
     pub fn remove(self, key: &[u8], members: nonempty::Slice<'_, &[u8]>) -> C::Call<u64> {
         let members = members.as_slice();
         self.0
-            .encode::<u64>(move |out| sorted::Writer::new(out).remove(key, members))
+            .encode::<u64>(move |out| out.slices(&[b"ZREM", key], members))
     }
 
     pub fn range(self, key: &[u8], start: i64, stop: i64) -> C::Call<decode::Bulks> {
@@ -55,23 +55,22 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Sorted<C, ID> {
 
     pub fn rank(self, key: &[u8], member: &[u8]) -> C::Call<Option<u64>> {
         self.0
-            .encode::<Option<u64>>(move |out| sorted::Writer::new(out).rank(key, member))
+            .encode::<Option<u64>>(move |out| out.command(&[b"ZRANK", key, member]))
     }
 
     pub fn reverse_rank<M: AsRef<[u8]>>(self, key: &[u8], member: M) -> C::Call<Option<u64>> {
-        self.0.encode::<Option<u64>>(move |out| {
-            sorted::Writer::new(out).rev_rank(key, member.as_ref())
-        })
+        self.0
+            .encode::<Option<u64>>(move |out| out.command(&[b"ZREVRANK", key, member.as_ref()]))
     }
 
     pub fn score(self, key: &[u8], member: &[u8]) -> C::Call<Option<f64>> {
         self.0
-            .encode::<Option<f64>>(move |out| sorted::Writer::new(out).score(key, member))
+            .encode::<Option<f64>>(move |out| out.command(&[b"ZSCORE", key, member]))
     }
 
     pub fn len(self, key: &[u8]) -> C::Call<u64> {
         self.0
-            .encode::<u64>(move |out| sorted::Writer::new(out).len(key))
+            .encode::<u64>(move |out| out.command(&[b"ZCARD", key]))
     }
 
     pub fn increment(self, key: &[u8], by: f64, member: &[u8]) -> C::Call<f64> {

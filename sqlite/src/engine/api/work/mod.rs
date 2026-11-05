@@ -38,9 +38,6 @@ impl Work {
 
     pub(crate) fn reset(&self) {
         self.meter.reset();
-        self.health.reset();
-        self.pending.reset();
-        self.depth.reset();
     }
 
     fn fail_cleanup(&self) -> Failed<'_> {
@@ -76,30 +73,6 @@ impl Work {
     pub(crate) fn take_errors(&self) -> Option<(crate::Error, Option<crate::Error>)> {
         self.health.take()
     }
-}
-
-impl Failed<'_> {
-    fn retain(self, error: crate::Error) {
-        self.0.health.cleanup(error);
-    }
-}
-
-const _: () = assert!(mem::size_of::<Work>() <= 11 * mem::size_of::<usize>());
-
-pub(crate) struct Hook<'a>(&'a work::Work);
-
-impl<'a> Hook<'a> {
-    pub(crate) fn new(work: &'a work::Work) -> Self {
-        Self(work)
-    }
-
-    fn tick(&self) -> Tick {
-        self.0.meter.tick()
-    }
-
-    fn as_ptr(&self) -> *mut std::ffi::c_void {
-        ptr::from_ref(self.0).cast_mut().cast()
-    }
 
     pub(crate) fn progress(&self, db: &sys::Connection, interval: i32) {
         unsafe {
@@ -107,7 +80,7 @@ impl<'a> Hook<'a> {
                 db.as_ptr(),
                 interval,
                 Some(progress),
-                self.as_ptr(),
+                ptr::from_ref(self).cast_mut().cast(),
             );
         }
     }
@@ -117,7 +90,11 @@ impl<'a> Hook<'a> {
     /// advisory statement expiration cannot allocate or invoke callbacks.
     pub(crate) fn authorizer(&self, db: &sys::Connection) {
         unsafe {
-            libsqlite3_sys::sqlite3_set_authorizer(db.as_ptr(), Some(authorize), self.as_ptr());
+            libsqlite3_sys::sqlite3_set_authorizer(
+                db.as_ptr(),
+                Some(authorize),
+                ptr::from_ref(self).cast_mut().cast(),
+            );
         }
     }
 
@@ -128,9 +105,17 @@ impl<'a> Hook<'a> {
     }
 }
 
+impl Failed<'_> {
+    fn retain(self, error: crate::Error) {
+        self.0.health.cleanup(error);
+    }
+}
+
+const _: () = assert!(mem::size_of::<Work>() <= 11 * mem::size_of::<usize>());
+
 unsafe extern "C" fn progress(context: *mut std::ffi::c_void) -> std::ffi::c_int {
-    let hook = Hook(unsafe { &*context.cast() });
-    match hook.tick() {
+    let work = unsafe { &*context.cast::<work::Work>() };
+    match work.meter.tick() {
         Tick::Continue => 0,
         Tick::Stop => 1,
     }

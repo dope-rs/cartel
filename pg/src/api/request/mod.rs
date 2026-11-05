@@ -2,7 +2,6 @@ pub(in crate::api) mod stateful;
 
 use crate::api::{sql, tx};
 use crate::port::replies;
-use crate::protocol::runtime::ready::Blocking;
 use crate::{api, port, protocol, schema};
 use api::task::{group, tx::Reserve};
 use cartel_core::reply::recv::attach::Attach;
@@ -237,11 +236,9 @@ impl<'d> Pending<'d> {
         }
         let shared = &client.port.shared;
         let Some(hold) = Reserve::acquire(client, region) else {
-            return match shared.transaction().blocking() {
-                Blocking::Held(count) => {
-                    api::TxOutcome::Failed(client.port.backpressure(count).into())
-                }
-                Blocking::Clear => api::TxOutcome::NoConn { request: req },
+            return match shared.ready.blocking() {
+                Some(count) => api::TxOutcome::Failed(client.port.backpressure(count).into()),
+                None => api::TxOutcome::NoConn { request: req },
             };
         };
         let conn = hold.sink().connection();

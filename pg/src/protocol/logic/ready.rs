@@ -181,8 +181,7 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                 self.push(data)
             }
             messages::Be::NOTIFICATION_RESPONSE => {
-                payloads::Plan::decode(data)?
-                    .retain(&self.port.shared.notifications, self.region)?;
+                payloads::notification(data, &self.port.shared.notifications, self.region)?;
                 Ok(None)
             }
             messages::Be::READY_FOR_QUERY => {

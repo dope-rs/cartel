@@ -22,7 +22,10 @@ use dope::{
     manifold::{app::env::Bundle, timing::Throughput},
     net::{tcp::Tcp, wire::Identity},
 };
-use dope_fiber::{BlockOn, abi::Join};
+use dope_fiber::{
+    BlockOn,
+    abi::{Join, Task},
+};
 use dope_test::{
     fibers,
     harness::{GUARD, peer::AcceptScript},
@@ -648,11 +651,11 @@ fn waiter_slot_reclaims() {
                                         mem::size_of_val(&wait),
                                         6 * mem::size_of::<usize>()
                                     );
-                                    let result =
-                                        BlockOn::block_on(&mut rt, retain_after_pending(wait));
-                                    let (held, waits) = result.expect("poll original waiter");
+                                    let mut held = Box::pin(Task::new(wait));
                                     assert!(
-                                        waits,
+                                        rt.block_on(fibers::TEST.poll_once(held.as_mut()))
+                                            .expect("poll original waiter")
+                                            .is_none(),
                                         "readiness completed before the gated handshake"
                                     );
 
@@ -664,14 +667,17 @@ fn waiter_slot_reclaims() {
                                     ));
 
                                     drop(held);
-                                    let result = BlockOn::block_on(
-                                        &mut rt,
-                                        retain_after_pending(redis.wait_active()),
+                                    let mut wait = Box::pin(Task::new(redis.wait_active()));
+                                    assert!(
+                                        rt.block_on(fibers::TEST.poll_once(wait.as_mut()))
+                                            .expect("poll replacement waiter")
+                                            .is_none(),
+                                        "replacement waiter was not registered"
                                     );
-                                    let (wait, waits) = result.expect("poll replacement waiter");
-                                    assert!(waits, "replacement waiter was not registered");
                                     assert!(allow.send(()).is_ok(), "release AUTH response");
-                                    assert!(matches!(BlockOn::block_on(&mut rt, wait), Ok(Ok(()))));
+                                    let result = rt.block_on(wait.as_mut());
+                                    drop(wait);
+                                    assert!(matches!(result, Ok(Ok(()))));
                                     assert!(stop.send(()).is_ok(), "finish active connection");
                                 })
                             })
@@ -759,28 +765,39 @@ fn parser_lane_waits_for_retained_replies() {
                                     .ok()
                                     .expect("first retained array");
                                 assert!(held.iter().eq([b"one".as_slice(), b"uno".as_slice()]));
-                                let (mut second, waits) = rt
-                                    .block_on(retain_after_pending(redis.sets().members(b"set")))
-                                    .expect("submit second array");
-                                assert!(waits);
+                                let mut second = Box::pin(Task::new(redis.sets().members(b"set")));
+                                assert!(
+                                    rt.block_on(fibers::TEST.poll_once(second.as_mut()))
+                                        .expect("submit second array")
+                                        .is_none()
+                                );
                                 fibers::TEST
                                     .try_pause(&mut rt, Duration::from_millis(20))
                                     .expect("retain the second decoded reply");
-                                let (mut third, waits) = rt
-                                    .block_on(retain_after_pending(redis.sets().members(b"set")))
-                                    .expect("submit third array");
-                                assert!(waits);
+                                let mut third = Box::pin(Task::new(redis.sets().members(b"set")));
+                                assert!(
+                                    rt.block_on(fibers::TEST.poll_once(third.as_mut()))
+                                        .expect("submit third array")
+                                        .is_none()
+                                );
                                 fibers::TEST
                                     .try_pause(&mut rt, Duration::from_millis(20))
                                     .expect("drive parser backpressure");
                                 assert!(
-                                    rt.block_on(second.poll_pending()).expect("second pending")
+                                    rt.block_on(fibers::TEST.poll_once(second.as_mut()))
+                                        .expect("second pending")
+                                        .is_none()
                                 );
-                                assert!(rt.block_on(third.poll_pending()).expect("third pending"));
+                                assert!(
+                                    rt.block_on(fibers::TEST.poll_once(third.as_mut()))
+                                        .expect("third pending")
+                                        .is_none()
+                                );
                                 drop(held);
                                 {
-                                    let values = fibers::TEST
-                                        .try_run(&mut rt, second)
+                                    let values = fibers::TEST.try_run(&mut rt, second.as_mut());
+                                    drop(second);
+                                    let values = values
                                         .expect("resume second array")
                                         .ok()
                                         .expect("second reply preserves its connection");
@@ -788,13 +805,15 @@ fn parser_lane_waits_for_retained_replies() {
                                         values.iter().eq([b"two".as_slice(), b"dos".as_slice()])
                                     );
                                     assert!(
-                                        rt.block_on(third.poll_pending())
+                                        rt.block_on(fibers::TEST.poll_once(third.as_mut()))
                                             .expect("third waits for credit")
+                                            .is_none()
                                     );
                                 }
                                 {
-                                    let values = fibers::TEST
-                                        .try_run(&mut rt, third)
+                                    let values = fibers::TEST.try_run(&mut rt, third.as_mut());
+                                    drop(third);
+                                    let values = values
                                         .expect("resume third array")
                                         .ok()
                                         .expect("third reply preserves FIFO");

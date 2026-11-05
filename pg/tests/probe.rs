@@ -45,7 +45,7 @@ fn probe_step_by_step() {
     let settings = settings.expect("port config");
 
     let ((), events) = {
-        let prepared = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+        let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
             port::Port::<Probe>::plan(
                 input.try_config().expect("PostgreSQL credentials"),
                 settings,

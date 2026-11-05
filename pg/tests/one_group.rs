@@ -47,7 +47,7 @@ fn deadline_keeps_results() {
             config::Config::with_window(config.capacities(), Positive::from_millis::<50>())
                 .and_then(|timed| timed.with_groups(config.groups().expect("group limits")))
                 .expect("bounded group deadline");
-        let prepared = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+        let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
             port::Port::<Database>::plan(Queries::try_config().expect("credentials"), config),
             server.addr(),
             Duration::from_millis(1),
@@ -99,7 +99,7 @@ fn rows_outlive_group() {
             group::resume_ready(socket)
         },
         |server| {
-            let prepared = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+            let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
                 port::Port::<Database>::plan(
                     Queries::try_config().expect("credentials"),
                     Queries::try_groups(
@@ -194,7 +194,7 @@ fn rows_outlive_group() {
 #[test]
 fn errors_survive_finish() {
     TcpScript::with(group::transaction, |server| {
-        let prepared = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+        let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
             port::Port::<Database>::plan(
                 Queries::try_config().expect("credentials"),
                 Queries::try_groups(
@@ -248,7 +248,7 @@ fn errors_survive_finish() {
 #[test]
 fn sync_keeps_commands() {
     TcpScript::with(group::late_error, |server| {
-        let prepared = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+        let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
             port::Port::<Database>::plan(
                 Queries::try_config().expect("credentials"),
                 Queries::try_groups(
@@ -296,7 +296,7 @@ fn classify_error_scope() {
         TcpScript::with(
             |socket| group::classified(socket, detail, ready),
             |server| {
-                let prepared = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+                let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
                     port::Port::<Database>::plan(
                         Queries::try_config().expect("credentials"),
                         Queries::try_groups(
@@ -387,7 +387,7 @@ fn capacity_keeps_error() {
             } else {
                 (3, COMMAND_ERROR.len())
             };
-            let prepared = topology::Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+            let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
                 port::Port::<Database>::plan(
                     Queries::try_config().expect("credentials"),
                     Queries::try_groups(

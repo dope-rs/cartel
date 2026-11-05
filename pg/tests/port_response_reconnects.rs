@@ -54,7 +54,7 @@ fn failed_reconnect_preserves_healthy_connection() {
         .capacities();
     capacity.connections = 2;
     let config = config::Config::new(capacity).expect("two connection capacity");
-    let prepared = topology::Prepare::try_new::<Env>(
+    let prepared = topology::try_new::<_, Env>(
         port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config),
         addr,
         Duration::from_millis(1),
@@ -142,7 +142,8 @@ fn stalled_partial_reconnects_idle_connection() {
             Positive::from_secs::<2>(),
         )
         .expect("PostgreSQL admission deadline");
-        let prepared = topology::Prepare::try_new::<
+        let prepared = topology::try_new::<
+            _,
             Bundle<Tcp, Identity, Throughput, postgres::retire::ShortIdle>,
         >(
             port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config),
@@ -199,7 +200,7 @@ fn unsolicited_partial_cannot_bind_next_request() {
         AcceptScript::with(
             move |peer| postgres::retire::unsolicited_partial(peer.accept()?, ready),
             |server| {
-                let prepared = topology::Prepare::try_new::<Env>(
+                let prepared = topology::try_new::<_, Env>(
                     port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config),
                     server.addr(),
                     Duration::from_millis(1),
@@ -272,7 +273,7 @@ fn asynchronous_partial_resumes_pinned_request() {
     AcceptScript::with(
         move |peer| postgres::retire::asynchronous_partial(peer.accept()?, ready),
         |server| {
-            let prepared = topology::Prepare::try_new::<Env>(
+            let prepared = topology::try_new::<_, Env>(
                 port::Port::<Queries>::plan(
                     Queries::try_config().expect("database config"),
                     Queries::try_reply().expect("PostgreSQL capacity"),
@@ -346,7 +347,7 @@ fn detached_partial_preserves_pipelined_request() {
     AcceptScript::with(
         |peer| postgres::retire::detached_partial(peer.accept()?),
         |server| {
-            let prepared = topology::Prepare::try_new::<Env>(
+            let prepared = topology::try_new::<_, Env>(
                 port::Port::<Queries>::plan(
                     Queries::try_config().expect("database config"),
                     Queries::try_reply().expect("PostgreSQL capacity"),
@@ -441,7 +442,7 @@ fn pending_ready_settles() {
         })
     })
     .expect("group configuration");
-    let prepared = topology::Prepare::try_new::<Env>(
+    let prepared = topology::try_new::<_, Env>(
         port::Port::<Database>::plan(Queries::try_config().expect("credentials"), config),
         address,
         Duration::from_millis(1),
@@ -563,7 +564,7 @@ fn late_error_keeps_batch() {
     });
     let config = Queries::try_cancel().expect("pipeline config");
     let ((), events) = {
-        let prepared = topology::Prepare::try_new::<Env>(
+        let prepared = topology::try_new::<_, Env>(
             port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config),
             addr,
             Duration::from_millis(1),
@@ -707,7 +708,7 @@ fn response_reconnects() {
         let config = config::Config::with_window(capacity, Positive::from_millis::<50>());
         let config = config.expect("valid pg configuration");
         let ((), events) = {
-            let prepared = topology::Prepare::try_new::<Env>(
+            let prepared = topology::try_new::<_, Env>(
                 port::Port::<Queries>::plan(
                     Queries::try_config().expect("database config"),
                     config,

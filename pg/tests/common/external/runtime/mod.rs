@@ -12,11 +12,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{
-    env,
-    port::Reply,
-    topology::{self, Prepare},
-};
+use crate::common::{env, port::Reply, topology};
 use cartel_pg::{api, port, port::config, protocol::logic, schema};
 use dope::runtime::topology::{Worker, error, ops};
 use dope::{
@@ -322,7 +318,7 @@ impl<I: schema::QuerySet> Session<I> {
         let name =
             cartel_pg::Identifier::try_from(&mut self.schema.clone()).map_err(Error::Identifier)?;
         let (output, reports) = {
-            let prepared = Prepare::try_new::<Bundle<Tcp, Identity, Throughput>>(
+            let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
                 port::Port::<I>::plan(self.config.search_path(name), settings),
                 self.address,
                 Duration::from_millis(500),

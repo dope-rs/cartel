@@ -36,25 +36,8 @@ impl<'a> Rows<'a> {
     }
 }
 
-pub(crate) trait ScopeLayout: Sized {
-    fn single(ident: syn::Ident) -> Self;
-    fn for_primary(src: &shape::QuerySource, ident: &syn::Ident) -> Self;
-    fn for_source(src: &shape::QuerySource, idents: &[syn::Ident]) -> syn::Result<Self>;
-    fn for_join_on(src: &shape::QuerySource, index: usize) -> syn::Result<Self>;
-    fn for_order(
-        parent: &Self,
-        inputs: &punctuated::Punctuated<syn::Pat, token::Comma>,
-    ) -> syn::Result<Self>;
-    fn with_agg(self, agg: syn::Ident) -> Self;
-    fn with_unnest(self, cols: Vec<syn::Ident>) -> Self;
-    fn unnest_ref(&self, expr: &syn::Expr) -> Option<Vec<proc_macro2::TokenStream>>;
-    fn with_outer(self, outer: Self) -> Self;
-    fn column_ref(&self, expr: &syn::Expr) -> Option<pred::SqlColRef>;
-    fn local_ref(&self, expr: &syn::Expr) -> Option<pred::SqlColRef>;
-}
-
-impl ScopeLayout for pred::RowScope {
-    fn single(ident: syn::Ident) -> Self {
+impl pred::RowScope {
+    pub(crate) fn single(ident: syn::Ident) -> Self {
         Self {
             vars: vec![var::Var {
                 ident,
@@ -67,15 +50,15 @@ impl ScopeLayout for pred::RowScope {
         }
     }
 
-    fn for_source(src: &shape::QuerySource, idents: &[syn::Ident]) -> syn::Result<Self> {
+    pub(crate) fn for_source(src: &shape::QuerySource, idents: &[syn::Ident]) -> syn::Result<Self> {
         Ok(Rows::new(src, &src.joins, idents)?.scope())
     }
 
-    fn for_primary(src: &shape::QuerySource, ident: &syn::Ident) -> Self {
+    pub(crate) fn for_primary(src: &shape::QuerySource, ident: &syn::Ident) -> Self {
         Self::for_bindings(src, slice::from_ref(ident))
     }
 
-    fn for_join_on(src: &shape::QuerySource, index: usize) -> syn::Result<Self> {
+    pub(crate) fn for_join_on(src: &shape::QuerySource, index: usize) -> syn::Result<Self> {
         let (j, joins) = src
             .joins
             .get(..=index)
@@ -90,7 +73,7 @@ impl ScopeLayout for pred::RowScope {
         Ok(Rows::new(src, joins, idents)?.scope())
     }
 
-    fn for_order(
+    pub(crate) fn for_order(
         parent: &Self,
         inputs: &punctuated::Punctuated<syn::Pat, token::Comma>,
     ) -> syn::Result<Self> {
@@ -123,17 +106,17 @@ impl ScopeLayout for pred::RowScope {
         })
     }
 
-    fn with_agg(mut self, agg: syn::Ident) -> Self {
+    pub(crate) fn with_agg(mut self, agg: syn::Ident) -> Self {
         self.agg_var = Some(agg);
         self
     }
 
-    fn with_unnest(mut self, cols: Vec<syn::Ident>) -> Self {
+    pub(crate) fn with_unnest(mut self, cols: Vec<syn::Ident>) -> Self {
         self.unnest_cols = cols;
         self
     }
 
-    fn unnest_ref(&self, expr: &syn::Expr) -> Option<Vec<proc_macro2::TokenStream>> {
+    pub(super) fn unnest_ref(&self, expr: &syn::Expr) -> Option<Vec<proc_macro2::TokenStream>> {
         let id = expr::Path::new(expr)?.single()?;
         let pos = self
             .unnest_cols
@@ -143,12 +126,12 @@ impl ScopeLayout for pred::RowScope {
         Some(vec![quote::quote! { #col }])
     }
 
-    fn with_outer(mut self, outer: Self) -> Self {
+    pub(crate) fn with_outer(mut self, outer: Self) -> Self {
         self.outer = Some(Box::new(outer));
         self
     }
 
-    fn column_ref(&self, expr: &syn::Expr) -> Option<pred::SqlColRef> {
+    pub(crate) fn column_ref(&self, expr: &syn::Expr) -> Option<pred::SqlColRef> {
         if let Some(c) = self.local_ref(expr) {
             return Some(c);
         }

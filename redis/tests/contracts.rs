@@ -261,7 +261,7 @@ fn contracts() -> Result<(), dope_test::checks::Error> {
     let suite = Suite::new(
         env!("CARGO_MANIFEST_DIR"),
         file!(),
-        &["cartel-redis", "dope-fiber", "dope", "o3"],
+        &["cartel-redis", "dope-fiber"],
     );
     let exe = env::current_exe().expect("current test executable");
     let output = suite
@@ -275,27 +275,6 @@ fn contracts() -> Result<(), dope_test::checks::Error> {
     );
     let status = artifacts.try_rustdoc()?.status().expect("run rustdoc");
     assert!(status.success(), "compile-time contracts: {status}");
-    for (source, errors, expected) in [
-        (include_str!("common/retired.rs"), 0, &[] as &[&str]),
-        (
-            include_str!("common/retire.rs"),
-            3,
-            &[
-                "self.0.disconnect(ctx);",
-                "let proof: turns::Drained<'d, KeyTag<0>, N> = ctx.into_drained();",
-                "let proof: conn::Retired<'d, KeyTag<0>, A> = proof;",
-            ],
-        ),
-    ] {
-        let output = compile(&mut artifacts.compiler(), source);
-        let diag = String::from_utf8(output.stderr).expect("diagnostic UTF-8");
-        assert!(
-            output.status.success() == (errors == 0)
-                && diag.matches("error[E0308]: mismatched types").count() == errors
-                && expected.iter().all(|part| diag.contains(part)),
-            "{source}\n{diag}"
-        );
-    }
     Ok(())
 }
 

@@ -15,11 +15,6 @@ use crate::{
     request::encode,
 };
 
-pub(crate) struct Plan<'a, 'app, 's, 'b, 'c, 'd, const ID: u8> {
-    state: &'app schedule::Schedule<'s, 'app, 'b, 'c, 'd, ID>,
-    region: &'a mut region::Token<region::Identity<'d>>,
-}
-
 pub(crate) enum Block {
     Pool,
     Queue(queue::Rejection),
@@ -36,22 +31,16 @@ pub(crate) enum Reject<A> {
     Reply(attach::Error),
 }
 
-impl<'a, 'app, 's, 'b, 'c, 'd, const ID: u8> Plan<'a, 'app, 's, 'b, 'c, 'd, ID> {
-    pub(crate) const fn new(
-        state: &'app schedule::Schedule<'s, 'app, 'b, 'c, 'd, ID>,
-        region: &'a mut region::Token<region::Identity<'d>>,
-    ) -> Self {
-        Self { state, region }
-    }
-
+impl<'app, 's, 'b, 'c, 'd, const ID: u8> schedule::Schedule<'s, 'app, 'b, 'c, 'd, ID> {
     pub(crate) fn try_pool<A, R>(
-        self,
+        &'app self,
+        region: &mut region::Token<region::Identity<'d>>,
         frame: encode::Complete,
         admit: A,
         reply: &mut impl attach::Attach<'app, 'b, 'c, 'd, frame::Stored<'s, 'd>, client::Failure<'d>>,
         seal: impl FnOnce(A, Id<'d, route::KeyTag<ID>>) -> R,
     ) -> Result<R, Reject<A>> {
-        let Self { state, region } = self;
+        let state = self;
         if state.is_exhausted(region) {
             return Err(Reject::Reply(attach::Error::IdentityExhausted));
         }
@@ -113,15 +102,16 @@ impl<'a, 'app, 's, 'b, 'c, 'd, const ID: u8> Plan<'a, 'app, 's, 'b, 'c, 'd, ID> 
         })
     }
 
-    pub(crate) fn try_lease<A, R>(
-        self,
+    pub(crate) fn try_dispatch_lease<A, R>(
+        &'app self,
+        region: &mut region::Token<region::Identity<'d>>,
         frame: encode::Complete,
         admit: A,
         reply: &mut impl attach::Attach<'app, 'b, 'c, 'd, frame::Stored<'s, 'd>, client::Failure<'d>>,
         token: Id<'d, route::KeyTag<ID>>,
         seal: impl FnOnce(A, Id<'d, route::KeyTag<ID>>) -> R,
     ) -> Result<R, Reject<A>> {
-        let Self { state, region } = self;
+        let state = self;
         let Some((conn, input)) = state.routes.exclusive(token) else {
             return Err(Reject::Unavailable);
         };
@@ -156,9 +146,5 @@ impl<'a, 'app, 's, 'b, 'c, 'd, const ID: u8> Plan<'a, 'app, 's, 'b, 'c, 'd, ID> 
 }
 
 const _: () = {
-    assert!(
-        mem::size_of::<Plan<'static, 'static, 'static, 'static, 'static, 'static, 0>>()
-            == 2 * mem::size_of::<usize>()
-    );
     assert!(mem::size_of::<Block>() == mem::size_of::<crate::Block>());
 };

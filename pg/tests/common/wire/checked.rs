@@ -243,17 +243,7 @@ pub fn description(oids: &[u32]) -> Vec<u8> {
 fn try_frame(socket: &peer::Stream<'_>) -> Result<(u8, Vec<u8>), Error> {
     let mut tag = [0];
     socket.read_exact(&mut tag)?;
-    Ok((tag[0], try_body(socket)?))
-}
-
-fn try_body(socket: &peer::Stream<'_>) -> Result<Vec<u8>, Error> {
-    let mut length = [0; 4];
-    socket.read_exact(&mut length)?;
-    let length = u32::from_be_bytes(length);
-    let size = length.checked_sub(4).ok_or(Error::InvalidLength(length))?;
-    let mut body = vec![0; size as usize];
-    socket.read_exact(&mut body)?;
-    Ok(body)
+    Ok((tag[0], startup::read(socket)?))
 }
 
 impl Database {
@@ -426,7 +416,7 @@ impl Bind {
             if socket.read(&mut tag)? == 0 {
                 return Ok(received);
             }
-            let body = try_body(socket)?;
+            let body = startup::read(socket)?;
             let tag = tag[0];
             if tag != b'B' {
                 return Err(Error::UnexpectedRequest);

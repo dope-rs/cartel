@@ -25,7 +25,7 @@ fn cancel_errno() {
     let addr = listener.local_addr().expect("listener address");
     let (server, closed, settled) = refused(listener);
     let ((), events) = {
-        let prepared = topology::Prepare::try_new::<Env>(
+        let prepared = topology::try_new::<_, Env>(
             port::Port::<Queries>::plan(
                 Queries::try_config().expect("database config"),
                 Queries::try_cancel().expect("cancel config"),

@@ -78,7 +78,7 @@ fn least_inflight_selects() {
         let config = config::Config::new(capacity);
         let config = config.expect("valid pg configuration");
         let ((), events) = {
-            let prepared = topology::Prepare::try_new::<Env>(
+            let prepared = topology::try_new::<_, Env>(
                 port::Port::<Queries>::plan(
                     Queries::try_config().expect("database config"),
                     config,

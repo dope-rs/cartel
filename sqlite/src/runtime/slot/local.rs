@@ -111,7 +111,7 @@ impl<I: catalogs::Catalog> Owned<I> {
     fn retire(&mut self, work: &work::Work) {
         if let Phase::Active(_) = self.phase {
             if let Some(db) = &self.connection {
-                work::Hook::new(work).refresh(db);
+                work.refresh(db);
             }
             self.statements.retire_all(work);
             self.finish();
@@ -153,7 +153,7 @@ impl<'slot, 'd, I: catalogs::Catalog> Vacant<'slot, 'd, I> {
         let config = self.lease.config();
         let work = self.lease.work();
         let guard = work.begin(config.work.open.progress)?;
-        work::Hook::new(work).progress(&db, config::Budget::PROGRESS_INTERVAL);
+        work.progress(&db, config::Budget::PROGRESS_INTERVAL);
         Ok(Opening {
             held: Held::new(guard, self.insert(db)),
         })

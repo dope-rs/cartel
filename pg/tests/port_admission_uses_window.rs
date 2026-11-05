@@ -46,7 +46,7 @@ fn admission_uses_window() {
     let config = config::Config::with_window(capacity, Positive::from_millis::<5>());
     let config = config.expect("valid pg configuration");
     let ((), events) = {
-        let prepared = topology::Prepare::try_new::<Env>(
+        let prepared = topology::try_new::<_, Env>(
             port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config),
             addr,
             Duration::from_millis(1),

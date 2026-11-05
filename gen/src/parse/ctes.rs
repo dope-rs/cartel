@@ -2,12 +2,8 @@ use crate::shape;
 
 use syn::spanned::Spanned as _;
 
-pub(crate) trait Binding: Sized {
-    fn extract_from(block: &syn::Block) -> syn::Result<(Vec<Self>, syn::Expr)>;
-}
-
-impl Binding for shape::CteBinding {
-    fn extract_from(block: &syn::Block) -> syn::Result<(Vec<Self>, syn::Expr)> {
+impl shape::CteBinding {
+    pub(crate) fn extract_from(block: &syn::Block) -> syn::Result<(Vec<Self>, syn::Expr)> {
         let stmts = &block.stmts;
         let Some((body, bindings)) = stmts.split_last() else {
             return Err(syn::Error::new(block.span(), "#[query] body is empty"));

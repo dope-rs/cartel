@@ -1,5 +1,4 @@
 mod error;
-pub(super) mod number;
 
 pub use error::Error;
 
@@ -29,16 +28,16 @@ enum Count16 {
     ResultFormats,
 }
 
-fn wire_length(value: usize) -> Result<number::Length, Error> {
+fn wire_length(value: usize) -> Result<i32, Error> {
     const MAXIMUM: usize = i32::MAX as usize;
     if value > MAXIMUM {
         Err(Error::FrameLength { actual: value })
     } else {
-        Ok(number::Length(value as i32))
+        Ok(value as i32)
     }
 }
 
-fn count16(value: usize, field: Count16) -> Result<number::Count16, Error> {
+fn count16(value: usize, field: Count16) -> Result<i16, Error> {
     const MAXIMUM: usize = i16::MAX as usize;
     if value > MAXIMUM {
         Err(match field {
@@ -47,7 +46,7 @@ fn count16(value: usize, field: Count16) -> Result<number::Count16, Error> {
             Count16::ResultFormats => Error::ResultFormats { actual: value },
         })
     } else {
-        Ok(number::Count16(value as i16))
+        Ok(value as i16)
     }
 }
 
@@ -118,7 +117,7 @@ impl Writer<'_> {
             frame::Sensitivity::Secret.clear(writer.0.as_mut_slice());
         })?;
         writer.0.commit();
-        *edit.prefix() = length.0.to_be_bytes();
+        *edit.prefix() = length.to_be_bytes();
         edit.commit();
         Ok(value)
     }
@@ -175,7 +174,7 @@ impl Writer<'_> {
     pub(crate) fn copy_data(&mut self, data: &[u8]) -> Result<(), Error> {
         let length = data.len() + 4;
         self.push(messages::Fe::COPY_DATA)?;
-        self.extend(&wire_length(length)?.0.to_be_bytes())?;
+        self.extend(&wire_length(length)?.to_be_bytes())?;
         self.extend(data)
     }
 
@@ -215,7 +214,7 @@ impl Writer<'_> {
             write_cstr(out, name)?;
             write(out)?;
             out.push(0)?;
-            out.extend(&count.0.to_be_bytes())?;
+            out.extend(&count.to_be_bytes())?;
             for oid in oids {
                 out.extend(&oid.to_be_bytes())?;
             }
@@ -237,14 +236,14 @@ impl Writer<'_> {
         self.patch::<true, _>(|out| {
             write_cstr(out, portal)?;
             write_cstr(out, name)?;
-            out.extend(&format_n.0.to_be_bytes())?;
+            out.extend(&format_n.to_be_bytes())?;
             for format in formats {
                 out.extend(&format.to_be_bytes())?;
             }
             out.extend(&params.to_be_bytes())?;
             let value = write(out)?;
             let count = count16(results.len(), Count16::ResultFormats)?;
-            out.extend(&count.0.to_be_bytes())?;
+            out.extend(&count.to_be_bytes())?;
             for format in results {
                 out.extend(&format.to_be_bytes())?;
             }

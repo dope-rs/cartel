@@ -16,9 +16,8 @@ pub(super) mod sql;
 mod subquery;
 pub(super) mod var;
 
-use expr::{Expr as _, Parsed};
+use expr::Parsed;
 use input::{Input, Method, Op};
-use subquery::Subquery as _;
 use var::Var;
 
 pub(super) struct WhereContext<'a> {
