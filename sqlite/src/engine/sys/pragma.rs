@@ -2,7 +2,7 @@ use o3::buffer::{storage::inline, write::Sink as _};
 use std::str;
 
 pub(super) struct Pragma {
-    bytes: inline::Bytes<96, usize>,
+    bytes: inline::Bytes<96>,
 }
 
 impl Pragma {
@@ -17,20 +17,8 @@ impl Pragma {
             pragma.push(b"-")?;
         }
         let mut digits = [0; 20];
-        let mut items = 0;
-        let mut left = value.unsigned_abs();
-        loop {
-            digits[items] = b'0' + (left % 10) as u8;
-            items += 1;
-            left /= 10;
-            if left == 0 {
-                break;
-            }
-        }
-        while items != 0 {
-            items -= 1;
-            pragma.push(&digits[items..items + 1])?;
-        }
+        let start = cartel_core::write_digits(&mut digits, value.unsigned_abs());
+        pragma.push(&digits[start..])?;
         Ok(pragma)
     }
 

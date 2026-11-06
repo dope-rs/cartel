@@ -48,9 +48,15 @@ impl Cmp {
         }
     }
 
-    pub(super) fn is_ltree(self) -> bool {
+    pub(super) fn capture(
+        self,
+        ident: syn::Ident,
+        sql: &mut crate::pred::sql::Sql,
+        dialect: &backend::Dialect,
+    ) {
+        sql.capture(ident);
         match self {
-            Self::LtreeDescOf | Self::LtreeAncOf => true,
+            Self::LtreeDescOf | Self::LtreeAncOf => sql.push(dialect.kw("CAST_LTREE_SUFFIX")),
             Self::Eq
             | Self::Ne
             | Self::Lt
@@ -68,7 +74,7 @@ impl Cmp {
             | Self::RegexIMatch
             | Self::NotRegexMatch
             | Self::NotRegexIMatch
-            | Self::FtsMatch => false,
+            | Self::FtsMatch => {}
         }
     }
 }

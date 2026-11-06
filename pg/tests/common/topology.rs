@@ -1,14 +1,57 @@
-use cartel_pg::{port, schema};
+use crate::common::{
+    self,
+    port::Reply,
+    wire::checked::{Database, Group},
+};
+use cartel_pg::{
+    api::{
+        Client,
+        results::Row,
+        traits::{self, Client as _, Status as _},
+    },
+    port::{self, replies::Payload},
+    schema::{self, result},
+};
 use dope::{
-    core::driver::settings::errors::Claim,
-    manifold::app::env,
+    core::driver::{life::recovery, route::Id, settings::errors::Claim},
+    manifold::app::env::{self, Bundle},
     manifold::service::{self, health},
     manifold::timing::Throughput,
-    net::Transport,
     net::wire::Identity,
-    runtime::topology::Prepared,
+    net::{Transport, tcp::Tcp},
+    runtime::{executor::session::Completion, topology::Prepared},
 };
-use std::time::Duration;
+use dope_fiber::BlockOn as _;
+use dope_test::{harness::GUARD, harness::peer::TcpScript, reclaim::Reports};
+use std::{marker::PhantomData, pin::Pin, time::Duration};
+
+#[pin_project::pin_project]
+#[derive(dope::Application)]
+#[dispatcher(driver = 'd)]
+pub struct App<'d, C, L> {
+    #[pin]
+    #[app]
+    connector: C,
+    #[pin]
+    #[manifold]
+    listener: L,
+    #[dispatcher(state)]
+    scope: PhantomData<&'d ()>,
+}
+
+impl<'d, C, L> App<'d, C, L> {
+    pub fn new(connector: C, listener: L) -> Self {
+        Self {
+            connector,
+            listener,
+            scope: PhantomData,
+        }
+    }
+
+    pub fn connector(self: Pin<&Self>) -> Pin<&C> {
+        self.project_ref().connector
+    }
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -34,4 +77,78 @@ where
         .map_err(Error::Health)?
         .for_install::<Throughput>()
         .map_err(Error::Claim)
+}
+
+pub fn with_row<Q>(bytes: &[u8], check: impl for<'b, 'c, 'd> FnOnce(Row<Payload<'b, 'c, 'd>, Q>))
+where
+    Q: schema::TypedQuery<Group = Group, Result = result::Rows>,
+    for<'p> Q::Params<'p>: Default,
+{
+    TcpScript::with(
+        |socket| Database::serve_rows(socket, [bytes]),
+        |server| {
+            let login = cartel_pg::Config::new("user".into(), "password".into(), "database".into())
+                .expect("database credentials");
+            let config = Database::config().expect("bounded PostgreSQL config");
+            let ready = try_new::<_, Bundle<Tcp, Identity, Throughput>>(
+                port::Port::<Database>::plan(login, config),
+                server.addr(),
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+            )
+            .expect("prepared PostgreSQL topology");
+            let mut reports = Reports::<_>::new(ready.layout(), [Id::fixed::<0>()]);
+            let mut report = Completion::new();
+            ready
+                .with_local(
+                    |worker| {
+                        worker.lend(|node, stage| {
+                            node.install(stage, |host, stage| {
+                                stage.with_quiesce(&mut report, host, GUARD, |mut app| {
+                                    let client: Client<'_, '_, '_, '_, '_, '_, '_, _, Database> =
+                                        app.root_client();
+                                    app.block_on(client.status().wait_ready())
+                                        .expect("driver ready")
+                                        .ok()
+                                        .expect("PostgreSQL ready");
+                                    let row = app
+                                        .block_on(traits::Query::run_one::<Q>(
+                                            client.query(),
+                                            Default::default(),
+                                        ))
+                                        .expect("driver query");
+                                    assert!(
+                                        row.is_ok(),
+                                        "{:?}",
+                                        row.as_ref().err().map(Reply::from)
+                                    );
+                                    check(row.ok().expect("query row"))
+                                })
+                            })
+                        })
+                    },
+                    recovery::Policy::new(|event| reports.push(event), common::recover),
+                    |outcome| {
+                        assert!(
+                            outcome.is_ok(),
+                            "{:?}",
+                            outcome.as_ref().err().map(|error| error.cause())
+                        );
+                        outcome.ok().expect("application entry")
+                    },
+                )
+                .expect("scoped PostgreSQL")
+                .ok()
+                .expect("application scope");
+            assert!(
+                reports.events().expect("native reclamation").is_empty(),
+                "unexpected native recovery"
+            );
+            server
+                .finish()
+                .expect("script execution")
+                .expect("PostgreSQL script");
+        },
+    )
+    .expect("script listener")
 }

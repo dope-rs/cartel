@@ -7,10 +7,9 @@ use cartel_pg::api::traits::{Client as _, Status as _, Unchecked as _};
 use common::env::{self, Env};
 use common::{external::runtime::check, recover};
 use dope_fiber::BlockOn as _;
-use dope_fiber::abi::poll_fn;
+use dope_test::fibers;
 use std::env::var_os;
 use std::num::NonZero;
-use std::task::Poll;
 
 pub mod common;
 
@@ -87,24 +86,14 @@ fn failure_stops_retry() {
     .try_run(
         |rt| {
             let client = rt.client();
-            let mut failed = false;
-            for _ in 0..200_000 {
-                if client.status().is_failed() {
-                    failed = true;
-                    break;
-                }
-                let mut yielded = false;
-                rt.runtime.block_on(poll_fn(|cx| {
-                    if yielded {
-                        Poll::Ready(())
-                    } else {
-                        yielded = true;
-                        cx.wake();
-                        Poll::Pending
-                    }
-                }))?;
-            }
-            ::core::assert!(failed, "pool with missing schema must reach is_failed()");
+            let ready = fibers::TEST
+                .try_run(&mut rt.runtime, client.status().wait_ready())
+                .expect("PostgreSQL startup driver");
+            assert!(
+                client.status().is_failed(),
+                "pool with missing schema must reach is_failed(): {:?}",
+                ready.as_ref().err().map(common::port::Reply::from),
+            );
             Ok(())
         },
         recover,

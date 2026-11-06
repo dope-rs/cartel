@@ -1,9 +1,6 @@
 use std::mem;
 
-use cartel_core::{
-    memory,
-    reply::{order::Front, usage},
-};
+use cartel_core::reply::{order::Front, usage};
 use dope::{core::driver::route::KeyTag, manifold::client::conn};
 use o3::{
     base::cell::region,
@@ -145,7 +142,7 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                         queue.complete(self.region);
                         self.state.completed = true;
                     }
-                    Completion::Ready => self.state.completed = true,
+                    Completion::Ready | Completion::Begin => self.state.completed = true,
                     Completion::Commit => match data.wire().as_slice() {
                         b"COMMIT\0" => self.state.completed = true,
                         b"ROLLBACK\0" => {
@@ -189,7 +186,19 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                 match status {
                     poll::Status::Transaction => {
                         match self.port.shared.transaction().current(self.conn) {
-                            access::Current::Reserved(_) | access::Current::Held(_) => {}
+                            access::Current::Reserved(_) => {
+                                let queue = self
+                                    .port
+                                    .responses(self.conn)
+                                    .ok_or(crate::Error::Protocol(Reason::ReadyUnknown))?;
+                                if !matches!(
+                                    queue.front(self.state.batch, self.region)?.0,
+                                    Some(Completion::Begin)
+                                ) {
+                                    return Err(crate::Error::Protocol(Reason::TransactionLease));
+                                }
+                            }
+                            access::Current::Held(_) => {}
                             access::Current::Finalizing(_) => {
                                 return Err(crate::Error::Protocol(Reason::TransactionOpen));
                             }
@@ -256,10 +265,11 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                 | Completion::Group
                 | Completion::Last
                 | Completion::Ready
+                | Completion::Begin
                 | Completion::Commit,
             ) => {}
         }
-        match selected.try_build(replies::RowPlan::row(data, memory::RETENTION)) {
+        match selected.try_build(replies::RowPlan::row(data)) {
             Ok(()) => Ok(None),
             Err(usage::PushError::Backpressure { builder: build, .. }) => {
                 match build.into_pending() {
@@ -351,6 +361,7 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                                     Completion::Sync => {}
                                     Completion::Command
                                     | Completion::Ready
+                                    | Completion::Begin
                                     | Completion::Commit => {
                                         return Err(crate::Error::Protocol(Reason::GroupReply));
                                     }
@@ -364,7 +375,7 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
             }
         };
         let scope = plan.scope();
-        let (server, class) = match plan.try_build(memory::RETENTION) {
+        let (server, class) = match plan.try_build() {
             Ok(built) => built,
             Err(error) => return Err(crate::Error::ResponseRetention(error)),
         };

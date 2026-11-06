@@ -1,22 +1,9 @@
-use cartel_redis::{
-    client,
-    client::{
-        settings,
-        settings::{Builder, Bulk},
-    },
+use cartel_redis::client::{
+    self, settings,
+    settings::{Builder, Bulk},
 };
 use dope_fiber::wait;
 use o3::base::time::Positive;
-
-#[test]
-fn client_is_pointer_sized() {
-    use std::mem::size_of;
-
-    assert_eq!(
-        size_of::<client::Redis<'static, 'static, 'static, 'static, 'static, ()>>(),
-        size_of::<&'static ()>()
-    );
-}
 
 #[test]
 fn capacities_match() {

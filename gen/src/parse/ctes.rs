@@ -2,8 +2,8 @@ use crate::shape;
 
 use syn::spanned::Spanned as _;
 
-impl shape::CteBinding {
-    pub(crate) fn extract_from(block: &syn::Block) -> syn::Result<(Vec<Self>, syn::Expr)> {
+impl<'a> shape::CteBinding<'a> {
+    pub(crate) fn extract_from(block: &'a syn::Block) -> syn::Result<(Vec<Self>, &'a syn::Expr)> {
         let stmts = &block.stmts;
         let Some((body, bindings)) = stmts.split_last() else {
             return Err(syn::Error::new(block.span(), "#[query] body is empty"));
@@ -39,13 +39,13 @@ impl shape::CteBinding {
                 ));
             }
             ctes.push(Self {
-                name: pi.ident.clone(),
-                inner_chain: (*mc.receiver).clone(),
+                name: &pi.ident,
+                inner_chain: &mc.receiver,
             });
         }
         match body {
             syn::Stmt::Expr(expr, semi) => match semi {
-                None => Ok((ctes, expr.clone())),
+                None => Ok((ctes, expr)),
                 Some(semi) => Err(syn::Error::new(
                     semi.span,
                     "#[query] body's main query expression must not have a trailing semicolon",

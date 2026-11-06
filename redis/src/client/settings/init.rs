@@ -1,25 +1,11 @@
-use std::ops::Deref;
-
-use o3::alloc::{self, VecExt};
+use o3::alloc::{self, BoxSliceExt};
 use o3::buffer::storage;
 use zeroize::Zeroizing;
 
-pub(crate) struct Secret(Zeroizing<Vec<u8>>);
+type Secret = Zeroizing<Box<[u8]>>;
 
-impl Secret {
-    fn try_copy(value: &[u8]) -> Result<Self, alloc::Error> {
-        let mut bytes = Vec::try_new(value.len())?;
-        bytes.extend_from_slice(value);
-        Ok(Self(Zeroizing::new(bytes)))
-    }
-}
-
-impl Deref for Secret {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_slice()
-    }
+fn try_secret(value: &[u8]) -> Result<Secret, alloc::Error> {
+    Ok(Zeroizing::new(Box::try_copy(value)?))
 }
 
 pub(crate) enum Auth {
@@ -78,7 +64,7 @@ impl Plan {
     }
 
     pub fn password(mut self, password: impl AsRef<[u8]>) -> Result<Self, alloc::Error> {
-        self.auth = Some(Auth::Password(Secret::try_copy(password.as_ref())?));
+        self.auth = Some(Auth::Password(try_secret(password.as_ref())?));
         Ok(self)
     }
 
@@ -89,7 +75,7 @@ impl Plan {
     ) -> Result<Self, Error> {
         self.auth = Some(Auth::User {
             username: storage::Shared::try_copy(username.as_ref()).map_err(Error::Username)?,
-            password: Secret::try_copy(password.as_ref()).map_err(Error::Password)?,
+            password: try_secret(password.as_ref()).map_err(Error::Password)?,
         });
         Ok(self)
     }

@@ -5,7 +5,7 @@ use o3::base::time::Positive;
 
 use crate::common::external::runtime::Error;
 
-pub(super) struct Limits {
+pub struct Limits {
     connections: NonZero<usize>,
     inflight: Option<NonZero<usize>>,
     window: Option<Positive>,
@@ -13,7 +13,7 @@ pub(super) struct Limits {
 }
 
 impl Limits {
-    pub(super) const fn new(max: NonZero<usize>) -> Self {
+    pub const fn new(max: NonZero<usize>) -> Self {
         Self {
             connections: max,
             inflight: None,
@@ -37,7 +37,7 @@ impl Limits {
         self
     }
 
-    pub(super) fn try_config<R>(self) -> Result<config::Config, Error<R>> {
+    pub fn try_config<R>(self) -> Result<config::Config, Error<R>> {
         let frames = self
             .connections
             .checked_mul(NonZero::<usize>::MIN.saturating_add(15))

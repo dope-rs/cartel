@@ -10,8 +10,8 @@ use protocol::runtime::tx::poll;
 
 use crate::{
     api::results::group::Position,
-    port::replies::End,
-    port::{self, pool::slot, replies, requests},
+    port::replies::Kind,
+    port::{self, replies, requests},
     protocol::{
         self,
         logic::{self, failure, state},
@@ -87,12 +87,15 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                 .apply(crate::Error::Protocol(protocol::Reason::ReadyUnknown));
             return Progress::Complete;
         };
-        loop {
+        let complete = loop {
             let action = lane
                 .inspect(pending.batch, self.driver.region_token(), |end, front| {
                     if pending.completed {
                         if !matches!(pending.skip, state::Skip::None)
-                            || !matches!(end, Some(End::Ready | End::Commit | End::Sync(_)))
+                            || !matches!(
+                                end,
+                                Some(Kind::Ready | Kind::Begin | Kind::Commit | Kind::Sync(_))
+                            )
                         {
                             return Err(crate::Error::Protocol(protocol::Reason::ReadyUnknown));
                         }
@@ -101,7 +104,7 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                     let Some(end) = end else {
                         return Ok(work::Capacity::Available(Action::Done));
                     };
-                    if let End::Sync(group) = end {
+                    if let Kind::Sync(group) = end {
                         if matches!(pending.skip, state::Skip::None) {
                             return Err(crate::Error::Protocol(protocol::Reason::ReadyUnknown));
                         }
@@ -115,10 +118,14 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                     let command = match pending.skip {
                         state::Skip::Pending => None,
                         state::Skip::Unknown => match end {
-                            End::Group(index, group) | End::Last(index, group) => {
+                            Kind::Group(index, group) | Kind::Last(index, group) => {
                                 Some((group, Position::Command(index as usize)))
                             }
-                            End::Command | End::Ready | End::Commit | End::Sync(_) => {
+                            Kind::Command
+                            | Kind::Ready
+                            | Kind::Begin
+                            | Kind::Commit
+                            | Kind::Sync(_) => {
                                 return Err(crate::Error::Protocol(protocol::Reason::GroupReply));
                             }
                         },
@@ -141,11 +148,8 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                 })
                 .and_then(|action| action);
             match action {
-                Ok(work::Capacity::Available(Action::Done)) => break,
-                Ok(work::Capacity::Available(Action::Complete)) => {
-                    lane.complete(self.driver.region_token());
-                    break;
-                }
+                Ok(work::Capacity::Available(Action::Done)) => break false,
+                Ok(work::Capacity::Available(Action::Complete)) => break true,
                 Ok(work::Capacity::Available(Action::Retire)) => {
                     lane.complete(self.driver.region_token());
                 }
@@ -168,46 +172,28 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                     return Progress::Complete;
                 }
             }
-        }
-        self.complete();
-        Progress::Complete
-    }
-
-    /// Retirement advances parsed batches without reindexing reset pending counts.
-    fn complete(&mut self) {
-        let Some(depth) = self.port.depth(self.conn, self.driver.region_token()) else {
-            failure::Failure::new(self.port, self.conn, self.state, self.driver.region_token())
-                .apply(crate::Error::Protocol(protocol::Reason::TransactionLane));
-            return;
         };
-        let settled = self.port.settle(self.conn);
-        match settled {
-            slot::Settle::Applied | slot::Settle::Closing => {}
-            slot::Settle::Empty | slot::Settle::Stale => {
+        let load = match lane.settle(complete, self.driver.region_token()) {
+            Ok(load) => load,
+            Err(error) => {
                 failure::Failure::new(self.port, self.conn, self.state, self.driver.region_token())
-                    .apply(crate::Error::Protocol(protocol::Reason::ReadyUnknown));
-                return;
+                    .apply(error);
+                return Progress::Complete;
             }
-        }
-        self.state.batch = self.pending.batch.next();
-        if matches!(settled, slot::Settle::Closing) {
-            return;
-        }
-        self.port.shared.reindex(self.conn, depth);
-        let Some(load) = self.port.load(self.conn, self.driver.region_token()) else {
-            failure::Failure::new(self.port, self.conn, self.state, self.driver.region_token())
-                .apply(crate::Error::Protocol(protocol::Reason::TransactionLane));
-            return;
         };
-        if matches!(
-            self.port
-                .shared
-                .transaction()
-                .poll_ready(self.conn, self.pending.status, load),
-            poll::Readiness::Pending
-        ) {
+        self.state.batch = self.pending.batch.next();
+        if let Some(load) = load
+            && matches!(
+                self.port
+                    .shared
+                    .transaction()
+                    .poll_ready(self.conn, self.pending.status, load),
+                poll::Readiness::Pending
+            )
+        {
             failure::Failure::new(self.port, self.conn, self.state, self.driver.region_token())
                 .apply(crate::Error::Protocol(protocol::Reason::TransactionOpen));
         }
+        Progress::Complete
     }
 }

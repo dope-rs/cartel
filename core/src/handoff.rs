@@ -8,21 +8,23 @@ use reply::{order, recv::attach};
 use crate::{queue, reply};
 
 /// The request and reply lanes of one handoff.
-pub struct Lane<'a, 's, 'b, 'c, 'd, T, D, E, K> {
-    requests: queue::Lane<'a, 'd, T>,
+pub struct Lane<'a, 's, 'b, 'c, 'd, T, D, E, K, W: queue::Weight = usize> {
+    requests: queue::Lane<'a, 'd, T, W>,
     replies: reply::Lane<'s, 'b, 'c, 'd, D, E, K>,
 }
 
 /// An unpublished request reservation with its matching reply lane.
 #[must_use = "a prepared handoff must be published or released"]
-pub struct Prepared<'turn, 'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K> {
-    request: queue::Reservation<'turn, 'a, 'd, T>,
+pub struct Prepared<'turn, 'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K, W: queue::Weight = usize> {
+    request: queue::Reservation<'turn, 'a, 'd, T, W>,
     replies: reply::Lane<'s, 'b, 'c, 'd, D, E, K>,
 }
 
-impl<'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K> Lane<'a, 's, 'b, 'c, 'd, T, D, E, K> {
+impl<'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K, W: queue::Weight>
+    Lane<'a, 's, 'b, 'c, 'd, T, D, E, K, W>
+{
     pub fn new(
-        requests: &'a queue::Scoped<'b, 'd, T>,
+        requests: &'a queue::Scoped<'b, 'd, T, W>,
         replies: reply::Lane<'s, 'b, 'c, 'd, D, E, K>,
     ) -> Self {
         Self {
@@ -35,8 +37,8 @@ impl<'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K> Lane<'a, 's, 'b, 'c, 'd, T, D, E, K>
     pub fn try_prepare<'turn>(
         self,
         token: &'turn mut region::Token<region::Identity<'d>>,
-        weight: usize,
-    ) -> Result<Prepared<'turn, 'a, 's, 'b, 'c, 'd, T, D, E, K>, queue::Rejection> {
+        weight: W,
+    ) -> Result<Prepared<'turn, 'a, 's, 'b, 'c, 'd, T, D, E, K, W>, queue::Rejection> {
         Ok(Prepared {
             request: self.requests.try_reserve(token, weight)?,
             replies: self.replies,
@@ -47,7 +49,7 @@ impl<'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K> Lane<'a, 's, 'b, 'c, 'd, T, D, E, K>
     pub fn try_publish<I, R>(
         self,
         token: &mut region::Token<region::Identity<'d>>,
-        weight: usize,
+        weight: W,
         reply: &mut impl attach::Attach<'s, 'b, 'c, 'd, D, E, K>,
         tag: K,
         input: I,
@@ -63,7 +65,9 @@ impl<'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K> Lane<'a, 's, 'b, 'c, 'd, T, D, E, K>
     }
 }
 
-impl<'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K> Prepared<'_, 'a, 's, 'b, 'c, 'd, T, D, E, K> {
+impl<'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K, W: queue::Weight>
+    Prepared<'_, 'a, 's, 'b, 'c, 'd, T, D, E, K, W>
+{
     /// Attaches the reply owner and immediately publishes the reserved request.
     pub fn try_publish<I, R>(
         self,

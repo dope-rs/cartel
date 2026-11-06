@@ -39,7 +39,6 @@ impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> abi::Fiber<'d>
         let mut guard = match this.deadline.as_mut().get_mut() {
             Ok(guard) => pin::Pin::new(guard),
             Err(error) => {
-                this.waiter.as_ref().unregister();
                 return task::Poll::Ready(Err(crate::Error::Deadline(*error)));
             }
         };
@@ -57,14 +56,14 @@ impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> abi::Fiber<'d>
             .try_lease(redis, ctx.as_mut().region_token())
         {
             this.waiter.as_ref().unregister();
-            guard.as_ref().complete();
+            guard.as_mut().complete();
             return task::Poll::Ready(Ok(conn::Connection { lease: permit }));
         }
         if !redis.port.is_active()
             && let Some(cause) = redis.port.activity.fatal_cause(ctx.as_mut().region_token())
         {
             this.waiter.as_ref().unregister();
-            guard.as_ref().complete();
+            guard.as_mut().complete();
             return task::Poll::Ready(Err(cause));
         }
         if let Err(error) = redis
@@ -73,7 +72,7 @@ impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> abi::Fiber<'d>
             .try_lease(this.waiter.as_ref(), ctx.as_ref())
         {
             this.waiter.as_ref().unregister();
-            guard.as_ref().complete();
+            guard.as_mut().complete();
             return task::Poll::Ready(Err(crate::Error::Wait(error)));
         }
         task::Poll::Pending

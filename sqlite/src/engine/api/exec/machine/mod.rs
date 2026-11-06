@@ -2,7 +2,7 @@ use crate::{api, catalogs};
 use api::{exec, stmt};
 use dope_fiber::context;
 use o3::mem;
-use std::{pin, result};
+use std::{ops, pin, result};
 use stmt::target::Target;
 
 mod active;
@@ -14,10 +14,7 @@ pub(super) use ready::Ready;
 pub(super) type Lease<'query, 'connection, 'd, P, A> =
     mem::Lease<Active<'query, 'connection, 'd, P, A>, mem::lease::Open>;
 
-pub(super) enum Next<S, R> {
-    Pending(S),
-    Ready(result::Result<R, crate::Error>),
-}
+pub(super) type Next<S, R> = result::Result<ops::ControlFlow<R, S>, crate::Error>;
 
 pub(super) enum State<S, A> {
     Start(S),
@@ -61,15 +58,14 @@ impl<'query, 'connection: 'query, 'd: 'connection, I: catalogs::Catalog, P: api:
             params,
             target,
         } = self;
-        match start.poll(context) {
-            Next::Pending(start) => Next::Pending(Self {
+        Ok(match start.poll(context)? {
+            ops::ControlFlow::Continue(start) => ops::ControlFlow::Continue(Self {
                 start,
                 params,
                 target,
             }),
-            Next::Ready(Ok(ready)) => Next::Ready(ready.bind(target, params)),
-            Next::Ready(Err(error)) => Next::Ready(Err(error)),
-        }
+            ops::ControlFlow::Break(ready) => ops::ControlFlow::Break(ready.bind(target, params)?),
+        })
     }
 }
 

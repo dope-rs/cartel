@@ -1,30 +1,9 @@
 use crate::common::plan;
 use cartel_sqlite::{
-    Access, Budget, Busy, Cache, Catalog, Entry, HasQuery, Limits, Lookaside, Memory, OpenOptions,
+    Access, Budget, Busy, Cache, Catalog, Entry, Limits, Lookaside, Memory, OpenOptions,
     Parameters, Program, Progress, Results, Scan, TypedQuery, Work, database, runtime::Runtime,
 };
 use std::{num::NonZero, path, time};
-
-pub struct Manual<const SLOT: usize>;
-pub struct Query<const ALTERED: bool, const PARAMETERS: usize, const COLUMNS: usize>;
-
-impl<const ALTERED: bool, const PARAMETERS: usize, const COLUMNS: usize> TypedQuery
-    for Query<ALTERED, PARAMETERS, COLUMNS>
-{
-    const SQL: &str = if ALTERED { "SELECT 2" } else { "SELECT 1" };
-    const PARAMETERS: usize = PARAMETERS;
-    const COLUMNS: usize = COLUMNS;
-}
-
-impl<const SLOT: usize> Catalog for Manual<SLOT> {
-    const STATEMENTS: &[Entry<'_>] = &[Entry::of::<Query<false, 0, 1>>()];
-}
-
-impl<const SLOT: usize, const ALTERED: bool, const PARAMETERS: usize, const COLUMNS: usize>
-    HasQuery<Query<ALTERED, PARAMETERS, COLUMNS>> for Manual<SLOT>
-{
-    const SLOT: usize = SLOT;
-}
 
 pub struct Malformed<const TAIL: bool, const UTF8: bool = false>;
 

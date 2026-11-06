@@ -152,46 +152,16 @@ impl<'a> Call<'a> {
         let function = Function::new(path.function()?)?;
         Some(Self { syntax, function })
     }
-
-    fn one(&self) -> Option<&'a syn::Expr> {
-        let mut args = self.syntax.args.iter();
-        let first = args.next()?;
-        if args.next().is_some() {
-            return None;
-        }
-        Some(first)
-    }
-
-    fn two(&self) -> Option<(&'a syn::Expr, &'a syn::Expr)> {
-        let mut args = self.syntax.args.iter();
-        let first = args.next()?;
-        let second = args.next()?;
-        if args.next().is_some() {
-            return None;
-        }
-        Some((first, second))
-    }
 }
 
-#[derive(Clone, Copy)]
-enum Aggregate {
+pub(super) enum Aggregate<'a> {
     Count,
-    Column(shape::AggregateFn),
-}
-
-impl Aggregate {
-    fn new(ident: &syn::Ident) -> Option<Self> {
-        if ident == "count" {
-            Some(Self::Count)
-        } else {
-            shape::AggregateFn::new(ident).map(Self::Column)
-        }
-    }
+    Column(shape::AggregateFn, &'a syn::Ident, &'a syn::Expr),
 }
 
 struct Method<'a> {
     syntax: &'a syn::ExprMethodCall,
-    aggregate: Aggregate,
+    function: Option<shape::AggregateFn>,
 }
 
 impl<'a> Method<'a> {
@@ -204,7 +174,11 @@ impl<'a> Method<'a> {
         }
         Some(Self {
             syntax,
-            aggregate: Aggregate::new(&syntax.method)?,
+            function: if syntax.method == "count" {
+                None
+            } else {
+                Some(shape::AggregateFn::new(&syntax.method)?)
+            },
         })
     }
 
@@ -217,28 +191,18 @@ impl<'a> Method<'a> {
         Some(first)
     }
 
-    fn shape(&self) -> syn::Result<Option<shape::Aggregation>> {
-        let function = match self.aggregate {
-            Aggregate::Count => {
-                return Ok(self
-                    .syntax
-                    .args
-                    .is_empty()
-                    .then_some(shape::Aggregation::Count));
+    fn shape(&self) -> syn::Result<Option<Aggregate<'a>>> {
+        let function = match self.function {
+            None => {
+                return Ok(self.syntax.args.is_empty().then_some(Aggregate::Count));
             }
-            Aggregate::Column(function) => function,
+            Some(function) => function,
         };
         let Some(expr) = self.one() else {
             return Ok(None);
         };
         let (arg, body) = expr.closure_one(function.lower())?;
-        Ok(Some(shape::Aggregation::Column(
-            function,
-            shape::AggCol {
-                args: vec![arg],
-                body,
-            },
-        )))
+        Ok(Some(Aggregate::Column(function, arg, body)))
     }
 }
 
@@ -256,7 +220,7 @@ impl Parsed {
     }
 }
 
-impl pred::RowScope {
+impl pred::RowScope<'_> {
     pub(super) fn has_column(&self, expr: &syn::Expr) -> bool {
         if self.column_ref(expr).is_some() || self.unnest_ref(expr).is_some() {
             return true;
@@ -285,91 +249,106 @@ impl pred::RowScope {
         params: Option<&[syn::Ident]>,
         types: &[syn::Type],
         dialect: &backend::Dialect,
-        cte_map: &collections::HashMap<String, syn::Path>,
+        cte_map: &collections::BTreeMap<String, syn::Path>,
     ) -> syn::Result<Parsed> {
-        if let Some(parts) = self.unnest_ref(expr) {
-            return Ok(Parsed::Sql(sql::Sql::tokens(parts)));
+        let mut sql = sql::Sql::new();
+        if self.parse_into(expr, params, types, dialect, cte_map, &mut sql)? {
+            Ok(Parsed::Sql(sql))
+        } else {
+            Ok(Parsed::Unsupported)
+        }
+    }
+
+    pub(super) fn parse_into(
+        &self,
+        expr: &syn::Expr,
+        params: Option<&[syn::Ident]>,
+        types: &[syn::Type],
+        dialect: &backend::Dialect,
+        cte_map: &collections::BTreeMap<String, syn::Path>,
+        sql: &mut sql::Sql,
+    ) -> syn::Result<bool> {
+        let start = sql.len();
+        let parsed = self.write_expr(expr, params, types, dialect, cte_map, sql)?;
+        if !parsed {
+            sql.truncate(start);
+        }
+        Ok(parsed)
+    }
+
+    fn write_expr(
+        &self,
+        expr: &syn::Expr,
+        params: Option<&[syn::Ident]>,
+        types: &[syn::Type],
+        dialect: &backend::Dialect,
+        cte_map: &collections::BTreeMap<String, syn::Path>,
+        sql: &mut sql::Sql,
+    ) -> syn::Result<bool> {
+        if let Some(token) = self.unnest_ref(expr) {
+            sql.push(token);
+            return Ok(true);
         }
         if let Some(column) = self.column_ref(expr) {
-            return Ok(Parsed::Sql(sql::Sql::tokens(column.into_parts())));
+            sql.extend(column.into_parts());
+            return Ok(true);
         }
         if let Some(params) = params
             && let Some(ident) = Path::new(expr).and_then(|path| path.single())
             && params.iter().any(|param| param.unraw() == ident.unraw())
         {
-            return Ok(Parsed::Sql(sql::Sql::captured(ident.clone())));
+            sql.capture(ident.clone());
+            return Ok(true);
         }
         if let Some(binary) = Binary::new(expr) {
-            let Parsed::Sql(left) =
-                self.parse(&binary.syntax.left, params, types, dialect, cte_map)?
-            else {
-                return Ok(Parsed::Unsupported);
-            };
-            let Parsed::Sql(right) =
-                self.parse(&binary.syntax.right, params, types, dialect, cte_map)?
-            else {
-                return Ok(Parsed::Unsupported);
-            };
-            return Ok(Parsed::Sql(sql::Sql::infix(
-                left,
-                binary.operator.tokens(),
-                right,
-                dialect,
-            )));
+            sql.push(dialect.kw("PAREN_OPEN"));
+            if !self.write_expr(&binary.syntax.left, params, types, dialect, cte_map, sql)? {
+                return Ok(false);
+            }
+            sql.push(binary.operator.tokens());
+            if !self.write_expr(&binary.syntax.right, params, types, dialect, cte_map, sql)? {
+                return Ok(false);
+            }
+            sql.push(dialect.kw("PAREN_CLOSE"));
+            return Ok(true);
         }
         if let Some(call) = Call::new(expr) {
-            let prefix = format!("{}(", call.function.name());
-            return match call.function {
+            let arity = match call.function {
                 Function::Vector
                 | Function::Query
                 | Function::PlainQuery
-                | Function::Cardinality => {
-                    let Some(arg) = call.one() else {
-                        return Ok(Parsed::Unsupported);
-                    };
-                    let Parsed::Sql(arg) = self.parse(arg, params, types, dialect, cte_map)? else {
-                        return Ok(Parsed::Unsupported);
-                    };
-                    Ok(Parsed::Sql(sql::Sql::call(
-                        quote::quote! { #prefix },
-                        [arg],
-                        dialect,
-                    )))
-                }
-                Function::Rank | Function::ArrayLength => {
-                    let Some((first, second)) = call.two() else {
-                        return Ok(Parsed::Unsupported);
-                    };
-                    let Parsed::Sql(first) = self.parse(first, params, types, dialect, cte_map)?
-                    else {
-                        return Ok(Parsed::Unsupported);
-                    };
-                    let Parsed::Sql(second) =
-                        self.parse(second, params, types, dialect, cte_map)?
-                    else {
-                        return Ok(Parsed::Unsupported);
-                    };
-                    Ok(Parsed::Sql(sql::Sql::call(
-                        quote::quote! { #prefix },
-                        [first, second],
-                        dialect,
-                    )))
-                }
+                | Function::Cardinality => 1,
+                Function::Rank | Function::ArrayLength => 2,
             };
+            if call.syntax.args.len() != arity {
+                return Ok(false);
+            }
+            let prefix = format!("{}(", call.function.name());
+            sql.push(quote::quote! { #prefix });
+            for (index, arg) in call.syntax.args.iter().enumerate() {
+                if index > 0 {
+                    sql.push(dialect.kw("COMMA"));
+                }
+                if !self.write_expr(arg, params, types, dialect, cte_map, sql)? {
+                    return Ok(false);
+                }
+            }
+            sql.push(dialect.kw("PAREN_CLOSE"));
+            return Ok(true);
         }
         if let syn::Expr::Paren(paren) = expr {
             if !paren.attrs.is_empty() {
-                return Ok(Parsed::Unsupported);
+                return Ok(false);
             }
-            return self.parse(&paren.expr, params, types, dialect, cte_map);
+            return self.write_expr(&paren.expr, params, types, dialect, cte_map, sql);
         }
         if let Some(method) = Method::new(expr) {
             if let syn::Expr::Call(receiver) = method.syntax.receiver.as_ref() {
                 let Some(kind) = method.shape()? else {
-                    return Ok(Parsed::Unsupported);
+                    return Ok(false);
                 };
                 let Some(params) = params else {
-                    return Ok(Parsed::Unsupported);
+                    return Ok(false);
                 };
                 let context = pred::WhereContext {
                     fn_params: params,
@@ -377,42 +356,43 @@ impl pred::RowScope {
                     dialect,
                     cte_map,
                 };
-                return Ok(Parsed::Sql(self.scalar_agg(receiver, &kind, &context)?));
+                self.scalar_agg(receiver, kind, &context, sql)?;
+                return Ok(true);
             }
             if let Some(agg_var) = &self.agg_var
                 && let Some(receiver) =
                     Path::new(&method.syntax.receiver).and_then(|path| path.single())
                 && receiver.unraw() == agg_var.unraw()
             {
-                let function = match method.aggregate {
-                    Aggregate::Count => {
+                let function = match method.function {
+                    None => {
                         if !method.syntax.args.is_empty() {
-                            return Ok(Parsed::Unsupported);
+                            return Ok(false);
                         }
-                        return Ok(Parsed::Sql(sql::Sql::tokens(vec![
-                            dialect.kw("COUNT_STAR"),
-                        ])));
+                        sql.push(dialect.kw("COUNT_STAR"));
+                        return Ok(true);
                     }
-                    Aggregate::Column(function) => function,
+                    Some(function) => function,
                 };
                 let Some(arg) = method.one() else {
-                    return Ok(Parsed::Unsupported);
-                };
-                let Parsed::Sql(inner) = self.parse(arg, None, types, dialect, cte_map)? else {
-                    return Ok(Parsed::Unsupported);
+                    return Ok(false);
                 };
                 let prefix = format!("{}(", function.upper());
-                return Ok(Parsed::Sql(sql::Sql::call(
-                    quote::quote! { #prefix },
-                    [inner],
-                    dialect,
-                )));
+                sql.push(quote::quote! { #prefix });
+                if !self.write_expr(arg, None, types, dialect, cte_map, sql)? {
+                    return Ok(false);
+                }
+                sql.push(dialect.kw("PAREN_CLOSE"));
+                return Ok(true);
             }
-            return Ok(Parsed::Unsupported);
+            return Ok(false);
         }
         match Literal::new(expr) {
-            Some(literal) => Ok(Parsed::Sql(literal.render(dialect))),
-            None => Ok(Parsed::Unsupported),
+            Some(literal) => {
+                sql.push(literal.render(dialect));
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 }

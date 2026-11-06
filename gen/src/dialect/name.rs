@@ -1,12 +1,11 @@
-use syn::ext::IdentExt as _;
-
 pub(super) struct Name(String);
 
 impl Name {
     pub(super) fn new(ident: &syn::Ident) -> Self {
         const HEX: &[u8; 16] = b"0123456789abcdef";
 
-        let ident = ident.unraw().to_string();
+        let ident = ident.to_string();
+        let ident = crate::ext::unraw(&ident);
         let mut name = String::with_capacity(1 + ident.len() * 2);
         name.push('N');
         for byte in ident.bytes() {

@@ -1,22 +1,7 @@
 use crate::{row, runtime};
-use std::{marker, mem, ops, result, slice};
+use std::{marker, mem, ops, slice};
 
-pub(crate) struct Arena<'owner> {
-    storage: &'owner mut runtime::raw::Span,
-}
-
-impl<'owner> Arena<'owner> {
-    pub(crate) const fn from_span(storage: &'owner mut runtime::raw::Span) -> Self {
-        Self { storage }
-    }
-
-    pub(crate) fn retain<T: Copy>(
-        &mut self,
-        rows: usize,
-    ) -> result::Result<row::raw::Retainer<'_, T>, crate::Error> {
-        row::raw::Retainer::new(self.storage, rows)
-    }
-}
+pub(crate) type Arena<'owner> = &'owner mut runtime::raw::Span;
 
 const _: () = assert!(mem::size_of::<Arena<'static>>() == mem::size_of::<usize>());
 

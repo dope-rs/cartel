@@ -64,15 +64,11 @@ impl<'slot, 'd> Loan<'slot, 'd> {
         lease::Lease::new(self.reborrow())
     }
 
-    pub(crate) const fn cleanup_ref(&self) -> lease::Ref<'_, 'd> {
-        lease::Ref::new(self.slot())
-    }
-
     pub(crate) fn finish(&mut self) {
         self.slot_mut().finish();
     }
 
-    pub(super) const fn slot(&self) -> &retry::Slot<'d> {
+    pub(crate) const fn slot(&self) -> &retry::Slot<'d> {
         // SAFETY: the installation grant excludes other loans; this borrow freezes its loan.
         unsafe { &*self.source.slot.get() }
     }

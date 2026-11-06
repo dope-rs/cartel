@@ -4,21 +4,21 @@ use cartel_sqlite::runtime::{self, Runtime};
 use common::{assert_reclaimed, assert_retirement, query::stream::*, schema};
 use dope_core::driver::life::recovery::Policy;
 use dope_test::fibers;
-use std::{cell::Cell, pin::Pin, sync::OnceLock};
+use std::{cell::Cell, pin::Pin};
 
 pub mod common;
 
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
-
 #[test]
-fn stream_visits_rows() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn query_stream() -> Result<(), plan::Error> {
+    // SAFETY: only this test calls SQLite in this binary. Only Cartel uses the
+    // installed runtime, retaining Core handles and allocations on their worker.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
+    stream_visits_rows(runtime)?;
+    stream_stop_releases(runtime)
+}
+
+fn stream_visits_rows(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -53,15 +53,7 @@ fn stream_visits_rows() -> Result<(), plan::Error> {
     }
 }
 
-#[test]
-fn stream_stop_releases() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn stream_stop_releases(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =

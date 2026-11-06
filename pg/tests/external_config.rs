@@ -406,7 +406,7 @@ fn validates_capacities() {
     let config = config::Config::new(valid).expect("valid port config");
     assert!(config.capacities() == valid);
     ::core::assert_eq!(config.socket_limit(), 4);
-    ::core::assert_eq!(config.memory_bound().request_bytes, 4096);
+    ::core::assert_eq!(config.memory_bound().request_bytes, 10240);
     ::core::assert_eq!(config.memory_bound().cancel_bytes, 32);
     ::core::assert_eq!(config.memory_bound().response_bytes, 4096);
     ::core::assert_eq!(config.memory_bound().ingress.active, 2048);
@@ -417,7 +417,7 @@ fn validates_capacities() {
     let ready = 2 * 136 + 2 * 20 + 5 * 4 + 4 + 8 + 8;
     ::core::assert_eq!(
         config.memory_bound().total_bytes.bytes(),
-        14_336 + 4096 + 32 + ready + 1024
+        14_336 + 10240 + 32 + ready + 1024
     );
     let window = Positive::from_millis::<17>();
     assert!(

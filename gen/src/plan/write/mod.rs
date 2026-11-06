@@ -1,9 +1,8 @@
 mod conflict;
-mod insert;
-mod reply;
-mod update;
+pub(in crate::plan) mod insert;
+pub(in crate::plan) mod reply;
+pub(in crate::plan) mod update;
 
 pub(in crate::plan) use conflict::Conflict;
-pub(in crate::plan) use insert::{From, Insert, Source};
-pub(in crate::plan) use reply::Reply;
-pub(in crate::plan) use update::{Each, Update};
+pub(in crate::plan) use insert::{From, Source};
+pub(in crate::plan) use update::Each;

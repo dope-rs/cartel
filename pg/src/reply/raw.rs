@@ -61,7 +61,7 @@ impl<'input, 'd, R: buffer::Source + 'input> Fields<'input, 'd, R> {
             }
         };
         // SAFETY: concatenating the complete admitted UTF-8 fields preserves UTF-8.
-        Ok(unsafe { buffer::raw::Text::from_utf8(owner) })
+        Ok(unsafe { buffer::raw::utf8(owner) })
     }
 }
 
@@ -72,7 +72,7 @@ const _: () = assert!(
 pub(super) fn group_fields(payload: &[u8], record: group::Record) -> server::Fields<'_> {
     // SAFETY: group admission reserves the aggregate owner; record publication
     // follows the complete copy of one parsed diagnostic into this exact range.
-    let payload = unsafe { payload.get_unchecked(record.start..record.end) };
+    let payload = unsafe { payload.get_unchecked(record.start as usize..record.end as usize) };
     // SAFETY: the immutable ledger retains the complete validated source bytes.
     unsafe { server::Fields::from_valid(payload) }
 }

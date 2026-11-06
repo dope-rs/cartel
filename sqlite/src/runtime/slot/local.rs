@@ -3,7 +3,7 @@ use crate::retry;
 use crate::runtime::slot::{Held, Opening, lease::Lease};
 use crate::runtime::{self, Error, heap};
 use crate::{catalogs, config, sys};
-use heap::scopes::{Conflict, Scope};
+use heap::scopes::Scope;
 use o3::mem::lease::Open;
 use std::{mem, ptr};
 
@@ -19,48 +19,45 @@ pub(crate) struct Local<I: catalogs::Catalog> {
 pub(super) struct Owned<I: catalogs::Catalog> {
     connection: Option<crate::sys::Connection>,
     statements: stmt::Storage<I>,
-    phase: Phase,
-}
-
-enum Phase {
-    Idle(heap::raw::Local),
-    Active(Scope),
-    Done,
+    scope: Option<Scope>,
 }
 
 impl<I: catalogs::Catalog> Local<I> {
     pub(crate) fn new(
+        memory: runtime::raw::Memory,
         sqlite: heap::raw::Span,
         collect: runtime::raw::Span,
         stmts: runtime::raw::Span,
         aside: runtime::raw::Span,
         layout: crate::memory::Lookaside,
-    ) -> Result<(Self, heap::raw::Retained), Error> {
-        let (sqlite, retained) = heap::raw::Local::from_span(sqlite);
+    ) -> Result<(Self, heap::raw::Local, heap::raw::Retained), Error> {
         let stmts = stmt::Storage::new(stmts)?;
+        let (sqlite, retained) = heap::raw::Local::from_span(sqlite, memory);
         Ok((
             Self {
                 owned: Owned {
                     connection: None,
                     statements: stmts,
-                    phase: Phase::Idle(sqlite),
+                    scope: None,
                 },
                 arena: collect,
                 work: work::Work::new(),
                 lookaside: aside,
                 lookaside_layout: layout,
             },
+            sqlite,
             retained,
         ))
     }
 
     pub(crate) fn lease<'slot, 'd: 'slot>(
         &'slot mut self,
+        heap: heap::raw::Local,
         retry: retry::raw::Loan<'slot, 'd>,
         report: &'slot mut crate::open::Completion,
     ) -> Result<Vacant<'slot, 'd, I>, crate::Error> {
-        self.owned.enter()?;
-        let arena = batches::Arena::from_span(&mut self.arena);
+        self.owned.scope = Some(Scope::enter(heap)?);
+        let arena = &mut self.arena;
         let owned = ptr::NonNull::from(&mut self.owned);
         let lease = Lease::new(owned, retry, &self.work, report);
         Ok(Vacant {
@@ -81,35 +78,17 @@ impl<I: catalogs::Catalog> Drop for Local<I> {
 }
 
 impl<I: catalogs::Catalog> Owned<I> {
-    fn enter(&mut self) -> Result<(), crate::Error> {
-        let phase = mem::replace(&mut self.phase, Phase::Done);
-        let Phase::Idle(heap) = phase else {
-            self.phase = phase;
-            return Err(crate::Error::LocalAllocatorOccupied);
-        };
-        match Scope::enter(heap) {
-            Ok(scope) => {
-                self.phase = Phase::Active(scope);
-                Ok(())
-            }
-            Err((heap, Conflict)) => {
-                self.phase = Phase::Idle(heap);
-                Err(crate::Error::LocalAllocatorOccupied)
-            }
-        }
-    }
-
-    /// Borrowed statement owners have already retired before their Reclaim is returned.
+    /// Borrowed statement owners have already retired before their lease is returned.
     pub(super) fn finish(&mut self) {
         self.connection = None;
-        if let Phase::Active(scope) = mem::replace(&mut self.phase, Phase::Done) {
-            drop(scope);
+        if let Some(scope) = self.scope.take() {
+            scope.finish();
         }
     }
     /// No borrower can execute after this pinned owner begins destruction.
     /// Forgotten owners leave initialized statement slots and callback contexts here.
     fn retire(&mut self, work: &work::Work) {
-        if let Phase::Active(_) = self.phase {
+        if self.scope.is_some() {
             if let Some(db) = &self.connection {
                 work.refresh(db);
             }
@@ -171,13 +150,13 @@ pub(super) struct Occupied<'slot, 'd, I: catalogs::Catalog> {
 
 const _: () = {
     let word = mem::size_of::<usize>();
-    assert!(mem::size_of::<Phase>() == 2 * word);
-    let previous = mem::size_of::<Option<crate::sys::Connection>>()
+    assert!(mem::size_of::<Option<Scope>>() == word);
+    let fields = mem::size_of::<Option<crate::sys::Connection>>()
         + mem::size_of::<stmt::Storage<catalogs::Empty>>()
         + 2 * mem::size_of::<runtime::raw::Span>()
         + mem::size_of::<work::Work>()
-        + mem::size_of::<heap::raw::Local>()
+        + mem::size_of::<Option<Scope>>()
         + mem::size_of::<crate::memory::Lookaside>();
     let align = mem::align_of::<Local<catalogs::Empty>>();
-    assert!(mem::size_of::<Local<catalogs::Empty>>() == previous.next_multiple_of(align) + word);
+    assert!(mem::size_of::<Local<catalogs::Empty>>() == fields.next_multiple_of(align));
 };

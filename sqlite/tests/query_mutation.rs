@@ -7,21 +7,15 @@ use cartel_sqlite::runtime::{self, Runtime};
 use common::{query::mutation::*, schema};
 use dope_core::driver::life::recovery::Policy;
 use dope_test::fibers;
-use std::sync::OnceLock;
 
 pub mod common;
 
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
-
 #[test]
 fn update_and_delete() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+    // SAFETY: this binary has one test; only Cartel uses installed SQLite.
+    // Core handles and allocations remain exclusively owned by their originating worker.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -62,19 +56,14 @@ fn update_and_delete() -> Result<(), plan::Error> {
             Policy::new(assert_reclaimed, assert_retirement),
             |result| result.expect("SQLite scope"),
         );
-        result.expect("SQLite integration scope")
+        result.expect("SQLite integration scope")?;
     }
+    insert_variants(runtime)?;
+    insert_on_conflict(runtime)?;
+    returning_clauses(runtime)
 }
 
-#[test]
-fn insert_variants() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn insert_variants(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -126,15 +115,7 @@ fn insert_variants() -> Result<(), plan::Error> {
     }
 }
 
-#[test]
-fn insert_on_conflict() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn insert_on_conflict(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -174,15 +155,7 @@ fn insert_on_conflict() -> Result<(), plan::Error> {
     }
 }
 
-#[test]
-fn returning_clauses() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn returning_clauses(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =

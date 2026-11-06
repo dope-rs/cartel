@@ -37,7 +37,7 @@ impl Qualify {
     pub(in crate::plan) fn new(
         quals: &qualify::State,
         end: Option<shape::Terminator>,
-        parent: &pred::RowScope,
+        parent: &pred::RowScope<'_>,
         state: &plan::State<'_>,
     ) -> syn::Result<Self> {
         if !matches!(quals.distinct, qualify::Distinct::None) {
@@ -84,10 +84,10 @@ impl Qualify {
         })
     }
 
-    pub(in crate::plan) fn render<'a>(
+    pub(in crate::plan) fn render(
         self,
-        mut state: plan::State<'a>,
-    ) -> plan::Step<'a, Vec<proc_macro2::TokenStream>> {
+        state: &mut plan::State<'_>,
+    ) -> Vec<proc_macro2::TokenStream> {
         let mut value = if self.clauses.is_empty() {
             Vec::new()
         } else {
@@ -102,10 +102,10 @@ impl Qualify {
                 value.push(state.dialect.kw("DESC"));
             }
         }
-        value.extend(self.limit.render(&mut state, &self.offset));
-        value.extend(self.offset.render(&mut state));
+        value.extend(self.limit.render(state, &self.offset));
+        value.extend(self.offset.render(state));
         value.extend(self.lock);
-        plan::Step { state, value }
+        value
     }
 }
 
@@ -243,7 +243,7 @@ impl Clause {
     fn new(
         state: &plan::State<'_>,
         clause: &qualify::Order,
-        parent: &pred::RowScope,
+        parent: &pred::RowScope<'_>,
     ) -> syn::Result<Self> {
         let syn::Expr::Closure(closure) = &clause.closure else {
             return Err(syn::Error::new(
@@ -251,15 +251,6 @@ impl Clause {
                 "`.order_by(...)` argument must be a closure",
             ));
         };
-        if closure.inputs.len() != parent.vars.len() {
-            return Err(syn::Error::new(
-                closure.inputs.span(),
-                format!(
-                    "`.order_by(|...|)` closure must take {} arg(s), matching the surrounding scope",
-                    parent.vars.len()
-                ),
-            ));
-        }
         let scope = pred::RowScope::for_order(parent, &closure.inputs)?;
         let sql = state.parse(
             &scope,

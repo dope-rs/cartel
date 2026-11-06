@@ -191,10 +191,16 @@ impl<'b, 'd, const ID: u8> Routes<'b, 'd, ID> {
 
     /// The exact endpoint's native retirement consumes its admitted closing slot.
     /// Rejected activations never attach; the immutable root cannot replace this FIFO.
-    pub(super) fn retire<'r, 's, 'storage, 'c>(
+    pub(crate) fn retire<'r, 's, 'storage, 'c, P>(
         &self,
-        proof: turns::Drained<'d, route::KeyTag<ID>, Owner<'r, 's, 'storage, 'b, 'c, 'd, ID>>,
-    ) {
+        proof: turns::Drained<'d, route::KeyTag<ID>, Owner<'r, 's, 'd, P, ID>>,
+    ) where
+        's: 'b,
+        'b: 'storage,
+        'c: 'b,
+        'd: 'c,
+        P: client::Root<'d, ID, Port = crate::Port<'s, 'storage, 'b, 'c, 'd, ID>>,
+    {
         let index = proof.connection().index().into_usize();
         // SAFETY: the invariant source is this Port domain. Its unique admitted
         // slot remains initialized and closing until this consuming callback;
@@ -202,7 +208,7 @@ impl<'b, 'd, const ID: u8> Routes<'b, 'd, ID> {
         let live: depot::raw::Proof<_, Initialized<()>> =
             unsafe { depot::raw::Proof::new((&self.conns, index)) };
         let conn = Slot(live.into());
-        let previous = conn.transition(|phase| (State::Vacant, phase));
+        let previous = conn.transition(|phase| mem::replace(phase, State::Vacant));
         drop(previous);
     }
 

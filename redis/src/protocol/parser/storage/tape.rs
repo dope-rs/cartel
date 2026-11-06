@@ -151,9 +151,6 @@ impl<'a> Tape<'a> {
             }
             cursor = batch.finish(next);
         }
-        if let Some(left) = num::NonZero::new(cursor.remaining()) {
-            return Err(CoordError::Remaining(left));
-        }
         Ok(Region {
             tape: self,
             start: Cursor {

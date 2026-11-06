@@ -7,8 +7,6 @@ use syn::{ext::IdentExt as _, spanned::Spanned as _};
 use crate::ext::PatExt as _;
 use crate::plan::read::qualify::Integer;
 
-pub(in crate::plan) struct Window<'a>(pub(in crate::plan) plan::State<'a>);
-
 enum Function {
     Nullary(Nullary),
     Count,
@@ -49,7 +47,7 @@ enum Keyword {
 enum Head {
     Keyword(Keyword),
     Expr(Keyword, sql::Sql),
-    Offset(String, sql::Sql, Integer),
+    Offset(&'static str, sql::Sql, Integer),
 }
 
 struct Chain<'a>(Vec<&'a syn::ExprMethodCall>);
@@ -104,7 +102,7 @@ impl Keyword {
 }
 
 impl Offset {
-    fn syntax(&self) -> (&str, &str) {
+    fn syntax(&self) -> (&'static str, &'static str) {
         match self {
             Self::Lag => ("lag", "lag("),
             Self::Lead => ("lead", "lead("),
@@ -160,7 +158,7 @@ impl Function {
 impl Head {
     fn new(
         call: &syn::ExprCall,
-        scope: &pred::RowScope,
+        scope: &pred::RowScope<'_>,
         state: &plan::State<'_>,
     ) -> syn::Result<Self> {
         match Function::parse(call.func.as_ref())? {
@@ -228,7 +226,7 @@ impl Head {
                     ),
                 )?;
                 let offset = Integer::parse(&call.args[1], state.fn_params)?;
-                Ok(Self::Offset(open.to_owned(), sql, offset))
+                Ok(Self::Offset(open, sql, offset))
             }
         }
     }
@@ -301,7 +299,7 @@ impl<'a> Chain<'a> {
 impl Part {
     fn new(
         call: &syn::ExprMethodCall,
-        scope: &pred::RowScope,
+        scope: &pred::RowScope<'_>,
         state: &plan::State<'_>,
     ) -> syn::Result<Self> {
         if call.args.len() != 1 {
@@ -340,7 +338,11 @@ impl Part {
 }
 
 impl Spec {
-    fn new(chain: Chain<'_>, scope: &pred::RowScope, state: &plan::State<'_>) -> syn::Result<Self> {
+    fn new(
+        chain: Chain<'_>,
+        scope: &pred::RowScope<'_>,
+        state: &plan::State<'_>,
+    ) -> syn::Result<Self> {
         let mut parts = Vec::new();
         for call in chain.0 {
             parts.push(Part::new(call, scope, state)?);
@@ -361,23 +363,23 @@ impl Spec {
         let mut output = Vec::new();
         if !groups.is_empty() {
             output.push(state.dialect.kw("PARTITION_BY"));
-            for (index, parts) in groups.iter().enumerate() {
+            for (index, parts) in groups.into_iter().enumerate() {
                 if index > 0 {
                     output.push(state.dialect.kw("COMMA"));
                 }
-                output.extend(parts.iter().cloned());
+                output.extend(parts);
             }
         }
         if !orders.is_empty() {
-            if !groups.is_empty() {
+            if !output.is_empty() {
                 output.push(state.dialect.kw("SPACE"));
             }
             output.push(state.dialect.kw("WIN_ORDER_BY"));
-            for (index, (parts, dir)) in orders.iter().enumerate() {
+            for (index, (parts, dir)) in orders.into_iter().enumerate() {
                 if index > 0 {
                     output.push(state.dialect.kw("COMMA"));
                 }
-                output.extend(parts.iter().cloned());
+                output.extend(parts);
                 if matches!(dir, qualify::Dir::Desc) {
                     output.push(state.dialect.kw("DESC"));
                 }
@@ -387,48 +389,45 @@ impl Spec {
     }
 }
 
-impl<'a> Window<'a> {
-    pub(in crate::plan) fn build(
-        self,
-        call: &syn::ExprMethodCall,
-        scope: &pred::RowScope,
-    ) -> syn::Result<plan::Step<'a, Vec<proc_macro2::TokenStream>>> {
-        if call.args.len() != 1 {
-            return Err(syn::Error::new(
-                call.args.span(),
-                "`.over(...)` takes exactly one closure argument",
-            ));
-        }
-        let function = match call.receiver.as_ref() {
-            syn::Expr::Call(function) => function,
-            other => {
-                return Err(syn::Error::new(
-                    other.span(),
-                    "window receiver must be a function call like `row_number()` / `rank()` / `count()` / `sum(col)` / etc.",
-                ));
-            }
-        };
-        let head = Head::new(function, scope, &self.0)?;
-        let syn::Expr::Closure(closure) = &call.args[0] else {
-            return Err(syn::Error::new(
-                call.args[0].span(),
-                "`.over(...)` argument must be a closure `|w| w.partition_by(...).order_by(...)`",
-            ));
-        };
-        if closure.inputs.len() != 1 {
-            return Err(syn::Error::new(
-                closure.inputs.span(),
-                "`.over(...)` closure must take one parameter",
-            ));
-        }
-        let root = closure.inputs[0].ident()?;
-        let chain = Chain::new(&closure.body, root)?;
-        let spec = Spec::new(chain, scope, &self.0)?;
-
-        let mut state = self.0;
-        let mut value = head.render(&mut state);
-        value.extend(spec.render(&mut state));
-        value.push(state.dialect.kw("PAREN_CLOSE"));
-        Ok(plan::Step { state, value })
+pub(in crate::plan) fn build(
+    state: &mut plan::State<'_>,
+    call: &syn::ExprMethodCall,
+    scope: &pred::RowScope<'_>,
+) -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    if call.args.len() != 1 {
+        return Err(syn::Error::new(
+            call.args.span(),
+            "`.over(...)` takes exactly one closure argument",
+        ));
     }
+    let function = match call.receiver.as_ref() {
+        syn::Expr::Call(function) => function,
+        other => {
+            return Err(syn::Error::new(
+                other.span(),
+                "window receiver must be a function call like `row_number()` / `rank()` / `count()` / `sum(col)` / etc.",
+            ));
+        }
+    };
+    let head = Head::new(function, scope, state)?;
+    let syn::Expr::Closure(closure) = &call.args[0] else {
+        return Err(syn::Error::new(
+            call.args[0].span(),
+            "`.over(...)` argument must be a closure `|w| w.partition_by(...).order_by(...)`",
+        ));
+    };
+    if closure.inputs.len() != 1 {
+        return Err(syn::Error::new(
+            closure.inputs.span(),
+            "`.over(...)` closure must take one parameter",
+        ));
+    }
+    let root = closure.inputs[0].ident()?;
+    let chain = Chain::new(&closure.body, root)?;
+    let spec = Spec::new(chain, scope, state)?;
+
+    let mut value = head.render(state);
+    value.extend(spec.render(state));
+    value.push(state.dialect.kw("PAREN_CLOSE"));
+    Ok(value)
 }

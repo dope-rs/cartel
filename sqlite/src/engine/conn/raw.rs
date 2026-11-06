@@ -83,12 +83,9 @@ unsafe impl<'local, 'd: 'local, I: catalogs::Catalog> executor::raw::App<'d>
         released
     }
 
-    fn shutdown<'app, 'turn, 'driver, 'owner>(
-        shutdown: executor::raw::Shutdown<'app, 'turn, 'driver, 'owner, 'd, Self>,
-    ) -> executor::raw::Shutdown<'app, 'turn, 'driver, 'owner, 'd, Self>
-    where
-        'd: 'owner,
-    {
+    fn shutdown<'app, 'turn, 'driver>(
+        shutdown: executor::raw::Shutdown<'app, 'turn, 'driver, 'd, Self>,
+    ) -> executor::raw::Shutdown<'app, 'turn, 'driver, 'd, Self> {
         let (app, turn, driver) = shutdown.into_parts();
         let conn = app.as_ref().get_ref();
         // SAFETY: shared phase access preserves any dependent client's state borrow.
@@ -126,12 +123,12 @@ unsafe impl<'local, 'd: 'local, I: catalogs::Catalog> executor::raw::App<'d>
 
     /// # Safety
     /// The root, prepared plan, and park authority belong to this installed owner.
-    unsafe fn park<'app, 'driver, 'turn, 'root>(
+    unsafe fn park<'app, 'driver, 'turn>(
         app: pin::Pin<&'app mut Self>,
         (): &mut Self::ParkPlan,
-        mut park: executor::raw::Park<'driver, 'turn, 'root, 'd>,
+        mut park: executor::raw::Park<'driver, 'turn, 'd>,
     ) where
-        'd: 'driver + 'turn + 'root,
+        'd: 'driver + 'turn,
     {
         let conn = app.as_ref().get_ref();
         // SAFETY: the phase remains pinned, and shared access preserves client state borrows.

@@ -149,13 +149,7 @@ pub enum Op {
 
 impl Config {
     pub fn new(cap: Capacities) -> Result<Self, Error> {
-        Builder {
-            caps: cap,
-            bulk: None,
-            parser_lanes: None,
-            window: DEFAULT_WINDOW,
-        }
-        .build()
+        Builder::new(cap).build()
     }
 }
 

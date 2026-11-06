@@ -1,11 +1,12 @@
 use crate::common::topology;
 use cartel_pg::api::traits::{Client as _, Query as _, Status as _, Stream as _, Unchecked as _};
 use cartel_pg::{port, protocol::Reason, reply::owned};
-use common::postgres::{Error, accept, startup::Stream as _};
+use common::postgres::{accept, startup::Stream as _};
 use dope::{
     core::{
+        Backend, Errno,
+        dope_sys::io::poll::{Entry, Poll as _},
         driver::{life::recovery, route::Id},
-        platform::wake::{Ends, Wait},
     },
     manifold::app::env::Bundle,
     manifold::timing::Throughput,
@@ -19,17 +20,11 @@ use dope_test::{
     harness::{GUARD, peer::TcpScript},
     reclaim::Reports,
 };
-use std::{
-    sync::mpsc::{self, TryRecvError},
-    task::Poll,
-    time::Duration,
-};
+use std::{os::fd::AsFd as _, task::Poll, time::Duration};
 type Env = Bundle<Tcp, Identity, Throughput>;
 use cartel_pg::{reply, reply::server::Fields};
 use common::port::Queries;
 use dope_test::alloc::Tracker;
-use o3::buffer::resident;
-use std::mem;
 
 pub mod common;
 
@@ -38,12 +33,8 @@ static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
 fn startup_closes_live() {
-    let (closed, eof) = mpsc::sync_channel(1);
     TcpScript::with(
-        move |socket| {
-            socket.reject()?;
-            Ok::<_, Error>(closed.send(()))
-        },
+        |socket| socket.reject(),
         |server| {
             let prepared = topology::try_new::<_, Env>(
                 port::Port::<Queries>::plan(
@@ -77,14 +68,18 @@ fn startup_closes_live() {
                                     ));
 
                                     runtime
-                                        .block_on(poll_fn(|context| match eof.try_recv() {
-                                            Ok(()) => Poll::Ready(Ok(())),
-                                            Err(TryRecvError::Empty) => {
-                                                context.wake();
-                                                Poll::Pending
-                                            }
-                                            Err(error @ TryRecvError::Disconnected) => {
-                                                Poll::Ready(Err(error))
+                                        .block_on(poll_fn(|context| {
+                                            let mut entry =
+                                                [Entry::readable(server.completion().as_fd())];
+                                            match Backend::wait::<_, Errno>(&mut entry, 0) {
+                                                Ok(events) if events.count() != 0 => {
+                                                    Poll::Ready(Ok(()))
+                                                }
+                                                Ok(_) => {
+                                                    context.wake();
+                                                    Poll::Pending
+                                                }
+                                                Err(error) => Poll::Ready(Err(error)),
                                             }
                                         }))
                                         .expect("close driver")
@@ -116,8 +111,7 @@ fn startup_closes_live() {
             server
                 .finish()
                 .expect("startup peer execution")
-                .expect("startup peer protocol")
-                .expect("startup close notification");
+                .expect("startup peer protocol");
         },
     )
     .expect("startup peer");
@@ -188,10 +182,6 @@ fn catalog_mismatch() {
 
 #[test]
 fn request_errors() {
-    assert_eq!(
-        mem::size_of::<reply::server::Diagnostic<'static>>(),
-        mem::size_of::<resident::Shared<'static>>()
-    );
     for (frame, expected) in accept::REPLIES {
         let (reply, alloc) = TcpScript::with(
             move |socket| accept::reply(socket, frame),
@@ -324,9 +314,8 @@ fn connection_errors_preserve_pending_diagnostics() {
             "PANIC",
         ),
     ] {
-        let (wait, release) = Ends::<Wait>::blocking().expect("fatal release").split();
         TcpScript::with(
-            move |socket| accept::fatal(socket, detail, buffered, wait),
+            move |socket| accept::fatal(socket, detail, buffered),
             |server| {
                 let mut caps = Queries::try_reply().expect("reply capacity").capacities();
                 caps.inflight = 1;
@@ -363,7 +352,6 @@ fn connection_errors_preserve_pending_diagnostics() {
                                                 .ok()
                                                 .flatten()
                                                 .expect("retained row");
-                                            release.notify().expect("release fatal response");
                                             fibers::TEST
                                                 .try_run(&mut runtime, poll_fn(|context| {
                                                     if client.status().is_ready() {
@@ -375,8 +363,6 @@ fn connection_errors_preserve_pending_diagnostics() {
                                                 }))
                                                 .expect("fatal removes connection while row holds reply credit");
                                             assert_eq!(row.decode().expect("retained payload").name, "retained");
-                                        } else {
-                                            release.notify().expect("release fatal response");
                                         }
                                         let error = runtime
                                             .block_on(rows.next_row())
@@ -384,7 +370,7 @@ fn connection_errors_preserve_pending_diagnostics() {
                                             .err()
                                             .expect("fatal diagnostic");
                                         let reply::Error::Server(error) = error else {
-                                            panic!("fatal diagnostic replaced by driver failure");
+                                            panic!("fatal diagnostic replaced by driver failure: {:?}", error.kind());
                                         };
                                         assert_eq!(error.fields().severity(), severity);
                                         assert_eq!(error.fields().message(), "closed");

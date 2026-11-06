@@ -1,5 +1,4 @@
-use crate::plan;
-use syn::ext::IdentExt as _;
+use crate::{ext, plan};
 
 pub(super) struct Params {
     pub(super) ty: proc_macro2::TokenStream,
@@ -16,7 +15,12 @@ impl Params {
         let mut ty = quote::quote! { () };
         let mut value = quote::quote! { () };
         for capture in captures.iter().rev() {
-            let Some(index) = ids.iter().position(|id| id.unraw() == capture.unraw()) else {
+            let display = capture.to_string();
+            let name = ext::unraw(&display);
+            let Some(index) = ids
+                .iter()
+                .position(|id| ext::unraw(&id.to_string()) == name)
+            else {
                 return Err(syn::Error::new(
                     capture.span(),
                     "unknown captured parameter",
@@ -25,11 +29,12 @@ impl Params {
             let plain = &types[index];
             let role = checks
                 .iter()
-                .find(|entry| entry.0.unraw() == capture.unraw())
-                .map(|entry| match entry.1 {
-                    plan::Bound::Limit => quote::quote! { ::cartel_sqlite::Limit },
-                    plan::Bound::Offset => quote::quote! { ::cartel_sqlite::Offset },
-                });
+                .find(|entry| ext::unraw(&entry.0.to_string()) == name);
+            drop(display);
+            let role = role.map(|entry| match entry.1 {
+                plan::Bound::Limit => quote::quote! { ::cartel_sqlite::Limit },
+                plan::Bound::Offset => quote::quote! { ::cartel_sqlite::Offset },
+            });
             let (item, bound) = match role {
                 Some(role) => (
                     quote::quote! { ::cartel_sqlite::Bound<#role> },

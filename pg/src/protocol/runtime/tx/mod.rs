@@ -4,7 +4,7 @@ use dope::core::driver::route;
 use dope::manifold::client::conn;
 use dope_fiber::context;
 use dope_fiber::wait;
-use std::pin;
+use std::{pin, task::Poll};
 
 pub(crate) mod poll;
 
@@ -52,39 +52,13 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
         self.shared.wake_tx(id);
     }
 
-    pub(crate) fn settled(&self, target: access::Transaction<'d, ID>) -> poll::Settlement {
-        match self.current(target.conn) {
-            access::Current::Reserved(current) if current.id() == target => {
-                poll::Settlement::Pending
-            }
-            access::Current::Held(current) if current == target => poll::Settlement::Pending,
-            access::Current::Finalizing(current) if current.id() == target => {
-                poll::Settlement::Pending
-            }
-            access::Current::Shared
-            | access::Current::Reserved(_)
-            | access::Current::Held(_)
-            | access::Current::Finalizing(_)
-            | access::Current::Draining => poll::Settlement::Complete(poll::Disposition::Reusable),
-            access::Current::Stale | access::Current::Handshaking | access::Current::Closing => {
-                poll::Settlement::Complete(poll::Disposition::Lost)
-            }
-        }
-    }
-
-    pub(crate) fn begin_finish(
-        &self,
-        id: access::Transaction<'d, ID>,
-    ) -> access::Finalization<'d, ID> {
-        self.shared.ready.finalize(id)
-    }
-
-    pub(crate) fn try_register<'target>(
+    #[inline]
+    pub(crate) fn poll_settled<'target>(
         &self,
         target: access::Transaction<'d, ID>,
         waiter: pin::Pin<&wait::Waiter<'target, 'd>>,
         ctx: pin::Pin<&context::Context<'_, 'd>>,
-    ) -> poll::Register<'d>
+    ) -> Poll<Result<poll::Disposition, wait::Error<'d>>>
     where
         'a: 'target,
         'd: 'target,
@@ -93,20 +67,27 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
             access::Current::Reserved(current) if current.id() == target => {}
             access::Current::Held(current) if current == target => {}
             access::Current::Finalizing(current) if current.id() == target => {}
-            access::Current::Stale
-            | access::Current::Handshaking
-            | access::Current::Shared
+            access::Current::Shared
             | access::Current::Reserved(_)
             | access::Current::Held(_)
             | access::Current::Finalizing(_)
-            | access::Current::Draining
-            | access::Current::Closing => return poll::Register::Stale,
+            | access::Current::Draining => {
+                return Poll::Ready(Ok(poll::Disposition::Reusable));
+            }
+            access::Current::Stale | access::Current::Handshaking | access::Current::Closing => {
+                return Poll::Ready(Ok(poll::Disposition::Lost));
+            }
         }
         let queue: &'a _ = &self.shared.transactions;
-        match queue.try_register(target, waiter, ctx) {
-            Ok(()) => poll::Register::Registered,
-            Err(error) => poll::Register::Failed(error),
-        }
+        queue.try_register(target, waiter, ctx)?;
+        Poll::Pending
+    }
+
+    pub(crate) fn begin_finish(
+        &self,
+        id: access::Transaction<'d, ID>,
+    ) -> access::Finalization<'d, ID> {
+        self.shared.ready.finalize(id)
     }
 
     pub(in crate::protocol) fn poll_ready(

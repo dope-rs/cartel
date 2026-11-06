@@ -8,7 +8,7 @@ use std::{marker, num};
 
 mod raw;
 mod scopes;
-pub(crate) use scopes::{Batch, Cursor, Nodes, Owner, Read, Selected, Selection};
+pub(crate) use scopes::{Nodes, Owner, Selected, Selection};
 
 /// A completed RESP frame that still borrows the receive cursor. Its parser
 /// tape is already in final pool-backed storage and transfers without copying.
@@ -27,29 +27,19 @@ impl<'input, 'd, 'storage, 'g, R: buffer::Cursor> Parsed<'input, 'd, 'storage, '
     pub(crate) fn into_stored(
         self,
         policy: hold::Policy,
-    ) -> Result<(Stored<'storage, 'd>, storage::Lane<'storage, 'g>), (Self, hold::Error)>
+    ) -> Result<(Stored<'storage, 'd>, storage::Lane<'storage, 'g>), hold::Error>
     where
         R: hold::raw::Retain<'d>,
     {
-        let Self { frame, nodes, lane } = self;
-        match frame.bind(policy).try_retain() {
-            Ok(frame) => Ok((
-                Stored {
-                    frame,
-                    nodes,
-                    storage: marker::PhantomData,
-                },
-                lane,
-            )),
-            Err((frame, error)) => Err((
-                Self {
-                    frame: frame.defer(),
-                    nodes,
-                    lane,
-                },
-                error,
-            )),
-        }
+        let frame = self.frame.bind(policy).try_into()?;
+        Ok((
+            Stored {
+                frame,
+                nodes: self.nodes,
+                storage: marker::PhantomData,
+            },
+            self.lane,
+        ))
     }
 }
 
@@ -177,6 +167,26 @@ impl<'a, const W: usize> Iterator for Iter<'a, '_, '_, storage::Bulk<W>> {
         }))
     }
 }
+
+impl<'a> Iterator for Iter<'a, '_, '_, storage::Maybe> {
+    type Item = Option<&'a [u8]>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let read = self.source.nodes.optionals(self.cursor.batch::<1>()?);
+        self.cursor = read.cursor;
+        let [span] = read.value;
+        Some(scope::Owner::with(&self.source.frame, |owner| {
+            span.map(|span| owner.borrow().get(Selection::new(span)).0)
+        }))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.remaining() as usize;
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for Iter<'_, '_, '_, storage::Maybe> {}
 
 impl<'a> Iterator for Iter<'a, '_, '_, storage::Scored> {
     type Item = (&'a [u8], f64);

@@ -11,9 +11,7 @@ use syn::spanned::Spanned as _;
 
 use crate::ext::ExprExt as _;
 use crate::ext::PatExt as _;
-use crate::plan::read::{Filter, Qualify};
-
-pub(in crate::plan) struct Set<'a>(pub(in crate::plan) plan::State<'a>);
+use crate::plan::read::{Qualify, filter};
 
 struct Output {
     ty: syn::ReturnType,
@@ -26,89 +24,74 @@ struct Order {
     dir: qualify::Dir,
 }
 
-impl<'a> Set<'a> {
-    pub(in crate::plan) fn build(
-        self,
-        set: &shape::SetQuery,
-        end: shape::Terminator,
-        outer: &qualify::State,
-    ) -> syn::Result<plan::Step<'a, emit::Plan>> {
-        let output = Output::new(&self.0, set, end)?;
-        let qual = Qualify::bounds(outer, end, &self.0)?;
-        let groups = match self.0.dialect.kind {
-            backend::Kind::Pg => set.links.len().saturating_sub(1),
-            backend::Kind::Sqlite => 0,
+pub(in crate::plan) fn build(
+    state: &mut plan::State<'_>,
+    set: &shape::SetQuery,
+    end: shape::Terminator,
+    outer: &qualify::State,
+) -> syn::Result<emit::Plan> {
+    let output = Output::new(state, set, end)?;
+    let qual = Qualify::bounds(outer, end, state)?;
+    let groups = match state.dialect.kind {
+        backend::Kind::Pg => set.links.len().saturating_sub(1),
+        backend::Kind::Sqlite => 0,
+    };
+    let mut sql: Vec<_> = iter::repeat_n(state.dialect.kw("PAREN_OPEN"), groups).collect();
+    for (index, (op, branch)) in iter::once((None, &set.first))
+        .chain(set.links.iter().map(|(op, branch)| (Some(*op), branch)))
+        .enumerate()
+    {
+        let scope = pred::RowScope::for_source(&branch.source, &branch.pred_idents)?;
+        let filter = if branch.predicate.is_true() {
+            None
+        } else {
+            Some(filter::build(state, &branch.predicate, &scope, false)?)
         };
-        let value: Vec<_> = iter::repeat_n(self.0.dialect.kw("PAREN_OPEN"), groups).collect();
-        let mut step = plan::Step {
-            state: self.0,
-            value,
-        };
-        for (index, (op, branch)) in iter::once((None, &set.first))
-            .chain(set.links.iter().map(|(op, branch)| (Some(*op), branch)))
-            .enumerate()
-        {
-            let scope = pred::RowScope::for_source(&branch.source, &branch.pred_idents)?;
-            let filter = if branch.predicate.is_true() {
-                None
-            } else {
-                let next = Filter(step.state).build(&branch.predicate, &scope, false)?;
-                step.state = next.state;
-                Some(next.value)
-            };
-            if let Some(op) = op {
-                step.value.push(op.sql_ref(step.state.dialect));
-            }
-            let path = &branch.source.primary_path;
-            step.value.push(step.state.dialect.kw("SETOP_BRANCH_OPEN"));
-            step.value
-                .push(quote::quote! { <#path>::__CARTEL_SELECT_COLS });
-            step.value.push(step.state.dialect.kw("FROM_KW"));
-            step.value.extend(branch.source.render_base());
-            if let Some(filter) = filter {
-                step.value.push(step.state.dialect.kw("WHERE_KW"));
-                step.value.extend(filter);
-            }
-            step.value.push(step.state.dialect.kw("SETOP_BRANCH_CLOSE"));
-            if index > 0 && index <= groups {
-                step.value.push(step.state.dialect.kw("PAREN_CLOSE"));
-            }
+        if let Some(op) = op {
+            sql.push(op.sql_ref(state.dialect));
         }
-        for (index, clause) in outer.order_by.iter().enumerate() {
-            let order = Order::new(clause)?;
-            let key = match index {
-                0 => "ORDER_BY_KW",
-                1.. => "COMMA",
-            };
-            step.value.push(step.state.dialect.kw(key));
-            order.col.append_to(&mut step.value);
-            if matches!(order.dir, qualify::Dir::Desc) {
-                step.value.push(step.state.dialect.kw("DESC"));
-            }
+        let path = &branch.source.primary_path;
+        sql.push(state.dialect.kw("SETOP_BRANCH_OPEN"));
+        sql.push(quote::quote! { <#path>::__CARTEL_SELECT_COLS });
+        sql.push(state.dialect.kw("FROM_KW"));
+        sql.extend(branch.source.render_base());
+        if let Some(filter) = filter {
+            sql.push(state.dialect.kw("WHERE_KW"));
+            sql.extend(filter);
         }
-        let mut sql = step.value;
-        let step = qual.render(step.state);
-        sql.extend(step.value);
-
-        let cols = row::View::new(&output.row).cols();
-        let dispatch = match output.kind {
-            shape::RowReturn::Plain => emit::Kind::One(output.row),
-            shape::RowReturn::Optional => emit::Kind::First(output.row),
-            shape::RowReturn::Many => emit::Kind::All(output.row),
-            shape::RowReturn::Stream => emit::Kind::Stream(output.row),
-        };
-        let value = emit::Plan {
-            output: output.ty,
-            sql_parts: sql,
-            n_result_cols: cols,
-            dispatch,
-            probe_override: None,
-        };
-        Ok(plan::Step {
-            state: step.state,
-            value,
-        })
+        sql.push(state.dialect.kw("SETOP_BRANCH_CLOSE"));
+        if index > 0 && index <= groups {
+            sql.push(state.dialect.kw("PAREN_CLOSE"));
+        }
     }
+    for (index, clause) in outer.order_by.iter().enumerate() {
+        let order = Order::new(clause)?;
+        let key = match index {
+            0 => "ORDER_BY_KW",
+            1.. => "COMMA",
+        };
+        sql.push(state.dialect.kw(key));
+        sql.extend(order.col.into_parts());
+        if matches!(order.dir, qualify::Dir::Desc) {
+            sql.push(state.dialect.kw("DESC"));
+        }
+    }
+    sql.extend(qual.render(state));
+
+    let cols = row::View::new(&output.row).cols();
+    let dispatch = match output.kind {
+        shape::RowReturn::Plain => emit::Kind::One(output.row),
+        shape::RowReturn::Optional => emit::Kind::First(output.row),
+        shape::RowReturn::Many => emit::Kind::All(output.row),
+        shape::RowReturn::Stream => emit::Kind::Stream(output.row),
+    };
+    Ok(emit::Plan {
+        output: output.ty,
+        sql_parts: sql,
+        n_result_cols: cols,
+        dispatch,
+        probe_override: None,
+    })
 }
 
 impl Output {

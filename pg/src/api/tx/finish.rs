@@ -127,6 +127,24 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                 waiter.unregister();
                 return Poll::Ready(Err(error));
             }
+            if let State::Dispatching(call) = this.state {
+                match call.poll_done(cx.as_mut(), waiter, |held, _client, _conn| held.begin()) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Done::AdmissionFailed(error)) => {
+                        *this.state = State::Done;
+                        waiter.unregister();
+                        timer.as_mut().complete();
+                        return Poll::Ready(Err(error));
+                    }
+                    Poll::Ready(Done::Response { outcome, committed }) => {
+                        *this.state = State::Settling {
+                            finalizing: committed,
+                            outcome,
+                        };
+                    }
+                }
+                continue;
+            }
             match mem::replace(this.state, State::Done) {
                 State::Holding(lease) => {
                     let owner = lease.client();
@@ -142,7 +160,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                         | access::Current::Draining
                         | access::Current::Closing => {
                             waiter.unregister();
-                            timer.as_ref().complete();
+                            timer.as_mut().complete();
                             return Poll::Ready(Err(crate::Error::Closed.into()));
                         }
                     }
@@ -151,17 +169,17 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                             .port
                             .shared
                             .transaction()
-                            .try_register(tx, waiter, cx.as_ref())
+                            .poll_settled(tx, waiter, cx.as_ref())
                         {
-                            poll::Register::Registered => {}
-                            poll::Register::Stale => {
+                            Poll::Pending => {}
+                            Poll::Ready(Ok(_)) => {
                                 waiter.unregister();
-                                timer.as_ref().complete();
+                                timer.as_mut().complete();
                                 return Poll::Ready(Err(crate::Error::Closed.into()));
                             }
-                            poll::Register::Failed(error) => {
+                            Poll::Ready(Err(error)) => {
                                 waiter.unregister();
-                                timer.as_ref().complete();
+                                timer.as_mut().complete();
                                 return Poll::Ready(Err(crate::reply::Error::Wait(error)));
                             }
                         }
@@ -178,87 +196,54 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                         Ok(req) => req,
                         Err(error) => {
                             waiter.unregister();
-                            timer.as_ref().complete();
+                            timer.as_mut().complete();
                             return Poll::Ready(Err(error.into()));
                         }
                     };
-                    let call = owner
-                        .pending::<api::ExtractUnit<ID>, _, access::Finalization<'d, ID>, Recover>(
-                            Some(api::Target::from_tx(tx)),
-                            req.map_state(|()| lease),
-                        );
+                    let call = Core::new(
+                        owner,
+                        Some(api::Target::from_tx(tx)),
+                        api::Response::new(),
+                        Ok(req.map_state(|()| lease)),
+                    );
                     *this.state = State::Dispatching(call);
                 }
-                State::Dispatching(mut call) => {
-                    match call.poll_done(cx.as_mut(), waiter, |held, _client, _conn| held.begin()) {
-                        Poll::Pending => {
-                            *this.state = State::Dispatching(call);
-                            return Poll::Pending;
-                        }
-                        Poll::Ready(Done::AdmissionFailed(error)) => {
-                            waiter.unregister();
-                            timer.as_ref().complete();
-                            return Poll::Ready(Err(error));
-                        }
-                        Poll::Ready(Done::Response {
-                            outcome: next,
-                            committed: lease,
-                        }) => {
-                            *this.state = State::Settling {
-                                finalizing: lease,
-                                outcome: next,
-                            };
-                        }
-                    }
-                }
+                State::Dispatching(_) => unreachable!("dispatching"),
                 State::Settling {
                     finalizing: lease,
                     outcome: next,
                 } => {
                     let owner = lease.client();
-                    let mode = match lease.settle() {
-                        access::Finalization::Pending(target) => loop {
-                            match owner.port.shared.transaction().settled(target) {
-                                poll::Settlement::Complete(mode) => break mode,
-                                poll::Settlement::Pending => {
-                                    match owner.port.shared.transaction().try_register(
-                                        target,
-                                        waiter,
-                                        cx.as_ref(),
-                                    ) {
-                                        poll::Register::Registered => {}
-                                        poll::Register::Stale => continue,
-                                        poll::Register::Failed(error) => {
-                                            waiter.unregister();
-                                            timer.as_ref().complete();
-                                            let next = next.and(Err(Error::Wait(error)));
-                                            if owner
-                                                .port
-                                                .shared
-                                                .transaction()
-                                                .is_current::<true>(target)
-                                            {
-                                                owner.abort(target.conn, crate::Error::Closed);
-                                            }
-                                            return Poll::Ready(next);
-                                        }
-                                    }
+                    let mode = match lease.target() {
+                        access::Finalization::Pending(target) => {
+                            match owner.port.shared.transaction().poll_settled(
+                                target,
+                                waiter,
+                                cx.as_ref(),
+                            ) {
+                                Poll::Ready(Ok(mode)) => mode,
+                                Poll::Ready(Err(error)) => {
+                                    waiter.unregister();
+                                    timer.as_mut().complete();
+                                    let next = next.and(Err(Error::Wait(error)));
+                                    lease.abort(crate::Error::Closed);
+                                    return Poll::Ready(next);
+                                }
+                                Poll::Pending => {
                                     *this.state = State::Settling {
-                                        finalizing: Lease::new(
-                                            owner,
-                                            access::Finalization::Pending(target),
-                                        ),
+                                        finalizing: lease,
                                         outcome: next,
                                     };
                                     return Poll::Pending;
                                 }
                             }
-                        },
+                        }
                         access::Finalization::Reusable(_) => poll::Disposition::Reusable,
                         access::Finalization::Lost(_) => poll::Disposition::Lost,
                     };
+                    lease.settle();
                     waiter.unregister();
-                    timer.as_ref().complete();
+                    timer.as_mut().complete();
                     let next = match mode {
                         poll::Disposition::Reusable => next,
                         poll::Disposition::Lost => next.and(Err(crate::Error::Closed.into())),
@@ -267,7 +252,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                 }
                 State::Done => {
                     waiter.unregister();
-                    timer.as_ref().complete();
+                    timer.as_mut().complete();
                     return Poll::Ready(Err(crate::Error::Closed.into()));
                 }
             }

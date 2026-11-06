@@ -70,10 +70,6 @@ impl<'id, K> Cursor<'id, K> {
             brand: self.brand,
         })
     }
-
-    pub(crate) fn remaining(&self) -> u32 {
-        self.cursor.remaining()
-    }
 }
 
 impl<'id> Array<'id> {
@@ -171,16 +167,12 @@ impl<'id, 's> Nodes<'id, 's> {
     pub(crate) fn pair(
         &self,
         batch: Batch<'id, 2>,
-    ) -> Read<'id, [Result<parser::Value<Selection<'id>>, Selection<'id>>; 2]> {
-        let read = self.nodes.pair(batch.batch);
-        Read {
-            value: read.value.map(|value| {
-                value
-                    .map(|value| value.map(Selection::new))
-                    .map_err(Selection::new)
-            }),
-            cursor: Cursor::new(read.cursor),
-        }
+    ) -> [Result<parser::Value<Selection<'id>>, Selection<'id>>; 2] {
+        self.nodes.pair(batch.batch).value.map(|value| {
+            value
+                .map(|value| value.map(Selection::new))
+                .map_err(Selection::new)
+        })
     }
 
     pub(crate) fn array(
@@ -236,7 +228,6 @@ impl<'id, 's> Nodes<'id, 's> {
                 storage::CoordError::Member(error) => storage::CoordError::Member(mismatch(error)),
                 storage::CoordError::Length { actual } => storage::CoordError::Length { actual },
                 storage::CoordError::Number(error) => storage::CoordError::Number(error),
-                storage::CoordError::Remaining(left) => storage::CoordError::Remaining(left),
             })
     }
 }

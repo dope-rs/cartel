@@ -2,10 +2,7 @@ use crate::value::list::Lease;
 use crate::value::source::Coordinates as _;
 use crate::{
     client::GeoCoord,
-    protocol::{
-        self,
-        parser::{frame, storage},
-    },
+    protocol::parser::{frame, storage},
     value::{self, reply, scalar, source},
 };
 use std::{iter, marker};
@@ -66,12 +63,6 @@ impl<'s, 'arena, 'credits, 'region, const ID: u8> value::Decode<'s, 'arena, 'cre
                             actual,
                         },
                         storage::CoordError::Number(error) => error,
-                        storage::CoordError::Remaining(count) => {
-                            return Err(crate::Error::Protocol(protocol::Error::Values {
-                                remaining: count,
-                            })
-                            .into());
-                        }
                     };
                     return Err(fault.into_reply(frame, keep));
                 }

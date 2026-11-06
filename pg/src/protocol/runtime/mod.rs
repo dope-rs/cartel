@@ -125,7 +125,7 @@ impl<'d, const ID: u8> Shared<'d, ID> {
     }
 
     pub(crate) fn wake_ready(&self) {
-        self.ready.waiters.wake();
+        self.ready.waiters.notify();
     }
 
     pub(crate) fn reindex(&self, slot: conn::Id<'d, route::KeyTag<ID>>, depth: order::Depth) {
@@ -171,7 +171,7 @@ impl<'d, const ID: u8> Shared<'d, ID> {
                 self.wake_tx(tx);
             }
             slot::Closed::Handshaking | slot::Closed::Shared | slot::Closed::Draining => {
-                self.ready.waiters.wake();
+                self.ready.waiters.notify();
             }
             slot::Closed::Closing => return close.failure,
         }
@@ -183,6 +183,6 @@ impl<'d, const ID: u8> Shared<'d, ID> {
             self.signals
                 .record_fatal(crate::Error::TransactionSlot(cause));
         }
-        self.ready.waiters.wake();
+        self.ready.waiters.notify();
     }
 }

@@ -7,40 +7,52 @@ pub mod notice;
 pub mod retire;
 pub mod startup;
 
-use dope::core::platform::wake::{Notify, NotifyError, WaitError};
 use dope::runtime::executor::root;
+use dope_fiber::{
+    abi::{Fiber, Task},
+    context::{Context, PollResult},
+};
 use std::{pin::Pin, task::Poll};
 
 pub struct Quarantine<F, C> {
-    query: Option<Pin<Box<F>>>,
-    release: Option<Notify>,
+    query: Option<Pin<Box<Task<F>>>>,
+    admitted: bool,
     quarantine: Option<C>,
 }
 
 #[derive(Debug)]
 pub enum RetireError {
-    Release(NotifyError),
+    Completed,
     Consumed,
 }
 
 impl<F, C> Quarantine<F, C> {
-    pub fn new(query: Pin<Box<F>>, release: Notify, close: C) -> Self {
+    pub fn new(query: Pin<Box<Task<F>>>, close: C) -> Self {
         Self {
             query: Some(query),
-            release: Some(release),
+            admitted: false,
             quarantine: Some(close),
         }
     }
 }
 
-impl<'d, F, C: FnOnce() + Unpin> root::Root<'d> for Quarantine<F, C> {
+impl<'d, F: Fiber<'d>, C: FnOnce() + Unpin> root::Root<'d> for Quarantine<F, C> {
     type Output = Result<(), RetireError>;
 
     fn poll(context: root::Context<'_, 'd, Self>) -> Poll<Self::Output> {
-        let (this, wake, work, _) = context.into_parts();
+        let (this, wake, work, driver) = context.into_parts();
         let this = this.get_mut();
-        if let Some(release) = this.release.take() {
-            release.notify().map_err(RetireError::Release)?;
+        if !this.admitted {
+            let query = this.query.as_mut().ok_or(RetireError::Consumed)?;
+            this.admitted = match Context::with_target(wake, work, driver, |context| {
+                context.try_poll(query.as_mut())
+            }) {
+                PollResult::Exhausted => false,
+                PollResult::Polled(Poll::Pending) => true,
+                PollResult::Polled(Poll::Ready(_)) => {
+                    return Poll::Ready(Err(RetireError::Completed));
+                }
+            };
             wake.wake();
             return Poll::Pending;
         }
@@ -75,7 +87,6 @@ pub enum SettleError {
     Startup(Error),
     Begin(Error),
     Group(Error),
-    Release(WaitError),
     Close(Error),
     Reconnect(peer::Error),
     Restart(Error),

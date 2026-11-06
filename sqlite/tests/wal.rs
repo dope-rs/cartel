@@ -2,25 +2,25 @@ use crate::common::plan;
 use cartel_sqlite::runtime::{self, Runtime};
 use common::{assert_reclaimed, assert_retirement, wal::*};
 use dope_core::driver::life::recovery::Policy;
-use dope_runtime::topology;
+use dope_runtime::{process::lifecycle, topology};
 use dope_test::fibers;
 use dope_test::harness::support::file::Directory;
-use std::{env, num::NonZero, path::Path, sync::OnceLock};
-use std::{sync::mpsc, thread, time::Duration};
+use std::{env, num::NonZero, path::Path};
 
 pub mod common;
 
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
-
 #[test]
-fn checkpoint_pages_fit_native_range() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn wal_contracts() -> Result<(), plan::Error> {
+    // SAFETY: this binary has one test; installation precedes every SQLite call
+    // and worker start. Only Cartel uses installed SQLite; Core handles and
+    // allocations remain exclusively owned by their originating worker until release.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
+    checkpoint_pages_fit_native_range(runtime)?;
+    reader_sees_wal_commit(runtime)
+}
+
+fn checkpoint_pages_fit_native_range(runtime: Runtime) -> Result<(), plan::Error> {
     let dir = Directory::try_with(
         Path::new(env!("CARGO_TARGET_TMPDIR")),
         "cartel-sqlite-checkpoint-pages",
@@ -59,16 +59,10 @@ fn checkpoint_pages_fit_native_range() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn reader_sees_wal_commit() -> Result<(), plan::Error> {
+fn reader_sees_wal_commit(runtime: Runtime) -> Result<(), plan::Error> {
+    use lifecycle::Task as _;
+
     let base = env::temp_dir();
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
     let dir = Directory::try_with(&base, "cartel-sqlite-wal", |removed| {
         removed.expect("temporary directory cleanup")
     })
@@ -77,82 +71,92 @@ fn reader_sees_wal_commit() -> Result<(), plan::Error> {
     let read_db = database(runtime, &path)?
         .commands(COMMANDS)
         .map_err(plan::Error::Client)?;
-    let write_db = database(runtime, &path)?;
-    let result = plan::Plan::<WalDatabase>::try_new(read_db, try_limits()?, try_memory()?)?
-        .try_run(
-            |driver, mut reader| {
-                let (lock_tx, lock_rx) = mpsc::channel();
-                let (free_tx, free_rx) = mpsc::channel();
-                let writer = thread::spawn(move || {
-                    let result = (|| -> Result<(), plan::Error> {
-                        let result = plan::Plan::<WalDatabase>::try_new(
-                            write_db,
-                            try_limits()?,
-                            try_memory()?,
-                        )?
-                        .try_run(
-                            |driver, mut writer| {
-                                let mut tx = fibers::TEST
-                                    .try_run(driver, writer.transaction())
-                                    .map_err(plan::Error::Run)?
-                                    .map_err(plan::Error::Call)?;
-                                let written = fibers::TEST.try_run(
+    let peer_read = database(runtime, &path)?;
+    let peer_write = database(runtime, &path)?;
+    let limits = try_limits()?;
+    let memory = try_memory()?;
+    let result = plan::Plan::<WalDatabase>::try_new(read_db, limits, memory)?.try_run(
+        |driver, mut reader| {
+            let mut tx = fibers::TEST
+                .try_run(driver, reader.transaction())
+                .map_err(plan::Error::Run)?
+                .map_err(plan::Error::Call)?;
+            fibers::TEST
+                .try_run(
+                    driver,
+                    tx.query()
+                        .run_no_rows(WalDatabase::INSERT_ITEM, (1_i64, ())),
+                )
+                .map_err(plan::Error::Run)?
+                .map_err(plan::Error::Call)?;
+            let ((), uncommitted) = lifecycle::Entry(move || {
+                let result = plan::Plan::<WalDatabase>::try_new(peer_read, limits, memory)
+                    .expect("WAL peer reader plan")
+                    .try_count(
+                        WalDatabase::COUNT_ITEMS,
+                        Policy::new(assert_reclaimed, assert_retirement),
+                        |result| result.expect("SQLite scope"),
+                    );
+                result
+                    .expect("WAL peer reader scope failed")
+                    .expect("WAL peer read")
+            })
+            .with(|| ())
+            .expect("WAL peer reader start and join");
+            assert_eq!(uncommitted, 1);
+            fibers::TEST
+                .try_run(driver, tx.rollback())
+                .map_err(plan::Error::Run)?
+                .map_err(plan::Error::Call)?;
+            let before = fibers::TEST
+                .try_run(
+                    driver,
+                    reader
+                        .query()
+                        .run_one::<i64, _, _>(WalDatabase::COUNT_ITEMS, ()),
+                )
+                .map_err(plan::Error::Run)?
+                .map_err(plan::Error::Call)?;
+            assert_eq!(before, 1);
+
+            lifecycle::Entry(move || {
+                let result = plan::Plan::<WalDatabase>::try_new(peer_write, limits, memory)
+                    .expect("WAL peer writer plan")
+                    .try_run(
+                        |driver, mut writer| {
+                            fibers::TEST
+                                .try_run(
                                     driver,
-                                    tx.query()
+                                    writer
+                                        .query()
                                         .run_no_rows(WalDatabase::INSERT_ITEM, (1_i64, ())),
-                                );
-                                assert!(
-                                    matches!(written, Ok(Ok(()))),
-                                    "uncommitted WAL write failed"
-                                );
-                                assert!(lock_tx.send(()).is_ok(), "WAL writer signal failed");
-                                assert!(
-                                    free_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
-                                    "WAL writer release failed"
-                                );
-                                let saved = fibers::TEST.try_run(driver, tx.commit());
-                                assert!(matches!(saved, Ok(Ok(()))), "WAL writer commit failed");
-                                Ok(())
-                            },
-                            Policy::new(assert_reclaimed, assert_retirement),
-                            |result| result.expect("SQLite scope"),
-                        );
-                        result.expect("WAL writer scope failed")
-                    })();
-                    assert!(result.is_ok(), "WAL writer failed");
-                });
-
-                assert!(
-                    lock_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
-                    "WAL writer wait failed"
-                );
-                let before = fibers::TEST
-                    .try_run(
-                        driver,
-                        reader
-                            .query()
-                            .run_one::<i64, _, _>(WalDatabase::COUNT_ITEMS, ()),
-                    )
-                    .map_err(plan::Error::Run)?
-                    .map_err(plan::Error::Call)?;
-                assert_eq!(before, 1);
-
-                assert!(free_tx.send(()).is_ok(), "WAL writer release failed");
-                assert!(writer.join().is_ok(), "WAL writer join failed");
-                let after = fibers::TEST
-                    .try_run(
-                        driver,
-                        reader
-                            .query()
-                            .run_one::<i64, _, _>(WalDatabase::COUNT_ITEMS, ()),
-                    )
-                    .map_err(plan::Error::Run)?
-                    .map_err(plan::Error::Call)?;
-                assert_eq!(after, 2);
-                Ok(())
-            },
-            Policy::new(assert_reclaimed, assert_retirement),
-            |result| result.expect("SQLite scope"),
-        );
+                                )
+                                .map_err(plan::Error::Run)?
+                                .map_err(plan::Error::Call)
+                        },
+                        Policy::new(assert_reclaimed, assert_retirement),
+                        |result| result.expect("SQLite scope"),
+                    );
+                result
+                    .expect("WAL peer writer scope failed")
+                    .expect("WAL peer write");
+            })
+            .with(|| ())
+            .expect("WAL peer writer start and join");
+            let after = fibers::TEST
+                .try_run(
+                    driver,
+                    reader
+                        .query()
+                        .run_one::<i64, _, _>(WalDatabase::COUNT_ITEMS, ()),
+                )
+                .map_err(plan::Error::Run)?
+                .map_err(plan::Error::Call)?;
+            assert_eq!(after, 2);
+            Ok(())
+        },
+        Policy::new(assert_reclaimed, assert_retirement),
+        |result| result.expect("SQLite scope"),
+    );
     result.expect("WAL reader scope failed")
 }

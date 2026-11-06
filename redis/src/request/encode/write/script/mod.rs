@@ -1,5 +1,18 @@
 use crate::request::encode;
 
+/// Measures an EVAL request from payload lengths, checking both declared counts.
+pub fn wire_len(
+    script: &[u8],
+    key_count: usize,
+    key_lengths: impl Iterator<Item = usize>,
+    argument_count: usize,
+    argument_lengths: impl Iterator<Item = usize>,
+) -> Result<usize, crate::request::Error> {
+    let length = start(script, key_count, argument_count)?;
+    let length = lengths(length, key_count, key_lengths)?;
+    lengths(length, argument_count, argument_lengths).map(encode::Length::get)
+}
+
 pub(crate) fn length<K, A>(
     script: &[u8],
     keys: &[K],
@@ -9,18 +22,12 @@ where
     K: AsRef<[u8]>,
     A: crate::request::Bulk,
 {
-    let count = count(keys.len(), args.len())?;
-    let mut wire = [0; 20];
-    let arity = encode::format_uint_into(&mut wire, keys.len() as u64);
-    let mut length = encode::Length::array(count)?
-        .bulk(b"EVAL")?
-        .bulk(script)?
-        .bulk(arity)?;
+    let mut length = start(script, keys.len(), args.len())?;
     for key in keys {
-        length = length.bulk(key.as_ref())?;
+        length = length.bulk(key.as_ref().len())?;
     }
     for argument in args {
-        length = length.bulk(argument)?;
+        length = length.bulk(argument.len())?;
     }
     Ok(length)
 }
@@ -36,8 +43,8 @@ where
     A: crate::request::Bulk,
 {
     let count = count(keys.len(), args.len())?;
-    let mut wire = [0; 20];
-    let arity = encode::format_uint_into(&mut wire, keys.len() as u64);
+    let mut wire = core::fmt::NumBuffer::new();
+    let arity = (keys.len() as u64).format_into(&mut wire).as_bytes();
     out.array(count)?;
     out.bulk(b"EVAL")?;
     out.bulk(script)?;
@@ -49,6 +56,28 @@ where
         out.bulk(argument)?;
     }
     out.complete()
+}
+
+#[inline(always)]
+fn start(script: &[u8], keys: usize, args: usize) -> Result<encode::Length, crate::request::Error> {
+    encode::Length::array(count(keys, args)?)?
+        .bulk(b"EVAL".len())?
+        .bulk(script.len())?
+        .bulk(encode::Number(keys as u64).digits())
+}
+
+fn lengths(
+    mut length: encode::Length,
+    declared: usize,
+    sizes: impl Iterator<Item = usize>,
+) -> Result<encode::Length, crate::request::Error> {
+    let mut actual = 0;
+    for size in sizes {
+        actual = encode::next_item(declared, actual)?;
+        length = length.bulk(size)?;
+    }
+    encode::check_items(declared, actual)?;
+    Ok(length)
 }
 
 fn count(keys: usize, args: usize) -> Result<usize, crate::request::Error> {

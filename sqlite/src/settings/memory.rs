@@ -1,7 +1,7 @@
 use crate::{
     api::stmt,
     catalogs, config, conn,
-    runtime::{Error, heap::layout::Layout, local, raw},
+    runtime::{Error, heap::layout::Layout, raw},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -31,10 +31,7 @@ impl Memory {
         }
         let phase = round(phase.size()).ok_or(Error::CapacityOverflow)?;
         let arena = sqlite.backing().ok_or(Error::CapacityOverflow)?;
-        let retain = local::State::<I>::RETENTION_BYTES
-            .checked_add(phase)
-            .and_then(|bytes| bytes.checked_add(arena))
-            .ok_or(Error::CapacityOverflow)?;
+        let retain = phase.checked_add(arena).ok_or(Error::CapacityOverflow)?;
         let backing = retain
             .checked_add(results)
             .and_then(|bytes| bytes.checked_add(stmts.slots_bytes))

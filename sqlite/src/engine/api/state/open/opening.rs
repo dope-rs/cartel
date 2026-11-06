@@ -1,3 +1,4 @@
+use crate::api::work::guard::{Guard, open};
 use crate::{catalogs, database, options, retry, runtime, sys};
 use retry::lease;
 use runtime::{local, slot};
@@ -26,8 +27,6 @@ enum Configure {
     TemporaryStore,
     MainCache,
     TemporaryCache,
-    MainSpill,
-    TemporarySpill,
 }
 
 #[derive(Clone, Copy)]
@@ -37,7 +36,6 @@ enum Settings {
     Mapped,
     Synchronous,
     Checkpoint,
-    JournalCheck,
 }
 
 #[derive(Clone, Copy)]
@@ -87,7 +85,12 @@ impl<'local, 'd: 'local, I: catalogs::Catalog> Opening<'local, 'd, I> {
         ))
     }
 
-    pub(super) fn retry(&mut self) -> lease::Lease<'_, 'd, lease::Open> {
+    pub(super) fn retry(
+        &mut self,
+    ) -> (
+        &Guard<'local, open::Open>,
+        lease::Lease<'_, 'd, lease::Open>,
+    ) {
         self.resources.retry()
     }
 
@@ -130,14 +133,7 @@ impl<'local, 'd: 'local, I: catalogs::Catalog> Opening<'local, 'd, I> {
                     "temp.cache_size",
                     i64::from(-self.resources.config().temp_kib()),
                 )?;
-                Configure::MainSpill
-            }
-            Configure::MainSpill => {
-                call.exec("PRAGMA cache_spill=ON")?;
-                Configure::TemporarySpill
-            }
-            Configure::TemporarySpill => {
-                call.exec("PRAGMA temp.cache_spill=ON")?;
+                // Native connection and pager creation already enable cache spilling.
                 self.phase = Phase::Settings(Settings::Journal);
                 return Ok(Progress::Pending);
             }
@@ -172,10 +168,6 @@ impl<'local, 'd: 'local, I: catalogs::Catalog> Opening<'local, 'd, I> {
             }
             Settings::Checkpoint => {
                 self.options.checkpoint(&call)?;
-                Settings::JournalCheck
-            }
-            Settings::JournalCheck => {
-                self.options.verify(&call)?;
                 self.phase = Phase::Verify(Verify::Mapped);
                 return Ok(Progress::Pending);
             }

@@ -1,5 +1,5 @@
 use cartel_pg::api::traits::{
-    Begin as _, Client as _, Query as _, Status as _, Stream as _, Unchecked as _,
+    Begin as _, Client as _, Notify as _, Query as _, Status as _, Stream as _, Unchecked as _,
 };
 use cartel_pg::{api, port, port::config, protocol::encode, reply};
 use common::wire::checked::{Database, TextQuery, TextRow};
@@ -10,12 +10,16 @@ use dope::{
     core::driver::route::Id, core::driver::schedule::clock::timer::Exhausted,
     manifold::app::env::Bundle, manifold::timing::Throughput, net::tcp::Tcp, net::wire::Identity,
 };
-use dope_fiber::{BlockOn as _, abi::poll_fn, context::raw::Live};
+use dope_fiber::{
+    BlockOn as _,
+    abi::poll_fn,
+    context::{PollResult, raw::Live},
+};
 use dope_test::{
     harness::{GUARD, peer::TcpScript},
     reclaim::Reports,
 };
-use std::{net::SocketAddr, pin::pin, time::Duration};
+use std::{net::SocketAddr, pin::pin, task::Poll, time::Duration};
 
 type Env = Bundle<Tcp, Identity, Throughput>;
 
@@ -131,7 +135,7 @@ fn timer_capacity_is_exact() {
 fn typed_queries_free_timer() {
     let bytes = TextRow::wire(7, b"retained");
     TcpScript::with(
-        |socket| Database::serve_rows(socket, [bytes.as_slice(); 4]),
+        |socket| Database::serve_timer_queries(socket, &bytes),
         |server| {
             let login = cartel_pg::Config::new("user".into(), "password".into(), "database".into())
                 .expect("database credentials");
@@ -214,30 +218,64 @@ fn typed_queries_free_timer() {
                                     drop(alarm);
 
                                     let mut first = pin!(client.query().run_first::<TextQuery>(()));
+                                    let mut all = pin!(None);
                                     assert!(matches!(timer.try_alarm(), Err(Exhausted::Slots)));
-                                    let row = runtime
-                                        .block_on(poll_fn(|context| {
+                                    runtime
+                                        .block_on(poll_fn(|mut context| {
                                             // SAFETY: the pinned query remains owned here, and Ready
                                             // ends this closure's polling authority.
-                                            unsafe { Live::new(first.as_mut()) }.poll(context)
+                                            let Poll::Ready(row) =
+                                                unsafe { Live::new(first.as_mut()) }
+                                                    .poll(context.as_mut())
+                                            else {
+                                                return Poll::Pending;
+                                            };
+                                            assert!(
+                                                row.is_ok(),
+                                                "optional query: {:?}",
+                                                row.as_ref().err().map(reply::Error::kind)
+                                            );
+                                            let row = row
+                                                .ok()
+                                                .expect("optional query")
+                                                .expect("optional row");
+                                            let alarm = timer
+                                                .try_alarm()
+                                                .expect("completed run_first timer");
+                                            let view = row.decode().expect("retained optional row");
+                                            assert_eq!((view.lease, view.name), (7, "retained"));
+                                            drop(row);
+                                            drop(alarm);
+
+                                            all.as_mut()
+                                                .set(Some(client.query().run_all::<TextQuery>(())));
+                                            assert!(matches!(
+                                                timer.try_alarm(),
+                                                Err(Exhausted::Slots)
+                                            ));
+                                            assert!(context.as_ref().work().remaining() >= 2);
+                                            // SAFETY: this first poll must stay Pending; the pinned
+                                            // query is retained until the later terminal poll below.
+                                            assert!(matches!(
+                                                unsafe {
+                                                    Live::new(
+                                                        all.as_mut()
+                                                            .as_pin_mut()
+                                                            .expect("next query"),
+                                                    )
+                                                }
+                                                .try_poll(context),
+                                                PollResult::Polled(Poll::Pending)
+                                            ));
+                                            Poll::Ready(())
                                         }))
                                         .expect("driver query");
-                                    assert!(
-                                        row.is_ok(),
-                                        "optional query: {:?}",
-                                        row.as_ref().err().map(reply::Error::kind)
-                                    );
-                                    let row =
-                                        row.ok().expect("optional query").expect("optional row");
-                                    let alarm =
-                                        timer.try_alarm().expect("completed run_first timer");
-                                    let view = row.decode().expect("retained optional row");
-                                    assert_eq!((view.lease, view.name), (7, "retained"));
-                                    drop(row);
-                                    drop(alarm);
-
-                                    let mut all = pin!(client.query().run_all::<TextQuery>(()));
-                                    assert!(matches!(timer.try_alarm(), Err(Exhausted::Slots)));
+                                    runtime
+                                        .block_on(client.notify().next())
+                                        .expect("notification driver")
+                                        .ok()
+                                        .expect("next request reached peer");
+                                    let mut all = all.as_mut().as_pin_mut().expect("next query");
                                     let rows = runtime
                                         .block_on(poll_fn(|context| {
                                             // SAFETY: the pinned query remains owned here, and Ready

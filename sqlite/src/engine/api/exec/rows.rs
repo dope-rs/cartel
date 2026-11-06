@@ -140,12 +140,12 @@ impl<
         let (active, policy) = match this.state {
             State::Start((machine, create)) => {
                 let active = match machine.poll(context.as_mut()) {
-                    machine::Next::Pending(machine) => {
+                    Ok(ops::ControlFlow::Continue(machine)) => {
                         this.state = State::Start((machine, create));
                         return vacant.insert(this).pending();
                     }
-                    machine::Next::Ready(Ok(active)) => active,
-                    machine::Next::Ready(Err(error)) => return vacant.complete(Err(error)),
+                    Ok(ops::ControlFlow::Break(active)) => active,
+                    Err(error) => return vacant.complete(Err(error)),
                 };
                 if let Err(error) = active.columns::<false>(R::N_COLS) {
                     return vacant.complete(active.finish(Err(error)));

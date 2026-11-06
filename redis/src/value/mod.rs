@@ -111,7 +111,7 @@ impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, '
         reply: Reply<'s, 'arena, 'credits, 'region>,
     ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
     {
-        wire::Wire::decode(reply, |wire, batch| wire::Wire::signed(wire, batch))
+        wire::Wire::decode(reply, |wire| wire::Wire::signed(wire))
     }
 }
 
@@ -124,7 +124,7 @@ impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, '
         reply: Reply<'s, 'arena, 'credits, 'region>,
     ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
     {
-        wire::Wire::decode(reply, |wire, batch| wire::Wire::unsigned(wire, batch))
+        wire::Wire::decode(reply, |wire| wire::Wire::unsigned(wire))
     }
 }
 
@@ -137,7 +137,7 @@ impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, '
         reply: Reply<'s, 'arena, 'credits, 'region>,
     ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
     {
-        wire::Wire::decode(reply, |wire, batch| wire::Wire::float(wire, batch))
+        wire::Wire::decode(reply, |wire| wire::Wire::float(wire))
     }
 }
 
@@ -150,7 +150,7 @@ impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, '
         reply: Reply<'s, 'arena, 'credits, 'region>,
     ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
     {
-        wire::Wire::decode(reply, |wire, batch| wire::Wire::coordinate(wire, batch))
+        wire::Wire::decode(reply, |wire| wire::Wire::coordinate(wire))
     }
 }
 
@@ -163,7 +163,7 @@ impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, '
         reply: Reply<'s, 'arena, 'credits, 'region>,
     ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
     {
-        wire::Wire::decode(reply, |wire, batch| wire::Wire::boolean(wire, batch))
+        wire::Wire::decode(reply, |wire| wire::Wire::boolean(wire))
     }
 }
 
@@ -190,11 +190,11 @@ impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, '
     ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
     {
         wire::Wire::with(reply, |wire| {
-            let read = match wire.try_next(wire.nodes.root()) {
-                Ok(read) => read,
+            let value = match wire.try_next() {
+                Ok(value) => value,
                 Err(error) => return Err(wire.failure(error)),
             };
-            let span = match read.value {
+            let span = match value {
                 parser::Value::Nil => None,
                 parser::Value::Bulk(span) => Some(span),
                 actual => {
@@ -203,7 +203,6 @@ impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, '
                     );
                 }
             };
-            let wire = wire.finish(read.cursor)?;
             Ok(span.map(|span| wire.project(span)))
         })
     }
@@ -234,8 +233,7 @@ impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, '
                     expected: 2,
                     actual: error.actual,
                 })?;
-            let read = wire.nodes.pair(batch);
-            let [first, second] = read.value;
+            let [first, second] = wire.nodes.pair(batch);
             let bulk = |value| match value {
                 Ok(parser::Value::Bulk(span)) => Ok(span),
                 Ok(actual) => Err(Fault::expected(reply::Expectation::Bulk, actual)),
@@ -249,7 +247,6 @@ impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, '
                 Ok(span) => span,
                 Err(error) => return Err(wire.failure(error)),
             };
-            let wire = wire.finish(read.cursor)?;
             let frame = wire
                 .frame
                 .try_clone()
@@ -277,7 +274,7 @@ impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, '
         reply: Reply<'s, 'arena, 'credits, 'region>,
     ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
     {
-        wire::Wire::decode(reply, |wire, batch| wire::Wire::opt_float(wire, batch))
+        wire::Wire::decode(reply, |wire| wire::Wire::opt_float(wire))
     }
 }
 
@@ -290,6 +287,6 @@ impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, '
         reply: Reply<'s, 'arena, 'credits, 'region>,
     ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
     {
-        wire::Wire::decode(reply, |wire, batch| wire::Wire::opt_unsigned(wire, batch))
+        wire::Wire::decode(reply, |wire| wire::Wire::opt_unsigned(wire))
     }
 }

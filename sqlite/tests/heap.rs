@@ -1,52 +1,72 @@
 use crate::common::{assert_reclaimed, assert_retirement, plan};
 use cartel_sqlite::runtime::{self, Runtime};
-use cartel_sqlite::{Action, Error, Progress};
+use cartel_sqlite::{Action, Error, Progress, open};
 use common::engine::heap::*;
 use dope_core::driver::life::recovery::Policy;
+use dope_runtime::{executor::session, process::lifecycle, topology::InstallError};
 use dope_test::fibers;
-use std::num::NonZero;
-use std::sync::OnceLock;
-use std::{sync::mpsc, thread, time::Duration};
+use std::{num::NonZero, ptr::NonNull, time::Duration};
 
 pub mod common;
 
-/// Only Cartel and same-worker allocator checks use installed SQLite; Core handles
-/// and allocations stay exclusively with their original worker while hooks can run.
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
-
 #[test]
-fn empty_scope_keeps_heap() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn heap_contracts() -> Result<(), plan::Error> {
+    // SAFETY: this binary has one test; installation precedes every SQLite call
+    // and worker start. Only Cartel uses installed SQLite; Core handles and
+    // allocations remain exclusively owned by their originating worker until release.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
+    empty_scope_keeps_heap(runtime)?;
+    realloc_recovers(runtime)?;
+    column_reset_recovery(runtime)?;
+    failed_query_keeps_reset(runtime)?;
+    reset_cleanup_receipts(runtime)?;
+    heaps_are_isolated(runtime)
+}
+
+fn empty_scope_keeps_heap(runtime: Runtime) -> Result<(), plan::Error> {
     let (limits, memory) = try_settings()?;
     let outer = plan::Plan::<HeapDatabase>::try_new(open(runtime)?, limits, memory)?;
     let layout = outer.layout();
     let result = outer.try_run(
         |driver, mut database| {
-            let (limits, memory) = try_settings()?;
-            open(runtime)?
-                .plan::<HeapDatabase>(limits, memory)
-                .map_err(plan::Error::Plan)?
-                .with_config(layout)
-                .map_err(plan::Error::Claim)?
-                .try_create(
-                    |_| (),
-                    Policy::new(assert_reclaimed, assert_retirement),
-                    |result| assert!(result.is_ok(), "unopened SQLite scope"),
-                );
+            for attempt in [false, true] {
+                let (limits, memory) = try_settings()?;
+                open(runtime)?
+                    .plan::<HeapDatabase>(limits, memory)
+                    .map_err(plan::Error::Plan)?
+                    .with_config(layout)
+                    .map_err(plan::Error::Claim)?
+                    .try_create(
+                        (),
+                        |worker| {
+                            if attempt {
+                                let mut cleanup = open::Completion::new();
+                                assert!(matches!(
+                                    worker.install_with(
+                                        |plan, stage| plan.install(stage, &mut cleanup)
+                                    ),
+                                    Err(InstallError::Install(open::Error::Step(
+                                        Error::LocalAllocatorOccupied
+                                    )))
+                                ));
+                                assert!(cleanup.take().is_ok(), "conflicting SQLite cleanup");
+                            }
+                        },
+                        Policy::new(assert_reclaimed, assert_retirement),
+                        |result| assert!(result.is_ok(), "nested SQLite scope"),
+                    );
+            }
             let value = fibers::TEST
                 .try_run(
                     driver,
                     database
                         .query()
-                        .run_one::<i64, _, _>(HeapDatabase::CHECK, ()),
+                        .run_one::<i64, _, _>(HeapDatabase::GROW, (1_i64, ())),
                 )
                 .map_err(plan::Error::Run)?
                 .map_err(plan::Error::Call)?;
-            assert_eq!(value, 1);
+            assert_eq!(value, 1024);
             Ok(())
         },
         Policy::new(assert_reclaimed, assert_retirement),
@@ -55,13 +75,7 @@ fn empty_scope_keeps_heap() -> Result<(), plan::Error> {
     result.expect("outer SQLite scope failed")
 }
 
-#[test]
-fn realloc_recovers() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn realloc_recovers(runtime: Runtime) -> Result<(), plan::Error> {
     let (limits, memory) = try_settings()?;
     let result = plan::Plan::<HeapDatabase>::try_new(open(runtime)?, limits, memory)?.try_run(
         |driver, mut database| {
@@ -95,13 +109,7 @@ fn realloc_recovers() -> Result<(), plan::Error> {
     result.expect("growing allocation cleanup scope")
 }
 
-#[test]
-fn column_reset_recovery() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn column_reset_recovery(runtime: Runtime) -> Result<(), plan::Error> {
     let (limits, memory) = try_settings()?;
     let result = plan::Plan::<HeapDatabase>::try_new(open(runtime)?, limits, memory)?.try_run(
         |driver, mut database| {
@@ -151,13 +159,7 @@ fn column_reset_recovery() -> Result<(), plan::Error> {
     result.expect("column failure cleanup scope")
 }
 
-#[test]
-fn failed_query_keeps_reset() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn failed_query_keeps_reset(runtime: Runtime) -> Result<(), plan::Error> {
     let (limits, memory) = try_settings()?;
     plan::Plan::<HeapDatabase>::try_new(open(runtime)?, limits, memory)?.try_run(
         |driver, mut database| {
@@ -192,13 +194,7 @@ fn failed_query_keeps_reset() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn reset_cleanup_receipts() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn reset_cleanup_receipts(runtime: Runtime) -> Result<(), plan::Error> {
     let (mut limits, memory) = try_settings()?;
     limits.work.cleanup.progress = Progress::new(NonZero::<u64>::MIN);
     let result = plan::Plan::<HeapDatabase>::try_new(open(runtime)?, limits, memory)?.try_app(
@@ -286,122 +282,108 @@ fn reset_cleanup_receipts() -> Result<(), plan::Error> {
     result.expect("reset and cleanup scope")
 }
 
-#[test]
-fn heaps_are_isolated() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
-    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
-    let (full_tx, full_rx) = mpsc::sync_channel(0);
-    let (free_tx, free_rx) = mpsc::sync_channel(0);
-
-    let healthy = thread::spawn(move || {
-        let result = (|| -> Result<(), plan::Error> {
-            let (limits, memory) = try_settings()?;
-            let result = plan::Plan::<HeapDatabase>::try_new(open(runtime)?, limits, memory)?
-                .try_run(
-                    |driver, mut database| {
-                        assert!(ready_tx.send(()).is_ok(), "healthy worker signal failed");
-                        assert!(
-                            full_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
-                            "peer exhaustion wait failed"
-                        );
-                        fibers::TEST
-                            .try_run(
-                                driver,
-                                database.query().run_no_rows(HeapDatabase::INSERT_SMALL, ()),
-                            )
-                            .map_err(plan::Error::Run)?
-                            .map_err(plan::Error::Call)?;
-                        let value = fibers::TEST
-                            .try_run(
-                                driver,
-                                database
-                                    .query()
-                                    .run_one::<i64, _, _>(HeapDatabase::CHECK, ()),
-                            )
-                            .map_err(plan::Error::Run)?
-                            .map_err(plan::Error::Call)?;
-                        assert_eq!(value, 1);
-                        Ok(())
-                    },
-                    Policy::new(assert_reclaimed, assert_retirement),
-                    |result| result.expect("SQLite scope"),
-                );
-            result.expect("healthy SQLite scope failed")
-        })();
-        assert!(result.is_ok(), "healthy SQLite worker failed");
-    });
-
-    assert!(
-        ready_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
-        "healthy worker wait failed"
-    );
-    let full = thread::spawn(move || {
-        let result = (|| -> Result<(), plan::Error> {
-            let (limits, memory) = try_settings()?;
-            let result = plan::Plan::<HeapDatabase>::try_new(open(runtime)?, limits, memory)?
-                .try_run(
-                    |driver, mut database| {
-                        let mut failure = None;
-                        for _ in 0..1_024 {
-                            match fibers::TEST.try_run(
-                                driver,
-                                database
-                                    .query()
-                                    .run_no_rows(HeapDatabase::INSERT_PAYLOAD, ()),
-                            ) {
-                                Ok(Err(error)) => {
-                                    failure = Some(error);
-                                    break;
-                                }
-                                Ok(Ok(())) => {}
-                                Err(error) => return Err(plan::Error::Run(error)),
-                            }
-                        }
-                        let error = (failure).expect("worker heap had no allocation ceiling");
-                        assert!(
-                            matches!(error, Error::Sqlite { code, .. } if code.primary() == 7),
-                            "expected SQLite allocation failure"
-                        );
-                        assert!(full_tx.send(()).is_ok(), "heap exhaustion signal failed");
-                        assert!(
-                            free_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
-                            "full heap release failed"
-                        );
-                        Ok(())
-                    },
-                    Policy::new(assert_reclaimed, assert_retirement),
-                    |result| result.expect("SQLite scope"),
-                );
-            result.expect("full SQLite scope failed")
-        })();
-        assert!(result.is_ok(), "full SQLite worker failed");
-    });
-
-    assert!(healthy.join().is_ok(), "healthy worker join failed");
-    assert!(free_tx.send(()).is_ok(), "full worker release failed");
-    assert!(full.join().is_ok(), "full worker join failed");
-
+fn heaps_are_isolated(runtime: Runtime) -> Result<(), plan::Error> {
     let (limits, memory) = try_settings()?;
-    let result = plan::Plan::<HeapDatabase>::try_new(open(runtime)?, limits, memory)?.try_run(
+    let healthy = plan::Plan::<HeapDatabase>::try_new(open(runtime)?, limits, memory)?;
+    let layout = healthy.layout();
+    let result = healthy.try_run(
         |driver, mut database| {
-            let value = fibers::TEST
-                .try_run(
-                    driver,
-                    database
-                        .query()
-                        .run_one::<i64, _, _>(HeapDatabase::CHECK, ()),
-                )
-                .map_err(plan::Error::Run)?
-                .map_err(plan::Error::Call)?;
-            assert_eq!(value, 1);
+            use lifecycle::Task as _;
+
+            let (main, worker) = lifecycle::Main::try_pair().expect("worker lifecycle");
+            let ((observed, stopped), ()) = lifecycle::Entry(move || {
+                let outcome = worker.run(|source| {
+                    open(runtime)?
+                        .plan::<HeapDatabase>(limits, memory)
+                        .map_err(plan::Error::Plan)?
+                        .with_config(layout)
+                        .map_err(plan::Error::Claim)?
+                        .try_create(
+                            source,
+                            |worker| {
+                                let mut cleanup = open::Completion::new();
+                                let app = worker
+                                    .install_with(|open, stage| open.install(stage, &mut cleanup))
+                                    .expect("full SQLite installation");
+                                let mut blocks = Vec::new();
+                                // Fill before with_app publishes Installed; each native block
+                                // retains this worker's arena until its matching free.
+                                for shift in (0..=SQLITE_BYTES.ilog2()).rev() {
+                                    while let Some(block) = NonNull::new(unsafe {
+                                        libsqlite3_sys::sqlite3_malloc64(1_u64 << shift)
+                                    }) {
+                                        blocks.push(block);
+                                    }
+                                }
+                                let mut complete = session::Completion::new();
+                                let output = app.with_app(&mut complete, |mut app| {
+                                    let mut database =
+                                        app.root_client().expect("full SQLite client");
+                                    let exhausted = fibers::TEST.try_run(
+                                        &mut app,
+                                        database
+                                            .query()
+                                            .run_no_rows(HeapDatabase::INSERT_PAYLOAD, ()),
+                                    );
+                                    let stopped = app.run_for(Duration::from_secs(5)).map(|_| ());
+                                    drop(database);
+                                    (exhausted, stopped)
+                                });
+                                for block in blocks {
+                                    // SAFETY: each receipt is freed once on its original worker,
+                                    // while the owning State remains inside this callback.
+                                    unsafe { libsqlite3_sys::sqlite3_free(block.as_ptr()) };
+                                }
+                                let (exhausted, stopped) = output.expect("full SQLite session");
+                                assert!(
+                                    matches!(exhausted, Ok(Err(Error::Sqlite { code, .. }))
+                                if code.primary() == 7),
+                                    "expected SQLite allocation failure"
+                                );
+                                stopped.expect("full worker shutdown");
+                                cleanup.take().expect("full SQLite cleanup");
+                            },
+                            Policy::new(assert_reclaimed, assert_retirement),
+                            |result| {
+                                if let Err(error) = result {
+                                    panic!("full SQLite scope: {:?}", error.kind());
+                                }
+                            },
+                        );
+                    Ok::<(), plan::Error>(())
+                });
+                assert!(
+                    matches!(&outcome, lifecycle::Outcome::Done(())),
+                    "SQLite worker: {outcome:?}"
+                );
+            })
+            .with(|| {
+                main.run(Duration::from_secs(5), || {
+                    fibers::TEST
+                        .try_run(
+                            driver,
+                            database
+                                .query()
+                                .run_one::<i64, _, _>(HeapDatabase::GROW, (1_i64, ())),
+                        )
+                        .map_err(plan::Error::Run)?
+                        .map_err(plan::Error::Call)
+                })
+            })
+            .expect("SQLite worker start and join");
+            stopped.expect("SQLite worker stop");
+            assert_eq!(observed.expect("SQLite worker readiness")?, 1024);
             Ok(())
         },
         Policy::new(assert_reclaimed, assert_retirement),
         |result| result.expect("SQLite scope"),
     );
-    result.expect("events SQLite scope failed")
+    result.expect("healthy SQLite scope failed")?;
+    let result = plan::Plan::<HeapDatabase>::try_new(open(runtime)?, limits, memory)?.try_count(
+        HeapDatabase::CHECK,
+        Policy::new(assert_reclaimed, assert_retirement),
+        |result| result.expect("SQLite scope"),
+    );
+    assert_eq!(result.expect("events SQLite scope failed")?, 1);
+    Ok(())
 }

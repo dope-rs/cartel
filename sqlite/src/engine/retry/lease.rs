@@ -1,8 +1,5 @@
 use crate::{config, engine::retry, sys};
-use dope_core::driver::{
-    schedule::clock,
-    schedule::{self, ready::wake},
-};
+use dope_core::driver::schedule::{clock, ready::wake};
 use o3::mem::{self, lease};
 use std::{marker, task};
 
@@ -29,11 +26,6 @@ pub(crate) struct Lease<'slot, 'd, R: Role> {
 }
 
 struct Return<'slot, 'd, R>(marker::PhantomData<(retry::raw::Loan<'slot, 'd>, R)>);
-
-#[derive(Clone, Copy)]
-pub(crate) struct Ref<'slot, 'd> {
-    slot: &'slot retry::Slot<'d>,
-}
 
 impl<'slot, 'd, R: Role> Lease<'slot, 'd, R> {
     pub(super) const fn new(slot: retry::raw::Loan<'slot, 'd>) -> Self {
@@ -98,20 +90,6 @@ impl<'slot, 'd, R: Role> mem::Return for Return<'slot, 'd, R> {
     }
 }
 
-impl<'slot, 'd> Ref<'slot, 'd> {
-    pub(super) const fn new(slot: &'slot retry::Slot<'d>) -> Self {
-        Self { slot }
-    }
-
-    pub(crate) fn progress(&self) -> schedule::Progress<'d> {
-        self.slot.progress()
-    }
-
-    pub(crate) fn park(&self, now: clock::Moment<'d>) -> retry::Park {
-        self.slot.park(now)
-    }
-}
-
 impl Role for Open {
     const RELEASE: Release = Release::Preserve;
 
@@ -141,5 +119,4 @@ const _: () = {
     assert!(size_of::<Lease<'static, 'static, Open>>() == word);
     assert!(size_of::<Lease<'static, 'static, Cleanup>>() == word);
     assert!(size_of::<Lease<'static, 'static, Call>>() == word);
-    assert!(size_of::<Ref<'static, 'static>>() == word);
 };

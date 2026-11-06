@@ -1,12 +1,5 @@
-use cartel_redis::api::Client;
-use dope_fiber::abi::Fiber;
-
 pub const REQUEST: &[u8] =
     b"*5\r\n$9\r\nZREVRANGE\r\n$5\r\nboard\r\n$1\r\n0\r\n$2\r\n-1\r\n$10\r\nWITHSCORES\r\n";
-
-pub fn query<'d, C: Client<'d>>(client: C) -> impl Fiber<'d, Output = Result<C::Scored, C::Error>> {
-    client.sorted_sets().rev_range(b"board", 0, -1)
-}
 
 #[derive(Clone, Copy)]
 pub enum Scored {

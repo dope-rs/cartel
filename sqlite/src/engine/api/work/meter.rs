@@ -2,7 +2,7 @@ use crate::limits;
 use std::{cell, mem};
 
 pub(crate) struct Meter {
-    primary: Counter,
+    primary: cell::Cell<u64>,
     mode: cell::Cell<Mode>,
     permission: cell::Cell<Permission>,
 }
@@ -31,13 +31,10 @@ pub(crate) enum Quota {
     Exhausted,
 }
 
-#[repr(transparent)]
-struct Counter(cell::Cell<u64>);
-
 impl Meter {
     pub(super) const fn new() -> Self {
         Self {
-            primary: Counter::new(),
+            primary: cell::Cell::new(0),
             mode: cell::Cell::new(Mode::Idle),
             permission: cell::Cell::new(Permission::Denied),
         }
@@ -62,13 +59,26 @@ impl Meter {
 
     pub(super) fn tick(&self) -> Tick {
         match self.mode.get() {
-            Mode::Idle => Tick::Continue,
-            Mode::Primary | Mode::Cleanup => self.primary.tick(),
+            Mode::Idle => return Tick::Continue,
+            Mode::Primary | Mode::Cleanup => {}
+        }
+        let left = self.primary.get();
+        if left == 0 {
+            return Tick::Stop;
+        }
+        let left = left - 1;
+        self.primary.set(left);
+        match left {
+            0 => Tick::Stop,
+            _ => Tick::Continue,
         }
     }
 
     pub(super) fn call_quota(&self) -> Quota {
-        self.primary.quota()
+        match self.primary.get() {
+            0 => Quota::Exhausted,
+            _ => Quota::Available,
+        }
     }
 
     pub(super) fn finish(&self) {
@@ -79,10 +89,7 @@ impl Meter {
         &self,
         op: impl FnOnce() -> Result<T, crate::Error>,
     ) -> Result<T, crate::Error> {
-        match self.permission.replace(Permission::Granted) {
-            Permission::Denied => {}
-            Permission::Granted => return Err(crate::Error::ReentrantQuery),
-        }
+        self.permission.set(Permission::Granted);
         let result = op();
         self.permission.set(Permission::Denied);
         result
@@ -96,39 +103,9 @@ impl Meter {
         if self.mode.get() != Mode::Idle {
             return Err(crate::Error::ReentrantQuery);
         }
-        self.primary.start(primary);
+        self.primary.set(primary.get());
         self.mode.set(mode);
         Ok(())
-    }
-}
-
-impl Counter {
-    const fn new() -> Self {
-        Self(cell::Cell::new(0))
-    }
-
-    fn start(&self, quota: limits::Progress) {
-        self.0.set(quota.get());
-    }
-
-    fn tick(&self) -> Tick {
-        let left = self.0.get();
-        if left == 0 {
-            return Tick::Stop;
-        }
-        let left = left - 1;
-        self.0.set(left);
-        match left {
-            0 => Tick::Stop,
-            _ => Tick::Continue,
-        }
-    }
-
-    fn quota(&self) -> Quota {
-        match self.0.get() {
-            0 => Quota::Exhausted,
-            _ => Quota::Available,
-        }
     }
 }
 

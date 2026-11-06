@@ -1,5 +1,6 @@
 use std::ptr;
 
+use crate::runtime::raw::Memory;
 use o3::base::marker::ThreadBound;
 
 pub(crate) struct Local {
@@ -8,11 +9,11 @@ pub(crate) struct Local {
 }
 
 impl Local {
-    pub(crate) fn from_span(span: super::Span) -> (Self, super::Retained) {
-        let (storage, base, layout) = span.into_parts();
-        let arena = unsafe { super::Arena::new(base, layout) };
+    pub(crate) fn from_span(span: super::Span, memory: Memory) -> (Self, super::Retained) {
+        let (storage, layout) = span.into_parts();
         let pointer = storage.cast::<super::Arena>();
-        unsafe { pointer.as_ptr().write(arena) };
+        // SAFETY: Span carries this backing's unpublished aligned arena region.
+        unsafe { super::Arena::initialize(pointer, layout, memory) };
         (
             Self {
                 arena: pointer,

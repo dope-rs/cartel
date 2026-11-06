@@ -2,7 +2,7 @@ use cartel_pg::api::traits::{
     Begin as _, Client as _, Notify as _, Query as _, Status as _, Transaction as _,
 };
 use dope::core::driver::life::recovery;
-use std::{num::NonZero, pin::pin, sync::mpsc, time::Duration};
+use std::{num::NonZero, pin::pin, time::Duration};
 
 use cartel_pg::{
     api::{
@@ -89,106 +89,143 @@ fn deadline_keeps_results() {
 
 #[test]
 fn rows_outlive_group() {
-    let (release, ready) = mpsc::sync_channel(1);
-    TcpScript::with(
-        move |socket| {
-            group::delay_ready(socket)?;
-            ready
-                .recv_timeout(Duration::from_secs(1))
-                .expect("group release");
-            group::resume_ready(socket)
+    use common::postgres::startup;
+    use dope::{
+        core::{
+            driver::route::{KeyTag, table::conn::Capacity},
+            io::socket,
         },
-        |server| {
-            let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
-                port::Port::<Database>::plan(
-                    Queries::try_config().expect("credentials"),
-                    Queries::try_groups(
-                        NonZero::new(3).expect("records"),
-                        NonZero::new(256).expect("bytes"),
-                    )
-                    .expect("bounded group config"),
-                ),
-                server.addr(),
-                Duration::from_millis(1),
-                Duration::from_secs(1),
-            )
-            .expect("group topology");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared
-                .with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let client = runtime.root_client();
-                                    runtime
-                                        .block_on(client.status().wait_ready())
-                                        .expect("ready driver")
-                                        .ok()
-                                        .expect("ready PostgreSQL");
-                                    let mut group = pin!(Task::new(
-                                        client.query().run_group::<TextQuery, 2>([(); 2])
-                                    ));
-                                    assert!(
-                                        runtime
-                                            .block_on(fibers::TEST.poll_once(group.as_mut()))
-                                            .expect("admission driver")
-                                            .is_none()
-                                    );
-                                    let marker = runtime
-                                        .block_on(client.notify().next())
-                                        .expect("notification driver")
-                                        .ok()
-                                        .expect("completion marker");
-                                    assert_eq!(marker.channel(), "group");
-                                    assert!(
-                                        runtime
-                                            .block_on(fibers::TEST.poll_once(group.as_mut()))
-                                            .expect("pending driver")
-                                            .is_none()
-                                    );
-                                    release.send(()).expect("release Sync");
-                                    let rows = runtime
-                                        .block_on(group.as_mut())
-                                        .expect("group driver")
-                                        .ok()
-                                        .expect("completed group");
-                                    let next = runtime
-                                        .block_on(client.query().run_group::<TextQuery, 1>([()]))
-                                        .expect("next group driver")
-                                        .ok()
-                                        .expect("active group owner released");
-                                    assert_eq!(
-                                        rows[0].decode().expect("retained first").name,
-                                        "first"
-                                    );
-                                    assert_eq!(rows[1].decode().expect("retained second").lease, 7);
-                                    assert_eq!(next[0].decode().expect("next row").lease, 11);
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), common::recover),
-                    |outcome| {
-                        assert!(
-                            outcome.is_ok(),
-                            "{:?}",
-                            outcome.as_ref().err().map(|error| error.cause())
-                        );
-                        outcome.ok().expect("application entry")
-                    },
-                )
-                .expect("group installation")
-                .expect("group session");
-            assert!(reports.events().expect("native reclamation").is_empty());
-            server
-                .finish()
-                .expect("group peer execution")
-                .expect("group peer protocol");
-        },
+        manifold::{app::receive, network::listener, service},
+        net::wire::domain,
+        runtime::topology::lending::Stage,
+    };
+    use dope_fiber::{abi::Join, net::server};
+
+    let bound = socket::Listener::bind(([127, 0, 0, 1], 0).into()).expect("peer listener");
+    let addr = bound.local_addr();
+    let snapshot = service::Snapshot::from_one(
+        service::Revision::new(1),
+        service::Endpoint::new(addr, addr),
+    );
+    let (_, node) = port::Port::<Database>::plan(
+        Queries::try_config().expect("credentials"),
+        Queries::try_groups(
+            NonZero::new(3).expect("records"),
+            NonZero::new(256).expect("bytes"),
+        )
+        .expect("bounded group config"),
     )
-    .expect("group peer");
+    .assemble::<Bundle<Tcp, Identity, Throughput>>(
+        snapshot,
+        Duration::from_millis(1),
+        Duration::from_secs(1),
+    )
+    .expect("group plan")
+    .into_parts();
+    let peer = server::Plan::<Identity, KeyTag<1>>::new(Capacity::fixed::<1>(), Identity);
+    let layout =
+        listener::topology::Layout::<KeyTag<1>, receive::Owned>::new(Capacity::fixed::<1>());
+    let prepared = dope::runtime::topology::Plan::new((), (node, layout))
+        .for_install::<Throughput>()
+        .expect("group topology");
+    let mut reports = Reports::new(prepared.layout(), [Id::fixed::<0>(), Id::fixed::<1>()]);
+    let mut report = Completion::new();
+    prepared
+        .with_local(
+            |worker| {
+                worker.lend(|(node, _), stage| {
+                    node.install(stage, |host, stage| {
+                        let hash = stage.hash_state(listener::Domain::DEFAULT);
+                        let port = peer
+                            .try_build(stage.driver().storage)
+                            .expect("peer storage");
+                        server::Listener::<KeyTag<1>, Tcp, Identity, _>::adopt(
+                            &port,
+                            server::Config {
+                                direct_flights: 0.into(),
+                                bind: addr,
+                                backlog: socket::Backlog::fixed::<1>(),
+                                stream: Default::default(),
+                                transport: Default::default(),
+                                egress: Default::default(),
+                                bound,
+                                wire: domain::Local::new(Identity),
+                            },
+                            |cause| cause.eliminate(),
+                            hash,
+                            stage,
+                            Stage::driver,
+                            |listener, stage| {
+                                let peer = listener.handle();
+                                stage.with_quiesce(
+                                    &mut report,
+                                    topology::App::new(host, listener),
+                                    GUARD,
+                                    |mut runtime| {
+                                        let client = runtime.client(topology::App::connector);
+                                        let mut io = fibers::TEST
+                                            .try_run(&mut runtime, dope_fiber::fiber!('_ => async move {
+                                                let mut io = peer.accept().await.ok().expect("peer connection");
+                                                startup::request(&mut io, true).await;
+                                                assert!(io.write_all(startup::AUTHENTICATED).await.is_ok());
+                                                startup::request(&mut io, false).await;
+                                                assert!(io.write_all(group::CATALOG_READY).await.is_ok());
+                                                client.status().wait_ready().await.ok().expect("ready PostgreSQL");
+                                                io
+                                            }))
+                                            .expect("startup driver");
+                                        let mut group = pin!(Task::new(
+                                            client.query().run_group::<TextQuery, 2>([(); 2])
+                                        ));
+                                        let (rows, mut io) = fibers::TEST
+                                            .try_run(&mut runtime, dope_fiber::fiber!('_ => async move {
+                                                assert!(fibers::TEST.poll_once(group.as_mut()).await.is_none());
+                                                startup::request(&mut io, false).await;
+                                                assert!(io.write_all(group::ROWS_COMPLETED).await.is_ok());
+                                                let marker = client.notify().next().await.ok().expect("completion marker");
+                                                assert_eq!(marker.channel(), "group");
+                                                assert!(fibers::TEST.poll_once(group.as_mut()).await.is_none());
+                                                assert!(io.write_all(startup::IDLE).await.is_ok());
+                                                let rows = group.as_mut().await.ok().expect("completed group");
+                                                (rows, io)
+                                            }))
+                                            .expect("group driver");
+                                        let peer = &mut io;
+                                        let exchange = dope_fiber::fiber!('_ => async move {
+                                            startup::request(peer, false).await;
+                                            assert!(peer.write_all(group::NEXT_ROW).await.is_ok());
+                                        });
+                                        let (next, ()) = fibers::TEST
+                                            .try_run(&mut runtime, Join::new(
+                                                client.query().run_group::<TextQuery, 1>([()]),
+                                                exchange,
+                                            ))
+                                            .expect("next group driver");
+                                        let next = next.ok().expect("active group owner released");
+                                        assert_eq!(rows[0].decode().expect("retained first").name, "first");
+                                        assert_eq!(rows[1].decode().expect("retained second").lease, 7);
+                                        assert_eq!(next[0].decode().expect("next row").lease, 11);
+                                    },
+                                )
+                            },
+                        )
+                        .expect("install peer")
+                    })
+                })
+            },
+            recovery::Policy::new(|event| reports.push(event), common::recover),
+            |outcome| {
+                assert!(
+                    outcome.is_ok(),
+                    "{:?}",
+                    outcome.as_ref().err().map(|error| error.cause())
+                );
+                outcome.ok().expect("application entry")
+            },
+        )
+        .expect("group installation")
+        .expect("group session");
+    assert!(reports.events().expect("native reclamation").is_empty());
 }
 
 #[test]

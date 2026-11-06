@@ -1,4 +1,4 @@
-use std::{mem, slice};
+use std::mem;
 use subtle::ConstantTimeEq as _;
 use zeroize;
 
@@ -15,16 +15,8 @@ impl Secret32 {
         &self.0
     }
 
-    pub(super) fn copy(bytes: &[u8; 32]) -> Self {
-        Self::new(*bytes)
-    }
-
-    pub(super) fn iter_mut(&mut self) -> slice::IterMut<'_, u8> {
-        self.0.iter_mut()
-    }
-
-    pub(super) fn iter(&self) -> slice::Iter<'_, u8> {
-        self.0.iter()
+    pub(super) fn as_array_mut(&mut self) -> &mut [u8; 32] {
+        &mut self.0
     }
 }
 

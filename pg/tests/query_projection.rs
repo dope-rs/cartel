@@ -11,7 +11,7 @@ fn preserves_subquery_distinct() {
     );
     assert_eq!(
         ProjectionLateralDistinct::SQL,
-        "SELECT q0_0.\"id\",q0_0.\"name\",q0_0.\"age\",q0_1.\"id\",q0_1.\"name\",q0_1.\"age\" FROM \"users\" AS q0_0 INNER JOIN LATERAL (SELECT DISTINCT ON (((q1_0.\"age\" + q0_0.\"age\") + $1)) q1_0.\"id\",q1_0.\"name\",q1_0.\"age\" FROM \"users\" AS q1_0 WHERE q1_0.\"id\" > q0_0.\"id\") q0_1 ON true"
+        "SELECT q0_0.\"id\",q0_0.\"name\",q0_0.\"age\",q0_1.\"id\",q0_1.\"name\",q0_1.\"age\" FROM \"users\" AS q0_0 INNER JOIN LATERAL (SELECT DISTINCT ON (((q1_0.\"age\" + q0_0.\"age\") + $1)) q1_0.\"id\",q1_0.\"name\",q1_0.\"age\" FROM \"users\" AS q1_0 WHERE q1_0.\"id\" > q0_0.\"id\" ORDER BY ((q1_0.\"age\" + q0_0.\"age\") + $1)) q0_1 ON true"
     );
     assert_eq!(ProjectionLateralDistinct::PARAM_OIDS, &[23]);
 }
@@ -55,7 +55,7 @@ fn quotes_batch_columns() {
 
     assert_eq!(
         ProjectionInsertBatch::SQL,
-        "INSERT INTO \"select\" AS q0_0 (\"select\") SELECT * FROM UNNEST($1)"
+        "INSERT INTO \"한\"\"글\".\"select\" AS q0_0 (\"select\") SELECT * FROM UNNEST($1)"
     );
 }
 

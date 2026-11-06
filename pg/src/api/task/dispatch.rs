@@ -20,26 +20,6 @@ use crate::{
 
 use crate::api::task::{State, lease};
 
-pub(super) struct Dispatch<
-    'app,
-    'g,
-    'r,
-    's,
-    'b,
-    'c,
-    'd: 'app,
-    B: ?Sized,
-    I: schema::QuerySet + 'd,
-    const ID: u8,
-    S,
-    A: lease::Target<'d, ID>,
-    P: lease::Policy,
-    H = (),
-> {
-    pub(super) deadline: Budget<'d>,
-    pub(super) state: State<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, S, A, P, H>,
-}
-
 impl<
     'app,
     'g,
@@ -55,41 +35,32 @@ impl<
     A: lease::Target<'d, ID>,
     P: lease::Policy,
     H,
-> Dispatch<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, S, A, P, H>
+> State<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, S, A, P, H>
 {
     pub(super) fn new(
         client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         target: Option<api::Target<'d, ID>>,
         next: Result<api::Pending<'d, S>, crate::Error>,
     ) -> Self {
-        let state = match next {
+        match next {
             Ok(request) => State::Connecting {
                 client,
                 target,
                 request,
             },
             Err(error) => State::Failed(error.into()),
-        };
-        let (timer, window) = client.port.lifecycle.deadline.into_parts();
-        Self {
-            deadline: Budget {
-                timer,
-                window,
-                state: BudgetState::Fresh,
-            },
-            state,
         }
     }
 
     pub(super) fn phase(&self) -> deadline::RequestPhase {
-        match self.state {
+        match self {
             State::Admitted(..) => deadline::RequestPhase::Response,
             _ => deadline::RequestPhase::Admission,
         }
     }
 
     pub(super) fn cancel(&mut self, error: crate::Error) -> Error<'d, ID> {
-        match mem::replace(&mut self.state, State::Done) {
+        match mem::replace(self, State::Done) {
             State::Failed(error) => return error,
             State::Admitted(lease, _) => lease.abort(error),
             _ => {}
@@ -113,19 +84,22 @@ impl<
         'app: 'target,
         'd: 'target,
     {
-        let (client, target, request) = match mem::replace(&mut self.state, State::Done) {
+        if matches!(self, State::Admitted(..)) {
+            return Poll::Ready(Ok(()));
+        }
+        let (client, target, request) = match mem::replace(self, State::Done) {
             State::Connecting {
                 client,
                 target,
                 request,
             } => (client, target, request),
-            State::Admitted(lease, held) => {
-                self.state = State::Admitted(lease, held);
-                return Poll::Ready(Ok(()));
-            }
+            State::Admitted(..) => unreachable!("admitted"),
             State::Failed(error) => return Poll::Ready(Err(error)),
             State::Done => return Poll::Ready(Err(crate::Error::Closed.into())),
         };
+        client
+            .port
+            .maintain(cx.as_ref().work(), cx.as_mut().region_token());
         let conn = match client.select(target, request.boundary) {
             Ok(Some(conn)) => conn,
             Ok(None) => {
@@ -133,7 +107,7 @@ impl<
                     waiter.unregister();
                     return Poll::Ready(Err(Error::Wait(error)));
                 }
-                self.state = State::Connecting {
+                *self = State::Connecting {
                     client,
                     target,
                     request,
@@ -174,7 +148,7 @@ impl<
         }
         // No order was published: a later poll must revalidate the original
         // target before selecting a connection that may now belong to a transaction.
-        self.state = State::Connecting {
+        *self = State::Connecting {
             client,
             target,
             request: throttle.request,
@@ -197,7 +171,7 @@ impl<
     S,
     A: lease::Target<'d, ID>,
     P: lease::Policy,
-> Dispatch<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, S, A, P>
+> State<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, S, A, P>
 {
     pub(super) fn poll_admit<'target>(
         &mut self,
@@ -233,10 +207,11 @@ impl<
             client
                 .port
                 .request()
-                .try_reply(frame, (this, state), reply, context, |(this, state)| {
-                    this.state = State::Admitted(seal(state, client, conn), ())
+                .try_reply(frame, state, reply, context, |state| {
+                    seal(state, client, conn)
                 })
-                .map_err(|(error, frame, (_, state))| {
+                .map(|lease| *this = State::Admitted(lease, ()))
+                .map_err(|(error, frame, state)| {
                     (
                         error,
                         api::Pending {
@@ -251,35 +226,41 @@ impl<
 }
 
 enum BudgetState<'d> {
-    Fresh,
+    Fresh(Positive),
     Armed(clock::Deadline<'d>),
     Elapsed,
 }
 
-pub(super) struct Budget<'d> {
+pub(in crate::api) struct Budget<'d> {
     timer: timer::Timer<'d>,
-    window: Positive,
     state: BudgetState<'d>,
 }
 
 impl<'d> Budget<'d> {
-    pub(super) fn guard(&self) -> Result<timer::Alarm<'d>, timer::Exhausted> {
+    pub(in crate::api) fn new(source: deadline::Source<'d>) -> Self {
+        let (timer, window) = source.into_parts();
+        Self {
+            timer,
+            state: BudgetState::Fresh(window),
+        }
+    }
+
+    pub(in crate::api) fn guard(&self) -> Result<timer::Alarm<'d>, timer::Exhausted> {
         self.timer.try_alarm()
     }
 
-    pub(super) fn poll_expired(
+    pub(in crate::api) fn poll_expired(
         &mut self,
         guard: Pin<&mut timer::Alarm<'d>>,
         mut ctx: Pin<&mut context::Context<'_, 'd>>,
         phase: deadline::RequestPhase,
     ) -> Poll<deadline::Elapsed> {
-        let wake = ctx.as_ref().completion();
         let now = ctx.as_mut().driver().driver_ref().clock().now();
         let due = match self.state {
             BudgetState::Elapsed => return Poll::Ready(deadline::Elapsed::new(phase)),
             BudgetState::Armed(due) => due,
-            BudgetState::Fresh => {
-                let due = now.clamp_add(self.window);
+            BudgetState::Fresh(window) => {
+                let due = now.clamp_add(window);
                 self.state = BudgetState::Armed(due);
                 due
             }
@@ -290,6 +271,7 @@ impl<'d> Budget<'d> {
             self.state = BudgetState::Elapsed;
             return Poll::Ready(deadline::Elapsed::new(phase));
         }
+        let wake = ctx.as_ref().completion();
         if !alarm.is_armed() {
             alarm.arm(due, wake);
             return Poll::Pending;

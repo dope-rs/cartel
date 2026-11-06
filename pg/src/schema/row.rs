@@ -1,19 +1,15 @@
 use crate::protocol::value::decode;
 use crate::schema::{array, desc};
-use o3::alloc;
-fn own<T>(value: &str) -> Result<T, crate::Error>
-where
-    T: for<'a> TryFrom<&'a mut String, Error = alloc::Exhausted>,
-{
-    let mut text = crate::Error::try_string(value)?;
-    T::try_from(&mut text).map_err(crate::Error::StorageExhausted)
+use o3::base::marker::ThreadBound;
+fn own<T>(value: &str, make: fn(crate::TextStorage) -> T) -> Result<T, crate::Error> {
+    Ok(make((crate::Error::try_string(value)?, ThreadBound::NEW)))
 }
 
-fn own_text<T>(value: Option<&str>) -> Result<Option<T>, crate::Error>
-where
-    T: for<'a> TryFrom<&'a mut String, Error = alloc::Exhausted>,
-{
-    value.map(own::<T>).transpose()
+fn own_text<T>(
+    value: Option<&str>,
+    make: fn(crate::TextStorage) -> T,
+) -> Result<Option<T>, crate::Error> {
+    value.map(|value| own(value, make)).transpose()
 }
 pub trait Row: desc::Validate + Sized {
     type View<'row>;
@@ -119,10 +115,12 @@ impl Row for i16 {
 impl Row for i32 {
     type View<'row> = Self;
 
+    #[inline]
     fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
         reader.read_i32()
     }
 
+    #[inline]
     fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
         reader.read_i32()
     }
@@ -131,10 +129,12 @@ impl Row for i32 {
 impl Row for i64 {
     type View<'row> = Self;
 
+    #[inline]
     fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
         reader.scalar().read_i64()
     }
 
+    #[inline]
     fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
         reader.scalar().read_i64()
     }
@@ -155,10 +155,12 @@ impl Row for f32 {
 impl Row for f64 {
     type View<'row> = Self;
 
+    #[inline]
     fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
         reader.scalar().read_f64()
     }
 
+    #[inline]
     fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
         reader.scalar().read_f64()
     }
@@ -202,7 +204,7 @@ impl Row for crate::Text {
     }
 
     fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        own(reader.data().read_text()?)
+        own(reader.data().read_text()?, Self)
     }
 }
 
@@ -214,7 +216,7 @@ impl Row for crate::Jsonb {
     }
 
     fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        own(reader.data().read_json()?)
+        own(reader.data().read_json()?, Self)
     }
 }
 
@@ -226,7 +228,7 @@ impl Row for crate::Ltree {
     }
 
     fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        own(reader.data().read_text()?)
+        own(reader.data().read_text()?, Self)
     }
 }
 
@@ -240,7 +242,7 @@ impl Row for Option<crate::Text> {
     }
 
     fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        own_text(reader.optional().read_text()?)
+        own_text(reader.optional().read_text()?, crate::Text)
     }
 }
 
@@ -254,7 +256,7 @@ impl Row for Option<crate::Jsonb> {
     }
 
     fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        own_text(reader.optional().read_json()?)
+        own_text(reader.optional().read_json()?, crate::Jsonb)
     }
 }
 
@@ -268,7 +270,7 @@ impl Row for Option<crate::Ltree> {
     }
 
     fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        own_text(reader.optional().read_text()?)
+        own_text(reader.optional().read_text()?, crate::Ltree)
     }
 }
 

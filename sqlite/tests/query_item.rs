@@ -4,21 +4,15 @@ use cartel_sqlite::runtime::{self, Runtime};
 use common::{assert_reclaimed, assert_retirement, query::item::*, schema};
 use dope_core::driver::life::recovery::Policy;
 use dope_test::fibers;
-use std::sync::OnceLock;
 
 pub mod common;
 
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
-
 #[test]
 fn composite_key_and_names() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+    // SAFETY: only this test calls SQLite in this binary. Only Cartel uses the
+    // installed runtime, retaining Core handles and allocations on their worker.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
     ::core::assert_eq!(Item::__CARTEL_TABLE, "\"items\"");
     ::core::assert_eq!(Widget::__CARTEL_TABLE, "\"widgets\"");
     {

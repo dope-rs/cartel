@@ -40,6 +40,7 @@ where
         conn::Id<'d, KeyTag<ID>>,
         Recover,
     >,
+    pub(in crate::api) budget: task::Budget<'d>,
 }
 
 impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Sealed
@@ -54,7 +55,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         &'a mut self,
         chunk: &'a [u8],
     ) -> impl abi::Fiber<'d, Output = Result<(), Error<'d, ID>>> + 'a {
-        let timer = self.dispatched.guard();
+        let timer = self.budget.guard();
         Write {
             guard: self,
             chunk,
@@ -68,7 +69,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 
     fn finish(self) -> impl abi::Fiber<'d, Output = Result<(), Error<'d, ID>>> {
-        let timer = self.dispatched.guard();
+        let timer = self.budget.guard();
         Finish {
             guard: self,
             state: Finishing::Opening,
@@ -109,8 +110,8 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         };
         let phase = guard.dispatched.phase();
         if let Poll::Ready(cause) = guard
-            .dispatched
-            .poll_time(timer.as_mut(), cx.as_mut(), phase)
+            .budget
+            .poll_expired(timer.as_mut(), cx.as_mut(), phase)
         {
             this.waiter.as_ref().unregister();
             let error = guard.dispatched.expire(cause);
@@ -175,33 +176,25 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         let phase = this.guard.dispatched.phase();
         if let Poll::Ready(cause) =
             this.guard
-                .dispatched
-                .poll_time(timer.as_mut(), cx.as_mut(), phase)
+                .budget
+                .poll_expired(timer.as_mut(), cx.as_mut(), phase)
         {
             this.waiter.as_ref().unregister();
             let error = this.guard.dispatched.expire(cause);
             return Poll::Ready(Err(error));
         }
-        if matches!(*this.state, Finishing::Opening) {
-            match this
-                .guard
-                .dispatched
-                .poll(cx.as_mut(), this.waiter.as_ref(), Lease::admit)
-            {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(error)) => {
-                    timer.as_ref().clear();
-                    return Poll::Ready(Err(error));
-                }
-                Poll::Ready(Ok(task::Progress::Complete {
-                    outcome: next,
-                    committed: commit,
-                })) => {
-                    commit.quarantine();
-                    timer.as_ref().clear();
-                    return Poll::Ready(next);
-                }
-                Poll::Ready(Ok(task::Progress::Admitted(lease))) => {
+        match this
+            .guard
+            .dispatched
+            .poll(cx.as_mut(), this.waiter.as_ref(), Lease::admit)
+        {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => {
+                timer.as_ref().clear();
+                Poll::Ready(Err(error))
+            }
+            Poll::Ready(Ok(task::Progress::Admitted(lease))) => {
+                if matches!(*this.state, Finishing::Opening) {
                     let client = lease.client();
                     let target = lease.target();
                     let result = {
@@ -214,23 +207,17 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                     }
                     *this.state = Finishing::Response;
                 }
-            }
-        }
-        match this
-            .guard
-            .dispatched
-            .poll(cx, this.waiter.as_ref(), Lease::admit)
-        {
-            Poll::Pending | Poll::Ready(Ok(task::Progress::Admitted(_))) => Poll::Pending,
-            Poll::Ready(Err(error)) => {
-                timer.as_ref().clear();
-                Poll::Ready(Err(error))
+                Poll::Pending
             }
             Poll::Ready(Ok(task::Progress::Complete {
                 outcome: next,
                 committed: commit,
             })) => {
-                commit.settle();
+                if matches!(*this.state, Finishing::Opening) {
+                    commit.quarantine();
+                } else {
+                    commit.settle();
+                }
                 timer.as_ref().clear();
                 Poll::Ready(next)
             }
@@ -319,14 +306,9 @@ fn finish<'d, B: ?Sized, I: schema::QuerySet, const ID: u8>(
     region: &mut region::Token<region::Identity<'d>>,
 ) -> Result<(), Error<'d, ID>> {
     api::check_open(client)?;
-    let requests = client.port.request();
-    let frame = requests
-        .encode(|frame| {
-            frame.copy_done()?;
-            frame.sync()
-        })
-        .map_err(Error::from)?;
-    requests
-        .try_sync(target, frame, region)
+    client
+        .port
+        .request()
+        .try_sync(target, region)
         .map_err(Error::from)
 }

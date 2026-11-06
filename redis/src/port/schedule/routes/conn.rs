@@ -57,19 +57,16 @@ impl<'b, 'd, const ID: u8> Conn<'b, 'd, ID> {
 }
 
 impl<'b, 'd, const ID: u8> Conn<'b, 'd, ID> {
-    /// Internal transitions restore the exact owner before any scheduler callback runs.
+    /// Internal transitions finish before any scheduler callback or owner drop.
     pub(super) fn transition<R>(
         &self,
-        apply: impl FnOnce(State<'b, 'd, ID>) -> (State<'b, 'd, ID>, R),
+        apply: impl for<'phase> FnOnce(&'phase mut State<'b, 'd, ID>) -> R,
     ) -> R {
         // SAFETY: Conn is not Sync and this private transition is called only
         // by the closed set of operations in this module. They move owners or update
         // Copy fields without callbacks, allocation, or owner destruction.
-        // Discarded owners are returned in R, after the successor is installed.
-        let value = unsafe { &mut *self.phase.get() };
-        let (next, result) = apply(mem::replace(value, State::Vacant));
-        *value = next;
-        result
+        // The callback cannot lend the phase; discarded owners are returned in R.
+        unsafe { apply(&mut *self.phase.get()) }
     }
 
     pub(in crate::port::schedule) fn bind(
@@ -78,8 +75,11 @@ impl<'b, 'd, const ID: u8> Conn<'b, 'd, ID> {
         ready: ready::Target<'d>,
     ) -> Bind {
         self.transition(|phase| match phase {
-            State::Vacant => (State::Initializing(Bound { position, ready }), Bind::Bound),
-            phase => (phase, Bind::Occupied),
+            State::Vacant => {
+                *phase = State::Initializing(Bound { position, ready });
+                Bind::Bound
+            }
+            _ => Bind::Occupied,
         })
     }
 
@@ -88,11 +88,12 @@ impl<'b, 'd, const ID: u8> Conn<'b, 'd, ID> {
         token: conn::Id<'d, route::KeyTag<ID>>,
     ) -> Option<Position<'b, 'd, route::KeyTag<ID>>> {
         self.transition(|phase| match phase {
-            State::Initializing(bound) if bound.position.connection() == token => (
-                State::Shared(bound, session::Input::Empty),
-                Some(bound.position),
-            ),
-            phase => (phase, None),
+            State::Initializing(bound) if bound.position.connection() == token => {
+                let bound = *bound;
+                *phase = State::Shared(bound, session::Input::Empty);
+                Some(bound.position)
+            }
+            _ => None,
         })
     }
 
@@ -113,9 +114,7 @@ impl<'b, 'd, const ID: u8> Conn<'b, 'd, ID> {
         token: conn::Id<'d, route::KeyTag<ID>>,
         input: session::Input,
     ) -> Option<Position<'b, 'd, route::KeyTag<ID>>> {
-        // SAFETY: this thread-local leaf updates only the matching generation's
-        // Copy input state; no callback runs or phase reference escapes.
-        match unsafe { &mut *self.phase.get() } {
+        self.transition(|phase| match phase {
             State::Shared(bound, stored) | State::Exclusive(bound, stored)
                 if bound.position.connection() == token =>
             {
@@ -123,7 +122,7 @@ impl<'b, 'd, const ID: u8> Conn<'b, 'd, ID> {
                 Some(bound.position)
             }
             _ => None,
-        }
+        })
     }
 
     /// The caller just removed this route from the idle FIFO. Publication checks
@@ -132,17 +131,13 @@ impl<'b, 'd, const ID: u8> Conn<'b, 'd, ID> {
         &self,
         token: conn::Id<'d, route::KeyTag<ID>>,
     ) -> Acquire {
-        // SAFETY: this private thread-local leaf invokes no callbacks and
-        // replaces only Copy fields after checking the exact shared generation.
-        let phase = unsafe { &mut *self.phase.get() };
-        let State::Shared(bound, input) = phase else {
-            return Acquire::Stale;
-        };
-        if bound.position.connection() != token {
-            return Acquire::Stale;
-        }
-        *phase = State::Exclusive(*bound, *input);
-        Acquire::Acquired
+        self.transition(|phase| match phase {
+            State::Shared(bound, input) if bound.position.connection() == token => {
+                *phase = State::Exclusive(*bound, *input);
+                Acquire::Acquired
+            }
+            _ => Acquire::Stale,
+        })
     }
 
     /// The affine lease may outlive retirement; only its own live generation becomes shared.
@@ -152,9 +147,10 @@ impl<'b, 'd, const ID: u8> Conn<'b, 'd, ID> {
     ) -> Release {
         self.transition(|phase| match phase {
             State::Exclusive(bound, input) if bound.position.connection() == token => {
-                (State::Shared(bound, input), Release::Shared)
+                *phase = State::Shared(*bound, *input);
+                Release::Shared
             }
-            phase => (phase, Release::Retired),
+            _ => Release::Retired,
         })
     }
 
@@ -189,17 +185,6 @@ impl<'b, 'd, const ID: u8> Conn<'b, 'd, ID> {
             }
             _ => None,
         }
-    }
-
-    pub(in crate::port::schedule) fn is_closing(
-        &self,
-        token: conn::Id<'d, route::KeyTag<ID>>,
-    ) -> bool {
-        // SAFETY: the thread-local leaf only compares copied identities and
-        // returns bool, without callbacks or a surviving phase reference.
-        matches!(unsafe { &*self.phase.get() },
-            State::Closing(closing) | State::Reconnecting(closing)
-                if closing.bound.position.connection() == token)
     }
 }
 

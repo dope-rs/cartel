@@ -59,6 +59,13 @@ fn missing_keeps_rows() {
                                     .expect("group driver")
                                     .err()
                                     .expect("missing row");
+                                let [next] = runtime
+                                    .block_on(client.query().run_group::<TextQuery, 1>([()]))
+                                    .expect("next group driver")
+                                    .unwrap_or_else(|failure| {
+                                        panic!("next group: {:?}", failure.cause().map(common::port::Reply::from))
+                                    });
+                                assert_eq!(next.decode().expect("next row").lease, 11);
                                 assert_eq!(failure.sync(), Sync::Complete);
                                 assert!(failure.diagnostics().is_empty());
                                 assert!(failure.cause().is_none());

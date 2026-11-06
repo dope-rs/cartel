@@ -51,7 +51,7 @@ impl List {
 
     pub const fn reply<'a>(self) -> &'a [u8] {
         match self {
-            Self::Optional => b"*2\r\n$3\r\none\r\n$-1\r\n",
+            Self::Optional => b"*2\r\n$0\r\n\r\n$-1\r\n",
             Self::Array | Self::ArrayVisit | Self::ArrayVisitAt => {
                 b"*3\r\n$3\r\none\r\n$3\r\ntwo\r\n$5\r\nthree\r\n"
             }

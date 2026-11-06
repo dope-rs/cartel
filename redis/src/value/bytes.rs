@@ -21,6 +21,7 @@ impl<'arena, 'credits, 'region> Bytes<'arena, 'credits, 'region> {
         inner: resident::Shared<'region>,
         credit: Option<retain::Bytes<'arena, 'credits, 'region>>,
     ) -> Self {
+        let credit = credit.filter(|_| !inner.is_empty());
         Self { inner, credit }
     }
 
@@ -28,11 +29,11 @@ impl<'arena, 'credits, 'region> Bytes<'arena, 'credits, 'region> {
         reply: value::Reply<'s, 'arena, 'credits, 'region>,
     ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Self>> {
         wire::Wire::with(reply, |wire| {
-            let read = match wire.try_next(wire.nodes.root()) {
-                Ok(read) => read,
+            let value = match wire.try_next() {
+                Ok(value) => value,
                 Err(error) => return Err(wire.failure(error)),
             };
-            let span = match read.value {
+            let span = match value {
                 parser::Value::Bulk(span) => span,
                 parser::Value::Status(span) if TYPE_NAME => span,
                 actual => {
@@ -44,7 +45,7 @@ impl<'arena, 'credits, 'region> Bytes<'arena, 'credits, 'region> {
                     return Err(wire.failure(reply::Fault::expected(expected, actual)));
                 }
             };
-            Ok(wire.finish(read.cursor)?.project(span))
+            Ok(wire.project(span))
         })
     }
 }

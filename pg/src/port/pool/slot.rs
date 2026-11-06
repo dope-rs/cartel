@@ -77,11 +77,15 @@ impl<'d, const ID: u8> Phase<'d, ID> {
 impl Sync {
     fn try_next(self, edge: requests::Boundary) -> Result<Self, crate::Error> {
         match (self, edge) {
-            (Self::Synced, requests::Boundary::Close | requests::Boundary::Commit)
+            (
+                Self::Synced,
+                requests::Boundary::Close | requests::Boundary::Begin | requests::Boundary::Commit,
+            )
             | (Self::Synced, requests::Boundary::Group)
-            | (Self::Automatic(_), requests::Boundary::Close | requests::Boundary::Commit) => {
-                Ok(Self::Synced)
-            }
+            | (
+                Self::Automatic(_),
+                requests::Boundary::Close | requests::Boundary::Begin | requests::Boundary::Commit,
+            ) => Ok(Self::Synced),
             (Self::Automatic(depth) | Self::Explicit(depth), requests::Boundary::Group) => {
                 Err(crate::Error::GroupOpen { depth })
             }
@@ -97,9 +101,10 @@ impl Sync {
             (Self::Synced, requests::Boundary::External) => {
                 Ok(Self::Explicit(num::NonZero::<u32>::MIN))
             }
-            (Self::Explicit(depth), requests::Boundary::Close | requests::Boundary::Commit) => {
-                Err(crate::Error::RequestCloseDuringCopy { depth })
-            }
+            (
+                Self::Explicit(depth),
+                requests::Boundary::Close | requests::Boundary::Begin | requests::Boundary::Commit,
+            ) => Err(crate::Error::RequestCloseDuringCopy { depth }),
             (Self::Explicit(depth), requests::Boundary::Open) => {
                 Err(crate::Error::RequestOpenDuringCopy { depth })
             }
@@ -143,54 +148,49 @@ pub(crate) enum Closed<'d, const ID: u8> {
     Closing,
 }
 
-pub(crate) enum Flush<'a> {
+pub(crate) enum Flush<'a, 'd, const ID: u8> {
     Idle,
-    Pending(Permit<'a>),
-}
-
-pub(crate) enum Change {
-    Available,
-    Unchanged,
+    Pending(Permit<'a, 'd, ID>),
 }
 
 #[must_use = "a PostgreSQL reply sync transition must be committed or discarded"]
-pub(crate) struct Permit<'a> {
-    sync: &'a cell::Cell<Sync>,
+pub(crate) struct Permit<'a, 'd, const ID: u8> {
+    slot: &'a Slot<'d, ID>,
     next: Sync,
-    batch: &'a cell::Cell<replies::Batch>,
     current: replies::Batch,
     boundary: requests::Boundary,
-    pending: &'a cell::Cell<Pending>,
 }
 
-impl Permit<'_> {
-    pub(crate) const fn batch(&self) -> replies::Batch {
-        self.current
+impl<'a, 'd, const ID: u8> Permit<'a, 'd, ID> {
+    pub(in crate::port) const fn slot(&self) -> &'a Slot<'d, ID> {
+        self.slot
+    }
+
+    pub(in crate::port) const fn parts(&self) -> (replies::Batch, requests::Boundary) {
+        (self.current, self.boundary)
     }
 
     /// Publication admits an order, or an existing automatic/COPY order owns its Sync.
     /// Future Syncs retain an order; only the current Sync may outlive its orders.
     /// This synchronous slot transition retains at most u32::MAX / 2 orders plus one Sync.
-    pub(in crate::port) fn commit(self) -> Change {
-        let change =
-            if matches!(self.next, Sync::Synced) && !matches!(self.sync.get(), Sync::Synced) {
-                Change::Available
-            } else {
-                Change::Unchanged
-            };
-        self.sync.set(self.next);
+    pub(in crate::port) fn commit(self) -> bool {
+        let unchanged =
+            !matches!(self.next, Sync::Synced) || matches!(self.slot.sync.get(), Sync::Synced);
+        self.slot.sync.set(self.next);
         match self.boundary {
-            requests::Boundary::Close | requests::Boundary::Commit | requests::Boundary::Group => {
-                self.batch.set(self.current.next());
-                let count = self.pending.get().get() + 1;
+            requests::Boundary::Close
+            | requests::Boundary::Begin
+            | requests::Boundary::Commit
+            | requests::Boundary::Group => {
+                self.slot.batch.set(self.current.next());
+                let count = self.slot.pending.get().get() + 1;
                 // SAFETY: consumed Sync admission retains at most one pending Sync
                 // per live order plus the single currently parsed Sync.
-                self.pending
-                    .set(unsafe { bounded::raw::Proof::assume(count).retain() });
+                self.slot.pending.set(unsafe { bounded::raw::u32(count) });
             }
             requests::Boundary::Open | requests::Boundary::External => {}
         }
-        change
+        unchanged
     }
 }
 
@@ -198,12 +198,12 @@ impl<'a, 'd, const ID: u8> Ready<'a, 'd, ID> {
     pub(crate) fn try_reply(
         self,
         boundary: requests::Boundary,
-    ) -> Result<Permit<'a>, crate::Error> {
+    ) -> Result<Permit<'a, 'd, ID>, crate::Error> {
         let next = self.slot.sync.get().try_next(boundary)?;
         Ok(self.slot.permit(next, boundary))
     }
 
-    pub(crate) fn try_finish(self) -> Result<Permit<'a>, crate::Error> {
+    pub(crate) fn try_finish(self) -> Result<Permit<'a, 'd, ID>, crate::Error> {
         match self.slot.sync.get() {
             Sync::Explicit(_) => {}
             Sync::Synced => return Err(crate::Error::CopyFinishWithoutStart),
@@ -230,6 +230,10 @@ impl<'d, const ID: u8> Slot<'d, ID> {
 
     pub(crate) fn is_synced(&self) -> bool {
         matches!(self.sync.get(), Sync::Synced)
+    }
+
+    pub(crate) fn can_begin(&self) -> bool {
+        !matches!(self.sync.get(), Sync::Automatic(_))
     }
 
     pub(crate) fn new() -> Self {
@@ -307,8 +311,7 @@ impl<'d, const ID: u8> Slot<'d, ID> {
             return Settle::Empty;
         };
         // SAFETY: checked subtraction preserves the retained inclusive upper bound.
-        self.pending
-            .set(unsafe { bounded::raw::Proof::assume(next).retain() });
+        self.pending.set(unsafe { bounded::raw::u32(next) });
         Settle::Applied
     }
 
@@ -416,7 +419,7 @@ impl<'d, const ID: u8> Slot<'d, ID> {
         })
     }
 
-    pub(crate) fn flush(&self, token: conn::Id<'d, KeyTag<ID>>) -> Flush<'_> {
+    pub(crate) fn flush(&self, token: conn::Id<'d, KeyTag<ID>>) -> Flush<'_, 'd, ID> {
         let Phase::Ready { bound, .. } = self.phase.get() else {
             return Flush::Idle;
         };
@@ -426,15 +429,12 @@ impl<'d, const ID: u8> Slot<'d, ID> {
         Flush::Pending(self.permit(Sync::Synced, requests::Boundary::Close))
     }
 
-    fn permit(&self, next: Sync, boundary: requests::Boundary) -> Permit<'_> {
-        let current = self.batch.get();
+    fn permit(&self, next: Sync, boundary: requests::Boundary) -> Permit<'_, 'd, ID> {
         Permit {
-            sync: &self.sync,
+            slot: self,
             next,
-            batch: &self.batch,
-            current,
+            current: self.batch.get(),
             boundary,
-            pending: &self.pending,
         }
     }
 }
@@ -450,6 +450,6 @@ const _: () = {
             == std::mem::size_of::<Closed<'static, 0>>() + std::mem::size_of::<replies::Failure>()
     );
     assert!(std::mem::size_of::<Slot<'static, 0>>() == 17 * std::mem::size_of::<usize>());
-    assert!(std::mem::size_of::<Permit<'static>>() <= 7 * std::mem::size_of::<usize>());
+    assert!(std::mem::size_of::<Permit<'static, 'static, 0>>() <= 7 * std::mem::size_of::<usize>());
     assert!(std::mem::size_of::<Ready<'static, 'static, 0>>() == std::mem::size_of::<&()>());
 };

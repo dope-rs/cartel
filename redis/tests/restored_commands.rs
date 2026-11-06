@@ -1,6 +1,6 @@
-use cartel_redis::api::Client as _;
+use cartel_redis::api::{Client as _, decode};
 use cartel_redis::value::source::{
-    Bulks as _, Bytes as _, Coordinates as _, Scan as _, Scored as _,
+    Bulks as _, Bytes as _, Coordinates as _, Reader as _, Reply as _, Scan as _, Scored as _,
 };
 use dope::core::driver::life::recovery;
 use std::{num::NonZero, time::Duration};
@@ -166,6 +166,55 @@ fn preserves_wire_and_geo() {
                             assert!(matches!(runtime.block_on(redis.server().ping()), Ok(Ok(()))));
                             assert!(matches!(error, reply::Failure::Server(value)
                                 if value.as_slice() == b"ERR first"));
+                            let fields = [b"\0".as_slice(), b"".as_slice()];
+                            assert!(matches!(runtime.block_on(redis.streams().add(
+                                b"key", b"*", Slice::from_pair(&fields)
+                            )), Ok(Ok(value)) if value.as_slice() == b"1-0"));
+                            let field = b"field".as_slice();
+                            assert!(matches!(runtime.block_on(redis.streams().add(
+                                b"key", b"*", Slice::from_ref(&field)
+                            )), Ok(Err(reply::Failure::Server(value)))
+                                if value.as_slice() == b"ERR wrong number of arguments for 'xadd' command"));
+                            assert!(matches!(runtime.block_on(redis.streams().range::<()>(
+                                b"key", b"(1-0", b"+", None
+                            )), Ok(Ok(()))));
+                            assert!(matches!(runtime.block_on(redis.streams().rev_range::<()>(
+                                b"key", b"+", b"-", Some(NonZero::<u64>::MIN)
+                            )), Ok(Ok(()))));
+                            let ids = [String::from("1-0"), String::from("2-0")];
+                            assert!(matches!(runtime.block_on(redis.streams().remove(
+                                b"key", Slice::from_pair(&ids)
+                            )), Ok(Ok(2))));
+                            assert!(matches!(runtime.block_on(redis.streams().len(b"key")), Ok(Ok(0))));
+                            assert!(matches!(runtime.block_on(redis.streams().create_group(
+                                b"key", b"group", b"0-0"
+                            )), Ok(Ok(()))));
+                            assert!(matches!(runtime.block_on(redis.streams().set_group_id(
+                                b"key", b"group", b"2-0"
+                            )), Ok(Ok(()))));
+                            assert!(matches!(runtime.block_on(redis.streams().read_group::<()>(
+                                b"key", b"group", b"worker", NonZero::<u64>::MIN
+                            )), Ok(Ok(()))));
+                            assert!(matches!(runtime.block_on(redis.streams().pending::<()>(
+                                b"key", b"group"
+                            )), Ok(Ok(()))));
+                            assert!(matches!(runtime.block_on(redis.sorted_sets().add_existing(
+                                b"board", 0.0, b"missing"
+                            )), Ok(Ok(0))));
+                            assert!(matches!(runtime.block_on(redis.keyspace().dump(b"key")),
+                                Ok(Ok(Some(value))) if value.as_slice() == b"\0\xff"));
+                            let user = runtime.block_on(redis.server().get_user::<decode::Reply>(b"user"))
+                                .expect("ACL operation").ok().expect("ACL reply");
+                            let mut reader = user.reader();
+                            assert!(matches!(reader.next_event(), Some(cartel_redis::value::Event::Nil)));
+                            assert!(reader.finish().is_ok());
+                            drop(user);
+                            let rules = [b"on".as_slice(), b">s\0".as_slice()];
+                            assert!(matches!(runtime.block_on(redis.server().set_user(b"user", &rules)),
+                                Ok(Err(reply::Failure::Server(value)))
+                                    if value.as_slice() == b"ERR invalid ACL rule"));
+                            assert!(matches!(runtime.block_on(redis.server().del_user(b"user")),
+                                Ok(Ok(0))));
                         })
                     })
                 })

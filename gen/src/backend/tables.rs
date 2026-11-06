@@ -1,5 +1,4 @@
 use crate::backend;
-use syn::ext::IdentExt as _;
 use syn::spanned::Spanned as _;
 
 pub(super) trait TableParse {
@@ -56,7 +55,10 @@ impl TableParse for syn::DeriveInput {
             }
             None => {
                 let mut table = String::new();
-                for (index, ch) in input.ident.unraw().to_string().chars().enumerate() {
+                for (index, ch) in crate::ext::unraw(&input.ident.to_string())
+                    .chars()
+                    .enumerate()
+                {
                     if ch.is_uppercase() && index > 0 {
                         table.push('_');
                     }

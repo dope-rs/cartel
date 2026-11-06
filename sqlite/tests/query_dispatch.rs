@@ -6,21 +6,21 @@ use cartel_sqlite::runtime::{self, Runtime};
 use common::{query::dispatch::*, schema};
 use dope_core::driver::life::recovery::Policy;
 use dope_test::fibers;
-use std::sync::OnceLock;
 
 pub mod common;
 
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
-
 #[test]
-fn dispatch_kinds() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn query_dispatch() -> Result<(), plan::Error> {
+    // SAFETY: only this test calls SQLite in this binary. Only Cartel uses the
+    // installed runtime, retaining Core handles and allocations on their worker.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
+    dispatch_kinds(runtime)?;
+    type_roundtrips(runtime)?;
+    raw_values_keep_classes(runtime)
+}
+
+fn dispatch_kinds(runtime: Runtime) -> Result<(), plan::Error> {
     ::core::assert_eq!(Keyword::<i64>::__CARTEL_TABLE, "\"select\"");
     ::core::assert_eq!(Keyword::<i64>::__CARTEL_SELECT_COLS, "\"type\"");
     {
@@ -102,15 +102,7 @@ fn dispatch_kinds() -> Result<(), plan::Error> {
     }
 }
 
-#[test]
-fn type_roundtrips() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn type_roundtrips(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -138,15 +130,7 @@ fn type_roundtrips() -> Result<(), plan::Error> {
     }
 }
 
-#[test]
-fn raw_values_keep_classes() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn raw_values_keep_classes(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =

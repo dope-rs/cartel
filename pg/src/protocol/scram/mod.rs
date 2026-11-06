@@ -3,17 +3,19 @@ use crate::scram::Base64;
 use base64::Engine as _;
 use base64::engine::general_purpose;
 use dope::core::{Backend, dope_sys::thread::Thread as _, driver::route};
-use dope::{core::driver::route::table::conn::Capacity, manifold::client::conn};
-use hmac::digest::consts::U64;
-use hmac::{Hmac, Mac as _, digest};
-use o3::{alloc, base::cell::region, buffer::bytes::bounded, depot::queue::indexed::shared};
-use sha2::{Digest as _, Sha256};
+use dope::manifold::client::conn;
+use o3::buffer::bytes::bounded;
+use sha2::block_api::compress256;
 use std::mem;
-use zeroize::{Zeroize as _, Zeroizing};
+use subtle::ConstantTimeEq as _;
+use zeroize::Zeroizing;
 
 pub(in crate::protocol) mod kdf;
 mod parser;
 mod secret32;
+
+pub(crate) use kdf::Runtime;
+use secret32::Secret32;
 
 const MECH: &str = "SCRAM-SHA-256";
 const PLUS: &str = "SCRAM-SHA-256-PLUS";
@@ -75,26 +77,29 @@ impl Mechanism {
 }
 
 struct ClientNonce([u8; CLIENT_NONCE_BYTES]);
-pub(super) struct Signature(digest::CtOutput<Hmac<Sha256>>);
+pub(super) struct Signature(Secret32);
 
-#[derive(Clone)]
 pub(in crate::protocol) struct Keys {
-    client: secret32::Secret32,
-    stored: secret32::Secret32,
-    server: secret32::Secret32,
+    client: Secret32,
+    stored: Secret32,
+    server: Secret32,
 }
 
 impl Keys {
-    fn new(salted: kdf::Salted) -> Self {
-        let key = hmac::<Hmac<Sha256>>(salted.as_array());
-        let client = key.clone().chain_update(b"Client Key").finalize();
-        let server = key.chain_update(b"Server Key").finalize();
-        let client = secret32::Secret32::copy(client.as_bytes().as_ref());
-        Self {
-            stored: sha256(client.as_array()),
-            client,
-            server: secret32::Secret32::copy(server.as_bytes().as_ref()),
-        }
+    fn write(&mut self, inner: &[u32; 8], outer: &[u32; 8]) {
+        let mut hash = Sha256::new(64);
+        hash.state.copy_from_slice(inner);
+        hash.update(b"Client Key");
+        hash.hmac(outer, &mut self.client);
+        hash.state.copy_from_slice(inner);
+        *hash.len = 64;
+        hash.update(b"Server Key");
+        hash.hmac(outer, &mut self.server);
+        hash.state.copy_from_slice(&IV);
+        *hash.len = 0;
+        hash.update(self.client.as_array());
+        hash.finalize();
+        write_state(&hash.state, self.stored.as_array_mut());
     }
 }
 
@@ -180,15 +185,23 @@ impl<'a, 'd, const ID: u8> Scram<'a, 'd, ID> {
                 }));
             }
 
-            let mut first = hmac::<Hmac<Sha256>>(password);
+            let mut first = Sha256::new(64);
+            let mut outer = Zeroizing::new(IV);
+            hmac(password, &mut first.state, &mut outer);
             decode_base64(salt, |decoded| first.update(decoded))?;
-            first.update(&1u32.to_be_bytes());
-            let output = first.finalize();
-            let key = kdf::KdfKey::from_server(output.as_bytes().as_ref(), count)?;
+            let iterations = kdf::try_iterations(count)?;
             self.state = State::Deriving(Deriving {
                 server_first: parsed.try_retain()?,
-                key,
+                key: kdf::KdfKey {
+                    first: Secret32::new([0; 32]),
+                    iterations,
+                },
             });
+            let State::Deriving(state) = &mut self.state else {
+                unreachable!("scram")
+            };
+            first.update(&1u32.to_be_bytes());
+            first.hmac(&outer, &mut state.key.first);
             Ok(())
         })
     }
@@ -203,8 +216,8 @@ impl<'a, 'd, const ID: u8> Scram<'a, 'd, ID> {
         }
     }
 
-    pub(super) fn await_final(&mut self, sig: Signature) {
-        self.state = State::AwaitServerFinal(sig);
+    pub(super) fn await_final(&mut self, sig: &Signature) {
+        self.state = State::AwaitServerFinal(Signature(sig.0.clone()));
     }
 
     pub(super) fn verify_final(&mut self, bytes: Wire<'_>) -> Result<(), crate::Error> {
@@ -224,7 +237,7 @@ impl<'a, 'd, const ID: u8> Scram<'a, 'd, ID> {
         let len = general_purpose::STANDARD
             .decode_slice(encoded.as_slice(), &mut actual[..])
             .map_err(|error| crate::Error::ServerFinalBase64(error.into()))?;
-        if len != expected.as_bytes().len() {
+        if len != expected.as_array().len() {
             // SAFETY: successful slice decoding returns an initialized prefix
             // of the fixed 33-byte output, which also retains the u32 bound.
             let bytes =
@@ -234,9 +247,7 @@ impl<'a, 'd, const ID: u8> Scram<'a, 'd, ID> {
                 expected: Length::from_u32(32),
             }));
         }
-        let mut digest = digest::Output::<Hmac<Sha256>>::default();
-        digest.copy_from_slice(&actual[..len]);
-        if expected != &digest::CtOutput::new(digest) {
+        if !bool::from(expected.as_array().ct_eq(&actual[..32])) {
             return Err(crate::Error::ServerFinal(Reason::SignatureMismatch));
         }
         self.state = State::Complete;
@@ -258,63 +269,39 @@ impl Derive<'_> {
 
     pub(super) fn write_final(
         &self,
-        keys: Keys,
+        keys: &Keys,
         out: &mut encode::Writer,
     ) -> Result<Signature, encode::Error> {
         let first = &self.state.server_first;
         let nonce = first.nonce();
-        let mask = hmac_auth_message(
+        let mut proof = Secret32::new([0; 32]);
+        hmac_auth_message(
             keys.stored.as_array(),
             &self.nonce.0,
             first.as_slice(),
             nonce,
+            &mut proof,
         );
-        let mut proof = keys.client;
-        for (left, right) in proof.iter_mut().zip(mask.as_bytes()) {
+        for (left, right) in std::iter::zip(proof.as_array_mut(), keys.client.as_array()) {
             *left ^= *right;
         }
-        let encoded = Zeroizing::new(encode_proof(&proof));
-        let expected = hmac_auth_message(
+        let mut encoded = Zeroizing::new([b'='; PROOF_BYTES]);
+        general_purpose::STANDARD
+            .internal_encode(proof.as_array(), &mut encoded[..PROOF_BYTES - 1]);
+        let mut expected = Secret32::new([0; 32]);
+        hmac_auth_message(
             keys.server.as_array(),
             &self.nonce.0,
             first.as_slice(),
             nonce,
+            &mut expected,
         );
 
         out.extend(b"c=biws,r=")?;
         out.extend(nonce)?;
         out.extend(b",p=")?;
         out.extend(encoded.as_slice())?;
-        Ok(Signature(expected))
-    }
-}
-
-pub(crate) struct Runtime<'d, const ID: u8> {
-    waiters: shared::Fifo<conn::Id<'d, route::KeyTag<ID>>>,
-    state: region::Value<region::Identity<'d>, kdf::Coordinator<'d, ID>>,
-}
-
-impl<'d, const ID: u8> Runtime<'d, ID> {
-    pub(in crate::protocol) fn try_new(
-        cap: Capacity,
-        proof: region::Proof<region::Identity<'d>>,
-    ) -> Result<Self, alloc::Error> {
-        Ok(Self {
-            waiters: shared::Fifo::try_new(cap.entries().get())?,
-            state: proof.bind(kdf::Coordinator::new()),
-        })
-    }
-
-    fn try_entry(
-        &self,
-        owner: conn::Id<'d, route::KeyTag<ID>>,
-    ) -> Result<kdf::Ticket<'_, 'd, ID>, shared::Bounds> {
-        let waiter = self.waiters.try_entry(owner.index().into_usize())?;
-        Ok(kdf::Ticket {
-            runtime: self,
-            waiter,
-            owner,
-        })
+        Ok(Signature(expected.clone()))
     }
 }
 
@@ -356,36 +343,92 @@ fn encode_nonce(input: &[u8; 18]) -> [u8; CLIENT_NONCE_BYTES] {
     output
 }
 
-fn encode_proof(input: &secret32::Secret32) -> [u8; PROOF_BYTES] {
-    let mut output = [b'='; PROOF_BYTES];
-    general_purpose::STANDARD.internal_encode(input.as_array(), &mut output[..PROOF_BYTES - 1]);
-    output
-}
+const IV: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
 
-fn hmac<M>(key: &[u8]) -> M
-where
-    M: hmac::KeyInit<KeySize = U64>,
-{
-    let mut block = digest::Key::<M>::default();
+fn hmac(key: &[u8], inner: &mut [u32; 8], outer: &mut [u32; 8]) {
+    let mut block = Zeroizing::new([0u8; 64]);
     if key.len() > block.len() {
-        let mut hash = sha2::Sha256::digest(key);
-        block[..hash.len()].copy_from_slice(hash.as_slice());
-        hash.as_mut_slice().zeroize();
+        let mut hash = Sha256::new(0);
+        hash.update(key);
+        hash.finalize();
+        write_state(&hash.state, &mut block.as_chunks_mut::<32>().0[0]);
     } else {
         block[..key.len()].copy_from_slice(key);
     }
-    let output = M::new(&block);
-    block.as_mut_slice().zeroize();
-    output
+    for (seed, pad) in [inner, outer].into_iter().zip([0x36, 0x36 ^ 0x5c]) {
+        for byte in block.iter_mut() {
+            *byte ^= pad;
+        }
+        compress256(seed, std::slice::from_ref(&*block));
+    }
 }
 
-fn sha256(input: &[u8; 32]) -> secret32::Secret32 {
-    let mut hash = sha2::Sha256::new();
-    hash.update(input);
-    let mut output = hash.finalize();
-    let secret = secret32::Secret32::copy(output.as_ref());
-    output.as_mut_slice().zeroize();
-    secret
+struct Sha256 {
+    state: Zeroizing<[u32; 8]>,
+    block: Zeroizing<[u8; 64]>,
+    len: Zeroizing<u64>,
+}
+
+impl Sha256 {
+    fn new(len: u64) -> Self {
+        Self {
+            state: Zeroizing::new(IV),
+            block: Zeroizing::new([0; 64]),
+            len: Zeroizing::new(len),
+        }
+    }
+
+    fn update(&mut self, mut input: &[u8]) {
+        let pos = (*self.len & 63) as usize;
+        *self.len = self.len.wrapping_add(input.len() as u64);
+        if pos != 0 {
+            let take = (64 - pos).min(input.len());
+            self.block[pos..pos + take].copy_from_slice(&input[..take]);
+            input = &input[take..];
+            if pos + take != 64 {
+                return;
+            }
+            compress256(&mut self.state, std::slice::from_ref(&*self.block));
+        }
+        let (blocks, tail) = input.as_chunks::<64>();
+        if !blocks.is_empty() {
+            compress256(&mut self.state, blocks);
+        }
+        self.block[..tail.len()].copy_from_slice(tail);
+    }
+
+    fn finalize(&mut self) {
+        pad(&mut self.state, &mut self.block, *self.len);
+        compress256(&mut self.state, std::slice::from_ref(&*self.block));
+    }
+
+    fn hmac(&mut self, outer: &[u32; 8], output: &mut Secret32) {
+        self.finalize();
+        write_state(&self.state, &mut self.block.as_chunks_mut::<32>().0[0]);
+        self.state.copy_from_slice(outer);
+        *self.len = 96;
+        self.finalize();
+        write_state(&self.state, output.as_array_mut());
+    }
+}
+
+fn pad(state: &mut [u32; 8], block: &mut [u8; 64], len: u64) {
+    let pos = (len & 63) as usize;
+    block[pos] = 0x80;
+    block[pos + 1..].fill(0);
+    if pos >= 56 {
+        compress256(state, std::slice::from_ref(block));
+        block.fill(0);
+    }
+    block[56..].copy_from_slice(&len.wrapping_mul(8).to_be_bytes());
+}
+
+fn write_state(state: &[u32; 8], output: &mut [u8; 32]) {
+    for (word, bytes) in state.iter().zip(output.as_chunks_mut::<4>().0) {
+        *bytes = word.to_be_bytes();
+    }
 }
 
 fn hmac_auth_message(
@@ -393,13 +436,16 @@ fn hmac_auth_message(
     client: &[u8; CLIENT_NONCE_BYTES],
     first: &[u8],
     server: &[u8],
-) -> digest::CtOutput<Hmac<Sha256>> {
-    let mut mac = hmac::<Hmac<Sha256>>(key);
+    output: &mut Secret32,
+) {
+    let mut mac = Sha256::new(64);
+    let mut outer = Zeroizing::new(IV);
+    hmac(key, &mut mac.state, &mut outer);
     mac.update(b"n=,r=");
     mac.update(client);
     mac.update(b",");
     mac.update(first);
     mac.update(b",c=biws,r=");
     mac.update(server);
-    mac.finalize()
+    mac.hmac(&outer, output);
 }

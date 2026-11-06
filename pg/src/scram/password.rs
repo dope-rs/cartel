@@ -1,5 +1,5 @@
 use o3::alloc::VecExt as _;
-use std::ptr;
+use std::{mem, ptr};
 use stringprep::tables;
 use unicode_normalization::char::{canonical_combining_class, compose, decompose_compatible};
 use zeroize::Zeroizing;
@@ -8,7 +8,7 @@ mod bidi;
 
 pub(crate) struct Password(Zeroizing<String>);
 
-struct Decomposed(Zeroizing<Vec<(u8, char)>>);
+struct Decomposed(Zeroizing<Vec<char>>);
 
 struct Composed(Zeroizing<Vec<char>>);
 
@@ -25,9 +25,7 @@ impl Password {
         {
             return Ok(self);
         }
-        if let Some(value) = prepare(&self.0)? {
-            self.0 = Zeroizing::new(value);
-        }
+        prepare(&mut self.0)?;
         Ok(self)
     }
 
@@ -40,60 +38,66 @@ impl Password {
     }
 }
 
-fn prepare(value: &str) -> Result<Option<String>, crate::ConfigError> {
+fn prepare(value: &mut Zeroizing<String>) -> Result<(), crate::ConfigError> {
     let mut chars = mapped(value);
     let Some(first) = chars.next() else {
-        return Ok(None);
+        return Ok(());
     };
-    let first_right = bidi::right(first);
-    let mut last_right = first_right;
+    let mut last_right = false;
     let mut right = false;
     let mut left = false;
     let mut length = Some(0usize);
+    let mut start = 0;
+    let mut last = 0;
+    let mut disordered = false;
+    let mut scratch = 0;
     for ch in std::iter::once(first).chain(chars) {
         if is_prohibited(ch) || tables::unassigned_code_point(ch) {
-            return Ok(None);
+            return Ok(());
         }
         last_right = bidi::right(ch);
         right |= last_right;
         left |= bidi::left(ch);
-        decompose_compatible(ch, |_| length = length.and_then(|len| len.checked_add(1)));
+        decompose_compatible(ch, |ch| {
+            length = length.and_then(|len| {
+                let class = canonical_combining_class(ch);
+                if class == 0 {
+                    if disordered {
+                        scratch = scratch.max(len - start);
+                    }
+                    start = len;
+                    disordered = false;
+                } else {
+                    disordered |= last > class;
+                }
+                last = class;
+                len.checked_add(1)
+            });
+        });
     }
-    if right && (left || !first_right || !last_right) {
-        return Ok(None);
+    if right && (left || !bidi::right(first) || !last_right) {
+        return Ok(());
     }
     let length = length.ok_or(crate::ConfigError::PasswordCapacity)?;
+    if disordered {
+        scratch = scratch.max(length - start);
+    }
     let mut source = Decomposed(Zeroizing::new(
-        Vec::try_new(length).map_err(crate::ConfigError::Allocation)?,
+        Vec::try_new(length.saturating_add(scratch)).map_err(crate::ConfigError::Allocation)?,
     ));
     for mapped in mapped(value) {
         decompose_compatible(mapped, |ch| {
-            let class = canonical_combining_class(ch);
             let output = &mut source.0;
             let len = output.len();
             // SAFETY: replaying this unchanged source emits exactly the admitted
-            // number of characters. The insertion position and shifted suffix
-            // stay within that exclusive allocation, which never reallocates.
+            // number of characters, preserving the admitted scratch suffix.
             unsafe {
-                let at = if class == 0 {
-                    output.as_mut_ptr().add(len)
-                } else {
-                    let offset = output
-                        .iter()
-                        .rposition(|value| value.0 <= class)
-                        .map_or(0, |index| index + 1);
-                    let at = output.as_mut_ptr().add(offset);
-                    if offset < len {
-                        ptr::copy(at, at.add(1), len - offset);
-                    }
-                    at
-                };
-                at.write((class, ch));
+                output.as_mut_ptr().add(len).write(ch);
                 output.set_len(len + 1);
             }
         });
     }
-    encode(&compose_all(&source)?).map(Some)
+    encode(&compose_all(source), value)
 }
 
 fn mapped(value: &str) -> impl Iterator<Item = char> + '_ {
@@ -109,47 +113,86 @@ fn mapped(value: &str) -> impl Iterator<Item = char> + '_ {
         .filter(|ch| !tables::commonly_mapped_to_nothing(*ch))
 }
 
-fn compose_all(input: &Decomposed) -> Result<Composed, crate::ConfigError> {
-    let mut output = Composed(Zeroizing::new(
-        Vec::try_new(input.0.len()).map_err(crate::ConfigError::Allocation)?,
-    ));
+fn compose_all(mut input: Decomposed) -> Composed {
+    let len = input.0.len();
+    let ordered_all = input.0.capacity() == len;
+    let values = input.0.as_mut_ptr();
+    // SAFETY: decomposition initialized len characters and retained enough spare
+    // slots for every disordered segment. Exact capacity == len proves none exist.
+    let scratch = unsafe { values.add(len) };
     let mut written = 0;
-    {
-        let mut source = input.0.iter();
-        let mut starter: Option<&mut char> = None;
-        let mut previous = 0;
-        'slots: for slot in output.0.spare_capacity_mut() {
-            let (class, ch) = loop {
-                let Some(&(class, ch)) = source.next() else {
-                    break 'slots;
-                };
-                if let Some(current) = starter.as_deref_mut()
-                    && (previous == 0 || previous < class)
-                    && let Some(joined) = compose(*current, ch)
-                {
-                    *current = joined;
-                    continue;
-                }
-                break (class, ch);
-            };
-            let current = slot.write(ch);
+    let mut starter: Option<*mut char> = None;
+    let mut previous = 0;
+    let mut start = 0;
+    while start < len {
+        let mut end = if ordered_all { len } else { start };
+        let mut last = 0;
+        let mut ordered = true;
+        while end < len {
+            // SAFETY: compaction never writes beyond the already consumed prefix.
+            let class = canonical_combining_class(unsafe { values.add(end).read() });
+            if class == 0 && end != start {
+                break;
+            }
+            ordered &= last <= class;
+            last = class;
+            end += 1;
+        }
+        let source = if ordered {
+            // SAFETY: this complete canonical segment remains initialized in place.
+            unsafe { values.add(start) }
+        } else {
+            let mut positions = Zeroizing::new([0usize; 256]);
+            for index in start..end {
+                // SAFETY: the complete unconsumed segment lies in the initialized prefix.
+                let ch = unsafe { values.add(index).read() };
+                positions[canonical_combining_class(ch) as usize] += 1;
+            }
+            let mut offset = 0;
+            for count in positions.iter_mut() {
+                let next = offset + *count;
+                *count = offset;
+                offset = next;
+            }
+            for index in start..end {
+                // SAFETY: the source and scratch ranges are disjoint; source-order
+                // scatter fills each counted position exactly once, preserving ties.
+                let ch = unsafe { values.add(index).read() };
+                let at = &mut positions[canonical_combining_class(ch) as usize];
+                unsafe { scratch.add(*at).write(ch) };
+                *at += 1;
+            }
+            scratch
+        };
+        for index in 0..end - start {
+            // SAFETY: the selected segment is fully initialized. Each read is copied
+            // before writing at most one earlier slot; future source stays untouched.
+            let ch = unsafe { source.add(index).read() };
+            let class = canonical_combining_class(ch);
+            if let Some(current) = starter
+                && (previous == 0 || previous < class)
+                && let Some(joined) = compose(unsafe { current.read() }, ch)
+            {
+                unsafe { current.write(joined) };
+                continue;
+            }
+            let current = unsafe { values.add(written) };
+            unsafe { current.write(ch) };
             if class == 0 {
                 starter = Some(current);
             }
             previous = class;
             written += 1;
         }
+        start = end;
     }
-    // SAFETY: disjoint spare slots initialize exactly this prefix. Capacity is
-    // at least the input length, so every source character is consumed before
-    // slots run out; composition can only reduce the number of written slots.
-    unsafe { output.0.set_len(written) };
-    Ok(output)
+    // Zeroizing clears the full capacity, including scratch and the truncated tail.
+    input.0.truncate(written);
+    Composed(input.0)
 }
 
 fn is_prohibited(ch: char) -> bool {
-    tables::non_ascii_space_character(ch)
-        || tables::ascii_control_character(ch)
+    tables::ascii_control_character(ch)
         || tables::non_ascii_control_character(ch)
         || tables::private_use(ch)
         || tables::non_character_code_point(ch)
@@ -160,19 +203,21 @@ fn is_prohibited(ch: char) -> bool {
         || tables::tagging_character(ch)
 }
 
-fn encode(value: &Composed) -> Result<String, crate::ConfigError> {
-    let bytes = value.0.iter().try_fold(0usize, |total, ch| {
-        total
-            .checked_add(ch.len_utf8())
-            .ok_or(crate::ConfigError::PasswordCapacity)
-    })?;
-    let mut output = Vec::try_new(bytes).map_err(crate::ConfigError::Allocation)?;
+fn encode(value: &Composed, original: &mut Zeroizing<String>) -> Result<(), crate::ConfigError> {
+    // The admitted char allocation bounds this unchanged output by four bytes per char.
+    let bytes = value.0.iter().map(|ch| ch.len_utf8()).sum();
+    let mut output = if original.capacity() == bytes {
+        // Every original and spare byte is overwritten before this allocation is returned.
+        mem::take(&mut **original).into_bytes()
+    } else {
+        Vec::try_new(bytes).map_err(crate::ConfigError::Allocation)?
+    };
     let mut cursor = output.as_mut_ptr();
+    let mut encoded = Zeroizing::new([0; 4]);
     for ch in value.0.iter() {
-        let mut encoded = Zeroizing::new([0; 4]);
         let encoded = ch.encode_utf8(&mut encoded[..]);
         // SAFETY: this unchanged source was measured above; every encoded
-        // fragment fits the fresh exact allocation and is disjoint from it.
+        // fragment fits the exact output allocation and is disjoint from it.
         unsafe {
             ptr::copy_nonoverlapping(encoded.as_ptr(), cursor, encoded.len());
             cursor = cursor.add(encoded.len());
@@ -181,6 +226,7 @@ fn encode(value: &Composed) -> Result<String, crate::ConfigError> {
     // SAFETY: the complete measured prefix was initialized solely by encode_utf8.
     unsafe {
         output.set_len(bytes);
-        Ok(String::from_utf8_unchecked(output))
+        *original = Zeroizing::new(String::from_utf8_unchecked(output));
     }
+    Ok(())
 }

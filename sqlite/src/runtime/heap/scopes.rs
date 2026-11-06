@@ -5,8 +5,6 @@ thread_local! {
     static CURRENT: cell::Cell<Option<heap::raw::Owner>> = const { cell::Cell::new(None) };
 }
 
-pub(crate) struct Conflict;
-
 /// Owns this worker's exact destination for new native allocations.
 /// Live allocations retain their original arena independently of this scope.
 pub(crate) struct Scope {
@@ -14,12 +12,17 @@ pub(crate) struct Scope {
 }
 
 impl Scope {
-    pub(crate) fn enter(heap: heap::raw::Local) -> Result<Self, (heap::raw::Local, Conflict)> {
+    #[inline]
+    pub(crate) fn enter(heap: heap::raw::Local) -> Result<Self, crate::Error> {
         if CURRENT.get().is_some() {
-            return Err((heap, Conflict));
+            return Err(crate::Error::LocalAllocatorOccupied);
         }
         CURRENT.set(Some(heap.owner()));
         Ok(Self { _heap: heap })
+    }
+
+    pub(crate) fn finish(self) {
+        CURRENT.set(None);
     }
 
     /// Rejects a new Core allocation when this worker has no admitted arena.
@@ -28,12 +31,6 @@ impl Scope {
             return ptr::null_mut();
         };
         owner.allocate(order)
-    }
-}
-
-impl Drop for Scope {
-    fn drop(&mut self) {
-        CURRENT.set(None);
     }
 }
 

@@ -1,6 +1,7 @@
 use crate::reply::Error;
 use crate::{api, schema};
 use api::{Response, request, task};
+use cartel_core::deadline;
 use dope::{
     core::driver::{route::KeyTag, schedule::clock::timer},
     manifold::client::conn,
@@ -31,7 +32,7 @@ where
         Recover,
     >,
     #[pin]
-    deadline: Result<timer::Alarm<'d>, timer::Exhausted>,
+    deadline: Result<deadline::Guard<'d>, timer::Exhausted>,
     #[pin]
     waiter: wait::Waiter<'app, 'd>,
 }
@@ -46,10 +47,9 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     ) -> Self {
         let core = client
             .raw_core_as::<api::ExtractUnit<ID>, conn::Id<'d, KeyTag<ID>>, Recover>(target, req);
-        let guard = core.guard();
         Self {
             command: core,
-            deadline: guard,
+            deadline: client.port.lifecycle.deadline.guard(),
             waiter: wait::Waiter::new(),
         }
     }
@@ -74,7 +74,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             }
         };
         let phase = this.command.phase();
-        if let Poll::Ready(time) = this.command.poll_time(guard.as_mut(), ctx.as_mut(), phase) {
+        if let Poll::Ready(time) = guard.as_mut().poll_expired(ctx.as_mut(), phase) {
             this.waiter.as_ref().unregister();
             return Poll::Ready(Err(this.command.expire(time)));
         }
@@ -84,14 +84,14 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         {
             Poll::Pending => Poll::Pending,
             Poll::Ready(task::Done::AdmissionFailed(error)) => {
-                guard.as_ref().clear();
+                guard.as_mut().complete();
                 Poll::Ready(Err(error))
             }
             Poll::Ready(task::Done::Response {
                 outcome: Ok(()),
                 committed: lease,
             }) => {
-                guard.as_ref().clear();
+                guard.as_mut().complete();
                 Poll::Ready(Ok(lease))
             }
             Poll::Ready(task::Done::Response {
@@ -99,7 +99,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                 committed: lease,
             }) => {
                 lease.settle();
-                guard.as_ref().clear();
+                guard.as_mut().complete();
                 Poll::Ready(Err(error))
             }
         }

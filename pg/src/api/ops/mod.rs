@@ -163,10 +163,6 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        const {
-            assert!(N > 0);
-            assert!(N < u32::MAX as usize);
-        }
         task::Map::new(
             self.client.group::<Q, N>(self.target, params),
             results::GroupFailure::required::<Q>,
@@ -192,6 +188,28 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             self.client
                 .typed::<Q, api::ExtractFirst<ID>>(self.target, params, ()),
             results::Row::<_, Q>::optional,
+        )
+    }
+
+    fn run_scalar<Q>(
+        self,
+        params: Q::Params<'_>,
+    ) -> impl abi::Fiber<
+        'd,
+        Output = Result<
+            Option<results::Row<<Self::Results as Storage>::Payload, Q, true>>,
+            Error<'d, ID>,
+        >,
+    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID>
+    where
+        Q: schema::TypedQuery<Result = result::Rows<true>>,
+        I: schema::HasGroup<Q::Group>,
+        Q::Group: schema::QueryGroup,
+    {
+        task::Map::new(
+            self.client
+                .typed::<Q, api::ExtractFirst<ID>>(self.target, params, ()),
+            results::Row::<_, Q, true>::optional,
         )
     }
 
@@ -298,6 +316,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                     self.0.target,
                     request::Request::raw_extra(sql, request::Extra::CopyInOpen),
                 ),
+            budget: task::Budget::new(self.0.client.port.lifecycle.deadline),
         }
     }
 

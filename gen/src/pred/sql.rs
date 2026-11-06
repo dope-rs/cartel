@@ -25,50 +25,24 @@ impl Sql {
         Self(Vec::new())
     }
 
-    pub(crate) fn tokens(tokens: Vec<proc_macro2::TokenStream>) -> Self {
-        Self(tokens.into_iter().map(Part::Token).collect())
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
     }
 
-    pub(crate) fn captured(ident: syn::Ident) -> Self {
-        Self(vec![Part::Capture(ident)])
+    pub(super) fn truncate(&mut self, len: usize) {
+        self.0.truncate(len);
     }
 
-    pub(crate) fn infix(
-        left: Self,
-        operator: proc_macro2::TokenStream,
-        right: Self,
-        dialect: &backend::Dialect,
-    ) -> Self {
-        Self::tokens(vec![dialect.kw("PAREN_OPEN")])
-            .append(left)
-            .push(operator)
-            .append(right)
-            .push(dialect.kw("PAREN_CLOSE"))
+    pub(super) fn capture(&mut self, ident: syn::Ident) {
+        self.0.push(Part::Capture(ident));
     }
 
-    pub(crate) fn call<const N: usize>(
-        prefix: proc_macro2::TokenStream,
-        args: [Self; N],
-        dialect: &backend::Dialect,
-    ) -> Self {
-        let mut sql = Self::tokens(vec![prefix]);
-        for (index, arg) in args.into_iter().enumerate() {
-            if index > 0 {
-                sql = sql.push(dialect.kw("COMMA"));
-            }
-            sql = sql.append(arg);
-        }
-        sql.push(dialect.kw("PAREN_CLOSE"))
-    }
-
-    pub(crate) fn push(mut self, token: proc_macro2::TokenStream) -> Self {
+    pub(super) fn push(&mut self, token: proc_macro2::TokenStream) {
         self.0.push(Part::Token(token));
-        self
     }
 
-    pub(crate) fn append(mut self, mut other: Self) -> Self {
-        self.0.append(&mut other.0);
-        self
+    pub(super) fn extend(&mut self, tokens: impl IntoIterator<Item = proc_macro2::TokenStream>) {
+        self.0.extend(tokens.into_iter().map(Part::Token));
     }
 
     pub(crate) fn render(

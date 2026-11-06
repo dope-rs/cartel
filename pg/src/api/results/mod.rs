@@ -31,17 +31,18 @@ pub trait Storage {
     type Diagnostics: group::Diagnostics;
 }
 
-pub(in crate::api) type StoredRow<S, Q> = Row<<S as Storage>::Payload, Q>;
+pub(in crate::api) type StoredRow<S, Q, const SCALAR: bool = false> =
+    Row<<S as Storage>::Payload, Q, SCALAR>;
 pub(in crate::api) type StoredCollection<S, Q> = Collection<<S as Storage>::Batch, Q>;
 
-pub(in crate::api) type FirstResult<'d, S, Q, const ID: u8> =
-    Result<Option<StoredRow<S, Q>>, Error<'d, ID>>;
+pub(in crate::api) type FirstResult<'d, S, Q, const ID: u8, const SCALAR: bool = false> =
+    Result<Option<StoredRow<S, Q, SCALAR>>, Error<'d, ID>>;
 
 pub(in crate::api) type GroupResult<T, E, D, const N: usize> =
     Result<[T; N], GroupFailure<T, E, D, N>>;
 
 /// One row retaining its original immutable payload and reply credits.
-pub struct Row<P, Q>
+pub struct Row<P, Q, const SCALAR: bool = false>
 where
     Q: schema::TypedQuery,
 {
@@ -53,9 +54,9 @@ where
 #[repr(transparent)]
 pub struct Validated<T>(T);
 
-impl<P: source::Payload, Q> Row<P, Q>
+impl<P: source::Payload, Q, const SCALAR: bool> Row<P, Q, SCALAR>
 where
-    Q: schema::TypedQuery,
+    Q: schema::TypedQuery<Result = schema::result::Rows<SCALAR>>,
 {
     pub(crate) fn new(data: P) -> Self {
         Self {
@@ -67,10 +68,18 @@ where
     pub(in crate::api) fn optional<E>(data: Result<Option<P>, E>) -> Result<Option<Self>, E> {
         Ok(data?.map(Self::new))
     }
+}
 
+impl<P: source::Payload, Q> Row<P, Q>
+where
+    Q: schema::TypedQuery,
+{
     pub(in crate::api) fn required<E: From<crate::Error>>(
         data: Result<Option<P>, E>,
-    ) -> Result<Self, E> {
+    ) -> Result<Self, E>
+    where
+        Q: schema::TypedQuery<Result = schema::result::Rows>,
+    {
         Ok(Self::new(data?.ok_or(crate::Error::NotFound)?))
     }
 
@@ -87,7 +96,25 @@ where
         reader.finish()?;
         Ok(row)
     }
+}
 
+impl<P: source::Payload, Q> Row<P, Q, true>
+where
+    Q: schema::TypedQuery<Result = schema::result::Rows<true>>,
+{
+    pub fn decode(&self) -> Result<Option<<Q::Row as schema::Row>::View<'_>>, crate::Error> {
+        decode::RowReader::nullable(self.payload.wire(), <Q::Row as schema::Row>::decode)
+    }
+
+    pub fn into_owned(self) -> Result<Option<Q::Row>, crate::Error> {
+        decode::RowReader::nullable(self.payload.wire(), <Q::Row as schema::Row>::decode_owned)
+    }
+}
+
+impl<P: source::Payload, Q, const SCALAR: bool> Row<P, Q, SCALAR>
+where
+    Q: schema::TypedQuery,
+{
     pub fn validate(self) -> Result<Validated<Self>, crate::Error>
     where
         Q::Row: schema::Project,
@@ -101,7 +128,7 @@ where
     }
 }
 
-impl<P: source::Payload, Q> Validated<Row<P, Q>>
+impl<P: source::Payload, Q, const SCALAR: bool> Validated<Row<P, Q, SCALAR>>
 where
     Q: schema::TypedQuery,
     Q::Row: schema::Project,
@@ -228,7 +255,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, Q, const ID: u8> traits::
     for RunStream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID>
 where
     I: schema::QuerySet + 'd,
-    Q: schema::TypedQuery,
+    Q: schema::TypedQuery<Result = schema::result::Rows>,
 {
     type Payload = replies::Payload<'b, 'c, 'd>;
 
@@ -334,7 +361,7 @@ impl<P: source::Payload, E: From<crate::Error>, D: Diagnostics, const N: usize>
     /// on prefix exhaustion, leaving no unread owner to release.
     pub(in crate::api) fn required<Q>(mut self) -> GroupResult<Row<P, Q>, E, D, N>
     where
-        Q: schema::TypedQuery,
+        Q: schema::TypedQuery<Result = schema::result::Rows>,
     {
         if self.sync == Sync::Complete
             && self.sync_error.is_none()

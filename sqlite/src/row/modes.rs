@@ -86,7 +86,7 @@ impl Kind for Arena {
         rows: usize,
     ) -> Result<Self::State<'query, T>, crate::Error> {
         Ok(ArenaState {
-            retainer: init.arena.retain(rows)?,
+            retainer: row::raw::Retainer::new(init.arena, rows)?,
             plain: Plain,
         })
     }

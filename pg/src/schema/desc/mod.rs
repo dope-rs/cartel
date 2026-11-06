@@ -78,11 +78,7 @@ impl<'a> Types<'a> {
                 actual: self.bytes.len(),
             });
         };
-        let Some(metadata) = self.bytes.get(name_end..).and_then(|tail| tail.get(1..)) else {
-            return Err(crate::Error::DescriptionFieldName {
-                actual: self.bytes.len(),
-            });
-        };
+        let metadata = &self.bytes[name_end + 1..];
         let [
             _,
             _,

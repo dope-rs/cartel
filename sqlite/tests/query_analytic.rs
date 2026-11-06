@@ -4,21 +4,16 @@ use cartel_sqlite::runtime::{self, Runtime};
 use common::{assert_reclaimed, assert_retirement, query::analytic::*, schema};
 use dope_core::driver::life::recovery::Policy;
 use dope_test::fibers;
-use std::sync::OnceLock;
 
 pub mod common;
 
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
-
 #[test]
 fn arithmetic_in_aggregate() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+    // SAFETY: no SQLite call can pass this binary's initializer before it returns.
+    // Only Cartel uses installed SQLite; Core handles and allocations remain
+    // exclusively owned by their originating worker.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -33,6 +28,7 @@ fn arithmetic_in_aggregate() -> Result<(), plan::Error> {
                         let mut conn = local;
                         let s = count_widgets_arith(&mut conn, 0).await?;
                         ::core::assert_eq!(s, Some((10 + 20 + 30 + 40 + 50) * 2));
+                        ::core::assert_eq!(count_widgets_arith(&mut conn, 51).await?, None);
 
                                 Ok::<(), cartel_sqlite::Error>(())
                             }),
@@ -44,18 +40,11 @@ fn arithmetic_in_aggregate() -> Result<(), plan::Error> {
             |result| result.expect("SQLite scope"),
         );
         result.expect("SQLite integration scope")
-    }
+    }?;
+    window_functions(runtime)
 }
 
-#[test]
-fn window_functions() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn window_functions(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -69,9 +58,7 @@ fn window_functions() -> Result<(), plan::Error> {
 
                         let mut conn = local;
                         let rows = user_row_numbers(&mut conn).await?;
-                        ::core::assert_eq!(rows.len(), 5);
-                        let rns: Vec<i64> = rows.iter().map(|(_, n)| *n).collect();
-                        ::core::assert_eq!(rns, vec![1, 2, 3, 4, 5]);
+                        ::core::assert_eq!(rows.as_slice(), &[(1, 4), (2, 2), (3, 5), (4, 1), (5, 3)]);
 
                                 Ok::<(), cartel_sqlite::Error>(())
                             }),

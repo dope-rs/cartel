@@ -104,18 +104,26 @@ fn validates_timeout() {
 
 #[test]
 fn identifier_nul() {
+    let mut source = String::from("safe\0truncated");
+    let original = (source.as_ptr(), source.capacity());
     assert!(matches!(
-        cartel_pg::Identifier::try_from(&mut String::from("safe\0truncated")),
+        cartel_pg::Identifier::try_from(&mut source),
         Err(cartel_pg::ParseError::Nul { position: 4 })
     ));
+    assert_eq!(source, "safe\0truncated");
+    assert_eq!((source.as_ptr(), source.capacity()), original);
 }
 
 #[test]
 fn identifier_empty() {
+    let mut source = String::with_capacity(64);
+    let original = (source.as_ptr(), source.capacity());
     assert!(matches!(
-        cartel_pg::Identifier::try_from(&mut String::new()),
+        cartel_pg::Identifier::try_from(&mut source),
         Err(cartel_pg::ParseError::Empty)
     ));
+    assert!(source.is_empty());
+    assert_eq!((source.as_ptr(), source.capacity()), original);
 }
 
 #[test]

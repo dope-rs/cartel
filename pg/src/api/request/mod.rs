@@ -171,8 +171,8 @@ impl<'a> Request<'a> {
     }
 
     fn write(self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
-        out.parse_with("", |out| self.sql.write(out), &[])?;
-        out.bind("", "", &[1], 0, &[1], |_| Ok(()))?;
+        out.parse_with(|out| self.sql.write(out))?;
+        out.bind("", &[1], 0, &[1], |_| Ok(()))?;
         out.execute()?;
         match self.extra {
             Extra::Plain => out.sync()?,
@@ -331,9 +331,10 @@ impl<'d> Pending<'d> {
         port: &port::Port<'_, '_, '_, '_, '_, '_, 'd, I, ID>,
         req: Request<'_>,
     ) -> Result<Self, crate::Error> {
-        let boundary = match req.extra {
-            Extra::Plain | Extra::CopyIn { .. } => requests::Boundary::Close,
-            Extra::CopyInOpen => requests::Boundary::External,
+        let boundary = match (req.sql, req.extra) {
+            (Sql::Begin(_), _) => requests::Boundary::Begin,
+            (_, Extra::Plain | Extra::CopyIn { .. }) => requests::Boundary::Close,
+            (_, Extra::CopyInOpen) => requests::Boundary::External,
         };
         let frame = port.request().encode(|frame| req.write(frame))?;
         Ok(Self {
@@ -360,7 +361,6 @@ impl<Q: schema::TypedQuery> schema::Admission<Q> {
     ) -> Result<(), encode::Error> {
         use protocol::value::encode::BindWriter;
         out.bind(
-            "",
             Q::STATEMENT_NAME,
             Q::PARAM_FORMAT_CODES,
             self.count(),

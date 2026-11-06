@@ -23,7 +23,7 @@ mod progress;
 pub(super) mod stream;
 pub(in crate::api) mod tx;
 
-use dispatch::Dispatch;
+pub(in crate::api) use dispatch::Budget;
 
 pub use call::Call;
 pub(super) use call::Map;
@@ -94,7 +94,7 @@ pub(super) struct Core<
     A: lease::Target<'d, ID>,
     P: lease::Policy,
 {
-    admission: Dispatch<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, S, A, P>,
+    admission: State<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, S, A, P>,
     reply: R,
 }
 
@@ -126,22 +126,9 @@ where
         next: Result<api::Pending<'d, S>, crate::Error>,
     ) -> Self {
         Self {
-            admission: Dispatch::new(client, target, next),
+            admission: State::new(client, target, next),
             reply,
         }
-    }
-
-    pub(super) fn guard(&self) -> Result<timer::Alarm<'d>, timer::Exhausted> {
-        self.admission.deadline.guard()
-    }
-
-    pub(super) fn poll_time(
-        &mut self,
-        guard: Pin<&mut timer::Alarm<'d>>,
-        ctx: Pin<&mut context::Context<'_, 'd>>,
-        phase: deadline::RequestPhase,
-    ) -> Poll<deadline::Elapsed> {
-        self.admission.deadline.poll_expired(guard, ctx, phase)
     }
 
     pub(super) fn phase(&self) -> deadline::RequestPhase {
@@ -203,12 +190,12 @@ where
         }
         let next = Pin::new(&mut self.reply).poll_reply(cx);
         match next {
-            Poll::Pending => match self.admission.state.admitted() {
+            Poll::Pending => match self.admission.admitted() {
                 Some(lease) => Poll::Ready(Ok(Progress::Admitted(lease))),
                 None => Poll::Ready(Err(crate::Error::Closed.into())),
             },
             Poll::Ready(next) => {
-                let Some(lease) = self.admission.state.take() else {
+                let Some(lease) = self.admission.take() else {
                     return Poll::Ready(Err(crate::Error::Closed.into()));
                 };
                 Poll::Ready(Ok(Progress::Complete {

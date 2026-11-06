@@ -15,7 +15,7 @@ dope-fiber.workspace = true
 cartel-core.workspace = true
 ryu.workspace = true
 pin-project.workspace = true
-zeroize = "1.8"
+zeroize = "1.9.1"
 
 [lib]
 test = false

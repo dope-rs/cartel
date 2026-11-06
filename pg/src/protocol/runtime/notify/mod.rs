@@ -6,15 +6,13 @@ use o3::base::cell::region;
 use o3::buffer::{Source, resident::copy};
 use std::{cell, num::NonZero, pin};
 
-use crate::protocol::runtime::waiters;
-
 mod buffer;
 
 pub(crate) struct Queue<'d> {
     buffer: region::Value<region::Identity<'d>, buffer::Buffer<'d>>,
     capacity: usize,
     dropped: cell::Cell<u64>,
-    pub(in crate::protocol) waiters: waiters::Queue<'d>,
+    pub(in crate::protocol) waiters: wait::Notifier<'d>,
 }
 
 impl<'d> Queue<'d> {
@@ -29,7 +27,7 @@ impl<'d> Queue<'d> {
             buffer: proof.bind(buffer::Buffer::try_new(items, bytes)?),
             capacity: bytes,
             dropped: cell::Cell::new(0),
-            waiters: waiters::Queue::new(driver, waiters),
+            waiters: wait::Notifier::new(driver, waiters),
         })
     }
 
@@ -63,7 +61,7 @@ impl<'d> Queue<'d> {
         token
             .borrow_mut(&self.buffer)
             .try_push(notice, &self.dropped)?;
-        self.waiters.wake();
+        self.waiters.notify();
         Ok(())
     }
 

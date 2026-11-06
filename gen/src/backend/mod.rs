@@ -112,9 +112,15 @@ impl Compiled {
         let (ctes, body) = shape::CteBinding::extract_from(&block)?;
 
         let dialect = B::dialect();
-        let mut cte_map: collections::HashMap<String, syn::Path> = collections::HashMap::new();
-        let mut captures = Vec::new();
-        let mut nonneg = Vec::new();
+        let mut state = plan::State {
+            fn_params: &ids,
+            param_tys: &tys,
+            captures: Vec::new(),
+            nonnegative: Vec::new(),
+            return_type: output,
+            dialect: &dialect,
+            cte_map: collections::BTreeMap::new(),
+        };
         let mut prefix: Vec<proc_macro2::TokenStream> = Vec::new();
         if !ctes.is_empty() {
             prefix.push(dialect.kw("WITH_KW"));
@@ -122,23 +128,12 @@ impl Compiled {
                 if i > 0 {
                     prefix.push(dialect.kw("COMMA"));
                 }
-                let name_str = cte.name.unraw().to_string().quoted();
+                let name = crate::ext::name(cte.name);
+                let name_str = name.quoted();
                 prefix.push(quote::quote! { #name_str });
                 prefix.push(dialect.kw("AS_OPEN"));
-                let state = plan::State {
-                    fn_params: &ids,
-                    param_tys: &tys,
-                    captures,
-                    nonnegative: nonneg,
-                    return_type: output,
-                    dialect: &dialect,
-                    cte_map: &cte_map,
-                };
-                let step = plan::Cte(state).build(&cte.inner_chain)?;
-                let (path, sql) = step.value;
-                captures = step.state.captures;
-                nonneg = step.state.nonnegative;
-                if cte_map.insert(cte.name.unraw().to_string(), path).is_some() {
+                let (path, sql) = plan::cte::build(&mut state, cte.inner_chain)?;
+                if state.cte_map.insert(name, path).is_some() {
                     return Err(syn::Error::new(
                         cte.name.span(),
                         format!("duplicate CTE name `{}`", cte.name),
@@ -150,22 +145,12 @@ impl Compiled {
             prefix.push(dialect.kw("SPACE"));
         }
 
-        let shape = shape::QueryShape::parse(&body, &cte_map)?;
-        let state = plan::State {
-            fn_params: &ids,
-            param_tys: &tys,
-            captures,
-            nonnegative: nonneg,
-            return_type: output,
-            dialect: &dialect,
-            cte_map: &cte_map,
-        };
-        let step = plan::Query(state).build(&shape)?;
-        let state = step.state;
-        let mut plan = step.value;
-        let mut sql = prefix;
-        sql.append(&mut plan.sql_parts);
-        plan.sql_parts = sql;
+        let shape = shape::QueryShape::parse(body, &state.cte_map)?;
+        let mut plan = plan::query::build(&mut state, &shape)?;
+        if !prefix.is_empty() {
+            prefix.append(&mut plan.sql_parts);
+            plan.sql_parts = prefix;
+        }
         let captures = state.captures;
         let nonneg = state.nonnegative;
         Ok(Self {
@@ -232,7 +217,7 @@ impl TableSpec<'_> {
                 parts.push(quote::quote! { "," });
                 select.push(',');
             }
-            let column = field.name.unraw().to_string().quoted();
+            let column = crate::ext::unraw(&field.name.to_string()).quoted();
             select.push_str(&column);
             parts.extend([
                 quote::quote! { prefix },
@@ -257,22 +242,9 @@ impl TableSpec<'_> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum Cast {
-    Ltree,
-}
-
-#[derive(Clone, Copy)]
 pub(super) enum Kind {
     Pg,
     Sqlite,
-}
-
-impl Cast {
-    fn apply(self, base: String) -> String {
-        match self {
-            Self::Ltree => format!("{base}::ltree"),
-        }
-    }
 }
 
 impl Kind {
@@ -348,35 +320,30 @@ impl Dialect {
 
     pub(super) fn placeholder(&self, idx0: usize, ctx: &ParamCtx<'_>) -> proc_macro2::TokenStream {
         let index = idx0 + 1;
-        let base = match self.kind {
+        let s = match self.kind {
+            Kind::Pg if Self::is_ltree_param(idx0, ctx) => format!("${index}::ltree"),
             Kind::Pg => format!("${index}"),
             Kind::Sqlite => format!("?{index}"),
-        };
-        let s = match self.lookup_cast(idx0, ctx) {
-            Some(cast) => cast.apply(base),
-            None => base,
         };
         quote::quote! { #s }
     }
 
-    fn lookup_cast(&self, idx0: usize, ctx: &ParamCtx<'_>) -> Option<Cast> {
-        if let Kind::Sqlite = self.kind {
-            return None;
-        }
-        let cap = ctx.captures.get(idx0)?;
-        let pos = ctx
-            .param_ids
-            .iter()
-            .position(|p| p.unraw() == cap.unraw())?;
-        let ty = ctx.param_tys.get(pos)?;
-        let syn::Type::Path(path) = ty else {
-            return None;
+    fn is_ltree_param(idx0: usize, ctx: &ParamCtx<'_>) -> bool {
+        let Some(cap) = ctx.captures.get(idx0) else {
+            return false;
         };
-        if path.qself.is_some() {
-            return None;
-        }
-        let segment = path.path.segments.last()?;
-        (segment.ident == "Ltree" && segment.arguments.is_empty()).then_some(Cast::Ltree)
+        let Some(pos) = ctx.param_ids.iter().position(|p| p.unraw() == cap.unraw()) else {
+            return false;
+        };
+        let Some(syn::Type::Path(path)) = ctx.param_tys.get(pos) else {
+            return false;
+        };
+        path.qself.is_none()
+            && path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "Ltree" && segment.arguments.is_empty())
     }
 
     pub(super) fn reject_op(&self, name: &str, span: proc_macro2::Span) -> syn::Result<()> {

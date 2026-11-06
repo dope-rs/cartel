@@ -1,22 +1,13 @@
-use cartel_pg::api::traits::{Client as _, Query as _, Status as _};
-use dope::core::driver::life::recovery;
-use dope_fiber::BlockOn as _;
-use std::num::NonZero;
+use cartel_pg::api::traits::{Client, Query as _, Status as _};
 
 use cartel_pg::{
     protocol::{encode, value::encode::BindWriter},
     schema::{self, groups, result},
 };
-use dope_fiber::task::time::sleep;
+use dope_fiber::{abi::Fiber, task::time::sleep};
 use dope_test::fibers;
 
-use crate::common::env;
-
-use crate::common::external::{
-    own,
-    own::Convert as _,
-    runtime::{self, Session},
-};
+use crate::common::external::{own, own::Convert as _};
 
 pub struct Observer;
 
@@ -54,42 +45,21 @@ impl schema::QuerySet for Observer {
 
 impl schema::HasGroup<Observer> for Observer {}
 
-type Observed<'d> = Result<Option<Result<(), own::Error<'d>>>, sleep::Error>;
+type Observed<'d> = Result<Option<Result<(), own::Error<'d, 1>>>, sleep::Error>;
 
 impl Observer {
     /// Each SELECT ends at Sync, so activity is read in a fresh transaction.
-    pub fn observe<R>(
-        input: env::Env,
+    pub fn observe<'d>(
+        client: impl Client<'d, 1, Schema = Self>,
         pid: i32,
-        inspect: impl for<'d> FnOnce(Observed<'d>),
-        recover: impl recovery::Recover + Copy,
-        check: impl Fn(runtime::Check<'_, '_, R>) -> R,
-    ) -> Result<R, runtime::Error<R>> {
-        Session::<Self>::new(
-            input.address(),
-            input.try_config().map_err(runtime::Error::Environment)?,
-            NonZero::<usize>::MIN,
-            "public".to_owned(),
-            false,
-        )
-        .try_run(
-            |rt| {
-                let client = rt.client();
-                let observed = rt.runtime.block_on(fibers::TEST.within(
-                    dope_fiber::fiber!('_ => async move {
-                        client.status().wait_ready().await.map_err(own::Error::Query)?;
-                        loop {
-                            if client.query().run_one::<Self>(pid).await.try_own()? {
-                                return Ok::<(), own::Error<'_>>(());
-                            }
-                        }
-                    }),
-                ))?;
-                inspect(observed);
-                Ok(())
-            },
-            recover,
-            check,
-        )
+    ) -> impl Fiber<'d, Output = Observed<'d>> {
+        fibers::TEST.within(dope_fiber::fiber!('d => async move {
+            client.status().wait_ready().await.map_err(own::Error::Query)?;
+            loop {
+                if client.query().run_one::<Self>(pid).await.try_own()? {
+                    return Ok::<(), own::Error<'d, 1>>(());
+                }
+            }
+        }))
     }
 }

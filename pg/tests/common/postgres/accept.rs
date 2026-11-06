@@ -4,7 +4,6 @@ use crate::common::wire::{
     queries::{DIAGNOSTIC, DUPLICATE},
 };
 use cartel_pg::protocol::{Number, Reason};
-use dope::core::platform::wake::Wait;
 use dope_test::harness::peer;
 use std::time::{Duration, Instant};
 
@@ -70,11 +69,78 @@ pub fn reply(socket: &mut &peer::Stream<'_>, frame: Frame<'_>) -> Result<(), Err
     socket.read_closed()
 }
 
+pub fn copy_finish(listener: &mut peer::TcpAcceptor<'_>) -> Result<(), Error> {
+    let mut socket = listener.accept()?;
+    socket.try_start(None)?;
+    read_empty(&socket, b'd')?;
+    socket.write_all(
+        &[
+            Frame::new(b'1', &[]).encode(),
+            Frame::new(b'2', &[]).encode(),
+            Frame::new(b'G', b"\0\0\0").encode(),
+            Frame::new(b'A', b"\0\0\0\x01copy\0ready\0").encode(),
+        ]
+        .concat(),
+    )?;
+    let mut finish = [0; 10];
+    socket.read_exact(&mut finish)?;
+    if &finish != b"c\0\0\0\x04S\0\0\0\x04" {
+        return Err(Error::UnexpectedRequest);
+    }
+    socket.write_all(
+        &[
+            Frame::new(b'C', b"COPY 0\0").encode(),
+            Frame::new(b'Z', b"I").encode(),
+        ]
+        .concat(),
+    )?;
+    read_empty(&socket, b'S')?;
+    socket.write_all(
+        &[
+            Frame::new(b'C', b"SELECT 1\0").encode(),
+            Frame::new(b'Z', b"I").encode(),
+        ]
+        .concat(),
+    )?;
+    socket.read_closed()
+}
+
+pub fn queued_cancel_reuse(listener: &mut peer::TcpAcceptor<'_>) -> Result<(), Error> {
+    const PID: i32 = 0x1020_3040;
+    const SECRET: i32 = 0x5060_7080;
+
+    let mut primary = listener.accept_within(Duration::from_secs(1))?;
+    primary.try_start(Some((PID, SECRET)))?;
+
+    read_empty(&primary, b'S')?;
+    primary.write_all(&Frame::new(b'C', b"BEGIN\0").encode())?;
+    primary.write_all(&Frame::new(b'Z', b"T").encode())?;
+
+    {
+        let cancel = listener.accept_within(Duration::from_secs(1))?;
+        let mut frame = [0_u8; 16];
+        cancel.read_exact(&mut frame)?;
+        let expected = [16, 80_877_102, PID, SECRET].map(i32::to_be_bytes);
+        if frame.as_slice() != expected.as_flattened() {
+            return Err(Error::UnexpectedRequest);
+        }
+    }
+
+    read_empty(&primary, b'S')?;
+    primary.write_all(&Frame::new(b'C', b"ROLLBACK\0").encode())?;
+    primary.write_all(&Frame::new(b'Z', b"I").encode())?;
+
+    primary.read_closed()?;
+    if listener.try_accept()?.is_some() {
+        return Err(Error::UnexpectedRequest);
+    }
+    Ok(())
+}
+
 pub fn fatal(
     socket: &mut &peer::Stream<'_>,
     detail: &[u8],
     buffered: bool,
-    release: Wait,
 ) -> Result<(), SettleError> {
     socket
         .prepare()
@@ -88,9 +154,6 @@ pub fn fatal(
             .map_err(Error::Io)
             .map_err(SettleError::Command)?;
     }
-    release
-        .wait_timeout(Duration::from_secs(1))
-        .map_err(SettleError::Release)?;
     socket
         .write_all(&Frame::new(b'E', detail).encode())
         .map_err(Error::Io)
@@ -98,25 +161,22 @@ pub fn fatal(
     socket.read_closed().map_err(SettleError::Close)
 }
 
-pub trait Listener {
-    fn accept_within(&self, timeout: Duration) -> Result<peer::Stream<'static>, peer::Error>;
-    fn group_settle(self, ready: Wait) -> Result<(), SettleError>;
-    fn reply_settle(self) -> Result<peer::Stream<'static>, Error>;
-    fn finalizer(self) -> Result<(), Error>;
-    fn copy_recover(self) -> Result<(), Error>;
-    fn recovery(self) -> Result<(peer::Stream<'static>, peer::Stream<'static>), Error>;
-    fn least_loaded(
-        self,
-        initial: usize,
-    ) -> Result<([peer::Stream<'static>; 2], Vec<usize>), Error>;
+pub trait Listener<'a> {
+    fn accept_within(&self, timeout: Duration) -> Result<peer::Stream<'a>, peer::Error>;
+    fn group_settle(&self) -> Result<(), SettleError>;
+    fn reply_settle(&self) -> Result<(), Error>;
+    fn finalizer(&self) -> Result<(), Error>;
+    fn copy_recover(&self) -> Result<(), Error>;
+    fn recovery(&self, idle: bool, held: bool) -> Result<(), Error>;
+    fn least_loaded(&self, initial: usize) -> Result<([peer::Stream<'a>; 2], usize), Error>;
 }
 
-impl Listener for peer::TcpAcceptor<'static> {
-    fn accept_within(&self, timeout: Duration) -> Result<peer::Stream<'static>, peer::Error> {
+impl<'a> Listener<'a> for peer::TcpAcceptor<'a> {
+    fn accept_within(&self, timeout: Duration) -> Result<peer::Stream<'a>, peer::Error> {
         self.accept_for(timeout)?.ok_or(peer::Error::TimedOut)
     }
 
-    fn group_settle(self, ready: Wait) -> Result<(), SettleError> {
+    fn group_settle(&self) -> Result<(), SettleError> {
         let mut stream = self
             .accept_within(Duration::from_secs(1))
             .map_err(SettleError::Connect)?;
@@ -138,9 +198,6 @@ impl Listener for peer::TcpAcceptor<'static> {
             .map_err(SettleError::Begin)?;
 
         read_empty(&mut stream, b'S').map_err(SettleError::Group)?;
-        ready
-            .wait_timeout(Duration::from_secs(1))
-            .map_err(SettleError::Release)?;
         stream
             .write_all(
                 &[
@@ -175,23 +232,9 @@ impl Listener for peer::TcpAcceptor<'static> {
         stream.read_closed().map_err(SettleError::Stop)
     }
 
-    fn reply_settle(self) -> Result<peer::Stream<'static>, Error> {
+    fn reply_settle(&self) -> Result<(), Error> {
         let mut stream = self.accept_within(Duration::from_secs(1))?;
         stream.try_start(None)?;
-
-        for _ in 0..2 {
-            read_empty(&mut stream, b'S')?;
-        }
-
-        let response = [
-            Frame::new(b'C', b"SELECT 1\0").encode(),
-            Frame::new(b'E', b"SERROR\0C23505\0Mlate sync\0\0").encode(),
-            Frame::new(b'Z', b"I").encode(),
-            Frame::new(b'C', b"SELECT 1\0").encode(),
-            Frame::new(b'Z', b"I").encode(),
-        ]
-        .concat();
-        stream.write_all(&response)?;
 
         read_empty(&mut stream, b'S')?;
         let reply = [
@@ -200,10 +243,20 @@ impl Listener for peer::TcpAcceptor<'static> {
         ]
         .concat();
         stream.write_all(&reply)?;
-        Ok(stream)
+
+        read_empty(&mut stream, b'S')?;
+        let response = [
+            Frame::new(b'E', b"SERROR\0C23505\0Mlate sync\0\0").encode(),
+            Frame::new(b'Z', b"I").encode(),
+            Frame::new(b'C', b"SELECT 1\0").encode(),
+            Frame::new(b'Z', b"I").encode(),
+        ]
+        .concat();
+        stream.write_all(&response)?;
+        stream.read_closed()
     }
 
-    fn finalizer(self) -> Result<(), Error> {
+    fn finalizer(&self) -> Result<(), Error> {
         let mut stream = self.accept_within(Duration::from_secs(1))?;
         stream.try_start(None)?;
         read_empty(&mut stream, b'S')?;
@@ -237,7 +290,7 @@ impl Listener for peer::TcpAcceptor<'static> {
         stream.read_closed()
     }
 
-    fn copy_recover(self) -> Result<(), Error> {
+    fn copy_recover(&self) -> Result<(), Error> {
         let mut stream = self.accept_within(Duration::from_secs(1))?;
         stream.try_start(None)?;
         for _ in 0..2 {
@@ -262,34 +315,47 @@ impl Listener for peer::TcpAcceptor<'static> {
         stream.read_closed()
     }
 
-    fn recovery(self) -> Result<(peer::Stream<'static>, peer::Stream<'static>), Error> {
+    fn recovery(&self, idle: bool, held: bool) -> Result<(), Error> {
         let mut first = self.accept_within(Duration::from_secs(1))?;
         first.try_start(None)?;
-        read_empty(&first, b'S')?;
+        if idle {
+            first.write_all(&Frame::new(b'Z', b"I").encode())?;
+            first.read_closed()?;
+        } else {
+            read_empty(&first, b'S')?;
+        }
+        let first = if held {
+            first.write_all(&Frame::new(b'E', b"SERROR\0C23505\0Mheld response\0\0").encode())?;
+            first.write_all(&Frame::new(b'Z', b"I").encode())?;
+            drop(first);
+            None
+        } else {
+            Some(first)
+        };
         let mut next = self.accept_within(Duration::from_secs(1))?;
         next.try_start(None)?;
-        let _ =
-            first.write_all(&Frame::new(b'E', b"SERROR\0CXX000\0Mstale generation\0\0").encode());
-        let _ = first.write_all(&Frame::new(b'Z', b"I").encode());
-        Ok((first, next))
+        if idle || held {
+            next.write_all(&Frame::new(b'A', b"\0\0\0\x02replacement\0ready\0").encode())?;
+        } else if let Some(first) = &first {
+            let _ = first
+                .write_all(&Frame::new(b'E', b"SERROR\0CXX000\0Mstale generation\0\0").encode());
+            let _ = first.write_all(&Frame::new(b'Z', b"I").encode());
+        }
+        next.recover()?;
+        drop(first);
+        Ok(())
     }
 
-    fn least_loaded(
-        self,
-        initial: usize,
-    ) -> Result<([peer::Stream<'static>; 2], Vec<usize>), Error> {
-        let mut selected = Vec::new();
+    fn least_loaded(&self, initial: usize) -> Result<([peer::Stream<'a>; 2], usize), Error> {
         let mut first = self.accept_within(Duration::from_secs(1))?;
         first.try_start(None)?;
         for _ in 0..initial {
             read_empty(&mut first, b'S')?;
-            selected.push(0);
         }
 
         let mut second = self.accept_within(Duration::from_secs(1))?;
         second.try_start(None)?;
         read_empty(&mut second, b'S')?;
-        selected.push(1);
         let response = [
             Frame::new(b'C', b"SELECT 1\0").encode(),
             Frame::new(b'Z', b"I").encode(),
@@ -312,7 +378,6 @@ impl Listener for peer::TcpAcceptor<'static> {
                     Ok(_) => {
                         socket.read_wait(Some(Duration::from_secs(1)))?;
                         read_empty(socket, b'S')?;
-                        selected.push(index);
                         break 'selection index;
                     }
                     Err(error)
@@ -331,6 +396,6 @@ impl Listener for peer::TcpAcceptor<'static> {
             }
             socket.read_wait(Some(Duration::from_secs(1)))?;
         }
-        Ok((sockets, selected))
+        Ok((sockets, last))
     }
 }

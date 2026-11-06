@@ -2,11 +2,9 @@ use crate::{api, catalogs};
 use api::{exec, tx};
 use dope_fiber::abi;
 use dope_runtime::client;
-use phase::Phase;
+use phase::{Borrow, Live, Phase};
 use std::{marker, mem, ptr};
 
-mod lease;
-use lease::Lease;
 mod phase;
 pub(crate) mod raw;
 
@@ -14,7 +12,7 @@ pub(crate) mod raw;
 ///
 #[repr(transparent)]
 pub struct Connection<'app, 'local: 'app, 'd: 'local, I: catalogs::Catalog = catalogs::Empty> {
-    guard: Lease<'app, 'local, 'd, I>,
+    app: client::Bound<'app, 'd, Installed<'local, 'd, I>, ptr::NonNull<Live<'local, 'd, I>>>,
 }
 
 impl<'app, 'local: 'app, 'd: 'local, I: catalogs::Catalog> Connection<'app, 'local, 'd, I> {
@@ -25,19 +23,51 @@ impl<'app, 'local: 'app, 'd: 'local, I: catalogs::Catalog> Connection<'app, 'loc
         assert!(mem::size_of::<Option<Self>>() == word);
     };
 
-    const fn new(guard: Lease<'app, 'local, 'd, I>) -> Self {
-        Self { guard }
+    fn try_new(
+        context: client::Context<'_, 'app, 'd, Installed<'local, 'd, I>>,
+    ) -> Result<Self, crate::Error> {
+        let (app, bound) = context.into_parts();
+        // SAFETY: the provider context retains this exact pinned application.
+        let phase = unsafe { &*app.get_ref().phase.as_ptr() };
+        let live = match phase {
+            Phase::Live(live) => live,
+            Phase::Closing(_) | Phase::Retiring(_) | Phase::Empty => {
+                return Err(crate::Error::LocalConnectionClosed);
+            }
+        };
+        match live.borrow.get() {
+            Borrow::Vacant => {}
+            Borrow::Borrowed => return Err(crate::Error::LocalConnectionBorrowed),
+            Borrow::Closed | Borrow::Closing => return Err(crate::Error::LocalConnectionClosed),
+        }
+        live.borrow.set(Borrow::Borrowed);
+        Ok(Self {
+            app: bound.bind(ptr::NonNull::from(live)),
+        })
+    }
+
+    fn state(&mut self) -> &mut api::State<'local, 'd, I> {
+        // SAFETY: this guard exclusively owns the borrowed phase until drop.
+        unsafe { &mut *self.app.as_ref().state.get() }
     }
 
     pub fn query(&mut self) -> exec::Query<'_, 'local, 'd, I> {
-        self.guard.state().query()
+        self.state().query()
     }
 
     pub fn transaction(
         &mut self,
     ) -> impl abi::Fiber<'d, Output = Result<tx::Transaction<'_, 'local, 'd, I>, crate::Error>>
     + use<'_, 'app, 'local, 'd, I> {
-        self.guard.state().transaction()
+        self.state().transaction()
+    }
+}
+
+impl<I: catalogs::Catalog> Drop for Connection<'_, '_, '_, I> {
+    fn drop(&mut self) {
+        // SAFETY: Installed stays pinned for the application lease.
+        let live = unsafe { self.app.as_ref() };
+        live.borrow.set(live.borrow.get().returned());
     }
 }
 
@@ -67,7 +97,7 @@ impl<'local, 'd: 'local, I: catalogs::Catalog> client::Provider<'d> for Installe
         Self: 'app,
         'd: 'app,
     {
-        Lease::try_new(context).map(Connection::new)
+        Connection::try_new(context)
     }
 }
 

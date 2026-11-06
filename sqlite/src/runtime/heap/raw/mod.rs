@@ -35,26 +35,45 @@ struct Free<'a> {
     links: Links,
 }
 
+impl<'a> Free<'a> {
+    /// # Safety
+    /// This arena retains the linked free block at its exact admitted order.
+    unsafe fn new(arena: &'a Arena, index: Index, order: Level) -> Self {
+        Self {
+            block: block::Segment {
+                arena,
+                index,
+                order,
+            },
+            // SAFETY: the retained free block contains its initialized links.
+            links: unsafe { arena.block(index).cast::<Links>().read() },
+        }
+    }
+}
+
 struct State {
     heads: [Option<Index>; ORDERS],
-    allocations: usize,
-    release: Option<Memory>,
+    references: usize,
+    backing: mem::ManuallyDrop<Memory>,
 }
 
 impl State {
-    const fn new() -> Self {
+    const fn new(backing: Memory) -> Self {
         Self {
             heads: [None; ORDERS],
-            allocations: 0,
-            release: None,
+            references: 1,
+            backing: mem::ManuallyDrop::new(backing),
         }
     }
 
-    fn arm(&mut self, release: Memory) -> Option<Memory> {
-        if self.is_empty() {
-            Some(release)
+    /// Consumes one runtime or native owner; the last owner takes the backing.
+    fn release(&mut self) -> Option<Memory> {
+        self.references -= 1;
+        if self.references == 0 {
+            // SAFETY: the unique last runtime/native owner takes the initialized
+            // backing; its caller drops it only after every arena borrow ends.
+            Some(unsafe { mem::ManuallyDrop::take(&mut self.backing) })
         } else {
-            self.release = Some(release);
             None
         }
     }
@@ -63,10 +82,6 @@ impl State {
         for block in block::Partition::new(arena) {
             self.link(block);
         }
-    }
-
-    const fn is_empty(&self) -> bool {
-        self.allocations == 0
     }
 
     fn reserve<'a>(
@@ -80,15 +95,8 @@ impl State {
             let Some(index) = *found.get(&self.heads) else {
                 continue;
             };
-            let free = Free {
-                block: block::Segment {
-                    arena,
-                    index,
-                    order: found,
-                },
-                // SAFETY: this arena's linked head retains the free block and its Links.
-                links: unsafe { arena.block(index).cast::<Links>().read() },
-            };
+            // SAFETY: this arena's linked head retains the exact free block and order.
+            let free = unsafe { Free::new(arena, index, found) };
             let block = self.unlink(free);
             return apply(block.reserve(self, order));
         }
@@ -105,7 +113,6 @@ impl State {
                 break;
             };
             self.unlink(free);
-            block.arena.set_control(block.index, 0);
             block.index = cmp::min(block.index, buddy);
             block.order = next;
         }
@@ -136,15 +143,8 @@ impl State {
         if arena.control(index) != FREE | order.index() as u8 {
             return None;
         }
-        let links = unsafe { arena.block(index).cast::<Links>().read() };
-        Some(Free {
-            block: block::Segment {
-                arena,
-                index,
-                order,
-            },
-            links,
-        })
+        // SAFETY: the checked control admits this arena's linked free block and order.
+        Some(unsafe { Free::new(arena, index, order) })
     }
 
     fn unlink<'a>(&mut self, free: Free<'a>) -> block::Segment<'a> {
@@ -257,7 +257,7 @@ impl Decoded {
             };
             // SAFETY: that original block start lies within this arena's immutable unit domain.
             // Its one-based index is positive and at most the unit count.
-            // Native custody also preserves Block::write's order and occupied control until release.
+            // Native custody also preserves the initialized header order until release.
             let index = Index(unsafe { num::NonZero::new_unchecked(offset / UNIT_BYTES + 1) });
             apply(block::Occupied {
                 source,
@@ -273,13 +273,6 @@ impl Decoded {
 
 impl Header {
     const BYTES: usize = size_of::<Self>();
-
-    fn new(owner: Owner, order: Order) -> Self {
-        Self {
-            owner: Some(owner),
-            metadata: Metadata { order },
-        }
-    }
 
     fn foreign(bytes: hooks::Len) -> Self {
         Self {
@@ -298,26 +291,29 @@ pub(in crate::runtime::heap) struct Arena {
 impl Arena {
     pub(crate) const BYTES: usize = size_of::<Self>().div_ceil(64) * 64;
 
-    unsafe fn new(base: span::ArenaBase, layout: Layout) -> Self {
-        let base = base.pointer();
+    /// # Safety
+    /// Pointer is the unpublished aligned Arena prefix in backing, followed by
+    /// the admitted layout's disjoint block and control regions.
+    unsafe fn initialize(pointer: ptr::NonNull<Self>, layout: Layout, backing: Memory) {
+        let base = unsafe { pointer.cast::<u8>().add(Self::BYTES) };
         let units = layout.units();
-        unsafe { base.as_ptr().add(units * UNIT_BYTES).write_bytes(0, units) };
-        let arena = Self {
-            base,
-            units,
-            state: cell::UnsafeCell::new(State::new()),
-            _thread: ThreadBound::NEW,
+        // SAFETY: complete placement precedes the first Arena reference.
+        // Initialization invokes no callbacks and publishes no owner.
+        unsafe {
+            pointer.as_ptr().write(Self {
+                base,
+                units,
+                state: cell::UnsafeCell::new(State::new(backing)),
+                _thread: ThreadBound::NEW,
+            });
+            base.as_ptr().add(units * UNIT_BYTES).write_bytes(0, units);
+            let arena = pointer.as_ref();
+            (&mut *arena.state.get()).initialize(arena);
         };
-        unsafe { (&mut *arena.state.get()).initialize(&arena) };
-        arena
     }
 
     fn capacity(&self) -> usize {
         self.units * UNIT_BYTES
-    }
-
-    fn arm(&self, release: Memory) -> Option<Memory> {
-        unsafe { (&mut *self.state.get()).arm(release) }
     }
 
     fn release(header: Decoded) {

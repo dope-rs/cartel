@@ -51,14 +51,18 @@ impl Row<'_> {
             }
         }
         let name = &input.ident;
-        let types: Vec<_> = fields.named.iter().map(|field| &field.ty).collect();
-        let names: Vec<_> = fields.named.iter().map(|field| &field.ident).collect();
-        let shape = types.iter().rev().fold(quote::quote! { () }, |tail, ty| {
-            quote::quote! { (#ty, #tail) }
-        });
+        let fields = fields.named.pairs().map(|pair| pair.into_value());
+        let shape = fields
+            .clone()
+            .rev()
+            .fold(quote::quote! { () }, |tail, field| {
+                let ty = &field.ty;
+                quote::quote! { (#ty, #tail) }
+            });
         let mut owned = Vec::new();
-        for (name, ty) in names.iter().zip(&types) {
-            let read = ty.row_read()?;
+        for field in fields.clone() {
+            let name = &field.ident;
+            let read = field.ty.row_read()?;
             owned.push(quote::quote! { #name: #read, });
         }
         let (view, decode, project) = if named {
@@ -68,7 +72,7 @@ impl Row<'_> {
             let lease = reserved.fresh("__cartel_lease_");
             let vis = &input.vis;
             let mut decls = Vec::new();
-            for field in &fields.named {
+            for field in fields.clone() {
                 let name = &field.ident;
                 let vis = &field.vis;
                 let ty = &field.ty;
@@ -76,9 +80,13 @@ impl Row<'_> {
                     #vis #name: <#ty as ::cartel_pg::schema::Row>::View<'row>
                 });
             }
-            let pattern = names.iter().rev().fold(quote::quote! { () }, |tail, name| {
-                quote::quote! { (#name, #tail) }
-            });
+            let names = fields.map(|field| &field.ident);
+            let pattern = names
+                .clone()
+                .rev()
+                .fold(quote::quote! { () }, |tail, name| {
+                    quote::quote! { (#name, #tail) }
+                });
             (
                 quote::quote! { #row<'row> },
                 quote::quote! {
@@ -126,11 +134,10 @@ impl Row<'_> {
 
             impl ::cartel_pg::schema::desc::Validate for #name {
                 const DYNAMIC_TYPES: u8 =
-                    0u8 #( | <#types as ::cartel_pg::schema::desc::Validate>::DYNAMIC_TYPES )*;
+                    <#shape as ::cartel_pg::schema::desc::Validate>::DYNAMIC_TYPES;
 
                 fn validate(types: &mut ::cartel_pg::schema::desc::Types<'_>) -> ::core::result::Result<(), ::cartel_pg::Error> {
-                    #(<#types as ::cartel_pg::schema::desc::Validate>::validate(types)?;)*
-                    ::core::result::Result::Ok(())
+                    <#shape as ::cartel_pg::schema::desc::Validate>::validate(types)
                 }
 
                 fn formats(values: &mut ::cartel_pg::schema::desc::Formats<'_>) -> ::core::result::Result<(), ::cartel_pg::protocol::encode::Error> {

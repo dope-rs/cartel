@@ -34,10 +34,10 @@ use o3::{
 };
 use protocol::parser::limit;
 
-type Owner<'r, 's, 'storage, 'b, 'c, 'd, const ID: u8> = endpoint::State<
+type Owner<'r, 's, 'd, P, const ID: u8> = endpoint::State<
     'r,
     'd,
-    Port<'s, 'storage, 'b, 'c, 'd, ID>,
+    P,
     client::Logic<'s, 'd>,
     route::KeyTag<ID>,
     { client::CONNECTOR_CONNECTION_LIMIT },

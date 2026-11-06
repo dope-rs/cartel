@@ -105,6 +105,7 @@ pub trait Optional: Sealed + Sized {
 
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool;
+    fn iter(&self) -> impl ExactSizeIterator<Item = Option<&[u8]>>;
     fn try_array<const N: usize>(&self) -> Result<[Option<&[u8]>; N], reply::Decode<Self::Bytes>>;
 }
 

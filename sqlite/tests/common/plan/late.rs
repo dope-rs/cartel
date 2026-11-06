@@ -40,12 +40,12 @@ unsafe impl<'app, 'local: 'app, 'd: 'local> executor::raw::App<'d> for Held<'app
 
     /// # Safety
     /// The selected plan is uninhabited, so this operation cannot be invoked.
-    unsafe fn park<'loan, 'driver, 'turn, 'root>(
+    unsafe fn park<'loan, 'driver, 'turn>(
         _: pin::Pin<&'loan mut Self>,
         plan: &mut Self::ParkPlan,
-        _: executor::raw::Park<'driver, 'turn, 'root, 'd>,
+        _: executor::raw::Park<'driver, 'turn, 'd>,
     ) where
-        'd: 'driver + 'turn + 'root,
+        'd: 'driver + 'turn,
     {
         match *plan {}
     }
@@ -97,7 +97,7 @@ impl<'mark, 'local, 'd: 'local> lending::Build<'d, Installed<'local, 'd, Integra
     }
 }
 
-impl<'mark, 'local, 'life, 'd: 'local + 'life, Q>
+impl<'mark, 'local, 'life, 'd: 'local + 'life, Q: executor::Startup>
     lending::Execute<'life, 'd, Installed<'local, 'd, IntegrationDatabase>, Q> for Create<'mark>
 {
     type Output = Result<(), Failure>;

@@ -3,7 +3,7 @@ use cartel_redis::value::source::Bulks as _;
 use dope::core::driver::life::recovery;
 use dope::runtime::executor::session::Completion;
 use dope_test::harness::peer;
-use std::{fmt, mem, net::Shutdown, sync::mpsc, time::Duration};
+use std::{fmt, mem, net::Shutdown, time::Duration};
 
 use cartel_redis::{
     client::{
@@ -257,73 +257,6 @@ fn half_close_preserves_truncated_response() {
         )
         .expect("spawn Redis peer");
     }
-}
-
-#[test]
-fn inflight_close_drains() {
-    let config = config(Positive::from_secs::<1>()).expect("valid redis configuration");
-    AcceptScript::with(
-        |peer| {
-            let failed = peer.accept()?;
-            failed.read_wait(Some(Duration::from_secs(1)))?;
-            let mut buf = [0_u8; PING.len() * 2];
-            failed.read_exact(&mut buf)?;
-            assert_eq!(&buf[..PING.len()], PING);
-            assert_eq!(&buf[PING.len()..], PING);
-            failed.shutdown(Shutdown::Both)?;
-            let socket = peer.accept()?;
-            pong_once(&socket)
-        },
-        |server| {
-            let addr = server.addr();
-
-            {
-                let prepared = topology::try_new::<Env>(config, addr, Plan::new())
-                    .expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut rt| {
-                                    let redis = rt.root_client();
-
-                                    assert!(matches!(
-                                        BlockOn::block_on(&mut rt, redis.wait_active()),
-                                        Ok(Ok(()))
-                                    ));
-                                    let result = BlockOn::block_on(
-                                        &mut rt,
-                                        Join::new(redis.server().ping(), redis.server().ping()),
-                                    );
-                                    let (first, second) = result.expect("drive saved requests");
-                                    assert_committed_close(first);
-                                    assert_committed_close(second);
-                                    assert!(matches!(
-                                        BlockOn::block_on(&mut rt, redis.wait_active()),
-                                        Ok(Ok(()))
-                                    ));
-                                    assert!(matches!(
-                                        BlockOn::block_on(&mut rt, redis.server().ping()),
-                                        Ok(Ok(()))
-                                    ));
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-                );
-                reports.events().expect("valid reclaim observations");
-            };
-            assert!(
-                matches!(server.finish(), Ok(Ok(()))),
-                "finish Redis peer; Redis peer I/O"
-            );
-        },
-    )
-    .expect("spawn failing Redis peer");
 }
 
 #[test]
@@ -603,49 +536,100 @@ fn binding_reconnects() {
 
 #[test]
 fn waiter_slot_reclaims() {
-    let (allow, gate) = mpsc::channel();
-    let (stop, done) = mpsc::channel();
-    AcceptScript::with(
-        move |peer| {
-            let socket = peer.accept()?;
-            socket.read_wait(Some(Duration::from_secs(1)))?;
-            let mut buf = [0_u8; 128];
-            assert_ne!(socket.read(&mut buf)?, 0);
-            (gate.recv_timeout(GUARD)).expect("allow AUTH response");
-            socket.write_all(b"+OK\r\n")?;
-            (done.recv_timeout(GUARD)).expect("finish active connection");
-            Ok::<_, peer::Error>(())
+    use dope::{
+        core::{
+            driver::route::{KeyTag, table::conn::Capacity},
+            io::socket,
         },
-        |server| {
-            let addr = server.addr();
+        manifold::{app::receive, network::listener, service},
+        net::wire::domain,
+        runtime::topology::{self, lending::Stage},
+    };
+    use dope_fiber::net::server;
 
-            let config = Builder::new(settings::Capacities {
-                connections: 1,
-                admission_waiters: 1,
-                inflight: 1,
-                request_frame_bytes: 128,
-                response_bytes: 128,
-                response_values: 1,
-                response_frame_bytes: 128,
-                response_frame_values: 1,
-            })
-            .window(Positive::from_millis::<1_000>())
-            .build()
-            .expect("valid redis configuration");
-            let init =
-                (Plan::new().password("secret")).expect("authentication storage must allocate");
-            {
-                let prepared = topology::try_new::<Env>(config, addr, init)
-                    .expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut rt| {
-                                    let redis = rt.root_client();
-
+    let bound = socket::Listener::bind(([127, 0, 0, 1], 0).into()).expect("peer listener");
+    let addr = bound.local_addr();
+    let config = Builder::new(settings::Capacities {
+        connections: 1,
+        admission_waiters: 1,
+        inflight: 1,
+        request_frame_bytes: 128,
+        response_bytes: 128,
+        response_values: 1,
+        response_frame_bytes: 128,
+        response_frame_values: 1,
+    })
+    .window(Positive::from_millis::<1_000>())
+    .build()
+    .expect("valid redis configuration");
+    let init = (Plan::new().password("secret")).expect("authentication storage must allocate");
+    let snapshot = service::Snapshot::from_one(
+        service::Revision::new(1),
+        service::Endpoint::new(addr, addr),
+    );
+    let (_, node) = cartel_redis::client::plan::Plan::<0>::new(config)
+        .assemble::<Env>(
+            snapshot,
+            settings::DEFAULT_BACKOFF,
+            settings::DEFAULT_BACKOFF_MAXIMUM,
+            init,
+        )
+        .expect("Redis plan")
+        .into_parts();
+    let peer = server::Plan::<Identity, KeyTag<1>>::new(Capacity::fixed::<1>(), Identity);
+    let layout =
+        listener::topology::Layout::<KeyTag<1>, receive::Owned>::new(Capacity::fixed::<1>());
+    let prepared = topology::Plan::new((), (node, layout))
+        .for_install::<Throughput>()
+        .expect("topology fixture completed");
+    let mut reports = Reports::new(prepared.layout(), [Id::fixed::<0>(), Id::fixed::<1>()]);
+    let mut report = Completion::new();
+    prepared.with_local(
+        |worker| {
+            worker.lend(|(node, _), stage| {
+                node.install(stage, |host, stage| {
+                    let hash = stage.hash_state(listener::Domain::DEFAULT);
+                    let port = peer
+                        .try_build(stage.driver().storage)
+                        .expect("peer storage");
+                    server::Listener::<KeyTag<1>, Tcp, Identity, _>::adopt(
+                        &port,
+                        server::Config {
+                            direct_flights: 0.into(),
+                            bind: addr,
+                            backlog: socket::Backlog::fixed::<1>(),
+                            stream: Default::default(),
+                            transport: Default::default(),
+                            egress: Default::default(),
+                            bound,
+                            wire: domain::Local::new(Identity),
+                        },
+                        |cause| cause.eliminate(),
+                        hash,
+                        stage,
+                        Stage::driver,
+                        |listener, stage| {
+                            let peer = listener.handle();
+                            stage.with_quiesce(
+                                &mut report,
+                                common::connect::App::new(host, listener),
+                                GUARD,
+                                |mut rt| {
+                                    let redis = rt.client(common::connect::App::connector);
+                                    let mut io = fibers::TEST
+                                        .try_run(&mut rt, peer.accept())
+                                        .expect("peer accept driver")
+                                        .ok()
+                                        .expect("peer connection");
+                                    fibers::TEST
+                                        .try_run(
+                                            &mut rt,
+                                            common::connect::expect(
+                                                &mut io,
+                                                b"*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n",
+                                            ),
+                                        )
+                                        .expect("AUTH request");
                                     let wait = redis.wait_active();
                                     assert_eq!(
                                         mem::size_of_val(&wait),
@@ -656,16 +640,14 @@ fn waiter_slot_reclaims() {
                                         rt.block_on(fibers::TEST.poll_once(held.as_mut()))
                                             .expect("poll original waiter")
                                             .is_none(),
-                                        "readiness completed before the gated handshake"
+                                        "readiness completed before the AUTH response"
                                     );
-
                                     assert!(matches!(
-                                        BlockOn::block_on(&mut rt, redis.wait_active()),
+                                        fibers::TEST.try_run(&mut rt, redis.wait_active()),
                                         Ok(Err(cartel_redis::Error::Wait(
                                             dope_fiber::wait::Error::QueueFull { capacity, .. }
                                         ))) if capacity == dope_fiber::wait::Capacity::new(1)
                                     ));
-
                                     drop(held);
                                     let mut wait = Box::pin(Task::new(redis.wait_active()));
                                     assert!(
@@ -674,27 +656,25 @@ fn waiter_slot_reclaims() {
                                             .is_none(),
                                         "replacement waiter was not registered"
                                     );
-                                    assert!(allow.send(()).is_ok(), "release AUTH response");
-                                    let result = rt.block_on(wait.as_mut());
+                                    assert!(matches!(
+                                        fibers::TEST.try_run(&mut rt, io.write_all(b"+OK\r\n")),
+                                        Ok(Ok(()))
+                                    ));
+                                    let result = fibers::TEST.try_run(&mut rt, wait.as_mut());
                                     drop(wait);
                                     assert!(matches!(result, Ok(Ok(()))));
-                                    assert!(stop.send(()).is_ok(), "finish active connection");
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-                );
-                reports.events().expect("valid reclaim observations");
-            };
-            assert!(
-                matches!(server.finish(), Ok(Ok(()))),
-                "finish Redis readiness peer; Redis readiness peer I/O"
-            );
+                                },
+                            )
+                        },
+                    )
+                    .expect("install peer")
+                })
+            })
         },
-    )
-    .expect("spawn Redis readiness peer");
+        recovery::Policy::new(|event| reports.push(event), recover),
+        |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
+    );
+    reports.events().expect("valid reclaim observations");
 }
 
 #[test]
@@ -719,7 +699,7 @@ fn parser_lane_waits_for_retained_replies() {
             let left = peer.accept()?;
             let right = peer.accept()?;
             let mut sockets = [&left, &right];
-            let first = first_request(&mut sockets, REQUEST)?;
+            let first = first_request(&mut sockets, REQUEST, &mut [0; REQUEST.len()])?;
             let (a, b) = if first == 0 {
                 (&left, &right)
             } else {

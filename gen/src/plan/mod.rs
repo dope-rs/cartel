@@ -5,14 +5,11 @@ use syn::ext::IdentExt as _;
 
 use pred::sql::Sql;
 
-mod cte;
-mod query;
+pub(super) mod cte;
+pub(super) mod query;
 mod read;
 mod row;
 mod write;
-
-pub(crate) use cte::Cte;
-pub(crate) use query::Query;
 
 #[derive(Clone, Copy)]
 pub(super) enum Bound {
@@ -27,12 +24,7 @@ pub(super) struct State<'a> {
     pub(super) nonnegative: Vec<(syn::Ident, Bound)>,
     pub(super) return_type: &'a syn::ReturnType,
     pub(super) dialect: &'a backend::Dialect,
-    pub(super) cte_map: &'a collections::HashMap<String, syn::Path>,
-}
-
-pub(super) struct Step<'a, T> {
-    pub(super) state: State<'a>,
-    pub(super) value: T,
+    pub(super) cte_map: collections::BTreeMap<String, syn::Path>,
 }
 
 impl State<'_> {
@@ -41,7 +33,7 @@ impl State<'_> {
             fn_params: self.fn_params,
             param_tys: self.param_tys,
             dialect: self.dialect,
-            cte_map: self.cte_map,
+            cte_map: &self.cte_map,
         }
     }
 
@@ -57,7 +49,7 @@ impl State<'_> {
 
     pub(super) fn parse(
         &self,
-        scope: &pred::RowScope,
+        scope: &pred::RowScope<'_>,
         expr: &syn::Expr,
         error: syn::Error,
     ) -> syn::Result<Sql> {
@@ -66,7 +58,7 @@ impl State<'_> {
             Some(self.fn_params),
             self.param_tys,
             self.dialect,
-            self.cte_map,
+            &self.cte_map,
         )?;
         sql.required(error)
     }

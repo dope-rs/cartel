@@ -1,7 +1,7 @@
 use crate::reply::Error;
 use crate::{api::Response, port::replies};
 use crate::{api::task, schema};
-use cartel_core::reply;
+use cartel_core::{deadline, reply};
 use dope::core::driver::schedule::clock::timer;
 use dope_fiber::{abi, context, wait};
 use reply::recv;
@@ -57,7 +57,7 @@ where
         ID,
     >,
     #[pin]
-    deadline: Result<timer::Alarm<'d>, timer::Exhausted>,
+    deadline: Result<deadline::Guard<'d>, timer::Exhausted>,
     #[pin]
     waiter: wait::Waiter<'app, 'd>,
 }
@@ -82,11 +82,11 @@ where
             Response<'app, 'g, 'r, 's, 'b, 'c, 'd, X>,
             ID,
         >,
+        source: deadline::Source<'d>,
     ) -> Self {
-        let guard = core.guard();
         Self {
             core,
-            deadline: guard,
+            deadline: source.guard(),
             waiter: wait::Waiter::new(),
         }
     }
@@ -119,7 +119,7 @@ where
             }
         };
         let phase = this.core.phase();
-        if let Poll::Ready(time) = this.core.poll_time(guard.as_mut(), cx.as_mut(), phase) {
+        if let Poll::Ready(time) = guard.as_mut().poll_expired(cx.as_mut(), phase) {
             this.waiter.as_ref().unregister();
             return Poll::Ready(Err(this.core.expire(time)));
         }
@@ -133,7 +133,7 @@ where
                 Poll::Ready(task::Done::Response { outcome, .. }) => Poll::Ready(outcome),
             };
         if next.is_ready() {
-            guard.as_ref().clear();
+            guard.as_mut().complete();
         }
         next
     }

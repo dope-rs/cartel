@@ -1,4 +1,4 @@
-use std::{cell, mem, pin, task};
+use std::{mem, pin, task};
 
 use dope::core::driver::schedule::clock::timer;
 use dope_fiber::context;
@@ -41,11 +41,13 @@ impl<'d> Source<'d> {
         Self { timer, window }
     }
 
+    #[inline]
     pub fn guard(self) -> Result<Guard<'d>, timer::Exhausted> {
         Ok(Guard {
-            alarm: self.timer.try_alarm()?,
-            window: self.window,
-            state: cell::Cell::new(GuardState::Fresh),
+            state: GuardState::Live {
+                alarm: self.timer.try_alarm()?,
+                window: Some(self.window),
+            },
         })
     }
 
@@ -56,16 +58,14 @@ impl<'d> Source<'d> {
 
 /// One first-poll-anchored absolute deadline. Phase changes never rearm it.
 pub struct Guard<'d> {
-    alarm: timer::Alarm<'d>,
-    window: Positive,
-    state: cell::Cell<GuardState>,
+    state: GuardState<'d>,
 }
 
-#[derive(Clone, Copy)]
-#[repr(u8)]
-enum GuardState {
-    Fresh,
-    Armed,
+enum GuardState<'d> {
+    Live {
+        alarm: timer::Alarm<'d>,
+        window: Option<Positive>,
+    },
     Elapsed,
     Complete,
 }
@@ -76,38 +76,35 @@ impl<'d> Guard<'d> {
         mut ctx: pin::Pin<&mut context::Context<'_, 'd>>,
         phase: RequestPhase,
     ) -> task::Poll<Elapsed> {
-        let this = self.get_mut();
-        match this.state.get() {
+        let state = &mut self.get_mut().state;
+        let (alarm, window) = match state {
+            GuardState::Live { alarm, window } => (alarm, window),
             GuardState::Elapsed => return task::Poll::Ready(Elapsed::new(phase)),
             GuardState::Complete => return task::Poll::Pending,
-            GuardState::Fresh => {
-                let wake = ctx.as_ref().completion();
-                let now = ctx.as_mut().driver().driver_ref().clock().now();
-                let due = now.clamp_add(this.window);
-                this.state.set(GuardState::Armed);
-                this.alarm.arm(due, wake);
-                return task::Poll::Pending;
-            }
-            GuardState::Armed => {}
-        }
+        };
         let wake = ctx.as_ref().completion();
         let now = ctx.as_mut().driver().driver_ref().clock().now();
-        if this.alarm.poll(now, wake).is_ready() {
-            this.state.set(GuardState::Elapsed);
+        let expired = match window.take() {
+            Some(duration) => alarm.arm_and_poll(now.clamp_add(duration), now, wake),
+            None => alarm.poll(now, wake),
+        };
+        if expired.is_ready() {
+            *state = GuardState::Elapsed;
             task::Poll::Ready(Elapsed::new(phase))
         } else {
             task::Poll::Pending
         }
     }
 
-    pub fn complete(&self) {
-        self.alarm.clear();
-        self.state.set(GuardState::Complete);
+    pub fn complete(&mut self) {
+        self.state = GuardState::Complete;
     }
 }
 
 const _: () = {
-    assert!(mem::size_of::<GuardState>() == 1);
-    assert!(mem::size_of::<cell::Cell<GuardState>>() == mem::size_of::<GuardState>());
-    assert!(mem::align_of::<cell::Cell<GuardState>>() == mem::align_of::<GuardState>());
+    const LIVE: usize = mem::size_of::<timer::Alarm<'static>>() + mem::size_of::<Positive>();
+
+    assert!(mem::size_of::<Guard<'static>>() == LIVE);
+    assert!(mem::size_of::<Option<Guard<'static>>>() == LIVE);
+    assert!(mem::size_of::<Result<Guard<'static>, timer::Exhausted>>() == LIVE);
 };

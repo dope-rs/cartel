@@ -68,7 +68,7 @@ impl<'s, 'arena, 'credits, 'region> Lease<'s, 'arena, 'credits, 'region, storage
                 let parser::Value::Bulk(span) = value else {
                     return Err(Fault::expected(reply::Expectation::ScanCursor, value));
                 };
-                match scalar::Scalar::new(frame.slice(span)).unsigned() {
+                match scalar::unsigned(frame.slice(span)) {
                     Ok(value) => Ok(value),
                     Err(scalar::Error::Negative(value)) => Err(Fault::NegativeCursor(value)),
                     Err(scalar::Error::Invalid(reason)) => Err(Fault::Integer { span, reason }),

@@ -4,12 +4,7 @@ use common::{external::runtime::check, recover};
 use dope_fiber::BlockOn as _;
 use dope_test::harness::peer;
 use std::env::var_os;
-use std::{
-    net::{Ipv4Addr, TcpListener},
-    num::NonZero,
-    thread,
-    time::Duration,
-};
+use std::{num::NonZero, thread, time::Duration};
 
 use crate::common::external::runtime::{Plan, Session};
 use crate::common::{port::Queries, postgres::accept::Listener as _};
@@ -27,66 +22,114 @@ use crate::common::external::{own, own::Convert as _, row::Copy, user::Lookup};
 pub mod common;
 
 #[test]
-fn rejected_copy_recovers() {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("listener");
-    let address = listener.local_addr().expect("listener address");
-    let peer = thread::spawn(move || {
-        peer::TcpAcceptor::try_adopt(listener.into())
-            .expect("listener admission")
-            .copy_recover()
-    });
-    Session::<Queries>::new(
-        address,
-        Queries::try_config().expect("database config"),
-        NonZero::<usize>::MIN,
-        "public".to_owned(),
-        false,
-    )
-    .try_run(
-        |rt| {
-            let client = rt.client();
-            assert!(rt.runtime.block_on(client.status().wait_ready())?.is_ok());
-            for finish in [false, true] {
-                let mut copy = traits::Client::copy(client).copy_stream("COPY missing FROM STDIN");
-                assert!(
-                    rt.runtime.block_on(copy.write(&[]))?.is_ok(),
-                    "initial COPY admission"
-                );
-                let marker = rt
+fn finish_with_full_request_pool() {
+    peer::AcceptScript::with(common::postgres::accept::copy_finish, |server| {
+        Session::<Queries>::new(
+            server.addr(),
+            Queries::try_config().expect("database config"),
+            NonZero::<usize>::MIN,
+            "public".to_owned(),
+            false,
+        )
+        .try_run(
+            |rt| {
+                let client = rt.client();
+                let mut copy = client.copy().copy_stream("COPY items FROM STDIN");
+                assert!(rt.runtime.block_on(copy.write(&[]))?.is_ok());
+                let notice = rt
                     .runtime
                     .block_on(client.notify().next())?
                     .ok()
-                    .expect("server rejection marker");
-                assert_eq!(marker.channel(), "copy");
-                let rejected = if finish {
-                    rt.runtime.block_on(copy.finish())?
-                } else {
-                    rt.runtime.block_on(copy.write(&[]))?
-                };
-                assert_eq!(
-                    rejected
-                        .as_ref()
-                        .err()
-                        .and_then(|error| error.as_server())
-                        .map(|error| error.fields().code().as_str()),
-                    Some("42P01"),
-                    "COPY retains the exact server rejection",
-                );
-                drop(rejected);
-                assert!(
+                    .expect("COPY admission marker");
+                assert_eq!((notice.channel(), notice.payload()), ("copy", "ready"));
+                drop(notice);
+                // Session admits sixteen request frames per connection.
+                let held =
+                    std::array::from_fn::<_, 16, _>(|_| client.unchecked().command("SELECT 1"));
+                assert!(matches!(
                     rt.runtime
-                        .block_on(client.unchecked().command("SELECT 1"))?
-                        .is_ok(),
-                    "a rejected COPY recovers through a replacement connection",
-                );
-            }
-            Ok(())
+                        .block_on(client.unchecked().command("SELECT 1"))?,
+                    Err(reply::Error::Driver(cartel_pg::Error::RequestCapacity))
+                ));
+                assert!(rt.runtime.block_on(copy.finish())?.is_ok());
+                let [reuse, held @ ..] = held;
+                assert!(rt.runtime.block_on(reuse)?.is_ok());
+                drop(held);
+                Ok(())
+            },
+            recover,
+            check,
+        )
+        .expect("PostgreSQL runtime");
+        server.finish().expect("COPY peer").expect("COPY protocol");
+    })
+    .expect("COPY listener");
+}
+
+#[test]
+fn rejected_copy_recovers() {
+    peer::AcceptScript::with(
+        |listener| listener.copy_recover(),
+        |server| {
+            Session::<Queries>::new(
+                server.addr(),
+                Queries::try_config().expect("database config"),
+                NonZero::<usize>::MIN,
+                "public".to_owned(),
+                false,
+            )
+            .try_run(
+                |rt| {
+                    let client = rt.client();
+                    assert!(rt.runtime.block_on(client.status().wait_ready())?.is_ok());
+                    for finish in [false, true] {
+                        let mut copy =
+                            traits::Client::copy(client).copy_stream("COPY missing FROM STDIN");
+                        assert!(
+                            rt.runtime.block_on(copy.write(&[]))?.is_ok(),
+                            "initial COPY admission"
+                        );
+                        let marker = rt
+                            .runtime
+                            .block_on(client.notify().next())?
+                            .ok()
+                            .expect("server rejection marker");
+                        assert_eq!(marker.channel(), "copy");
+                        let rejected = if finish {
+                            rt.runtime.block_on(copy.finish())?
+                        } else {
+                            rt.runtime.block_on(copy.write(&[]))?
+                        };
+                        assert_eq!(
+                            rejected
+                                .as_ref()
+                                .err()
+                                .and_then(|error| error.as_server())
+                                .map(|error| error.fields().code().as_str()),
+                            Some("42P01"),
+                            "COPY retains the exact server rejection",
+                        );
+                        drop(rejected);
+                        assert!(
+                            rt.runtime
+                                .block_on(client.unchecked().command("SELECT 1"))?
+                                .is_ok(),
+                            "a rejected COPY recovers through a replacement connection",
+                        );
+                    }
+                    Ok(())
+                },
+                recover,
+                check,
+            )
+            .expect("PostgreSQL runtime");
+            server
+                .finish()
+                .expect("COPY peer")
+                .expect("COPY recovery peer");
         },
-        recover,
-        check,
     )
-    .expect("PostgreSQL runtime");
-    peer.join().expect("peer").expect("COPY recovery peer");
+    .expect("COPY listener");
 }
 
 #[test]

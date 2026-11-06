@@ -36,7 +36,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         let mut left = client.port.capacity();
         while left != 0 {
             left -= 1;
-            let conn = client.port.shared.pick_conn(None)?;
+            let conn = client.port.shared.ready.pick_begin()?;
             let Some(load) = client.port.load(conn, region) else {
                 continue;
             };

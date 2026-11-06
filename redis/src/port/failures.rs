@@ -50,10 +50,15 @@ impl<'b, 'd, const ID: u8> Failures<'b, 'd, ID> {
         }
         let previous = slot.take();
         if first {
-            self.first = self.lanes.iter_mut().find_map(|slot| {
-                slot.as_mut()
-                    .map(|value| base.with_addr(NonNull::from(value).addr()))
-            });
+            // The cached minimum proves every earlier slot is empty.
+            self.first = self
+                .lanes
+                .iter_mut()
+                .skip(position.connection().index().into_usize() + 1)
+                .find_map(|slot| {
+                    slot.as_mut()
+                        .map(|value| base.with_addr(NonNull::from(value).addr()))
+                });
         }
         previous
     }
@@ -65,9 +70,6 @@ impl<'b, 'd, const ID: u8> Failures<'b, 'd, ID> {
     ) -> Option<client::Failure<'d>> {
         let base = self.allocation();
         let slot = position.entry_mut(&mut self.lanes);
-        if self.first == slot.as_mut().map(NonNull::from) {
-            self.first = None;
-        }
         let previous = slot.take();
         let occupied = base.with_addr(NonNull::from(slot.insert(failure)).addr());
         self.first = Some(self.first.map_or(occupied, |first| {

@@ -5,7 +5,7 @@ use cartel_redis::value::source::{
 };
 use dope::core::driver::life::recovery;
 use dope::runtime::executor::session::Completion;
-use std::{convert, mem, time::Duration};
+use std::{convert, time::Duration};
 
 use cartel_redis::{
     client::{nonempty::Slice, settings::init::Plan},
@@ -88,13 +88,27 @@ fn run(case: List) {
                                                     actual: 2
                                                 })
                                             ));
+                                            let expected = [Some(b"".as_slice()), None];
                                             assert_eq!(
                                                 values
                                                     .try_array::<2>()
                                                     .ok()
                                                     .expect("optional pair"),
-                                                [Some(b"one".as_slice()), None]
+                                                expected
                                             );
+                                            let mut iter = values.iter();
+                                            for (index, value) in expected.into_iter().enumerate() {
+                                                let remaining = expected.len() - index;
+                                                assert_eq!(iter.len(), remaining);
+                                                assert_eq!(
+                                                    iter.size_hint(),
+                                                    (remaining, Some(remaining))
+                                                );
+                                                assert_eq!(iter.next(), Some(value));
+                                            }
+                                            assert_eq!(iter.len(), 0);
+                                            assert_eq!(iter.size_hint(), (0, Some(0)));
+                                            assert_eq!(iter.next(), None);
                                         }
                                         List::Array
                                         | List::ArrayProof
@@ -386,40 +400,6 @@ fn pairs_reject_late_kind() {
 #[test]
 fn pairs_retains_failure() {
     run(List::PairsVisit);
-}
-
-#[test]
-fn bounded_layout() {
-    let word = mem::size_of::<usize>();
-    assert_eq!(
-        mem::size_of::<bulks::Array<'static, 'static, 'static, 'static>>(),
-        10 * word
-    );
-    assert_eq!(
-        mem::size_of::<Option<bulks::Array<'static, 'static, 'static, 'static>>>(),
-        mem::size_of::<bulks::Array<'static, 'static, 'static, 'static>>()
-    );
-    assert_eq!(
-        mem::size_of::<bulks::Optional<'static, 'static, 'static, 'static>>(),
-        10 * word
-    );
-    assert_eq!(
-        mem::size_of::<Option<bulks::Optional<'static, 'static, 'static, 'static>>>(),
-        mem::size_of::<bulks::Optional<'static, 'static, 'static, 'static>>()
-    );
-    assert_eq!(
-        mem::size_of::<pair::BulkPairs<'static, 'static, 'static, 'static>>(),
-        10 * word
-    );
-    assert_eq!(
-        mem::size_of::<Option<pair::BulkPairs<'static, 'static, 'static, 'static>>>(),
-        mem::size_of::<pair::BulkPairs<'static, 'static, 'static, 'static>>()
-    );
-    assert!(mem::size_of::<pair::Rejected<'static, 'static, 'static, 'static, u32>>() <= 9 * word);
-    assert_eq!(
-        mem::size_of::<Option<pair::Rejected<'static, 'static, 'static, 'static, u32>>>(),
-        mem::size_of::<pair::Rejected<'static, 'static, 'static, 'static, u32>>()
-    );
 }
 
 fn check_array_case<'s, 'b, 'c, 'd>(

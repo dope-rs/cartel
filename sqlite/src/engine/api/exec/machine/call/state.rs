@@ -77,13 +77,11 @@ impl<'query, 'd> State<'query, 'd> {
         bound: &mut stmt::Bound<'_, '_, P>,
         access: &A,
     ) -> result::Result<(), crate::Error> {
-        let mut op = || match bound.finish(access, self.transaction) {
+        // Fixed controls never yield rows; step halts or resets them while authorized.
+        // Plain reset retains its denied authority.
+        match bound.finish(access, self.transaction) {
             Ok(()) => Ok(()),
             Err(error) => self.guard.check(Err(error)),
-        };
-        match A::AUTHORIZATION {
-            Authority::Plain => op(),
-            Authority::Control => self.guard.work().control().run(op),
         }
     }
 

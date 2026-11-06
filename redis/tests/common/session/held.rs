@@ -32,11 +32,11 @@ pub fn pong_once(socket: &Stream<'_>) -> Result<(), Error> {
 pub fn first_request(
     sockets: &mut [&Stream<'_>; 2],
     expected: &[u8],
+    request: &mut [u8],
 ) -> Result<usize, peer::Error> {
     for socket in sockets.iter() {
         socket.read_wait(Some(Duration::from_millis(1)))?;
     }
-    let mut request = vec![0; expected.len()];
     let started = Instant::now();
     loop {
         for (index, socket) in sockets.iter_mut().enumerate() {

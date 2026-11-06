@@ -48,6 +48,7 @@ impl<'a> Wire<'a> {
         self.0.split_array().map(|(head, tail)| (head, Self(tail)))
     }
 
+    #[inline]
     pub fn split_at(self, mid: usize) -> Option<(Self, Self)> {
         self.0
             .split_at(mid)

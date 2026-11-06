@@ -2,7 +2,7 @@ use crate::{api, catalogs};
 use api::{exec, stmt};
 use dope_fiber::{abi, context};
 use exec::machine::{self, State};
-use std::task;
+use std::{ops, task};
 use stmt::{access::Access, target::Target};
 
 #[must_use = "a SQLite command does nothing unless it is driven"]
@@ -55,27 +55,26 @@ impl<'d, I: catalogs::Catalog, P: api::Bind, T: Target<I>> abi::Resume<'d>
     ) -> abi::Transition<'id, Self::Output> {
         let mut context = admit.context();
         let (vacant, mut this) = live.take();
-        let active = match this.state {
+        let mut active = match this.state {
             State::Start(machine) => match machine.poll(context.as_mut()) {
-                machine::Next::Pending(machine) => {
+                Ok(ops::ControlFlow::Continue(machine)) => {
                     this.state = State::Start(machine);
                     return vacant.insert(this).pending();
                 }
-                machine::Next::Ready(Ok(active)) => active,
-                machine::Next::Ready(Err(error)) => return vacant.complete(Err(error)),
+                Ok(ops::ControlFlow::Break(active)) => active,
+                Err(error) => return vacant.complete(Err(error)),
             },
             State::Active(active) => active.into_parts().0,
         };
         let result = match ready {
             Some(result) => result,
-            None => {
-                this.state = State::Active(machine::Lease::open(active, ()));
-                let mut live = vacant.insert(this);
-                return match Self::poll(&mut live, &mut admit) {
-                    task::Poll::Pending => live.pending(),
-                    task::Poll::Ready(ready) => Self::finish(live, ready, admit),
-                };
-            }
+            None => match active.poll(context.as_mut()) {
+                task::Poll::Pending => {
+                    this.state = State::Active(machine::Lease::open(active, ()));
+                    return vacant.insert(this).pending();
+                }
+                task::Poll::Ready(result) => result,
+            },
         };
         let result = match result {
             Ok(stmt::Step::Done) => Ok(()),

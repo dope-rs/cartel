@@ -12,8 +12,8 @@ use crate::api::results::group::{self, Diagnostic, Position};
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Record {
     pub(crate) position: Position,
-    pub(crate) start: usize,
-    pub(crate) end: usize,
+    pub(crate) start: u32,
+    pub(crate) end: u32,
 }
 
 /// One exclusively borrowed backing with its published diagnostic prefix.
@@ -92,7 +92,7 @@ pub(crate) enum Resolution {
     Unchanged,
 }
 
-const _: () = assert!(size_of::<Record>() == 4 * size_of::<usize>());
+const _: () = assert!(size_of::<Record>() == size_of::<Position>() + 2 * size_of::<u32>());
 
 /// An immutable snapshot of the diagnostics observed before group completion.
 ///

@@ -18,13 +18,8 @@ impl Draft {
         length: usize,
         kind: Sensitivity,
     ) -> Result<mem::Lease<Self, lease::Open>, request::Error> {
-        let out = match pool::Limit::try_from(cursor, length, kind) {
-            Ok(out) => out,
-            Err((mut cursor, kind, cause)) => {
-                kind.clear(cursor.as_mut());
-                return Err(request::Error::Capacity(cause));
-            }
-        };
+        let out = pool::Limit::try_from(cursor, length, kind)
+            .map_err(|(_, _, cause)| request::Error::Capacity(cause))?;
         Ok(mem::Lease::open(Self { out }, ()))
     }
 

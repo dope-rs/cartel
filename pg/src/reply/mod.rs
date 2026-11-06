@@ -3,7 +3,7 @@ use cartel_core::reply::recv::attach;
 use dope::{
     core::driver::route::KeyTag,
     manifold::client::{attempt, conn},
-    net::link::{event, pool::change::opening},
+    net::link::pool::change::opening,
 };
 use dope_fiber::wait;
 
@@ -127,7 +127,7 @@ impl<const ID: u8> From<crate::Error> for Error<'_, ID> {
 pub enum Open<'d, const ID: u8> {
     Transport {
         key: attempt::Id<'d, KeyTag<ID>>,
-        cause: event::ConnectFault,
+        cause: attempt::ConnectFault,
     },
     Exhaustion {
         key: attempt::Id<'d, KeyTag<ID>>,

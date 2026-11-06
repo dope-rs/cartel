@@ -14,6 +14,21 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Server<C, ID> {
             .encode::<i64>(move |out| out.command(&[b"PUBLISH", channel, message]))
     }
 
+    pub fn get_user<D: decode::Decode<C>>(self, username: &[u8]) -> C::Call<D> {
+        self.0
+            .encode::<D>(move |out| out.command(&[b"ACL", b"GETUSER", username]))
+    }
+
+    pub fn set_user(self, username: &[u8], rules: &[&[u8]]) -> C::Call<()> {
+        self.0
+            .encode::<()>(move |out| out.secret(&[b"ACL", b"SETUSER", username], rules))
+    }
+
+    pub fn del_user(self, username: &[u8]) -> C::Call<u64> {
+        self.0
+            .encode::<u64>(move |out| out.command(&[b"ACL", b"DELUSER", username]))
+    }
+
     pub fn info(self, section: Option<&[u8]>) -> C::Call<decode::Bytes> {
         self.0.encode::<decode::Bytes>(move |out| match section {
             None => out.command(&[b"INFO"]),

@@ -5,21 +5,22 @@ use common::{assert_reclaimed, assert_retirement, engine::smoke::*};
 use dope_core::driver::life::recovery::Policy;
 use dope_manifold::timing::Throughput;
 use dope_test::fibers;
-use std::sync::OnceLock;
 
 pub mod common;
 
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
-
 #[test]
-fn repeat_open_is_rejected() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn smoke_contracts() -> Result<(), plan::Error> {
+    // SAFETY: this binary has one test; installation precedes every SQLite call.
+    // Only Cartel uses installed SQLite; Core handles and allocations remain
+    // exclusively owned by their originating worker until release.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
+    repeat_open_is_rejected(runtime)?;
+    exclusive_reusable_lease(runtime)?;
+    round_trip(runtime)
+}
+
+fn repeat_open_is_rejected(runtime: Runtime) -> Result<(), plan::Error> {
     let limits = try_limits()?;
     let memory = try_memory()?;
     let (unused, second) = database(runtime)?
@@ -33,6 +34,7 @@ fn repeat_open_is_rejected() -> Result<(), plan::Error> {
         .for_profile::<Throughput>()
         .map_err(plan::Error::Claim)?
         .try_create(
+            (),
             |worker| {
                 let mut cleanup = open::Completion::new();
                 assert!(matches!(
@@ -57,15 +59,7 @@ fn repeat_open_is_rejected() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn exclusive_reusable_lease() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn exclusive_reusable_lease(runtime: Runtime) -> Result<(), plan::Error> {
     let result =
         plan::Plan::<SmokeDatabase>::try_new(database(runtime)?, try_limits()?, try_memory()?)?
             .try_app(
@@ -96,15 +90,7 @@ fn exclusive_reusable_lease() -> Result<(), plan::Error> {
     result.expect("SQLite application scope failed")
 }
 
-#[test]
-fn round_trip() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn round_trip(runtime: Runtime) -> Result<(), plan::Error> {
     let result =
         plan::Plan::<SmokeDatabase>::try_new(database(runtime)?, try_limits()?, try_memory()?)?
             .try_run(

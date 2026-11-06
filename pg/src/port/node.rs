@@ -150,7 +150,7 @@ where
         let run = *config.runtime();
         let cap = config.side().primary();
         let window = config.operation_window;
-        let (shared, requests, cancel, buffer, queue, deadline, proof) = {
+        let (shared, requests, controls, cancel, buffer, queue, deadline, proof) = {
             let mut driver = stage.driver();
             let shared = runtime::Shared::try_new(
                 database,
@@ -161,6 +161,9 @@ where
             .map_err(port::Build::Runtime)
             .map_err(manifold::BuildError::Factory)?;
             let requests = pool::Pool::try_from(run.request_pool())
+                .map_err(port::Build::Requests)
+                .map_err(manifold::BuildError::Factory)?;
+            let controls = pool::Pool::try_from(run.control_pool())
                 .map_err(port::Build::Requests)
                 .map_err(manifold::BuildError::Factory)?;
             let cancel = registry::Registry::try_new(cap)
@@ -179,6 +182,7 @@ where
             (
                 shared,
                 requests,
+                controls,
                 cancel,
                 buffer,
                 queue,
@@ -240,6 +244,7 @@ where
                         },
                         request_queue: queue,
                         requests,
+                        controls,
                         responses: replies,
                         batches,
                         diagnostics: access,

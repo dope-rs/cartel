@@ -1,4 +1,4 @@
-pub const SCRIPT: [(&[u8], &[u8]); 46] = [
+pub const SCRIPT: [(&[u8], &[u8]); 61] = [
     (
         b"*5\r\n$3\r\nSET\r\n$3\r\nkey\r\n$3\r\nval\r\n$2\r\nPX\r\n$4\r\n1250\r\n",
         b"+OK\r\n",
@@ -117,4 +117,58 @@ pub const SCRIPT: [(&[u8], &[u8]); 46] = [
         b"*2\r\n*2\r\n:1\r\n-ERR first\r\n-ERR later\r\n",
     ),
     (b"*1\r\n$4\r\nPING\r\n", b"+PONG\r\n"),
+    (
+        b"*5\r\n$4\r\nXADD\r\n$3\r\nkey\r\n$1\r\n*\r\n$1\r\n\0\r\n$0\r\n\r\n",
+        b"$3\r\n1-0\r\n",
+    ),
+    (
+        b"*4\r\n$4\r\nXADD\r\n$3\r\nkey\r\n$1\r\n*\r\n$5\r\nfield\r\n",
+        b"-ERR wrong number of arguments for 'xadd' command\r\n",
+    ),
+    (
+        b"*4\r\n$6\r\nXRANGE\r\n$3\r\nkey\r\n$4\r\n(1-0\r\n$1\r\n+\r\n",
+        b"*1\r\n*2\r\n$3\r\n2-0\r\n*2\r\n$1\r\n\0\r\n$0\r\n\r\n",
+    ),
+    (
+        b"*6\r\n$9\r\nXREVRANGE\r\n$3\r\nkey\r\n$1\r\n+\r\n$1\r\n-\r\n$5\r\nCOUNT\r\n$1\r\n1\r\n",
+        b"*0\r\n",
+    ),
+    (
+        b"*4\r\n$4\r\nXDEL\r\n$3\r\nkey\r\n$3\r\n1-0\r\n$3\r\n2-0\r\n",
+        b":2\r\n",
+    ),
+    (b"*2\r\n$4\r\nXLEN\r\n$3\r\nkey\r\n", b":0\r\n"),
+    (
+        b"*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n$3\r\nkey\r\n$5\r\ngroup\r\n$3\r\n0-0\r\n",
+        b"+OK\r\n",
+    ),
+    (
+        b"*5\r\n$6\r\nXGROUP\r\n$5\r\nSETID\r\n$3\r\nkey\r\n$5\r\ngroup\r\n$3\r\n2-0\r\n",
+        b"+OK\r\n",
+    ),
+    (
+        b"*9\r\n$10\r\nXREADGROUP\r\n$5\r\nGROUP\r\n$5\r\ngroup\r\n$6\r\nworker\r\n$5\r\nCOUNT\r\n$1\r\n1\r\n$7\r\nSTREAMS\r\n$3\r\nkey\r\n$1\r\n>\r\n",
+        b"*-1\r\n",
+    ),
+    (
+        b"*3\r\n$8\r\nXPENDING\r\n$3\r\nkey\r\n$5\r\ngroup\r\n",
+        b"*4\r\n:0\r\n$-1\r\n$-1\r\n*0\r\n",
+    ),
+    (
+        b"*5\r\n$4\r\nZADD\r\n$5\r\nboard\r\n$2\r\nXX\r\n$1\r\n0\r\n$7\r\nmissing\r\n",
+        b":0\r\n",
+    ),
+    (b"*2\r\n$4\r\nDUMP\r\n$3\r\nkey\r\n", b"$2\r\n\0\xff\r\n"),
+    (
+        b"*3\r\n$3\r\nACL\r\n$7\r\nGETUSER\r\n$4\r\nuser\r\n",
+        b"$-1\r\n",
+    ),
+    (
+        b"*5\r\n$3\r\nACL\r\n$7\r\nSETUSER\r\n$4\r\nuser\r\n$2\r\non\r\n$3\r\n>s\0\r\n",
+        b"-ERR invalid ACL rule\r\n",
+    ),
+    (
+        b"*3\r\n$3\r\nACL\r\n$7\r\nDELUSER\r\n$4\r\nuser\r\n",
+        b":0\r\n",
+    ),
 ];

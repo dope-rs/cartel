@@ -5,21 +5,15 @@ use cartel_sqlite::{Catalog as _, Error};
 use common::{query::filter::*, schema};
 use dope_core::driver::life::recovery::Policy;
 use dope_test::fibers;
-use std::sync::OnceLock;
 
 pub mod common;
 
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
-
 #[test]
 fn predicates() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+    // SAFETY: this binary has one test; only Cartel uses installed SQLite.
+    // Core handles and allocations remain exclusively owned by their originating worker.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -52,12 +46,13 @@ fn predicates() -> Result<(), plan::Error> {
                 Policy::new(assert_reclaimed, assert_retirement),
                 |result| result.expect("SQLite scope"),
             );
-        result.expect("SQLite integration scope")
+        result.expect("SQLite integration scope")?;
     }
+    ordering_and_limits(runtime)?;
+    aggregates(runtime)
 }
 
-#[test]
-fn ordering_and_limits() -> Result<(), plan::Error> {
+fn ordering_and_limits(runtime: Runtime) -> Result<(), plan::Error> {
     let sql = format!(
         "SELECT {} FROM \"users\" AS q0_0 ORDER BY q0_0.\"id\" LIMIT -1 OFFSET ?1",
         schema::User::__CARTEL_SELECT_COLS
@@ -67,13 +62,6 @@ fn ordering_and_limits() -> Result<(), plan::Error> {
             .iter()
             .any(|entry| entry.sql() == sql)
     );
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -116,15 +104,7 @@ fn ordering_and_limits() -> Result<(), plan::Error> {
     }
 }
 
-#[test]
-fn aggregates() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn aggregates(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =

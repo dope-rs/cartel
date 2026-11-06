@@ -3,6 +3,8 @@
 use crate::api::{Client, decode::Decode};
 use crate::request::{self, encode, encode::write::script};
 
+pub use script::wire_len;
+
 /// A complete Redis EVAL invocation whose backing bytes remain owned by the
 /// caller until eager request encoding has completed.
 pub trait Invocation {

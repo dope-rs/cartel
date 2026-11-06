@@ -5,59 +5,12 @@ use dope_fiber::wait::Capacity;
 use dope_fiber::{context, wait};
 use o3::alloc;
 use o3::depot::queue::indexed::shared;
-use std::{cell, mem, ops, pin};
+use std::{cell, mem, pin};
 
 fn index_error<'d>(cause: shared::Bounds) -> wait::Error<'d> {
     wait::Error::Index {
         index: wait::Index::new(cause.index),
         slots: wait::Slots::new(cause.capacity),
-    }
-}
-
-pub(in crate::protocol) struct Queue<'d> {
-    inner: wait::Queue<'d>,
-    remaining: cell::Cell<usize>,
-}
-
-impl<'d> Queue<'d> {
-    pub(in crate::protocol) fn new(driver: driver::Reference<'d>, capacity: Capacity) -> Self {
-        Self {
-            inner: wait::Queue::new(driver, capacity),
-            remaining: cell::Cell::new(0),
-        }
-    }
-
-    pub(in crate::protocol) fn wake(&self) {
-        self.remaining.set(self.inner.len().get());
-    }
-
-    pub(in crate::protocol) fn flush(&self, work: app::Work<'_, 'd>) {
-        let remaining = self.remaining.get();
-        if remaining == 0 {
-            return;
-        }
-        if self.inner.wake_one(work) == wait::WakeStatus::Complete {
-            // Re-registering callers cannot extend this notification round.
-            self.remaining
-                .set((remaining - 1).min(self.inner.len().get()));
-        }
-    }
-
-    pub(in crate::protocol) fn is_pending(&self) -> bool {
-        self.remaining.get() != 0
-    }
-}
-
-const _: () = assert!(
-    mem::size_of::<Queue<'static>>()
-        == mem::size_of::<wait::Queue<'static>>() + mem::size_of::<usize>()
-);
-
-impl<'d> ops::Deref for Queue<'d> {
-    type Target = wait::Queue<'d>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
     }
 }
 
@@ -142,8 +95,8 @@ impl<'d, const ID: u8> Table<'d, ID> {
 }
 
 pub(crate) struct Egress<'d> {
-    full: Queue<'d>,
-    lanes: shared::Fifo<(), Queue<'d>>,
+    full: wait::Notifier<'d>,
+    lanes: shared::Fifo<(), wait::Notifier<'d>>,
 }
 
 impl<'d> Egress<'d> {
@@ -153,8 +106,10 @@ impl<'d> Egress<'d> {
         capacity: Capacity,
     ) -> Result<Self, alloc::Error> {
         Ok(Self {
-            full: Queue::new(driver, capacity),
-            lanes: shared::Fifo::try_with(slots.entries().get(), || Queue::new(driver, capacity))?,
+            full: wait::Notifier::new(driver, capacity),
+            lanes: shared::Fifo::try_with(slots.entries().get(), || {
+                wait::Notifier::new(driver, capacity)
+            })?,
         })
     }
 
@@ -174,13 +129,13 @@ impl<'d> Egress<'d> {
         }
     }
 
-    pub(in crate::protocol) fn release(
+    pub(crate) fn release(
         &self,
         released: reply::Released<'_>,
     ) -> Result<(), shared::Bounds> {
         let lane = released.index();
         let slot = self.lanes.try_entry(lane.get())?;
-        self.full.wake();
+        self.full.notify();
         Self::wake_lane(slot);
         Ok(())
     }
@@ -201,15 +156,15 @@ impl<'d> Egress<'d> {
     }
 
     fn wake_all(&self) {
-        self.full.wake();
+        self.full.notify();
         for slot in self.lanes.iter() {
             Self::wake_lane(slot);
         }
     }
 
-    fn wake_lane(slot: shared::Slot<'_, (), Queue<'d>>) {
+    fn wake_lane(slot: shared::Slot<'_, (), wait::Notifier<'d>>) {
         let queue = slot.state();
-        queue.wake();
+        queue.notify();
         if queue.is_pending() && slot.get::<0>().is_none() {
             slot.push::<0>(());
         }
@@ -218,21 +173,22 @@ impl<'d> Egress<'d> {
 
 const _: () = assert!(
     mem::size_of::<Egress<'static>>()
-        == mem::size_of::<Queue<'static>>() + mem::size_of::<shared::Fifo<(), Queue<'static>>>()
+        == mem::size_of::<wait::Notifier<'static>>()
+            + mem::size_of::<shared::Fifo<(), wait::Notifier<'static>>>()
 );
 
 pub(crate) struct Set<'a, 'd, const ID: u8> {
-    ready: &'a Queue<'d>,
+    ready: &'a wait::Notifier<'d>,
     transactions: &'a Table<'d, ID>,
-    notifications: &'a Queue<'d>,
+    notifications: &'a wait::Notifier<'d>,
     egress: &'a Egress<'d>,
 }
 
 impl<'a, 'd, const ID: u8> Set<'a, 'd, ID> {
     pub(in crate::protocol) const fn new(
-        ready: &'a Queue<'d>,
+        ready: &'a wait::Notifier<'d>,
         tx: &'a Table<'d, ID>,
-        notices: &'a Queue<'d>,
+        notices: &'a wait::Notifier<'d>,
         egress: &'a Egress<'d>,
     ) -> Self {
         Self {
@@ -258,9 +214,9 @@ impl<'a, 'd, const ID: u8> Set<'a, 'd, ID> {
     }
 
     pub(crate) fn wake_all(&self) {
-        self.ready.wake();
+        self.ready.notify();
         self.transactions.wake_all();
-        self.notifications.wake();
+        self.notifications.notify();
         self.egress.wake_all();
     }
 }

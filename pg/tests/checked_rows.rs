@@ -1,17 +1,13 @@
 use cartel_pg::api::traits::{Client as _, Status as _};
 use cartel_pg::{
-    api::results::Row,
-    port::replies::Payload,
-    protocol::{Reason, Wire},
-};
-use cartel_pg::{
     api::{Client, traits},
-    port, schema,
-    schema::{array::Element as _, result},
+    port,
+    protocol::{Reason, Wire},
+    schema::array::Element as _,
 };
 use common::port::Reply;
+use common::topology::{self, with_row};
 use common::wire::checked::{ArrayQuery, Database, MixedQuery, MixedRow, TextQuery, TextRow};
-use common::{topology, wire::checked::Group};
 use dope::core::driver::life::recovery;
 use dope::{
     core::driver::route::Id, manifold::app::env::Bundle, manifold::timing::Throughput,
@@ -27,88 +23,10 @@ pub mod common;
 #[global_allocator]
 static ALLOCATOR: Tracker = Tracker::new();
 
-fn with_row<Q, R>(
-    bytes: &[u8],
-    check: impl for<'b, 'c, 'd> FnOnce(Row<Payload<'b, 'c, 'd>, Q>) -> R,
-) -> R
-where
-    Q: schema::TypedQuery<Group = Group, Result = result::Rows>,
-    for<'p> Q::Params<'p>: Default,
-{
-    TcpScript::with(
-        |socket| Database::serve_rows(socket, [bytes]),
-        |server| {
-            let login = cartel_pg::Config::new("user".into(), "password".into(), "database".into())
-                .expect("database credentials");
-            let config = Database::config().expect("bounded PostgreSQL config");
-            let ready = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
-                port::Port::<Database>::plan(login, config),
-                server.addr(),
-                Duration::from_millis(1),
-                Duration::from_secs(1),
-            )
-            .expect("prepared PostgreSQL topology");
-            let mut reports = Reports::<_>::new(ready.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            let result = ready
-                .with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut app| {
-                                    let client: Client<'_, '_, '_, '_, '_, '_, '_, _, Database> =
-                                        app.root_client();
-                                    app.block_on(client.status().wait_ready())
-                                        .expect("driver ready")
-                                        .ok()
-                                        .expect("PostgreSQL ready");
-                                    let row = app
-                                        .block_on(traits::Query::run_one::<Q>(
-                                            client.query(),
-                                            Default::default(),
-                                        ))
-                                        .expect("driver query");
-                                    assert!(
-                                        row.is_ok(),
-                                        "{:?}",
-                                        row.as_ref().err().map(Reply::from)
-                                    );
-                                    check(row.ok().expect("query row"))
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), common::recover),
-                    |outcome| {
-                        assert!(
-                            outcome.is_ok(),
-                            "{:?}",
-                            outcome.as_ref().err().map(|error| error.cause())
-                        );
-                        outcome.ok().expect("application entry")
-                    },
-                )
-                .expect("scoped PostgreSQL")
-                .ok()
-                .expect("application scope");
-            assert!(
-                reports.events().expect("native reclamation").is_empty(),
-                "unexpected native recovery"
-            );
-            server
-                .finish()
-                .expect("script execution")
-                .expect("PostgreSQL script");
-            result
-        },
-    )
-    .expect("script listener")
-}
-
 #[test]
 fn retains_source() {
     let bytes = TextRow::wire(i64::MIN, "여름".as_bytes());
-    with_row::<TextQuery, _>(&bytes, |row| {
+    with_row::<TextQuery>(&bytes, |row| {
         let ptr = row.decode().expect("decoded row").name.as_ptr();
         let (row, count) = Tracker::count(|| row.validate());
         let row = row.expect("validated row");
@@ -124,8 +42,24 @@ fn retains_source() {
 fn collects_multiple_rows() {
     let first = MixedRow::wire(3, 4, 0, b"\x01[]", 5);
     let second = MixedRow::wire(7, 8, 1, b"\x01{}", 9);
+    let value = ArrayQuery::wire(&[b"value"], &[]);
+    let empty = ArrayQuery::wire(&[], &[]);
+    let mut trailing = ArrayQuery::NULL.to_vec();
+    trailing.push(9);
     TcpScript::with(
-        |socket| Database::serve_batch(socket, [first.as_slice(), second.as_slice()]),
+        |socket| {
+            Database::serve(
+                socket,
+                [
+                    &[first.as_slice(), second.as_slice()][..],
+                    &[value.as_slice()][..],
+                    &[empty.as_slice()][..],
+                    &[ArrayQuery::NULL][..],
+                    &[trailing.as_slice()][..],
+                ]
+                .map(|rows| rows.iter().copied()),
+            )
+        },
         |server| {
             let login = cartel_pg::Config::new("user".into(), "password".into(), "database".into())
                 .expect("database credentials");
@@ -164,8 +98,8 @@ fn collects_multiple_rows() {
                                     );
                                     let rows = rows.ok().expect("query rows");
                                     let (rows, count) = Tracker::count(|| rows.validate());
-                                    let rows = rows.expect("validated rows");
-                                    let mut rows = rows.iter();
+                                    let retained = rows.expect("validated rows");
+                                    let mut rows = retained.iter();
                                     let (first, read) = Tracker::count(|| rows.next());
                                     let first = first.expect("first row");
                                     assert_eq!((count, read), (0, 0));
@@ -191,6 +125,48 @@ fn collects_multiple_rows() {
                                         (7, 8, true, "{}", 9)
                                     );
                                     assert!(rows.next().is_none());
+                                    drop(retained);
+                                    for expected in [
+                                        Ok(Some((1, Some("value")))),
+                                        Ok(Some((0, None))),
+                                        Ok(None),
+                                        Err(()),
+                                    ] {
+                                        let row = app
+                                            .block_on(traits::Query::run_scalar::<ArrayQuery<true>>(
+                                                client.query(),
+                                                (),
+                                            ))
+                                            .expect("driver scalar")
+                                            .unwrap_or_else(|error| panic!("{:?}", Reply::from(&error)))
+                                            .expect("scalar row");
+                                        match expected {
+                                            Ok(expected) => {
+                                                let view = row.decode().expect("scalar decode");
+                                                assert_eq!(
+                                                    view.map(|array| array.len()),
+                                                    expected.map(|value| value.0),
+                                                );
+                                                let owned = row.into_owned().expect("owned scalar");
+                                                assert_eq!(
+                                                    owned.as_ref().map(|array| (
+                                                        array.len(),
+                                                        array.first().map(String::as_str),
+                                                    )),
+                                                    expected,
+                                                );
+                                            }
+                                            Err(()) => {
+                                                for error in [row.decode().err(), row.into_owned().err()] {
+                                                    assert!(matches!(
+                                                        error,
+                                                        Some(cartel_pg::Error::Protocol(Reason::RowTrailing { actual }))
+                                                            if actual.get() == 1
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
                                 })
                             })
                         })
@@ -292,7 +268,7 @@ fn owned_batch_failure() {
 
 #[test]
 fn rejects_invalid_utf8() {
-    with_row::<TextQuery, _>(&TextRow::wire(3, &[0xff]), |row| {
+    with_row::<TextQuery>(&TextRow::wire(3, &[0xff]), |row| {
         assert!(matches!(
             row.validate(),
             Err(cartel_pg::Error::Protocol(Reason::TextUtf8 {
@@ -307,7 +283,7 @@ fn rejects_invalid_utf8() {
 fn rejects_scalar_width() {
     let mut bytes = TextRow::wire(3, b"name");
     bytes[2..6].copy_from_slice(&7i32.to_be_bytes());
-    with_row::<TextQuery, _>(&bytes, |row| {
+    with_row::<TextQuery>(&bytes, |row| {
         assert!(matches!(
             row.validate(),
             Err(cartel_pg::Error::Protocol(Reason::ColumnWidth {
@@ -322,7 +298,7 @@ fn rejects_scalar_width() {
 fn rejects_null_text() {
     let mut bytes = TextRow::wire(3, b"");
     bytes[14..18].copy_from_slice(&(-1i32).to_be_bytes());
-    with_row::<TextQuery, _>(&bytes, |row| {
+    with_row::<TextQuery>(&bytes, |row| {
         assert!(matches!(
             row.validate(),
             Err(cartel_pg::Error::Protocol(Reason::ColumnNull { column: 1 }))
@@ -334,7 +310,7 @@ fn rejects_null_text() {
 fn rejects_row_shape() {
     let mut bytes = TextRow::wire(3, b"name");
     bytes[..2].copy_from_slice(&1u16.to_be_bytes());
-    with_row::<TextQuery, _>(&bytes, |row| {
+    with_row::<TextQuery>(&bytes, |row| {
         assert!(matches!(
             row.validate(),
             Err(cartel_pg::Error::Protocol(Reason::ColumnCount {
@@ -345,7 +321,7 @@ fn rejects_row_shape() {
     });
     bytes[..2].copy_from_slice(&2u16.to_be_bytes());
     bytes.push(0);
-    with_row::<TextQuery, _>(&bytes, |row| {
+    with_row::<TextQuery>(&bytes, |row| {
         assert!(matches!(
             row.validate(),
             Err(cartel_pg::Error::Protocol(Reason::RowTrailing { .. }))
@@ -357,7 +333,7 @@ fn rejects_row_shape() {
 fn rejects_truncated_text() {
     let mut bytes = TextRow::wire(3, b"name");
     bytes.pop();
-    with_row::<TextQuery, _>(&bytes, |row| {
+    with_row::<TextQuery>(&bytes, |row| {
         assert!(matches!(
             row.validate(),
             Err(cartel_pg::Error::Protocol(Reason::ColumnBytes {
@@ -371,7 +347,7 @@ fn rejects_truncated_text() {
 #[test]
 fn retains_mixed_widths() {
     let mut bytes = MixedRow::wire(i64::MIN, i32::MIN, 1, "\x01[\"여름\"]".as_bytes(), i64::MAX);
-    with_row::<MixedQuery, _>(&bytes, |row| {
+    with_row::<MixedQuery>(&bytes, |row| {
         let ptr = row.decode().expect("decoded row").tags.as_ptr();
         let (row, count) = Tracker::count(|| row.validate());
         let row = row.expect("mixed scalar fields");
@@ -384,7 +360,7 @@ fn retains_mixed_widths() {
         assert_eq!(view.tags.as_ptr(), ptr);
     });
     bytes[14..18].copy_from_slice(&3i32.to_be_bytes());
-    with_row::<MixedQuery, _>(&bytes, |row| {
+    with_row::<MixedQuery>(&bytes, |row| {
         assert!(matches!(
             row.validate(),
             Err(cartel_pg::Error::Protocol(Reason::ColumnWidth {
@@ -398,7 +374,7 @@ fn retains_mixed_widths() {
 #[test]
 fn rejects_invalid_mixed_fields() {
     let bytes = MixedRow::wire(3, 4, 2, b"\x01[]", 5);
-    with_row::<MixedQuery, _>(&bytes, |row| {
+    with_row::<MixedQuery>(&bytes, |row| {
         assert!(matches!(
             row.validate(),
             Err(cartel_pg::Error::Protocol(Reason::Bool {
@@ -408,7 +384,7 @@ fn rejects_invalid_mixed_fields() {
         ));
     });
     let bytes = MixedRow::wire(3, 4, 1, b"\x02[]", 5);
-    with_row::<MixedQuery, _>(&bytes, |row| {
+    with_row::<MixedQuery>(&bytes, |row| {
         assert!(matches!(
             row.validate(),
             Err(cartel_pg::Error::Protocol(Reason::JsonVersion {
@@ -418,13 +394,37 @@ fn rejects_invalid_mixed_fields() {
         ));
     });
     let bytes = MixedRow::wire(3, 4, 1, b"\x01[\xff]", 5);
-    with_row::<MixedQuery, _>(&bytes, |row| {
+    with_row::<MixedQuery>(&bytes, |row| {
         assert!(matches!(
             row.validate(),
             Err(cartel_pg::Error::Protocol(Reason::JsonUtf8 { column: 3, valid, error }))
                 if valid.get() == 1 && error == cartel_pg::protocol::Utf8::One
         ));
     });
+}
+
+#[test]
+fn owned_json_uses_one_allocation() {
+    let bytes = MixedRow::wire(3, 4, 1, b"\x01[]", 5);
+    for allowed in 0..=1 {
+        with_row::<MixedQuery>(&bytes, |row| {
+            let (result, counts) =
+                Tracker::measure(|| Tracker::fail_after(allowed, || row.into_owned()));
+            if allowed == 0 {
+                assert!(matches!(
+                    result,
+                    Err(cartel_pg::Error::Allocation(o3::alloc::Error::Exhausted))
+                ));
+                assert_eq!(&counts[..2], &[0, 0]);
+            } else {
+                let row = result.expect("owned JSON row");
+                assert_eq!(row.tags.as_ref(), "[]");
+                assert_eq!(&counts[..2], &[1, 2]);
+                let ((), counts) = Tracker::measure(|| drop(row));
+                assert_eq!(counts, [0, 0, 1, 2]);
+            }
+        });
+    }
 }
 
 #[test]
@@ -487,7 +487,7 @@ fn array_collect_owns() {
     for (len, count, bytes) in [(0, 0, 0), (2, 3, 2 * size_of::<String>() + 11)] {
         let values: &[&[u8]] = &[b"first", b"second"];
         let input = ArrayQuery::wire(&values[..len], &[]);
-        with_row::<ArrayQuery, _>(&input, |row| {
+        with_row::<ArrayQuery>(&input, |row| {
             let array = row.decode().expect("array row");
             let (owned, counts) =
                 Tracker::measure(|| Tracker::fail_after(count, || array.try_collect()));
@@ -512,7 +512,7 @@ fn array_collect_fails() {
     ];
     for (values, trailing, count, size) in cases {
         let bytes = ArrayQuery::wire(values, trailing);
-        with_row::<ArrayQuery, _>(&bytes, |row| {
+        with_row::<ArrayQuery>(&bytes, |row| {
             let array = row.decode().expect("array row");
             if count == 3 {
                 for (allows, bytes) in [0, outer, outer + 5].into_iter().enumerate() {

@@ -88,7 +88,6 @@ pub(crate) enum CoordError<E, S = parser::Span> {
     Member(Mismatch<S>),
     Length { actual: usize },
     Number(E),
-    Remaining(num::NonZero<u32>),
 }
 
 pub(crate) enum Group<S = parser::Span> {

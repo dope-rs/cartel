@@ -15,9 +15,15 @@ use crate::{
 };
 
 const _: () = {
+    type T = Pooled<'static, 'static, 'static, 'static, 'static, (), 0>;
+    let word = mem::size_of::<usize>();
+    assert!(mem::size_of::<T>() == word);
+    assert!(mem::size_of::<State<'static, 'static, 'static, 'static, 'static, 0>>() == 6 * word);
     assert!(
-        mem::size_of::<Pooled<'static, 'static, 'static, 'static, 'static, (), 0>>()
-            == mem::size_of::<client::Redis<'static, 'static, 'static, 'static, 'static, (), 0>>()
+        mem::size_of::<Core<'static, 'static, 'static, 'static, 'static, T, 0>>()
+            == 7 * word
+                + mem::size_of::<Option<deadline::Guard<'static>>>()
+                + mem::size_of::<wait::Waiter<'static, 'static>>()
     );
 };
 
@@ -40,11 +46,11 @@ pub(in crate::client) trait Target<'app, 's, 'b, 'c, 'd: 'app, const ID: u8>:
     fn redis(&self) -> client::Redis<'app, 's, 'b, 'c, 'd, Self::Provider, ID>;
 
     fn try_admit(
-        self,
+        &self,
         frame: encode::Complete,
         reply: &mut replies::Admitted<'app, 'b, 'c, 's, 'd, ID>,
         region: &mut region::Token<region::Identity<'d>>,
-    ) -> Attempt<'d, Self, ID>;
+    ) -> Result<conn::Id<'d, route::KeyTag<ID>>, schedule::Reject<'d, ID>>;
 }
 
 impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Target<'app, 's, 'b, 'c, 'd, ID>
@@ -57,52 +63,24 @@ impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Target<'app, 's, 'b, '
     }
 
     fn try_admit(
-        self,
+        &self,
         frame: encode::Complete,
         reply: &mut replies::Admitted<'app, 'b, 'c, 's, 'd, ID>,
         region: &mut region::Token<region::Identity<'d>>,
-    ) -> Attempt<'d, Self, ID> {
+    ) -> Result<conn::Id<'d, route::KeyTag<ID>>, schedule::Reject<'d, ID>> {
         let redis = self.0;
-        match redis
-            .port
-            .schedule
-            .try_pool(region, frame, self, reply, |target, token| Committed {
-                target,
-                token,
-            }) {
-            Ok(sent) => Attempt::Sent(sent),
+        match redis.port.schedule.try_pool(region, frame, reply) {
             Err(schedule::Reject::Blocked {
-                cause: schedule::Block::Pool,
+                cause: crate::Block::Inactive,
                 frame,
-                admit,
-            }) => Attempt::Blocked {
-                cause: crate::Block::Pool,
-                target: admit,
-                frame,
-            },
-            Err(schedule::Reject::Blocked {
-                cause: schedule::Block::Queue(cause),
-                frame,
-                admit,
-            }) => Attempt::Blocked {
-                cause: crate::Block::Queue(cause),
-                target: admit,
-                frame,
-            },
-            Err(schedule::Reject::Blocked {
-                cause: schedule::Block::Unavailable,
-                frame,
-                admit,
             }) => match redis.port.activity.fatal_cause(region) {
-                Some(cause) => Attempt::Failed(cause),
-                None => Attempt::Blocked {
+                Some(cause) => Err(schedule::Reject::Failed(cause)),
+                None => Err(schedule::Reject::Blocked {
                     cause: crate::Block::Inactive,
-                    target: admit,
                     frame,
-                },
+                }),
             },
-            Err(schedule::Reject::Unavailable) => Attempt::Failed(crate::Error::Unavailable),
-            Err(schedule::Reject::Reply(error)) => Attempt::Failed(crate::Error::Reply(error)),
+            result => result,
         }
     }
 }
@@ -117,75 +95,35 @@ impl<'lease, 'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Target<'app, '
     }
 
     fn try_admit(
-        self,
+        &self,
         frame: encode::Complete,
         reply: &mut replies::Admitted<'app, 'b, 'c, 's, 'd, ID>,
         region: &mut region::Token<region::Identity<'d>>,
-    ) -> Attempt<'d, Self, ID> {
+    ) -> Result<conn::Id<'d, route::KeyTag<ID>>, schedule::Reject<'d, ID>> {
         let redis = schedule::Lease::redis(self);
         let token = self.target();
-        match redis.port.schedule.try_dispatch_lease(
-            region,
-            frame,
-            self,
-            reply,
-            token,
-            |target, token| Committed { target, token },
-        ) {
-            Ok(sent) => Attempt::Sent(sent),
-            Err(schedule::Reject::Blocked {
-                cause,
-                frame,
-                admit,
-            }) => Attempt::Blocked {
-                cause: match cause {
-                    schedule::Block::Pool => crate::Block::Pool,
-                    schedule::Block::Queue(cause) => crate::Block::Queue(cause),
-                    schedule::Block::Unavailable => {
-                        return Attempt::Failed(crate::Error::Unavailable);
-                    }
-                },
-                target: admit,
-                frame,
-            },
-            Err(schedule::Reject::Unavailable) => Attempt::Failed(crate::Error::Unavailable),
-            Err(schedule::Reject::Reply(error)) => Attempt::Failed(crate::Error::Reply(error)),
-        }
+        redis
+            .port
+            .schedule
+            .try_dispatch_lease(region, frame, reply, token)
     }
 }
 
-pub(in crate::client) struct Committed<'d, T, const ID: u8> {
-    target: T,
-    token: conn::Id<'d, route::KeyTag<ID>>,
-}
-
-pub(in crate::client) enum Attempt<'d, T, const ID: u8> {
-    Sent(Committed<'d, T, ID>),
-    Blocked {
-        cause: crate::Block,
-        target: T,
-        frame: encode::Complete,
-    },
-    Failed(crate::Error<'d, ID>),
-}
-
-enum State<'app, 's, 'b, 'c, 'd, T, const ID: u8> {
-    Admission {
-        target: T,
-        frame: encode::Complete,
-        reply: replies::Admitted<'app, 'b, 'c, 's, 'd, ID>,
-    },
+enum State<'app, 's, 'b, 'c, 'd, const ID: u8> {
+    Admission(encode::Complete),
     Response {
-        sent: Committed<'d, T, ID>,
+        token: conn::Id<'d, route::KeyTag<ID>>,
         reply: replies::Admitted<'app, 'b, 'c, 's, 'd, ID>,
     },
-    Failed(crate::Error<'d, ID>),
+    Request(request::Error),
+    Deadline(dope::core::driver::schedule::clock::timer::Exhausted),
     Done,
 }
 
 #[pin_project::pin_project]
 struct Core<'app, 's, 'b, 'c, 'd: 'app + 's, T, const ID: u8> {
-    state: State<'app, 's, 'b, 'c, 'd, T, ID>,
+    target: T,
+    state: State<'app, 's, 'b, 'c, 'd, ID>,
     #[pin]
     deadline: Option<deadline::Guard<'d>>,
     #[pin]
@@ -202,18 +140,42 @@ where
     ) -> Poll<Result<value::Reply<'s, 'b, 'c, 'd>, ReplyError<'b, 'c, 'd, ID>>> {
         let mut this = self.project();
         loop {
-            match (
-                mem::replace(this.state, State::Done),
-                this.deadline.as_mut().as_pin_mut(),
-            ) {
-                (
-                    State::Admission {
-                        target,
-                        frame,
-                        mut reply,
-                    },
-                    Some(mut guard),
-                ) => {
+            let guard = this.deadline.as_mut().as_pin_mut();
+            let error = match &mut *this.state {
+                State::Response { token, reply } => {
+                    let Some(mut guard) = guard else {
+                        unreachable!("deadline")
+                    };
+                    if let Poll::Ready(due) = guard
+                        .as_mut()
+                        .poll_expired(cx.as_mut(), deadline::RequestPhase::Response)
+                    {
+                        this.waiter.as_ref().unregister();
+                        let redis = this.target.redis();
+                        redis.port.schedule.reconnect(
+                            *token,
+                            client::Failure::RequestTimeout(due),
+                            cx.as_mut().region_token(),
+                            &redis.port.activity,
+                        );
+                        *this.state = State::Done;
+                        return Poll::Ready(Err(crate::Error::from(due).into()));
+                    }
+                    let poll = pin::Pin::new(reply).poll_reply(cx.as_mut());
+                    if poll.is_ready() {
+                        *this.state = State::Done;
+                    }
+                    return poll;
+                }
+                State::Admission(_) => {
+                    let frame = match mem::replace(this.state, State::Done) {
+                        State::Admission(frame) => frame,
+                        State::Response { reply: _reply, .. } => unreachable!("response"),
+                        _ => unreachable!("admission"),
+                    };
+                    let Some(mut guard) = guard else {
+                        unreachable!("deadline")
+                    };
                     if let Poll::Ready(due) = guard
                         .as_mut()
                         .poll_expired(cx.as_mut(), deadline::RequestPhase::Admission)
@@ -221,74 +183,46 @@ where
                         this.waiter.as_ref().unregister();
                         return Poll::Ready(Err(crate::Error::from(due).into()));
                     }
-                    let redis = target.redis();
-                    let sent = match target.try_admit(frame, &mut reply, cx.as_mut().region_token())
-                    {
-                        Attempt::Sent(sent) => sent,
-                        Attempt::Blocked {
-                            cause,
-                            target,
-                            frame,
-                        } => {
-                            *this.state = State::Admission {
-                                target,
-                                frame,
-                                reply,
-                            };
-                            if let Err(error) = redis
-                                .port
-                                .activity
-                                .try_dispatch(this.waiter.as_ref(), cx.as_ref())
-                            {
-                                this.waiter.as_ref().unregister();
-                                *this.state = State::Done;
-                                guard.as_ref().complete();
-                                return Poll::Ready(Err(crate::Error::Dispatch {
-                                    blocked: cause,
-                                    wait: error,
+                    let redis = this.target.redis();
+                    let mut reply = replies::Admitted::new();
+                    let token =
+                        match this
+                            .target
+                            .try_admit(frame, &mut reply, cx.as_mut().region_token())
+                        {
+                            Ok(token) => token,
+                            Err(schedule::Reject::Blocked { cause, frame }) => {
+                                *this.state = State::Admission(frame);
+                                if let Err(error) = redis
+                                    .port
+                                    .activity
+                                    .try_dispatch(this.waiter.as_ref(), cx.as_ref())
+                                {
+                                    this.waiter.as_ref().unregister();
+                                    *this.state = State::Done;
+                                    return Poll::Ready(Err(crate::Error::Dispatch {
+                                        blocked: cause,
+                                        wait: error,
+                                    }
+                                    .into()));
                                 }
-                                .into()));
+                                return Poll::Pending;
                             }
-                            return Poll::Pending;
-                        }
-                        Attempt::Failed(error) => {
-                            this.waiter.as_ref().unregister();
-                            guard.as_ref().complete();
-                            return Poll::Ready(Err(error.into()));
-                        }
-                    };
+                            Err(schedule::Reject::Failed(error)) => {
+                                this.waiter.as_ref().unregister();
+                                return Poll::Ready(Err(error.into()));
+                            }
+                        };
                     this.waiter.as_ref().unregister();
-                    *this.state = State::Response { sent, reply };
+                    *this.state = State::Response { token, reply };
+                    continue;
                 }
-                (State::Response { sent, mut reply }, Some(mut guard)) => {
-                    if let Poll::Ready(due) = guard
-                        .as_mut()
-                        .poll_expired(cx.as_mut(), deadline::RequestPhase::Response)
-                    {
-                        this.waiter.as_ref().unregister();
-                        let redis = sent.target.redis();
-                        redis.port.schedule.reconnect(
-                            sent.token,
-                            client::Failure::RequestTimeout(due),
-                            cx.as_mut().region_token(),
-                            &redis.port.activity,
-                        );
-                        return Poll::Ready(Err(crate::Error::from(due).into()));
-                    }
-                    let poll = pin::Pin::new(&mut reply).poll_reply(cx.as_mut());
-                    if poll.is_pending() {
-                        *this.state = State::Response { sent, reply };
-                        return Poll::Pending;
-                    }
-                    guard.as_ref().complete();
-                    return poll;
-                }
-                (State::Failed(error), _) => return Poll::Ready(Err(error.into())),
-                (State::Done, _) => return Poll::Pending,
-                (State::Admission { .. } | State::Response { .. }, None) => {
-                    unreachable!("deadline")
-                }
-            }
+                State::Request(error) => crate::Error::Request(*error),
+                State::Deadline(error) => crate::Error::Deadline(*error),
+                State::Done => return Poll::Pending,
+            };
+            *this.state = State::Done;
+            return Poll::Ready(Err(error.into()));
         }
     }
 }
@@ -307,30 +241,16 @@ impl<'app, 's, 'b, 'c, 'd: 'app + 's, T, D, const ID: u8> Command<'app, 's, 'b, 
     where
         T: Target<'app, 's, 'b, 'c, 'd, ID>,
     {
-        let redis = target.redis();
-        let ready = frame.map_err(crate::Error::Request).and_then(|frame| {
-            Ok((
-                frame,
-                redis
-                    .port
-                    .deadline
-                    .guard()
-                    .map_err(crate::Error::Deadline)?,
-            ))
-        });
-        let (state, deadline) = match ready {
-            Ok((frame, deadline)) => (
-                State::Admission {
-                    target,
-                    frame,
-                    reply: replies::Admitted::new(),
-                },
-                Some(deadline),
-            ),
-            Err(error) => (State::Failed(error), None),
+        let (state, deadline) = match frame {
+            Err(error) => (State::Request(error), None),
+            Ok(frame) => match target.redis().port.deadline.guard() {
+                Ok(deadline) => (State::Admission(frame), Some(deadline)),
+                Err(error) => (State::Deadline(error), None),
+            },
         };
         Self {
             core: Core {
+                target,
                 state,
                 deadline,
                 waiter: wait::Waiter::new(),
@@ -350,11 +270,11 @@ where
 
     fn poll(call: context::PollCall<'_, '_, 'd, Self>) -> Poll<Self::Output> {
         let (this, context) = call.into_parts();
-        let reply = match this.project().core.poll_raw(context) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Ready(Ok(reply)) => reply,
+        let mut this = this.project();
+        let Poll::Ready(reply) = this.core.as_mut().poll_raw(context) else {
+            return Poll::Pending;
         };
-        Poll::Ready(D::decode(reply))
+        this.core.project().deadline.set(None);
+        Poll::Ready(D::decode(reply?))
     }
 }

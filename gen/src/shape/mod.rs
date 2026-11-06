@@ -2,7 +2,7 @@ use crate::{
     backend,
     ext::{ExprExt as _, SqlIdent as _},
 };
-use syn::{ext::IdentExt as _, spanned::Spanned as _, token};
+use syn::{spanned::Spanned as _, token};
 
 pub(super) mod bound;
 pub(super) mod join;
@@ -132,14 +132,14 @@ impl QuerySource {
         &self,
         relation: proc_macro2::TokenStream,
         index: usize,
-    ) -> Vec<proc_macro2::TokenStream> {
-        vec![relation, quote::quote! { " AS " }, self.qualifier(index)]
+    ) -> [proc_macro2::TokenStream; 3] {
+        [relation, quote::quote! { " AS " }, self.qualifier(index)]
     }
 
-    pub(super) fn render_base(&self) -> Vec<proc_macro2::TokenStream> {
+    pub(super) fn render_base(&self) -> [proc_macro2::TokenStream; 3] {
         let relation = match &self.primary_alias {
             Some(alias) => {
-                let name = alias.unraw().to_string().quoted();
+                let name = crate::ext::unraw(&alias.to_string()).quoted();
                 quote::quote! { #name }
             }
             None => {
@@ -154,7 +154,7 @@ impl QuerySource {
         &self,
         index: usize,
         join: &join::Join,
-    ) -> Vec<proc_macro2::TokenStream> {
+    ) -> [proc_macro2::TokenStream; 3] {
         let path = &join.path;
         self.declaration(quote::quote! { <#path>::__CARTEL_TABLE }, index + 1)
     }
@@ -165,9 +165,9 @@ impl QuerySource {
     }
 }
 
-pub(super) struct CteBinding {
-    pub(super) name: syn::Ident,
-    pub(super) inner_chain: syn::Expr,
+pub(super) struct CteBinding<'a> {
+    pub(super) name: &'a syn::Ident,
+    pub(super) inner_chain: &'a syn::Expr,
 }
 
 pub(super) struct Projection {
@@ -410,6 +410,10 @@ impl<'a> Explicit<'a> {
         } else {
             false
         }
+    }
+
+    pub(super) fn scalar(&mut self) {
+        self.row = self.ty;
     }
 
     pub(super) fn into_parts(self) -> (syn::ReturnType, syn::Type, RowReturn) {

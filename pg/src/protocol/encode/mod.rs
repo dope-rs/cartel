@@ -22,11 +22,19 @@ use o3::buffer::{
 
 use crate::protocol::messages;
 
-enum Count16 {
-    ParseTypes,
-    ParameterFormats,
-    ResultFormats,
-}
+pub(crate) const SYNC: &[u8; 5] = &[messages::Fe::SYNC, 0, 0, 0, 4];
+pub(crate) const COPY_DONE_SYNC: &[u8; 10] = &[
+    messages::Fe::COPY_DONE,
+    0,
+    0,
+    0,
+    4,
+    SYNC[0],
+    SYNC[1],
+    SYNC[2],
+    SYNC[3],
+    SYNC[4],
+];
 
 fn wire_length(value: usize) -> Result<i32, Error> {
     const MAXIMUM: usize = i32::MAX as usize;
@@ -37,22 +45,8 @@ fn wire_length(value: usize) -> Result<i32, Error> {
     }
 }
 
-fn count16(value: usize, field: Count16) -> Result<i16, Error> {
-    const MAXIMUM: usize = i16::MAX as usize;
-    if value > MAXIMUM {
-        Err(match field {
-            Count16::ParseTypes => Error::ParseTypes { actual: value },
-            Count16::ParameterFormats => Error::ParameterFormats { actual: value },
-            Count16::ResultFormats => Error::ResultFormats { actual: value },
-        })
-    } else {
-        Ok(value as i16)
-    }
-}
-
 fn write_cstr(out: &mut Writer<'_>, value: &str) -> Result<(), Error> {
-    out.extend(value.as_bytes())?;
-    out.push(0)
+    out.write_slices([value.as_bytes(), &[0]])
 }
 
 fn write_search_path(out: &mut Writer<'_>, schema: &str) -> Result<(), Error> {
@@ -154,21 +148,12 @@ impl Writer<'_> {
     }
 
     pub(crate) fn sync(&mut self) -> Result<(), Error> {
-        self.write_slices([&[messages::Fe::SYNC], &4i32.to_be_bytes()])
+        self.write_slices([&SYNC[..1], &SYNC[1..]])
     }
 
-    pub(crate) fn write_u32(&mut self, mut value: u32) -> Result<(), Error> {
-        let mut digits = [0; 10];
-        let mut start = digits.len();
-        loop {
-            start -= 1;
-            digits[start] = b'0' + (value % 10) as u8;
-            value /= 10;
-            if value == 0 {
-                break;
-            }
-        }
-        self.extend(&digits[start..])
+    pub(crate) fn write_u32(&mut self, value: u32) -> Result<(), Error> {
+        let mut digits = core::fmt::NumBuffer::new();
+        self.extend(value.format_into(&mut digits).as_bytes())
     }
 
     pub(crate) fn copy_data(&mut self, data: &[u8]) -> Result<(), Error> {
@@ -179,7 +164,7 @@ impl Writer<'_> {
     }
 
     pub(crate) fn copy_done(&mut self) -> Result<(), Error> {
-        self.write_slices([&[messages::Fe::COPY_DONE], &4i32.to_be_bytes()])
+        self.write_slices([&COPY_DONE_SYNC[..1], &COPY_DONE_SYNC[1..5]])
     }
 
     pub(crate) fn sasl_first(
@@ -204,51 +189,44 @@ impl Writer<'_> {
 
     pub(crate) fn parse_with(
         &mut self,
-        name: &str,
         write: impl FnOnce(&mut Writer<'_>) -> Result<(), Error>,
-        oids: &[u32],
     ) -> Result<(), Error> {
-        let count = count16(oids.len(), Count16::ParseTypes)?;
         self.push(messages::Fe::PARSE)?;
         self.patch::<true, _>(|out| {
-            write_cstr(out, name)?;
+            out.push(0)?;
             write(out)?;
             out.push(0)?;
-            out.extend(&count.to_be_bytes())?;
-            for oid in oids {
-                out.extend(&oid.to_be_bytes())?;
-            }
-            Ok(())
+            out.extend(&0i16.to_be_bytes())
         })
     }
 
     pub(crate) fn bind<T>(
         &mut self,
-        portal: &str,
         name: &str,
         formats: &[u16],
         params: i16,
         results: &[u16],
         write: impl FnOnce(&mut Writer<'_>) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let format_n = count16(formats.len(), Count16::ParameterFormats)?;
         self.push(messages::Fe::BIND)?;
         self.patch::<true, _>(|out| {
-            write_cstr(out, portal)?;
+            out.push(0)?;
             write_cstr(out, name)?;
-            out.extend(&format_n.to_be_bytes())?;
-            for format in formats {
-                out.extend(&format.to_be_bytes())?;
-            }
+            out.write_formats(formats)?;
             out.extend(&params.to_be_bytes())?;
             let value = write(out)?;
-            let count = count16(results.len(), Count16::ResultFormats)?;
-            out.extend(&count.to_be_bytes())?;
-            for format in results {
-                out.extend(&format.to_be_bytes())?;
-            }
+            out.write_formats(results)?;
             Ok(value)
         })
+    }
+
+    fn write_formats(&mut self, formats: &[u16]) -> Result<(), Error> {
+        // Bind callers retain query admission or supply the fixed singleton format.
+        self.extend(&(formats.len() as i16).to_be_bytes())?;
+        for format in formats {
+            self.extend(&format.to_be_bytes())?;
+        }
+        Ok(())
     }
 
     pub(crate) fn execute(&mut self) -> Result<(), Error> {

@@ -126,10 +126,16 @@ pub fn users_without_post() -> Vec<User> {
 }
 
 #[cartel_sqlite::query]
-pub fn user_post_counts() -> Vec<(i64, i64)> {
+pub fn user_post_counts() -> Vec<(i64, i64, Option<i64>)> {
     User::filter(|_u| true)
         .rows()
         .order_by(|u| u.id)
-        .select(|u| (u.id, Post::filter(|p| p.author_id == u.id).count()))
+        .select(|u| {
+            (
+                u.id,
+                Post::filter(|p| p.author_id == u.id).count(),
+                Post::filter(|p| p.author_id == u.id).max(|p| p.id),
+            )
+        })
         .all()
 }

@@ -15,11 +15,11 @@ impl Assign {
     pub(crate) fn collect(
         body: &syn::Expr,
         row_var: &syn::Ident,
-        scope: &pred::RowScope,
+        scope: &pred::RowScope<'_>,
         params: &[syn::Ident],
         types: &[syn::Type],
         dialect: &backend::Dialect,
-        cte_map: &collections::HashMap<String, syn::Path>,
+        cte_map: &collections::BTreeMap<String, syn::Path>,
     ) -> syn::Result<Vec<Self>> {
         match body {
             syn::Expr::Block(block) => {
@@ -64,11 +64,11 @@ impl Assign {
     fn parse_single(
         expr: &syn::Expr,
         row_var: &syn::Ident,
-        scope: &pred::RowScope,
+        scope: &pred::RowScope<'_>,
         params: &[syn::Ident],
         types: &[syn::Type],
         dialect: &backend::Dialect,
-        cte_map: &collections::HashMap<String, syn::Path>,
+        cte_map: &collections::BTreeMap<String, syn::Path>,
     ) -> syn::Result<Self> {
         let syn::Expr::Assign(assign) = expr else {
             return Err(syn::Error::new(

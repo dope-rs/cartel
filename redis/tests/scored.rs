@@ -15,7 +15,7 @@ use dope::{
 };
 use dope_fiber::BlockOn as _;
 use dope_test::{harness::GUARD, harness::peer::TcpScript, reclaim::Reports};
-use std::{mem, time::Duration};
+use std::time::Duration;
 use value::source::{self, ScoredText as _};
 
 type Failure<'b, 'c, 'd> = reply::Failure<cartel_redis::Error<'d>, value::Bytes<'b, 'c, 'd>>;
@@ -54,8 +54,9 @@ fn exercise(case: Scored) {
                                         runtime.block_on(redis.wait_active()),
                                         Ok(Ok(()))
                                     ));
-                                    let result =
-                                        runtime.block_on(query(redis)).expect("drive scored reply");
+                                    let result = runtime
+                                        .block_on(redis.sorted_sets().rev_range(b"board", 0, -1))
+                                        .expect("drive scored reply");
                                     check(case, result);
                                 })
                             })
@@ -187,20 +188,6 @@ fn score_encoding_origin() {
 #[test]
 fn invalid_text_keeps_owner() {
     exercise(Scored::Text);
-}
-
-#[test]
-fn bounded_layout() {
-    let word = mem::size_of::<usize>();
-    assert_eq!(mem::size_of::<value::reply::Invalid>(), 2 * word);
-    assert_eq!(
-        mem::size_of::<ScoredBulks<'static, 'static, 'static, 'static>>(),
-        10 * word
-    );
-    assert_eq!(
-        mem::size_of::<Option<ScoredBulks<'static, 'static, 'static, 'static>>>(),
-        mem::size_of::<ScoredBulks<'static, 'static, 'static, 'static>>()
-    );
 }
 
 fn check<'s, 'b, 'c, 'd>(

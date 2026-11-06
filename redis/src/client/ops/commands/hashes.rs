@@ -1,6 +1,5 @@
 use crate::api::{Client, decode};
 use crate::client::nonempty;
-use crate::request::encode;
 use std::num;
 
 #[derive(Clone, Copy)]
@@ -14,9 +13,8 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Hashes<C, ID> {
     }
 
     pub fn set(self, key: &[u8], field: &[u8], value: &[u8]) -> C::Call<decode::Changed> {
-        self.0.encode::<decode::Changed>(move |out| {
-            out.sequence(&[b"HSET", key], 1, [(field, value)].into_iter())
-        })
+        self.0
+            .encode::<decode::Changed>(move |out| out.command(&[b"HSET", key, field, value]))
     }
 
     pub fn set_many(self, key: &[u8], fv: nonempty::Slice<'_, (&[u8], &[u8])>) -> C::Call<u64> {
@@ -72,8 +70,8 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Hashes<C, ID> {
 
     pub fn increment(self, key: &[u8], field: &[u8], by: i64) -> C::Call<i64> {
         self.0.encode::<i64>(move |out| {
-            let mut buffer = [0; 21];
-            let by = encode::format_int_into(&mut buffer, by);
+            let mut buffer = core::fmt::NumBuffer::new();
+            let by = by.format_into(&mut buffer).as_bytes();
             out.command(&[b"HINCRBY", key, field, by])
         })
     }

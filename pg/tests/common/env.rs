@@ -24,7 +24,7 @@ pub enum Error {
 pub struct Env {
     address: SocketAddr,
     user: String,
-    password: String,
+    password: zeroize::Zeroizing<String>,
     database: String,
 }
 
@@ -42,7 +42,7 @@ impl Env {
         Ok(Self {
             address,
             user: Self::read(user, "bench")?,
-            password: Self::read(password, "bench")?,
+            password: zeroize::Zeroizing::new(Self::read(password, "bench")?),
             database: Self::read(database, "bench")?,
         })
     }
@@ -52,7 +52,7 @@ impl Env {
     pub fn try_config(&self) -> Result<Config, Error> {
         Config::new(
             self.user.clone(),
-            self.password.clone(),
+            self.password.as_str().to_owned(),
             self.database.clone(),
         )
         .map_err(Error::Config)

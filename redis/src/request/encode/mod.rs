@@ -60,6 +60,7 @@ impl Number {
         Ok(Self(value as u64))
     }
 
+    #[inline]
     fn digits(self) -> usize {
         self.0.checked_ilog10().unwrap_or(0) as usize + 1
     }
@@ -77,8 +78,12 @@ impl Encoder {
         self.encode(args, [], Sensitivity::Plain)
     }
 
-    fn secret<const N: usize>(self, args: &[&[u8]; N]) -> Result<Complete, request::Error> {
-        self.encode(args, [], Sensitivity::Secret)
+    pub(crate) fn secret<'a, const N: usize>(
+        self,
+        prefix: &[&[u8]; N],
+        tail: impl AsRef<[&'a [u8]]>,
+    ) -> Result<Complete, request::Error> {
+        self.encode(prefix, tail, Sensitivity::Secret)
     }
 
     pub(crate) fn slices<'a, const N: usize>(
@@ -87,6 +92,21 @@ impl Encoder {
         tail: impl AsRef<[&'a [u8]]>,
     ) -> Result<Complete, request::Error> {
         self.encode(prefix, tail, Sensitivity::Plain)
+    }
+
+    pub(crate) fn range<const N: usize>(
+        self,
+        verb: &[u8],
+        suffix: &[&[u8]; N],
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<Complete, request::Error> {
+        let mut head = core::fmt::NumBuffer::new();
+        let start = start.format_into(&mut head).as_bytes();
+        let mut tail = core::fmt::NumBuffer::new();
+        let stop = stop.format_into(&mut tail).as_bytes();
+        self.slices(&[verb, key, start, stop], suffix)
     }
 
     fn encode<'a, const N: usize>(
@@ -99,7 +119,7 @@ impl Encoder {
         let count = add_count(N, tail.len())?;
         let mut length = Length::array(count)?;
         for argument in prefix.iter().chain(tail) {
-            length = length.bulk(*argument)?;
+            length = length.bulk(argument.len())?;
         }
         let mut out = self.admit_with(length, kind)?;
         out.array(count)?;
@@ -122,13 +142,13 @@ impl Encoder {
         let count = add_group_count(P, declared, I::Item::WIDTH)?;
         let mut length = Length::array(count)?;
         for value in prefix {
-            length = length.bulk(*value)?;
+            length = length.bulk(value.len())?;
         }
         let mut actual = 0;
         for item in items.clone() {
             actual = next_item(declared, actual)?;
             for value in item.values() {
-                length = length.bulk(value)?;
+                length = length.bulk(value.len())?;
             }
         }
         check_items(declared, actual)?;
@@ -165,13 +185,14 @@ impl Complete {
 }
 
 impl Length {
+    #[inline]
     fn array(count: usize) -> Result<Self, request::Error> {
         let count = Number::new(count)?;
-        Self(0).add(3)?.add(count.digits())
+        Ok(Self(3 + count.digits()))
     }
 
-    fn bulk(self, payload: &(impl request::Bulk + ?Sized)) -> Result<Self, request::Error> {
-        let len = payload.len();
+    #[inline(always)]
+    fn bulk(self, len: usize) -> Result<Self, request::Error> {
         let length = Number::new(len)?;
         self.add(5)?.add(length.digits())?.add(len)
     }
@@ -191,15 +212,14 @@ impl Writer {
         Ok(Self { out })
     }
 
-    fn extend(&mut self, bytes: &(impl AsRef<[u8]> + ?Sized)) -> Result<(), request::Error> {
-        let bytes = bytes.as_ref();
+    #[inline]
+    fn extend(&mut self, bytes: &[u8]) -> Result<(), request::Error> {
         self.out
             .parts_mut()
             .0
             .out
             .try_extend(bytes)
-            .map_err(request::Error::Write)?;
-        Ok(())
+            .map_err(request::Error::Write)
     }
 
     fn bulk(&mut self, payload: &(impl request::Bulk + ?Sized)) -> Result<(), request::Error> {
@@ -228,10 +248,10 @@ impl Writer {
         if actual != declared {
             return Err(request::Error::BulkLength { declared, actual });
         }
-        self.extend(b"\r\n")?;
-        Ok(())
+        self.extend(b"\r\n")
     }
 
+    #[inline]
     fn array(&mut self, count: usize) -> Result<(), request::Error> {
         let mut header = [0; 23];
         self.extend(format_header_into(&mut header, b'*', count as u64))
@@ -247,42 +267,14 @@ impl Writer {
     }
 }
 
+#[inline]
 fn format_header_into(buffer: &mut [u8; 23], marker: u8, value: u64) -> &[u8] {
     let [_, digits @ .., cr, lf] = buffer;
     *cr = b'\r';
     *lf = b'\n';
-    let start = write_digits(digits, value);
+    let start = cartel_core::write_digits(digits, value);
     buffer[start] = marker;
     &buffer[start..]
-}
-
-pub(crate) fn format_int_into(buffer: &mut [u8; 21], value: i64) -> &[u8] {
-    let [_, digits @ ..] = buffer;
-    let mut start = write_digits(digits, value.unsigned_abs());
-    if value < 0 {
-        buffer[start] = b'-';
-    } else {
-        start += 1;
-    }
-    &buffer[start..]
-}
-
-pub(crate) fn format_uint_into(buffer: &mut [u8; 20], value: u64) -> &[u8] {
-    let start = write_digits(buffer, value);
-    &buffer[start..]
-}
-
-fn write_digits(buffer: &mut [u8; 20], mut value: u64) -> usize {
-    let mut index = buffer.len();
-    loop {
-        index -= 1;
-        buffer[index] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
-    }
-    index
 }
 
 pub(crate) fn format_float(buffer: &mut ryu::Buffer, value: f64) -> &[u8] {

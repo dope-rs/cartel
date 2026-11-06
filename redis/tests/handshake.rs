@@ -17,7 +17,7 @@ use dope::{
     core::driver::route::Id, manifold::app::env::Bundle, manifold::client::close,
     manifold::timing::Throughput, net::tcp::Tcp, net::wire::Identity,
 };
-use dope_fiber::BlockOn;
+use dope_fiber::{BlockOn, abi::Join};
 use dope_test::harness::peer;
 use dope_test::{
     fibers::{self, TEST},
@@ -25,7 +25,6 @@ use dope_test::{
     reclaim::Reports,
 };
 use o3::base::time::Positive;
-use std::{net::Shutdown, sync::mpsc, time::Duration};
 
 type Env = Bundle<Tcp, Identity, Throughput>;
 
@@ -42,7 +41,6 @@ fn init_accessors() {
 
 #[test]
 fn reconnect_replays_init() {
-    let (finish, done) = mpsc::channel();
     AcceptScript::with(
         move |peer| {
             {
@@ -62,8 +60,8 @@ fn reconnect_replays_init() {
                 assert_eq!(read_request(&mut socket, PING.len())?, PING);
                 socket.write_all(b"+PONG\r\n")?;
                 if epoch == 1 {
-                    done.recv_timeout(GUARD)
-                        .expect("finish replacement connection");
+                    socket.read_wait(Some(GUARD))?;
+                    assert_eq!(socket.read(&mut [0])?, 0, "replacement connection EOF");
                 }
             }
             Ok::<_, peer::Error>(())
@@ -145,7 +143,6 @@ fn reconnect_replays_init() {
                                     runtime.block_on(redis.server().ping()),
                                     Ok(Ok(_))
                                 ));
-                                finish.send(()).expect("finish server");
                             })
                         })
                     })
@@ -166,7 +163,6 @@ fn reconnect_replays_init() {
 #[test]
 fn rejection_stops_init() {
     for expected in [Step::Authenticate, Step::Select, Step::SetClientName] {
-        let (seen, gate) = mpsc::channel();
         AcceptScript::with(
             move |peer| {
                 let mut socket = peer.accept()?;
@@ -178,15 +174,12 @@ fn rejection_stops_init() {
                     );
                     if step == expected {
                         socket.write_all(REJECTED)?;
-                        gate.recv_timeout(GUARD).expect("failure observed");
-                        socket.nonblock(true);
-                        let mut byte = [0; 1];
-                        match socket.read(&mut byte) {
-                            Err(peer::Error::Syscall(error)) if error.is_block() => {}
-                            outcome => {
-                                assert_eq!(outcome?, 0, "a command followed rejected {expected:?}")
-                            }
-                        }
+                        socket.read_wait(Some(GUARD))?;
+                        assert_eq!(
+                            socket.read(&mut [0])?,
+                            0,
+                            "a command followed rejected {expected:?}"
+                        );
                         return Ok::<_, peer::Error>(Some(step));
                     }
                     socket.write_all(b"+OK\r\n")?;
@@ -218,7 +211,10 @@ fn rejection_stops_init() {
                                     let first = runtime.block_on(redis.wait_active())
                                         .expect("drive rejected connection")
                                         .expect_err("initialization must fail");
-                                    runtime.block_on(yield_turns(2)).expect("yield rejected connection");
+                                    runtime.block_on(dope_fiber::fiber!('_ => async move {
+                                        fibers::Yield::new().await;
+                                        fibers::Yield::new().await;
+                                    })).expect("yield rejected connection");
                                     {
                                         let second = runtime.block_on(redis.wait_active())
                                             .expect("drive repeated failure")
@@ -240,7 +236,6 @@ fn rejection_stops_init() {
                                     assert!(matches!(&first, cartel_redis::Error::Handshake(error)
                                         if error.step == expected && error.kind == init::Kind::Rejected
                                             && matches!(&error.frame, Ok(frame) if frame.as_ref() == REJECTED)));
-                                    seen.send(()).expect("report observed failure");
                                 })
                             })
                         })
@@ -263,120 +258,203 @@ fn rejection_stops_init() {
 
 #[test]
 fn lane_failure_survives() {
-    for invalid in [false, true] {
-        let (allow, gate) = mpsc::channel();
-        let (sent, recv) = mpsc::channel();
-        let (close, stop) = mpsc::channel();
-        AcceptScript::with(
-        move |peer| {
-            let bad = peer.accept()?;
-            let good = peer.accept()?;
-            bad.read_wait(Some(Duration::from_secs(1)))?;
-            good.read_wait(Some(Duration::from_secs(1)))?;
-            let mut buf = [0_u8; 128];
-            assert_ne!(bad.read(&mut buf)?, 0);
-            assert_ne!(good.read(&mut buf)?, 0);
-            bad.write_all(DENIED)?;
-            (gate.recv_timeout(GUARD)).expect("allow healthy AUTH");
-            good.write_all(b"+OK\r\n")?;
-            (sent.send(())).expect("healthy AUTH sent");
-            assert_ne!(good.read(&mut buf)?, 0);
-            good.write_all(b"+PONG\r\n")?;
-            (stop.recv_timeout(GUARD)).expect("close healthy connection");
-            let mut ping = [0; PING.len()];
-            good.read_exact(&mut ping)?;
-            assert_eq!(&ping, PING, "the closing lane owns the pending request");
-            if invalid {
-                good.write_all(b"?\r\n")?;
-            } else {
-                good.shutdown(Shutdown::Write)?;
-            }
-            Ok::<_, peer::Error>(())
+    use dope::{
+        core::{
+            driver::route::{KeyTag, table::conn::Capacity},
+            io::socket,
         },
-        |server| {
-            let addr = server.addr();
+        manifold::{app::receive, network::listener, service},
+        net::wire::domain,
+        runtime::topology::{self, lending::Stage},
+    };
+    use dope_fiber::net::server;
 
-            let config = Builder::new(settings::Capacities {
-                connections: 2,
-                admission_waiters: 2,
-                inflight: 2,
-                request_frame_bytes: 128,
-                response_bytes: 256,
-                response_values: 4,
-                response_frame_bytes: 128,
-                response_frame_values: 2,
-            })
-            .window(Positive::from_millis::<25>())
-            .build();
-            let config = config.expect("valid redis configuration");
-            let init = (Plan::new().password("secret")).expect("authentication storage must allocate");
-            {
-                let prepared =
-                    topology::try_new::<Env>(config, addr, init).expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut rt| {
-                                    let redis = rt.root_client();
-
-                                    let first = BlockOn::block_on(&mut rt, redis.wait_active())
-                                        .expect("drive rejected lane")
-                                        .expect_err("authentication must fail");
-
-                                    assert!(allow.send(()).is_ok(), "allow healthy connection");
-                                    assert!(recv.recv_timeout(GUARD).is_ok(), "healthy AUTH response");
-                                    assert!(BlockOn::block_on(&mut rt, fibers::Yield::new()).is_ok());
-                                    assert!(BlockOn::block_on(&mut rt, fibers::Yield::new()).is_ok());
-                                    assert!(matches!(
-                                        BlockOn::block_on(&mut rt, redis.wait_active()),
-                                        Ok(Ok(()))
-                                    ));
-                                    assert!(matches!(
-                                        BlockOn::block_on(&mut rt, redis.server().ping()),
-                                        Ok(Ok(()))
-                                    ));
-
-                                    assert!(close.send(()).is_ok(), "close healthy connection");
-                                    let closed = BlockOn::block_on(&mut rt, redis.server().ping());
-                                    let closed = closed.expect("drive closed connection request");
-                                    if invalid {
-                                        assert!(matches!(closed, Err(value::reply::Failure::Control(cartel_redis::Error::Protocol(_)))));
-                                    } else {
-                                        assert!(matches!(closed, Err(value::reply::Failure::Control(cartel_redis::Error::Closed(
-                                            close::Reason::Remote | close::Reason::Transport
-                                        )))));
-                                    }
-                                    {
-                                        let second = BlockOn::block_on(&mut rt, TEST.poll_once(redis.wait_active()))
+    for invalid in [false, true] {
+        let bound = socket::Listener::bind(([127, 0, 0, 1], 0).into()).expect("peer listener");
+        let addr = bound.local_addr();
+        let config = Builder::new(settings::Capacities {
+            connections: 2,
+            admission_waiters: 2,
+            inflight: 2,
+            request_frame_bytes: 128,
+            response_bytes: 256,
+            response_values: 4,
+            response_frame_bytes: 128,
+            response_frame_values: 2,
+        })
+        .window(Positive::from_millis::<25>())
+        .build()
+        .expect("valid redis configuration");
+        let init = (Plan::new().password("secret")).expect("authentication storage must allocate");
+        let snapshot = service::Snapshot::from_one(
+            service::Revision::new(1),
+            service::Endpoint::new(addr, addr),
+        );
+        let (_, node) = cartel_redis::client::plan::Plan::<0>::new(config)
+            .assemble::<Env>(
+                snapshot,
+                settings::DEFAULT_BACKOFF,
+                settings::DEFAULT_BACKOFF_MAXIMUM,
+                init,
+            )
+            .expect("Redis plan")
+            .into_parts();
+        let peer = server::Plan::<Identity, KeyTag<1>>::new(Capacity::fixed::<2>(), Identity);
+        let layout =
+            listener::topology::Layout::<KeyTag<1>, receive::Owned>::new(Capacity::fixed::<2>());
+        let prepared = topology::Plan::new((), (node, layout))
+            .for_install::<Throughput>()
+            .expect("topology fixture completed");
+        let mut reports = Reports::new(prepared.layout(), [Id::fixed::<0>(), Id::fixed::<1>()]);
+        let mut report = Completion::new();
+        prepared.with_local(
+            |worker| {
+                worker.lend(|(node, _), stage| {
+                    node.install(stage, |host, stage| {
+                        let hash = stage.hash_state(listener::Domain::DEFAULT);
+                        let port = peer
+                            .try_build(stage.driver().storage)
+                            .expect("peer storage");
+                        server::Listener::<KeyTag<1>, Tcp, Identity, _>::adopt(
+                            &port,
+                            server::Config {
+                                direct_flights: 0.into(),
+                                bind: addr,
+                                backlog: socket::Backlog::fixed::<2>(),
+                                stream: Default::default(),
+                                transport: Default::default(),
+                                egress: Default::default(),
+                                bound,
+                                wire: domain::Local::new(Identity),
+                            },
+                            |cause| cause.eliminate(),
+                            hash,
+                            stage,
+                            Stage::driver,
+                            |listener, stage| {
+                                let peer = listener.handle();
+                                stage.with_quiesce(
+                                    &mut report,
+                                    common::connect::App::new(host, listener),
+                                    GUARD,
+                                    |mut rt| {
+                                        let redis = rt.client(common::connect::App::connector);
+                                        let mut bad = TEST
+                                            .try_run(&mut rt, peer.accept())
+                                            .expect("bad lane accept driver")
+                                            .ok()
+                                            .expect("bad lane connection");
+                                        let mut good = TEST
+                                            .try_run(&mut rt, peer.accept())
+                                            .expect("healthy lane accept driver")
+                                            .ok()
+                                            .expect("healthy lane connection");
+                                        TEST.try_run(
+                                            &mut rt,
+                                            common::connect::expect(
+                                                &mut bad,
+                                                b"*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n",
+                                            ),
+                                        )
+                                        .expect("bad lane AUTH request");
+                                        TEST.try_run(
+                                            &mut rt,
+                                            common::connect::expect(
+                                                &mut good,
+                                                b"*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n",
+                                            ),
+                                        )
+                                        .expect("healthy lane AUTH request");
+                                        assert!(matches!(
+                                            TEST.try_run(&mut rt, bad.write_all(DENIED)),
+                                            Ok(Ok(()))
+                                        ));
+                                        let first = TEST
+                                            .try_run(&mut rt, redis.wait_active())
+                                            .expect("drive rejected lane")
+                                            .expect_err("authentication must fail");
+                                        assert!(matches!(
+                                            TEST.try_run(&mut rt, good.write_all(b"+OK\r\n")),
+                                            Ok(Ok(()))
+                                        ));
+                                        assert!(
+                                            BlockOn::block_on(&mut rt, fibers::Yield::new())
+                                                .is_ok()
+                                        );
+                                        assert!(
+                                            BlockOn::block_on(&mut rt, fibers::Yield::new())
+                                                .is_ok()
+                                        );
+                                        let client = dope_fiber::fiber!('_ => async move {
+                                            assert!(redis.wait_active().await.is_ok());
+                                            assert!(redis.server().ping().await.is_ok());
+                                            redis.server().ping().await
+                                        });
+                                        let server = dope_fiber::fiber!('_ => async move {
+                                            common::connect::expect(&mut good, PING).await;
+                                            assert!(good.write_all(b"+PONG\r\n").await.is_ok());
+                                            common::connect::expect(&mut good, PING).await;
+                                            if invalid {
+                                                assert!(good.write_all(b"?\r\n").await.is_ok());
+                                            }
+                                        });
+                                        let (closed, ()) = TEST
+                                            .try_run(&mut rt, Join::new(client, server))
+                                            .expect("drive healthy lane through close");
+                                        if invalid {
+                                            assert!(matches!(
+                                                closed,
+                                                Err(value::reply::Failure::Control(
+                                                    cartel_redis::Error::Protocol(_)
+                                                ))
+                                            ));
+                                        } else {
+                                            assert!(matches!(
+                                                closed,
+                                                Err(value::reply::Failure::Control(
+                                                    cartel_redis::Error::Closed(
+                                                        close::Reason::Remote
+                                                            | close::Reason::Transport
+                                                    )
+                                                ))
+                                            ));
+                                        }
+                                        {
+                                            let second = BlockOn::block_on(
+                                                &mut rt,
+                                                TEST.poll_once(redis.wait_active()),
+                                            )
                                             .expect("poll rejected lane")
                                             .expect("rejection must be ready")
                                             .expect_err("authentication failure must persist");
-                                        assert!(matches!(&second, cartel_redis::Error::Handshake(error)
-                                            if error.step == Step::Authenticate && error.kind == init::Kind::Rejected
-                                                && matches!(&error.frame, Ok(frame) if frame.as_ref() == DENIED)));
-                                    }
-                                    assert!(matches!(&first, cartel_redis::Error::Handshake(error)
-                                        if error.step == Step::Authenticate && error.kind == init::Kind::Rejected
-                                            && matches!(&error.frame, Ok(frame) if frame.as_ref() == DENIED)));
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-                );
-                reports.events().expect("valid reclaim observations");
-
-            };
-            assert!(
-                matches!(server.finish(), Ok(Ok(()))),
-                "finish Redis lanes; Redis lanes I/O"
-            );
-        },
-    )
-    .expect("spawn Redis lanes");
+                                            assert!(matches!(
+                                                &second,
+                                                cartel_redis::Error::Handshake(error)
+                                                    if error.step == Step::Authenticate
+                                                        && error.kind == init::Kind::Rejected
+                                                        && matches!(&error.frame, Ok(frame)
+                                                            if frame.as_ref() == DENIED)
+                                            ));
+                                        }
+                                        assert!(matches!(
+                                            &first,
+                                            cartel_redis::Error::Handshake(error)
+                                                if error.step == Step::Authenticate
+                                                    && error.kind == init::Kind::Rejected
+                                                    && matches!(&error.frame, Ok(frame)
+                                                        if frame.as_ref() == DENIED)
+                                        ));
+                                    },
+                                )
+                            },
+                        )
+                        .expect("install peer")
+                    })
+                })
+            },
+            recovery::Policy::new(|event| reports.push(event), recover),
+            |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
+        );
+        reports.events().expect("valid reclaim observations");
     }
 }

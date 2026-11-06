@@ -1,16 +1,3 @@
-use dope_fiber::wait;
-
-pub(crate) enum Register<'d> {
-    Registered,
-    Stale,
-    Failed(wait::Error<'d>),
-}
-
-pub(crate) enum Settlement {
-    Pending,
-    Complete(Disposition),
-}
-
 pub(crate) enum Disposition {
     Reusable,
     Lost,

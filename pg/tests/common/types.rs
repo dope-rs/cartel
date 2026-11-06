@@ -1,5 +1,3 @@
-use std::{cell::Cell, marker::PhantomData};
-
 use cartel_pg::dsl::query::ops::{
     Arrange as _, Change as _, Fetch as _, Project as _, Reduce as _, Set as _,
 };
@@ -19,11 +17,6 @@ pub struct Post {
 }
 
 #[derive(PgRow, PgTable)]
-pub struct T {
-    pub id: i64,
-}
-
-#[derive(PgRow, PgTable)]
 #[table_name("users")]
 pub struct UserId {
     pub id: i64,
@@ -31,20 +24,12 @@ pub struct UserId {
 
 #[derive(PgTable)]
 #[table(batch)]
-#[table_name("select")]
+#[table_name("한\"글.select")]
 pub struct BatchKeyword {
     pub r#select: i64,
 }
 
 type UserAlias = User;
-
-pub struct Converted;
-
-impl From<Converted> for String {
-    fn from(_: Converted) -> Self {
-        Self::from("converted")
-    }
-}
 
 #[derive(PgRow, PgTable)]
 pub struct Formats {
@@ -60,50 +45,10 @@ pub struct Formats {
 
 pub enum Projection {}
 
-pub struct N;
-
-pub struct C;
-const ID: usize = 1;
-
 #[cartel_gen::query_group]
 impl Projection {
     pub fn insert_batch(values: &[i64]) {
         BatchKeyword::insert_each(|row| row.r#select = values)
-    }
-
-    #[doc = "Preserves caller names and higher-ranked parameter types."]
-    #[must_use]
-    pub fn lexical(
-        client: i64,
-        _owner: C,
-        _route: [u8; ID],
-        _ranked: PhantomData<for<'d, 'pool, 'p> fn(&'d str, &'pool str, &'p str)>,
-        _function: PhantomData<Cell<fn(&str)>>,
-        _closure: &Cell<dyn Fn(&str)>,
-    ) -> User {
-        User::filter(User::id == client).one()
-    }
-    pub fn by_name(name: &str, _unused: N) -> User {
-        User::filter(User::name == name).one()
-    }
-    pub fn named(name: &str) -> User {
-        User::filter(User::name == name).one()
-    }
-
-    pub fn first_named(name: &str) -> Option<User> {
-        User::filter(User::name == name).first()
-    }
-
-    pub fn all_named(name: &str) -> Vec<User> {
-        User::filter(User::name == name).all()
-    }
-
-    pub fn named_id(id: i64, name: &str) -> User {
-        User::filter(User::id == id && User::name == name).one()
-    }
-
-    pub fn required() -> User {
-        User::filter(User::id == 1).one()
     }
 
     pub fn rename_owned(id: i64, name: String) {
@@ -112,11 +57,6 @@ impl Projection {
 
     pub fn rename_ref(id: i64, name: &str) {
         User::filter(|scope| scope.id == id).update(|scope| scope.name = name)
-    }
-
-    pub fn rename_bulk(ids: &[i64], names: &[&str]) {
-        User::filter_each((&ids, &names), |scope, id, name| scope.id == id)
-            .update(|scope, id, name| scope.name = name)
     }
 
     pub fn mixed_rows() -> Vec<(User, Formats)> {
@@ -219,6 +159,7 @@ impl Projection {
         User::lateral_join::<User>(|outer| {
             User::filter(|inner| inner.id > outer.id)
                 .distinct_on(|inner| inner.age + outer.age + shift)
+                .order_by(|inner| inner.age + outer.age + shift)
         })
         .filter(|_outer, _inner| true)
         .all()

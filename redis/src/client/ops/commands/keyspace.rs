@@ -1,6 +1,5 @@
 use crate::api::{Client, decode};
 use crate::client::nonempty;
-use crate::request::encode::write::space;
 use std::num::NonZero;
 
 #[derive(Clone, Copy)]
@@ -8,6 +7,11 @@ use std::num::NonZero;
 pub struct Keyspace<C, const ID: u8 = 0>(pub(crate) C);
 
 impl<'d, C: Client<'d, ID>, const ID: u8> Keyspace<C, ID> {
+    pub fn dump(self, key: &[u8]) -> C::Call<decode::MaybeBytes> {
+        self.0
+            .encode::<decode::MaybeBytes>(move |out| out.command(&[b"DUMP", key]))
+    }
+
     pub fn swap(self, key: &[u8], value: &[u8]) -> C::Call<decode::MaybeBytes> {
         self.0
             .encode::<decode::MaybeBytes>(move |out| out.command(&[b"GETSET", key, value]))
@@ -59,8 +63,7 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Keyspace<C, ID> {
         pattern: Option<&[u8]>,
         count: Option<NonZero<u64>>,
     ) -> C::Call<decode::Scan> {
-        self.0.encode::<decode::Scan>(move |out| {
-            space::Writer::new(out).scan(&[b"SCAN"], cursor, pattern, count)
-        })
+        self.0
+            .encode::<decode::Scan>(move |out| out.scan(&[b"SCAN"], cursor, pattern, count))
     }
 }

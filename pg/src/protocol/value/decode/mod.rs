@@ -30,6 +30,7 @@ enum Field<'a> {
 }
 
 impl<'a> RowReader<'a> {
+    #[inline]
     pub(crate) fn new(bytes: Wire<'a>, want: u16) -> Result<Self, crate::Error> {
         let Some((head, tail)) = bytes.split_array::<2>() else {
             return Err(crate::Error::Protocol(Reason::RowTruncated {
@@ -55,6 +56,23 @@ impl<'a> RowReader<'a> {
         })
     }
 
+    pub(crate) fn nullable<T>(
+        bytes: Wire<'a>,
+        decode: impl FnOnce(&mut Self) -> Result<T, crate::Error>,
+    ) -> Result<Option<T>, crate::Error> {
+        let mut reader = Self::new(bytes, 1)?;
+        let value = match reader.buf.split_array::<4>() {
+            Some((head, tail)) if *head == [u8::MAX; 4] => {
+                reader.buf = tail;
+                reader.columns.start = 1;
+                None
+            }
+            _ => Some(decode(&mut reader)?),
+        };
+        reader.finish()?;
+        Ok(value)
+    }
+
     pub(crate) fn finish(self) -> Result<(), crate::Error> {
         if !self.columns.is_empty() {
             return Err(crate::Error::Protocol(Reason::RowUnread {
@@ -69,6 +87,7 @@ impl<'a> RowReader<'a> {
         Ok(())
     }
 
+    #[inline]
     fn take_column(&mut self) -> Result<Field<'a>, crate::Error> {
         let mut columns = self.columns.clone();
         let index = columns
@@ -106,6 +125,7 @@ impl<'a> RowReader<'a> {
         Ok(Field::Data(Column { buf: head, index }))
     }
 
+    #[inline]
     fn require(&mut self) -> Result<Column<'a>, crate::Error> {
         match self.take_column()? {
             Field::Data(column) => Ok(column),
@@ -113,6 +133,7 @@ impl<'a> RowReader<'a> {
         }
     }
 
+    #[inline]
     pub fn read_i32(&mut self) -> Result<i32, crate::Error> {
         Ok(i32::from_be_bytes(self.require()?.fixed()?))
     }
@@ -189,6 +210,7 @@ impl Scalar<'_, '_> {
         Ok(i16::from_be_bytes(self.read_fixed()?))
     }
 
+    #[inline]
     pub fn read_i64(&mut self) -> Result<i64, crate::Error> {
         Ok(i64::from_be_bytes(self.read_fixed()?))
     }
@@ -197,6 +219,7 @@ impl Scalar<'_, '_> {
         Ok(f32::from_be_bytes(self.read_fixed()?))
     }
 
+    #[inline]
     pub fn read_f64(&mut self) -> Result<f64, crate::Error> {
         Ok(f64::from_be_bytes(self.read_fixed()?))
     }

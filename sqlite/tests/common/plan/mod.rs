@@ -89,19 +89,14 @@ impl<'sql, I: Catalog> Plan<'sql, I> {
         db: database::Target<'sql>,
         limits: Limits,
         memory: Memory,
-        cap: Option<slots::Slots>,
+        cap: slots::Slots,
     ) -> Result<Self, Error> {
-        let base = settings::Config::for_profile::<Throughput>();
-        let layout = match cap {
-            Some(cap) => {
-                use settings::demands::Schedule;
+        use settings::demands::Schedule;
 
-                let clock = settings::Schedule::fixed::<0, 0>()
-                    .resolve(Schedule::new(base.schedule().ready(), cap));
-                base.set_schedule(clock)
-            }
-            None => base,
-        };
+        let base = settings::Config::for_profile::<Throughput>();
+        let clock = settings::Schedule::fixed::<0, 0>()
+            .resolve(Schedule::new(base.schedule().ready(), cap));
+        let layout = base.set_schedule(clock);
         Self::prepare(db, limits, memory, layout)
     }
 
@@ -145,6 +140,7 @@ impl<'sql, I: Catalog> Plan<'sql, I> {
         let mut complete = session::Completion::new();
         let complete = &mut complete;
         self.ready.try_create(
+            (),
             move |worker| {
                 let mut cleanup = open::Completion::new();
                 let output =

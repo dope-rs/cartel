@@ -127,20 +127,19 @@ pub(super) struct ScopeCalls {
 }
 
 impl ScopeCalls {
-    pub(super) fn sqlite(block: &syn::Block) -> syn::Block {
+    pub(super) fn sqlite(block: syn::Block) -> syn::Block {
         Self::lower(block, syn::parse_quote!(::cartel_sqlite), true)
     }
 
-    pub(super) fn pg(block: &syn::Block) -> syn::Block {
+    pub(super) fn pg(block: syn::Block) -> syn::Block {
         Self::lower(block, syn::parse_quote!(::cartel_pg), true)
     }
 
-    pub(super) fn pg_assign(block: &syn::Block) -> syn::Block {
+    pub(super) fn pg_assign(block: syn::Block) -> syn::Block {
         Self::lower(block, syn::parse_quote!(::cartel_pg), false)
     }
 
-    fn lower(block: &syn::Block, dialect: syn::Path, scoped: bool) -> syn::Block {
-        let mut block = block.clone();
+    fn lower(mut block: syn::Block, dialect: syn::Path, scoped: bool) -> syn::Block {
         let owner = if scoped {
             Some(syn::parse_quote!(#dialect::dsl::Scope))
         } else {

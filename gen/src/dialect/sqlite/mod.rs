@@ -47,16 +47,7 @@ impl backend::TableBackend for Backend {
                 ty
             })
             .collect();
-        let fields: Vec<_> = fields
-            .iter()
-            .zip(&types)
-            .map(|(field, ty)| backend::TableField {
-                name: field.name,
-                ty,
-                vis: field.vis,
-            })
-            .collect();
-        let Some((first, tail)) = fields.split_first() else {
+        let Some((first, tail)) = types.split_first() else {
             return Err(syn::Error::new(
                 name.span(),
                 "SQLite Table requires at least one field",
@@ -83,9 +74,8 @@ impl backend::TableBackend for Backend {
         let input_ty = names.fresh("__CartelSource");
         let mut row_g = input.generics.clone();
         owner.visit_generics_mut(&mut row_g);
-        for field in &fields {
-            if generic::Generic::contains(&input.generics, field.ty) {
-                let ty = field.ty;
+        for ty in &types {
+            if generic::Generic::contains(&input.generics, ty) {
                 row_g
                     .make_where_clause()
                     .predicates
@@ -100,43 +90,37 @@ impl backend::TableBackend for Backend {
         let (view_i, view_t, view_w) = view_g.split_for_impl();
         let tbl_sql = table.quoted();
 
-        let mut view_fs = Vec::new();
-        let mut loads = Vec::new();
-        let mut keeps = Vec::new();
+        let field_names = fields.iter().map(|field| field.name);
+        let borrow_names = field_names.clone();
+        let field_vis = fields.iter().map(|field| field.vis);
         let mut dec_g = row_g;
         let mode = if input.generics.params.is_empty() {
-            retain::Retain::of(first.ty, tail)
+            retain::Retain::of(first, tail)
         } else {
-            retain::Retain::bind(first.ty, tail, &mut dec_g, &mut names)
+            retain::Retain::bind(first, tail, &mut dec_g, &mut names)
         };
-        for f in &fields {
-            let fname = f.name;
-            let fty = f.ty;
-            let fvis = f.vis;
-            view_fs.push(quote::quote! {
-                #fvis #fname: <#fty as #rt::row::raw::Decode>::Borrowed<#row_lt>
-            });
-            loads.push(quote::quote! {
-                #fname: <#fty as #rt::row::raw::Decode>::borrow(reader)?,
-            });
-            let kind = retain::Retain::field(fty);
-            if !input.generics.params.is_empty() && !tail.is_empty() {
+        if !input.generics.params.is_empty() && !tail.is_empty() {
+            for fty in &types {
                 mode.require(&mut dec_g, fty);
             }
+        }
+        let keeps = fields.iter().zip(&types).map(|(f, fty)| {
+            let fname = f.name;
             let state = if tail.is_empty() {
                 quote::quote!(state)
             } else {
+                let kind = retain::Retain::field(fty);
                 quote::quote! {
                     <Self::Retention as #rt::row::modes::Contains<#kind>>::get::<#slot_ty>(state)
                 }
             };
-            keeps.push(quote::quote! {
+            quote::quote! {
                 #fname: <#fty as #rt::row::raw::Decode>::retain::<#slot_ty>(
                     value.#fname,
                     #state,
                 )?,
-            });
-        }
+            }
+        });
         let sum = quote::quote! { 0usize #( + <#types as #rt::row::raw::Decode>::N_COLS )* };
         let (dec_i, _, dec_w) = dec_g.split_for_impl();
         let mode = mode.0;
@@ -144,7 +128,7 @@ impl backend::TableBackend for Backend {
         Ok(quote::quote! {
             #[doc(hidden)]
             #vis struct #view #view_g #view_w {
-                #( #view_fs, )*
+                #( #field_vis #field_names: <#types as #rt::row::raw::Decode>::Borrowed<#row_lt>, )*
             }
 
             impl #view_i ::core::marker::Copy
@@ -170,7 +154,7 @@ impl backend::TableBackend for Backend {
                     reader: &mut #rt::row::raw::Reader<#row_lt>,
                 ) -> ::core::result::Result<Self::Borrowed<#row_lt>, #rt::Error> {
                     ::core::result::Result::Ok(#view {
-                        #( #loads )*
+                        #( #borrow_names: <#types as #rt::row::raw::Decode>::borrow(reader)?, )*
                     })
                 }
 

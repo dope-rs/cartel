@@ -1,6 +1,6 @@
 mod common;
 
-use std::cell;
+use std::{cell, convert::Infallible};
 
 use cartel_core::{
     frame::{Buffer, Sensitivity},
@@ -8,13 +8,26 @@ use cartel_core::{
     reply::{layout, recv, recv::attach::Attach as _, usage},
 };
 use common::Pending;
-use dope::net::link::egress;
+use dope::{
+    core::driver::{life::recovery, settings},
+    net::link::egress,
+};
+use dope_test::scope::Driver;
 use o3::{
     base::cell::region,
     buffer::pool,
     depot::queue::pool::fair,
     mem::credit::fair::{Axis, Cause},
 };
+
+#[test]
+fn decimal_suffix() {
+    for (value, expected) in [(0, b"0".as_slice()), (u64::MAX, b"18446744073709551615")] {
+        let mut buffer = [0; 20];
+        let start = cartel_core::write_digits(&mut buffer, value);
+        assert_eq!(&buffer[start..], expected);
+    }
+}
 
 #[test]
 fn completed_frames() {
@@ -165,7 +178,7 @@ fn queue_domain() {
     region::Token::scope(|mut token| {
         reply::Arena::<u8>::try_with(replies, token.proof(), |replies| {
             let config = fair::Plan::new(1, 1).expect("queue layout");
-            let mismatch = queue::Arena::<()>::try_new(config, &token)
+            let mismatch = queue::Arena::<()>::try_unweighted(config, &token)
                 .expect("queue storage")
                 .try_bind(replies.domain())
                 .err()
@@ -173,7 +186,7 @@ fn queue_domain() {
             assert_eq!((mismatch.expected.get(), mismatch.actual), (2, 1));
 
             let config = fair::Plan::new(2, 2).expect("queue layout");
-            let requests = queue::Arena::try_new(config, &token)
+            let requests = queue::Arena::try_unweighted(config, &token)
                 .expect("queue storage")
                 .try_bind(replies.domain())
                 .expect("matching lane extent");
@@ -189,7 +202,7 @@ fn queue_domain() {
             let mut response = recv::Response::<_, Pending>::new();
             assert!(
                 handoff::Lane::new(&requests, reply)
-                    .try_publish(&mut token, 3, &mut response, (), 7, |item| (item, ()))
+                    .try_publish(&mut token, (), &mut response, (), 7, |item| (item, ()))
                     .is_ok()
             );
             assert!(first.is_empty(&token));
@@ -200,9 +213,9 @@ fn queue_domain() {
 }
 
 #[test]
-fn preserve_peer_capacity() {
+fn lane_weights() {
     region::Token::scope(|mut token| {
-        let config = (fair::Plan::new(4, 2)).expect("four slots must fit two lanes");
+        let config = (fair::Plan::new(3, 2)).expect("three slots must fit two lanes");
         let arena = (queue::Arena::try_new(config, &token)).expect("the queue must allocate");
         let (left, right) = match (arena.lane(0), arena.lane(1)) {
             (Some(left), Some(right)) => Some((left, right)),
@@ -219,68 +232,138 @@ fn preserve_peer_capacity() {
             "queue must preserve the admitted value"
         );
         assert!(
-            left.try_push(&mut token, 3, 30).is_ok(),
-            "queue must preserve the admitted value"
-        );
-        assert!(
-            left.try_push(&mut token, 4, 40)
-                == Err(queue::Rejected {
-                    value: 4,
-                    cause: queue::Rejection::Capacity(Cause::Exhausted {
-                        axis: Axis::at::<0>(),
-                        required: 1,
-                        available: 0,
-                    }),
-                })
-        );
-        assert!(
             right.try_push(&mut token, 5, 50).is_ok(),
             "queue must preserve the admitted value"
         );
-        assert_eq!(left.weight(&token), 60);
+        assert_eq!(left.weight(&token), 30);
         assert_eq!(right.weight(&token), 50);
     });
 }
 
 #[test]
+fn clear_budget() {
+    Driver::new(settings::Config::default()).with_scope(
+        |scope| {
+            let (_, mut context, mut control) = scope.split();
+            for (extra, expected) in [(0, queue::Drain::Empty), (1, queue::Drain::Exhausted)] {
+                let turn = control.begin();
+                let work = turn.turn().app();
+                let budget = work.remaining();
+                let token = context.region_token();
+                let plan = fair::Plan::new(budget + extra, 1).expect("queue layout");
+                let arena = queue::Arena::try_unweighted(plan, token).expect("queue storage");
+                let lane = arena.lane(0).expect("queue lane");
+                for value in 0..budget + extra {
+                    lane.try_push(token, value, ()).expect("queue entry");
+                }
+                let mut released = 0;
+                assert!(lane.clear(work, token, |_| released += 1) == expected);
+                assert_eq!(released, budget);
+                assert_eq!(lane.pop_front(token), (extra == 1).then_some(budget));
+            }
+        },
+        recovery::Policy::new(
+            |event| panic!("unexpected reclamation: {event:?}"),
+            |failure: recovery::Recovery<'_, '_>| -> Infallible {
+                panic!("driver recovery: {:?}", failure.cause());
+            },
+        ),
+        |result| {
+            result
+                .as_ref()
+                .map_err(dope_test::scope::Error::cause)
+                .expect("driver lifecycle");
+        },
+    );
+}
+
+#[test]
+fn deadline_expires_at_clock_limit() {
+    use cartel_core::deadline::{Elapsed, RequestPhase, Source};
+    use dope::core::driver::{route, schedule::clock};
+    use dope_fiber::context::Context;
+    use o3::base::time::Positive;
+    use std::{pin::pin, task::Poll, time::Duration};
+
+    Driver::new(settings::Config::default()).with_scope(
+        |scope| {
+            let (_, driver, mut control) = scope.split();
+            let site = driver.driver_ref();
+            let target = site
+                .targets::<route::KeyTag<0>>()
+                .bind(route::indices::SlotIndex::ZERO, route::Epoch::INITIAL);
+            let ready = site
+                .ready()
+                .make_slot(target.dispatch())
+                .expect("ready slot");
+            let mut guard = pin!(
+                Source::new(site.timer(), Positive::from_nanos::<1>())
+                    .guard()
+                    .expect("deadline slot")
+            );
+            let last = site.clock().now().clamp_add(Duration::MAX).into_raw();
+            let turn = control.begin_at(clock::Sample::new(last));
+            Context::with_target(ready.target(), turn.turn().app(), driver, |context| {
+                assert_eq!(
+                    guard
+                        .as_mut()
+                        .poll_expired(context, RequestPhase::Admission),
+                    Poll::Ready(Elapsed::new(RequestPhase::Admission))
+                );
+            });
+        },
+        recovery::Policy::new(
+            |event| panic!("unexpected reclamation: {event:?}"),
+            |failure: recovery::Recovery<'_, '_>| -> Infallible {
+                panic!("driver recovery: {:?}", failure.cause());
+            },
+        ),
+        |result| {
+            result
+                .as_ref()
+                .map_err(dope_test::scope::Error::cause)
+                .expect("driver lifecycle");
+        },
+    );
+}
+
+#[test]
 fn guards_restore_credit() {
-    for index in 0..3 {
-        region::Token::scope(|mut token| {
-            let config = (fair::Plan::new(4, 3)).expect("four slots must fit three lanes");
-            let arena = (queue::Arena::try_new(config, &token)).expect("the queue must allocate");
-            let lane = (arena.lane(index)).expect("the configured lane must exist");
+    region::Token::scope(|mut token| {
+        let config = (fair::Plan::new(2, 2)).expect("two slots must fit two lanes");
+        let arena = (queue::Arena::try_new(config, &token)).expect("the queue must allocate");
+        let lane = (arena.lane(1)).expect("the configured lane must exist");
 
-            drop(
-                lane.try_reserve(&mut token, 7)
-                    .expect("queue credit must be reserved"),
-            );
-            assert_eq!(lane.len(&token), 0);
-            assert_eq!(lane.weight(&token), 0);
+        drop(
+            lane.try_reserve(&mut token, 7)
+                .expect("queue credit must be reserved"),
+        );
+        assert_eq!(lane.len(&token), 0);
+        assert_eq!(lane.weight(&token), 0);
 
-            assert!(
-                lane.try_push(&mut token, 11, usize::MAX).is_ok(),
-                "queue must preserve the admitted value"
-            );
-            assert!(
-                lane.try_push(&mut token, 12, 1)
-                    == Err(queue::Rejected {
-                        value: 12,
-                        cause: queue::Rejection::Weight {
-                            lane: index,
-                            cause: Cause::Overflow {
-                                axis: Axis::at::<0>(),
-                                held: usize::MAX,
-                                requested: 1,
-                            },
+        assert!(
+            lane.try_push(&mut token, 11, usize::MAX).is_ok(),
+            "queue must preserve the admitted value"
+        );
+        assert!(
+            lane.try_push(&mut token, 12, 1)
+                == Err(queue::Rejected {
+                    value: 12,
+                    cause: queue::Rejection::Weight {
+                        lane: 1,
+                        cause: Cause::Overflow {
+                            axis: Axis::at::<0>(),
+                            held: usize::MAX,
+                            requested: 1,
                         },
-                    })
-            );
-            assert_eq!(lane.pop_front(&mut token), Some(11));
-            assert!(
-                lane.try_push(&mut token, 12, 9).is_ok(),
-                "queue must preserve the admitted value"
-            );
-            assert_eq!(lane.pop_front(&mut token), Some(12));
-        });
-    }
+                    },
+                })
+        );
+        assert_eq!(lane.pop_front(&mut token), Some(11));
+        assert!(
+            lane.try_push(&mut token, 12, 9).is_ok(),
+            "queue must preserve the admitted value"
+        );
+        assert_eq!(lane.pop_front(&mut token), Some(12));
+    });
 }

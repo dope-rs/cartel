@@ -1,9 +1,40 @@
-use crate::common::external::user::User;
+use crate::common::{external::user::User, types::UserId};
 use cartel_gen::query_group;
 use cartel_pg::{
-    dsl::query::ops::Arrange as _, dsl::query::ops::Fetch as _, dsl::query::ops::Project as _,
-    dsl::query::ops::Reduce as _, dsl::query::ops::Set as _,
+    dsl::query::ops::Arrange as _,
+    dsl::query::ops::Fetch as _,
+    dsl::query::ops::Project as _,
+    dsl::query::ops::Reduce as _,
+    dsl::query::ops::Set as _,
+    protocol::{Reason, value::decode::RowReader},
+    schema::{Row, desc},
 };
+
+pub struct Reject;
+
+impl Reject {
+    pub const __CARTEL_RESULT_FORMAT_CODES: &'static [u16] = &[0];
+}
+
+impl desc::Validate for Reject {
+    const FORMAT: u16 = 0;
+
+    fn validate(types: &mut desc::Types<'_>) -> Result<(), cartel_pg::Error> {
+        <i64 as desc::Validate>::validate(types)
+    }
+}
+
+impl Row for Reject {
+    type View<'row> = Self;
+
+    fn decode<'row>(_: &mut RowReader<'row>) -> Result<Self, cartel_pg::Error> {
+        Err(cartel_pg::Error::Protocol(Reason::ColumnNull { column: 0 }))
+    }
+
+    fn decode_owned(reader: &mut RowReader<'_>) -> Result<Self, cartel_pg::Error> {
+        Self::decode(reader)
+    }
+}
 
 pub enum Aggregate {}
 
@@ -33,8 +64,15 @@ impl Aggregate {
         User::filter(|_u| true).max(|u| u.score)
     }
 
-    pub fn sum_doubled(min: i32) -> Option<i64> {
-        User::filter(|u| u.age >= min).sum(|u| u.age * 2)
+    pub fn sum_doubled(min: i32, limit: i64, offset: i64) -> Option<UserId> {
+        User::filter(|u| u.age >= min)
+            .limit(limit)
+            .offset(offset)
+            .sum(|u| u.age * 2)
+    }
+
+    pub fn reject_id(min: i64) -> Option<Reject> {
+        User::filter(|u| u.id >= min).min(|u| u.id)
     }
 
     pub fn row_numbers() -> Vec<(i64, i64)> {

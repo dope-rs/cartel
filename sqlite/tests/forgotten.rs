@@ -33,13 +33,11 @@ fn forgotten_app_retires() -> Result<(), plan::Error> {
             .for_profile::<Throughput>()
             .map_err(plan::Error::Claim)?
             .try_create(
+                (),
                 |worker| {
                     let mut cleanup = open::Completion::new();
                     let result = worker.install_with(|open, stage| {
-                        let config = stage.pinned().config();
-                        let bytes = config.result_bytes();
                         let root = open.install(stage, &mut cleanup);
-                        assert_eq!(config.result_bytes(), bytes);
                         forget::Forgotten {
                             root,
                             stage: expected,

@@ -1,7 +1,7 @@
 use crate::shape;
 use std::collections;
 
-use syn::{ext::IdentExt as _, spanned::Spanned as _};
+use syn::spanned::Spanned as _;
 
 use crate::ext::ExprExt as _;
 use crate::ext::PathExt as _;
@@ -10,7 +10,7 @@ use shape::join;
 impl shape::QuerySource {
     pub(crate) fn parse_chain(
         expr: &syn::Expr,
-        cte_map: &collections::HashMap<String, syn::Path>,
+        cte_map: &collections::BTreeMap<String, syn::Path>,
     ) -> syn::Result<(Self, Vec<syn::Ident>, syn::Expr)> {
         let expr = expr.unbrace();
 
@@ -28,7 +28,7 @@ impl shape::QuerySource {
                 ));
             }
             if let Some(id) = source.path.get_ident()
-                && let Some(table) = cte_map.get(&id.unraw().to_string())
+                && let Some(table) = cte_map.get(crate::ext::unraw(&id.to_string()))
             {
                 let dummy = syn::Ident::new("__cte", id.span());
                 let pred: syn::Expr = syn::parse_quote!(true);
@@ -48,7 +48,7 @@ impl shape::QuerySource {
         if let syn::Expr::Call(call) = expr {
             let (table, arg, pred) = Self::parse_call(call)?;
             let source = Self::new(table);
-            return Ok((source, vec![arg], pred));
+            return Ok((source, vec![arg.clone()], pred.clone()));
         }
         if let syn::Expr::MethodCall(mc) = expr
             && mc.method == "filter"
@@ -73,7 +73,7 @@ impl shape::QuerySource {
                     ));
                 }
                 if let Some(id) = source.path.get_ident()
-                    && let Some(table) = cte_map.get(&id.unraw().to_string())
+                    && let Some(table) = cte_map.get(crate::ext::unraw(&id.to_string()))
                 {
                     let (ids, body) = mc.args[0].closure_n(1, "filter")?;
                     return Ok((
@@ -154,7 +154,7 @@ impl shape::QuerySource {
 
     pub(crate) fn parse_call(
         call: &syn::ExprCall,
-    ) -> syn::Result<(syn::Path, syn::Ident, syn::Expr)> {
+    ) -> syn::Result<(syn::Path, &syn::Ident, &syn::Expr)> {
         let syn::Expr::Path(function) = call.func.as_ref() else {
             return Err(syn::Error::new(
                 call.func.span(),
@@ -201,7 +201,7 @@ impl shape::QuerySource {
 impl shape::Target {
     pub(super) fn parse_shape(
         expr: &syn::Expr,
-        cte_map: &collections::HashMap<String, syn::Path>,
+        cte_map: &collections::BTreeMap<String, syn::Path>,
     ) -> syn::Result<(Self, shape::QueryShape)> {
         let syn::Expr::MethodCall(mc) = expr else {
             return Err(syn::Error::new(
@@ -222,7 +222,7 @@ impl shape::Target {
             ));
         }
         let (arg, body) = mc.args[0].closure_one("on_conflict")?;
-        let cols = Self::parse_cols(&arg, &body)?;
+        let cols = Self::parse_cols(arg, body)?;
         let inner = shape::QueryShape::parse(mc.receiver.as_ref(), cte_map)?;
         Ok((Self { cols }, inner))
     }

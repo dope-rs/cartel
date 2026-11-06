@@ -42,16 +42,13 @@ impl<'a> Parts<'a> {
     /// `N` must equal the non-overflowing sum of every fragment length.
     pub const unsafe fn concat<const N: usize>(self) -> Text<N> {
         let mut bytes = [0u8; N];
-        let mut bi = 0;
+        let mut remaining: &mut [u8] = &mut bytes;
         let mut pi = 0;
         while pi < self.parts.len() {
             let part = self.parts[pi].as_bytes();
-            let mut i = 0;
-            while i < part.len() {
-                bytes[bi] = part[i];
-                bi += 1;
-                i += 1;
-            }
+            let (head, tail) = remaining.split_at_mut(part.len());
+            head.copy_from_slice(part);
+            remaining = tail;
             pi += 1;
         }
         Text::new(bytes)

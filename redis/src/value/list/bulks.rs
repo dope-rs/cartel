@@ -184,6 +184,10 @@ impl<'s, 'arena, 'credits, 'region> source::Optional for Optional<'s, 'arena, 'c
         self.0.len() == 0
     }
 
+    fn iter(&self) -> impl ExactSizeIterator<Item = Option<&[u8]>> {
+        self.0.stored.iter()
+    }
+
     fn try_array<const N: usize>(&self) -> Result<[Option<&[u8]>; N], reply::Decode<Self::Bytes>> {
         self.0
             .stored

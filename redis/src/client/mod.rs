@@ -7,7 +7,6 @@ use dope::core::{Errno, driver::result::SubmitCause};
 
 use o3::buffer::write::consume::scope;
 use o3::buffer::{hold, resident};
-use o3::depot::queue::indexed::shared;
 
 use crate::api::{
     self,
@@ -32,6 +31,7 @@ use parser::limit;
 use std::mem;
 
 pub mod conn;
+pub mod connect;
 pub mod dispatch;
 mod logic;
 mod node;
@@ -42,6 +42,7 @@ pub mod settings;
 
 use conn::acquire;
 pub use logic::Logic;
+pub(crate) use logic::Root;
 pub use node::Node;
 
 pub(super) const CONNECTOR_CONNECTION_LIMIT: usize = u32::MAX as usize;
@@ -51,7 +52,6 @@ type ReplyError<'b, 'c, 'd, const ID: u8 = 0> =
 
 pub(crate) enum Failure<'d> {
     Input(scope::Error),
-    ParserWait(shared::Bounds),
     Closed(close::Reason),
     Receive(Errno),
     Transmit(Transmit),
@@ -101,7 +101,6 @@ impl<'d> Failure<'d> {
             Self::Timeout(kind) => close::Reason::Timeout(*kind),
             Self::RequestTimeout(_) => close::Reason::Timeout(deadline::Kind::Inbound),
             Self::Input(_)
-            | Self::ParserWait(_)
             | Self::Protocol(_)
             | Self::Handshake(_)
             | Self::UnexpectedResponse
@@ -139,7 +138,6 @@ impl<'d> Failure<'d> {
             },
             Self::Request(request::Error::Entries { .. }) => close::Policy::Reconnect,
             Self::Input(_)
-            | Self::ParserWait(_)
             | Self::Protocol(_)
             | Self::Handshake(_)
             | Self::UnexpectedResponse
@@ -172,7 +170,6 @@ impl<'d> Failure<'d> {
     pub(crate) fn into_error<const ID: u8>(self) -> crate::Error<'d, ID> {
         match self {
             Self::Input(cause) => crate::Error::Input(cause),
-            Self::ParserWait(cause) => crate::Error::ParserWait(cause),
             Self::Closed(reason) => crate::Error::Closed(reason),
             Self::Receive(error) => crate::Error::Receive(error),
             Self::Transmit(error) => crate::Error::Transmit(error),
@@ -209,7 +206,6 @@ impl<'d> From<&Failure<'d>> for Failure<'d> {
     fn from(cause: &Failure<'d>) -> Self {
         match cause {
             Self::Input(error) => Self::Input(*error),
-            Self::ParserWait(error) => Self::ParserWait(*error),
             Self::Closed(reason) => Self::Closed(*reason),
             Self::Receive(error) => Self::Receive(*error),
             Self::Transmit(error) => Self::Transmit(*error),

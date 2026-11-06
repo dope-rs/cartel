@@ -18,6 +18,7 @@ fn count32(value: usize) -> Result<i32, encode::Error> {
     }
 }
 
+#[inline]
 fn write_with_len(out: &mut encode::Writer<'_>, payload: &[u8]) -> Result<(), encode::Error> {
     out.write_slices([&wire_length(payload.len())?.to_be_bytes(), payload])
 }
@@ -102,13 +103,12 @@ impl<'a, 'out> BindWriter<'a, 'out> {
         write: impl FnOnce(&mut encode::Writer<'_>) -> Result<(), encode::Error>,
     ) -> Result<(), encode::Error> {
         self.check(oid, format)?;
-        let result = write(self.out);
-        if result.is_ok() {
-            self.index += 1;
-        }
-        result
+        write(self.out)?;
+        self.index += 1;
+        Ok(())
     }
 
+    #[inline]
     fn check(&self, oid: u32, format: u16) -> Result<(), encode::Error> {
         let index = self.index;
         let Some(expected) = self.oids.get(index).copied() else {
@@ -158,31 +158,37 @@ impl<'a, 'out> BindWriter<'a, 'out> {
 pub struct Scalar<'a, 'values, 'out>(&'a mut BindWriter<'values, 'out>);
 
 impl Scalar<'_, '_, '_> {
+    #[inline]
     pub fn write_bool(&mut self, value: bool) -> Result<(), encode::Error> {
         self.0
             .write(16, 1, |out| write_with_len(out, &[value as u8]))
     }
 
+    #[inline]
     pub fn write_i16(&mut self, value: i16) -> Result<(), encode::Error> {
         self.0
             .write(21, 1, |out| write_with_len(out, &value.to_be_bytes()))
     }
 
+    #[inline]
     pub fn write_i32(&mut self, value: i32) -> Result<(), encode::Error> {
         self.0
             .write(23, 1, |out| write_with_len(out, &value.to_be_bytes()))
     }
 
+    #[inline]
     pub fn write_i64(&mut self, value: i64) -> Result<(), encode::Error> {
         self.0
             .write(20, 1, |out| write_with_len(out, &value.to_be_bytes()))
     }
 
+    #[inline]
     pub fn write_f32(&mut self, value: f32) -> Result<(), encode::Error> {
         self.0
             .write(700, 1, |out| write_with_len(out, &value.to_be_bytes()))
     }
 
+    #[inline]
     pub fn write_f64(&mut self, value: f64) -> Result<(), encode::Error> {
         self.0
             .write(701, 1, |out| write_with_len(out, &value.to_be_bytes()))
@@ -193,11 +199,13 @@ impl Scalar<'_, '_, '_> {
 pub struct Data<'a, 'values, 'out>(&'a mut BindWriter<'values, 'out>);
 
 impl Data<'_, '_, '_> {
+    #[inline]
     pub fn write_text(&mut self, value: &str) -> Result<(), encode::Error> {
         self.0
             .write(25, 1, |out| write_with_len(out, value.as_bytes()))
     }
 
+    #[inline]
     pub fn write_ltree(&mut self, value: &str) -> Result<(), encode::Error> {
         self.0
             .write(25, 0, |out| write_with_len(out, value.as_bytes()))
@@ -210,19 +218,23 @@ impl Data<'_, '_, '_> {
         })
     }
 
+    #[inline]
     pub fn write_bytes(&mut self, value: &[u8]) -> Result<(), encode::Error> {
         self.0.write(17, 1, |out| write_with_len(out, value))
     }
 
+    #[inline]
     pub fn write_uuid(&mut self, value: [u8; 16]) -> Result<(), encode::Error> {
         self.0.write(2950, 1, |out| write_with_len(out, &value))
     }
 
+    #[inline]
     pub fn write_time(&mut self, value: crate::Timestamp) -> Result<(), encode::Error> {
         self.0
             .write(1114, 1, |out| write_with_len(out, &value.0.to_be_bytes()))
     }
 
+    #[inline]
     pub fn write_date(&mut self, value: crate::Date) -> Result<(), encode::Error> {
         self.0
             .write(1082, 1, |out| write_with_len(out, &value.0.to_be_bytes()))

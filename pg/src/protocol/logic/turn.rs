@@ -1,11 +1,11 @@
-use cartel_core::{memory, reply::order};
+use cartel_core::reply::order;
 use dope::{
     core::driver::{self, route},
     manifold::client::{
         self, conn,
         session::{Input, response::Delivery, turns},
     },
-    net::link::egress::{self, data},
+    net::link::egress,
 };
 use o3::{
     base::cell::region,
@@ -14,14 +14,9 @@ use o3::{
 
 use crate::{
     api::sql,
-    port::{
-        self,
-        pool::{control, key},
-        replies,
-        requests::Frame,
-    },
+    port::{self, pool::key, replies, requests::Frame},
     protocol::{
-        Reason, Wire, frame,
+        Reason, Wire, encode, frame,
         logic::{Pending, State, failure, payloads, ready, state},
         messages,
         runtime::tx::poll,
@@ -91,7 +86,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
     }
 
     pub(super) fn connect(mut self) {
-        let frame = self.port.request().encode(|frame| {
+        let frame = self.port.request().control(|frame| {
             frame.startup(
                 self.port.shared.database.user(),
                 self.port.shared.database.database(),
@@ -140,16 +135,15 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 Self::drive_scram(self.port, &self.sink, self.driver.region_token(), scram)?
             }
             state::Phase::Ready => {
-                let sync: data::Inline<16> = [messages::Fe::SYNC, 0, 0, 0, 4].into();
-                let result = egress::NonEmpty::try_new(Frame::from(sync))
-                    .map_err(crate::Error::RequestLoad)
-                    .and_then(|frame| {
-                        self.port.request().try_flush(
-                            self.conn,
-                            self.driver.region_token(),
-                            |region| Self::enqueue(&self.sink, region, frame),
-                        )
-                    });
+                let result = self.port.request().try_flush(
+                    self.conn,
+                    self.driver.region_token(),
+                    |region| {
+                        let frame = egress::NonEmpty::try_new(Frame::from(encode::SYNC.as_slice()))
+                            .map_err(crate::Error::RequestLoad)?;
+                        Self::enqueue(&self.sink, region, frame)
+                    },
+                );
                 if let Err(error) = result {
                     self.port
                         .connection()
@@ -235,7 +229,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             | state::Phase::AwaitingReady
             | state::Phase::Sasl { .. }
             | state::Phase::Preparing { .. } => {
-                let (server, class) = match plan.try_build(memory::RETENTION) {
+                let (server, class) = match plan.try_build() {
                     Ok(built) => built,
                     Err(error) => {
                         failure::Failure::new(
@@ -296,7 +290,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                         let mode = set.pick()?;
                         let scram = scram::Scram::new(&self.port.shared.scram, self.conn)?;
                         let first = scram.client_first();
-                        let frame = self.port.request().encode(|frame| {
+                        let frame = self.port.request().control(|frame| {
                             frame.sasl_first(mode.as_str(), |frame| first.write_to(frame))
                         })?;
                         Self::enqueue(&self.sink, self.driver.region_token(), frame.into_frame())?;
@@ -377,31 +371,27 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         region: &mut region::Token<region::Identity<'d>>,
         scram: &mut scram::Scram<'life, 'd, ID>,
     ) -> Result<(), crate::Error> {
-        use scram::kdf::Drive;
-
         let Some(derive) = scram.deriving() else {
             return Ok(());
         };
-        let drive = scram.ticket.poll(
-            derive.key(),
-            port.shared.database.password().as_bytes(),
-            region,
-        );
-        let (keys, wake) = match drive {
-            Drive::Waiting => return Ok(()),
-            Drive::Running(wake) => {
-                port.connection().wake(wake);
-                return Ok(());
-            }
-            Drive::Ready { keys, wake } => (keys, wake),
+        let Some((frame, sig)) = scram
+            .ticket
+            .poll(
+                derive.key(),
+                port.shared.database.password().as_bytes(),
+                region,
+                |wake| port.connection().wake(wake),
+                |keys| {
+                    port.request()
+                        .secret(|frame| frame.sasl_final(|frame| derive.write_final(keys, frame)))
+                },
+            )
+            .transpose()?
+        else {
+            return Ok(());
         };
-        if let Some(wake) = wake {
-            port.connection().wake(wake);
-        }
-        let (frame, sig) = port
-            .request()
-            .secret(|frame| frame.sasl_final(|frame| derive.write_final(keys, frame)))?;
-        scram.await_final(sig);
+        scram.await_final(&sig);
+        drop(sig);
         Self::enqueue(sink, region, frame.into_frame())
     }
 
@@ -451,10 +441,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             }
             (Prepare::QueryResult { cursor, registry }, messages::Be::NO_DATA) => {
                 let query = cursor.metadata();
-                if matches!(query.result, result::Kind::Rows)
-                    || query.result_columns != 0
-                    || !data.is_empty()
-                {
+                if matches!(query.result, result::Kind::Rows) || !data.is_empty() {
                     return Err(crate::Error::Protocol(Reason::NoDataMismatch));
                 }
                 Prepare::resume(cursor.next(), registry)
@@ -469,15 +456,10 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 if depth != order::Depth::ZERO {
                     return Err(crate::Error::Protocol(Reason::PrepareRetained));
                 }
-                match self
-                    .port
+                self.port
                     .connection()
-                    .try_ready(self.conn, depth)
-                    .map_err(crate::Error::Protocol)?
-                {
-                    control::Ready::Complete => self.port.shared.signals.clear_open(),
-                    control::Ready::Pending => {}
-                }
+                    .try_ready(self.conn)
+                    .map_err(crate::Error::Protocol)?;
                 self.state.phase = state::Phase::Ready;
                 return Ok(());
             }

@@ -7,11 +7,20 @@ use dope_runtime::topology;
 use dope_test::fibers;
 use dope_test::harness::support::file::Directory;
 use libsqlite3_sys::SQLITE_CONSTRAINT_FOREIGNKEY;
-use std::{env, sync::OnceLock};
+use std::env;
 
 pub mod common;
 
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
+#[test]
+fn foreign_key_contracts() -> Result<(), plan::Error> {
+    // SAFETY: this binary has one test; installation precedes every SQLite call.
+    // Only Cartel uses installed SQLite; Core handles and allocations remain
+    // exclusively owned by their originating worker until release.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
+    orphans_are_rejected(runtime)?;
+    enforce_foreign_keys(runtime)
+}
 
 fn assert_relations(db: database::Target<'_>) -> Result<(), plan::Error> {
     let result = plan::Plan::<Relations>::try_new(db, try_limits()?, try_memory()?)?.try_run(
@@ -57,16 +66,8 @@ fn assert_relations(db: database::Target<'_>) -> Result<(), plan::Error> {
     result.expect("foreign key scope failed")
 }
 
-#[test]
-fn orphans_are_rejected() -> Result<(), plan::Error> {
+fn orphans_are_rejected(runtime: Runtime) -> Result<(), plan::Error> {
     let base = env::temp_dir();
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
     let target = OpenOptions::new()
         .open_memory(runtime)
         .map_err(plan::Error::Client)?
@@ -116,16 +117,8 @@ fn orphans_are_rejected() -> Result<(), plan::Error> {
     result.expect("reopened foreign key scope failed")
 }
 
-#[test]
-fn enforce_foreign_keys() -> Result<(), plan::Error> {
+fn enforce_foreign_keys(runtime: Runtime) -> Result<(), plan::Error> {
     let base = env::temp_dir();
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
     let dir = Directory::try_with(&base, "cartel-sqlite-foreign-commands", |removed| {
         removed.expect("temporary directory cleanup")
     })

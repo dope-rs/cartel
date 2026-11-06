@@ -1,6 +1,5 @@
 use crate::api::{Client, decode};
 use crate::client::nonempty;
-use crate::request::encode;
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
@@ -30,13 +29,8 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Lists<C, ID> {
     }
 
     pub fn range(self, key: &[u8], start: i64, stop: i64) -> C::Call<decode::Bulks> {
-        self.0.encode::<decode::Bulks>(move |out| {
-            let mut head = [0; 21];
-            let start = encode::format_int_into(&mut head, start);
-            let mut tail = [0; 21];
-            let stop = encode::format_int_into(&mut tail, stop);
-            out.command(&[b"LRANGE", key, start, stop])
-        })
+        self.0
+            .encode::<decode::Bulks>(move |out| out.range(b"LRANGE", &[], key, start, stop))
     }
 
     pub fn len(self, key: &[u8]) -> C::Call<u64> {

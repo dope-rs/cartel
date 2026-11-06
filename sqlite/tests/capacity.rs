@@ -4,21 +4,23 @@ use cartel_sqlite::{Error, OpenOptions, Statement};
 use common::engine::capacity::*;
 use dope_core::driver::life::recovery::Policy;
 use dope_test::fibers;
-use std::sync::OnceLock;
 
 pub mod common;
 
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
-
 #[test]
-fn collect_row_limit() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn capacity_contracts() -> Result<(), plan::Error> {
+    // SAFETY: this binary has one test; installation precedes every SQLite call.
+    // Only Cartel uses installed SQLite; Core handles and allocations remain
+    // exclusively owned by their originating worker until release.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
+    collect_row_limit(runtime)?;
+    collect_text_storage(runtime)?;
+    scan_row_limit(runtime)?;
+    parameter_limits(runtime)
+}
+
+fn collect_row_limit(runtime: Runtime) -> Result<(), plan::Error> {
     let (limits, memory) = try_settings(4 << 10, 3, 1 << 10, 2, 4 << 10, 100)?;
     assert!(
         matches!(
@@ -48,15 +50,7 @@ fn collect_row_limit() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn collect_text_storage() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn collect_text_storage(runtime: Runtime) -> Result<(), plan::Error> {
     let (limits, memory) = try_settings(4 << 10, 3, 1_023, 3, 1_023, 100)?;
     assert!(
         matches!(
@@ -86,15 +80,7 @@ fn collect_text_storage() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn scan_row_limit() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn scan_row_limit(runtime: Runtime) -> Result<(), plan::Error> {
     let (limits, memory) = try_settings(4 << 10, 2, 1 << 10, 2, 4 << 10, 100)?;
     assert!(
         matches!(
@@ -125,15 +111,7 @@ fn scan_row_limit() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn parameter_limits() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn parameter_limits(runtime: Runtime) -> Result<(), plan::Error> {
     let (mut limits, memory) = try_settings(64, 2, 1 << 10, 2, 4 << 10, 100)?;
     limits.parameters.items = 2;
     assert!(

@@ -1,5 +1,5 @@
 use crate::api::{batches, exec, stmt, work};
-use crate::retry::lease::Ref;
+use crate::retry;
 use crate::runtime::slot::{Held, lease};
 use crate::{catalogs, sys};
 use dope_core::driver::schedule::clock;
@@ -9,7 +9,7 @@ use stmt::{access::Access, target::Target};
 use work::cleanup;
 
 #[repr(transparent)]
-pub(crate) struct Ready<'slot, 'd: 'slot, I: catalogs::Catalog> {
+pub(crate) struct Ready<'slot, 'd: 'slot, I: catalogs::Catalog = catalogs::Empty> {
     pub(super) held: Held<Fields<'slot, I>, lease::Lease<'slot, 'd, I, lease::Ready>>,
 }
 
@@ -25,7 +25,7 @@ pub(super) struct Fields<'slot, I: catalogs::Catalog> {
 }
 
 impl<'slot, 'd: 'slot, I: catalogs::Catalog> Ready<'slot, 'd, I> {
-    pub(crate) fn query<'a>(&'a mut self, txn: exec::Tx<'a>) -> exec::Query<'a, 'slot, 'd, I> {
+    pub(crate) fn query_in<'a>(&'a mut self, txn: exec::Tx<'a>) -> exec::Query<'a, 'slot, 'd, I> {
         let (start, arena) = self.start(txn);
         exec::Query::new(start, arena)
     }
@@ -61,7 +61,7 @@ impl<'slot, 'd: 'slot, I: catalogs::Catalog> Ready<'slot, 'd, I> {
         self.work().pending.status()
     }
 
-    pub(crate) const fn retry_ref(&self) -> Ref<'_, 'd> {
+    pub(crate) const fn retry_ref(&self) -> &retry::Slot<'d> {
         self.held.lease.cleanup_ref()
     }
 
@@ -81,7 +81,7 @@ impl<'slot, 'd: 'slot, I: catalogs::Catalog> Ready<'slot, 'd, I> {
         self.work().pending.transaction();
     }
 
-    pub(crate) fn transaction(&self) -> sys::Tx {
+    pub(crate) fn tx(&self) -> sys::Tx {
         self.held.value.engine.transaction()
     }
 }

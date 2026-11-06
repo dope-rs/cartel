@@ -4,7 +4,7 @@ use crate::{
 };
 use dope::core::driver::route;
 use dope::manifold::client::attempt;
-use dope::net::link::{event, pool::change::opening};
+use dope::net::link::pool::change::opening;
 use std::cell;
 
 pub(super) enum Failure<'d, const ID: u8> {
@@ -28,6 +28,9 @@ impl<'d, const ID: u8> Signals<'d, ID> {
     /// storage. Neither operation calls application code, wakes a waiter, or
     /// destroys the original diagnostic before it is restored.
     pub(crate) fn failure(&self) -> Option<reply::Error<'d, ID>> {
+        if !self.is_failed() {
+            return None;
+        }
         let cause = self.cause.take();
         let failure = match cause.as_ref() {
             Some(Failure::Driver(error)) => Some(reply::Error::Driver(*error)),
@@ -42,7 +45,7 @@ impl<'d, const ID: u8> Signals<'d, ID> {
         failure
     }
 
-    pub(in crate::protocol) fn clear_open(&self) {
+    pub(crate) fn clear_open(&self) {
         let cause = self.cause.take();
         if matches!(cause, Some(Failure::Open(_))) {
             self.failed.set(false);
@@ -51,7 +54,7 @@ impl<'d, const ID: u8> Signals<'d, ID> {
         }
     }
 
-    pub(in crate::protocol) fn record_fatal(&self, error: crate::Error) {
+    pub(crate) fn record_fatal(&self, error: crate::Error) {
         self.record_cause(Failure::Driver(error));
     }
 
@@ -82,7 +85,7 @@ impl<'d, const ID: u8> Signals<'d, ID> {
     pub(in crate::protocol) fn failed(
         &self,
         key: attempt::Id<'d, route::KeyTag<ID>>,
-        cause: event::ConnectFault,
+        cause: attempt::ConnectFault,
     ) {
         self.record_cause(Failure::Open(reply::Open::Transport { key, cause }));
     }

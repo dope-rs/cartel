@@ -4,21 +4,15 @@ use cartel_sqlite::runtime::{self, Runtime};
 use common::{query::relation::*, schema};
 use dope_core::driver::life::recovery::Policy;
 use dope_test::fibers;
-use std::sync::OnceLock;
 
 pub mod common;
 
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
-
 #[test]
 fn joins() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+    // SAFETY: this binary has one test; only Cartel uses installed SQLite.
+    // Core handles and allocations remain exclusively owned by their originating worker.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -57,19 +51,14 @@ fn joins() -> Result<(), plan::Error> {
             Policy::new(assert_reclaimed, assert_retirement),
             |result| result.expect("SQLite scope"),
         );
-        result.expect("SQLite integration scope")
+        result.expect("SQLite integration scope")?;
     }
+    set_ops(runtime)?;
+    ctes(runtime)?;
+    subqueries(runtime)
 }
 
-#[test]
-fn set_ops() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn set_ops(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -109,15 +98,7 @@ fn set_ops() -> Result<(), plan::Error> {
     }
 }
 
-#[test]
-fn ctes() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn ctes(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -135,10 +116,7 @@ fn ctes() -> Result<(), plan::Error> {
                         ::core::assert_eq!(ids, vec![1, 2, 5]);
 
                         let r = cte_union(&mut conn, 22).await?;
-                        let ids: Vec<i64> = r.iter().map(|u| u.id).collect();
-                        ::core::assert!(ids.contains(&2));
-                        ::core::assert!(ids.contains(&4));
-                        ::core::assert!(ids.contains(&5));
+                        ::core::assert!(r.iter().map(|u| u.id).eq([1, 2, 4, 5]));
 
                                 Ok::<(), cartel_sqlite::Error>(())
                             }),
@@ -153,15 +131,7 @@ fn ctes() -> Result<(), plan::Error> {
     }
 }
 
-#[test]
-fn subqueries() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn subqueries(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -180,7 +150,10 @@ fn subqueries() -> Result<(), plan::Error> {
         ::core::assert_eq!(ids, vec![4, 5]);
 
         let counts = user_post_counts(&mut conn).await?;
-        ::core::assert_eq!(counts.as_slice(), &[(1, 2), (2, 1), (3, 1), (4, 0), (5, 0)]);
+        ::core::assert_eq!(
+            counts.as_slice(),
+            &[(1, 2, Some(11)), (2, 1, Some(12)), (3, 1, Some(13)), (4, 0, None), (5, 0, None)]
+        );
 
                 Ok::<(), cartel_sqlite::Error>(())
             })).map_err(plan::Error::Run)?.map_err(plan::Error::Call)

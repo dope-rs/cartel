@@ -14,23 +14,14 @@ use crate::{
     init,
     port::schedule::Ready,
     protocol::{self, parser},
-    request::encode::write::init::Writer,
     value,
     value::source::Reader as _,
 };
 
-pub(in crate::client) struct Init {
-    plan: Plan,
-}
-
 type Turn<'a, 'e, 'd, const ID: u8> =
     turns::Parts<'a, 'e, 'd, protocol::ConnState, Buffer, route::KeyTag<ID>>;
 
-impl Init {
-    pub(in crate::client) const fn new(plan: Plan) -> Self {
-        Self { plan }
-    }
-
+impl Plan {
     fn send<'e, 's, 'b, 'c, 'd, const ID: u8>(
         &self,
         port: &crate::Port<'s, '_, 'b, 'c, 'd, ID>,
@@ -40,14 +31,14 @@ impl Init {
         let frame = port
             .encode(|out| match command {
                 Command::Authenticate(auth) => match auth {
-                    Auth::Password(pass) => Writer::new(out).auth(pass),
+                    Auth::Password(pass) => out.auth(pass),
                     Auth::User {
                         username: user,
                         password: pass,
-                    } => Writer::new(out).auth_user(user, pass),
+                    } => out.auth_user(user, pass),
                 },
-                Command::Select(database) => Writer::new(out).select(database),
-                Command::Name(name) => Writer::new(out).set_name(name),
+                Command::Select(database) => out.select(database),
+                Command::Name(name) => out.set_name(name),
             })
             .map_err(client::Failure::Request)?;
         match turn
@@ -132,7 +123,7 @@ impl Init {
             Self::fail(port, client::Failure::Handshake(cause), &mut turn);
             return;
         }
-        match self.plan.next(step) {
+        match self.next(step) {
             Some(next) => self.begin(port, next, &mut turn),
             None => Self::ready(port, &mut turn),
         }
@@ -151,11 +142,9 @@ impl Init {
             driver: ctx.driver,
             close: ctx.close,
         };
-        match self.plan.first() {
+        match self.first() {
             Some(command) => self.begin(port, command, &mut turn),
             None => Self::ready(port, &mut turn),
         }
     }
 }
-
-const _: () = assert!(std::mem::size_of::<Init>() == std::mem::size_of::<Plan>());

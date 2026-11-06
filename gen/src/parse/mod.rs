@@ -14,7 +14,7 @@ pub(super) mod sources;
 impl shape::QueryShape {
     pub(crate) fn parse(
         expr: &syn::Expr,
-        cte_map: &collections::HashMap<String, syn::Path>,
+        cte_map: &collections::BTreeMap<String, syn::Path>,
     ) -> syn::Result<Self> {
         use mutation::{Delete, From, Input, Insert, Mutation, Query, Update, Values};
 
@@ -60,7 +60,10 @@ impl shape::QueryShape {
                 }
                 let (set_arg, set_body) = top.args[0].closure_one("do_update")?;
                 let (target, inner) = shape::Target::parse_shape(top.receiver.as_ref(), cte_map)?;
-                let upd = shape::Update { set_arg, set_body };
+                let upd = shape::Update {
+                    set_arg: set_arg.clone(),
+                    set_body: set_body.clone(),
+                };
                 return inner.conflict(
                     shape::Conflict::TargetDoUpdate(target, upd),
                     top.method.span(),
@@ -105,8 +108,8 @@ impl shape::QueryShape {
                 let (arg, body) = args[0].closure_one(method)?;
                 let values = Values {
                     table,
-                    arg,
-                    body: Box::new(body),
+                    arg: arg.clone(),
+                    body: Box::new(body.clone()),
                 };
                 let input = if each {
                     Input::Each(values)
@@ -329,9 +332,9 @@ impl shape::QueryShape {
             let (source, ids, pred) = shape::QuerySource::parse_chain(peeled, cte_map)?;
             let n = 1 + source.joins.len();
             let (idents, body) = mc.args[0].closure_n(n, "select")?;
-            let elems = match &body {
-                syn::Expr::Tuple(t) => t.elems.iter().cloned().collect::<Vec<_>>(),
-                single => vec![single.clone()],
+            let elems = match body {
+                syn::Expr::Tuple(t) => t.elems.into_iter().collect(),
+                single => vec![single],
             };
             return Ok(Self::Select {
                 source,

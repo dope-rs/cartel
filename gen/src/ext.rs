@@ -1,5 +1,18 @@
 use syn::{ext::IdentExt as _, spanned::Spanned as _};
 
+pub(super) fn unraw(name: &str) -> &str {
+    name.strip_prefix("r#").unwrap_or(name)
+}
+
+pub(super) fn name(ident: &syn::Ident) -> String {
+    let mut name = ident.to_string();
+    let prefix = name.len() - unraw(&name).len();
+    if prefix != 0 {
+        name.replace_range(..prefix, "");
+    }
+    name
+}
+
 pub(super) trait PathExt {
     fn without_last(&self) -> syn::Result<syn::Path>;
 }
@@ -25,7 +38,7 @@ pub(super) trait ExprExt {
     fn closure<'a>(&'a self, arity: Option<usize>, method: &str) -> syn::Result<Closure<'a>>;
     fn closure_n(&self, n: usize, method: &str) -> syn::Result<(Vec<syn::Ident>, syn::Expr)>;
     fn closure_args(&self, method: &str) -> syn::Result<(Vec<syn::Ident>, syn::Expr)>;
-    fn closure_one(&self, method: &str) -> syn::Result<(syn::Ident, syn::Expr)>;
+    fn closure_one(&self, method: &str) -> syn::Result<(&syn::Ident, &syn::Expr)>;
     fn closure_same(&self, names: &[syn::Ident], method: &str) -> syn::Result<syn::Expr>;
 }
 
@@ -63,7 +76,7 @@ impl ExprExt for syn::Expr {
         let syn::Member::Named(col) = &field.member else {
             return None;
         };
-        Some(col.unraw().to_string())
+        Some(name(col))
     }
 
     fn is_true(&self) -> bool {
@@ -156,7 +169,7 @@ impl ExprExt for syn::Expr {
         closure.parts()
     }
 
-    fn closure_one(&self, method: &str) -> syn::Result<(syn::Ident, syn::Expr)> {
+    fn closure_one(&self, method: &str) -> syn::Result<(&syn::Ident, &syn::Expr)> {
         let closure = self.closure(None, method)?;
         let mut inputs = closure.0.inputs.iter();
         let (Some(input), None) = (inputs.next(), inputs.next()) else {
@@ -165,7 +178,7 @@ impl ExprExt for syn::Expr {
                 format!("`{method}` closure must take exactly 1 parameter(s)"),
             ));
         };
-        Ok((input.ident()?.clone(), closure.0.body.unbrace().clone()))
+        Ok((input.ident()?, closure.0.body.unbrace()))
     }
 
     fn closure_same(&self, names: &[syn::Ident], method: &str) -> syn::Result<syn::Expr> {
@@ -276,13 +289,28 @@ pub(super) trait SqlIdent {
 
 impl SqlIdent for str {
     fn quoted(&self) -> String {
-        if self.contains('.') {
-            return self
-                .split('.')
-                .map(str::quoted)
-                .collect::<Vec<_>>()
-                .join(".");
+        let extra: usize = self
+            .bytes()
+            .map(|byte| match byte {
+                b'"' => 1,
+                b'.' => 2,
+                _ => 0,
+            })
+            .sum();
+        let mut quoted = String::with_capacity(self.len() + extra + 2);
+        quoted.push('"');
+        let mut start = 0;
+        for (end, byte) in self
+            .bytes()
+            .enumerate()
+            .filter(|(_, byte)| matches!(*byte, b'"' | b'.'))
+        {
+            quoted.push_str(&self[start..end]);
+            quoted.push_str(if byte == b'.' { "\".\"" } else { "\"\"" });
+            start = end + 1;
         }
-        format!("\"{}\"", self.replace('"', "\"\""))
+        quoted.push_str(&self[start..]);
+        quoted.push('"');
+        quoted
     }
 }

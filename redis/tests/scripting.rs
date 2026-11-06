@@ -1,11 +1,16 @@
 use cartel_redis::api::Client as _;
-use cartel_redis::value::source::{Reader as _, Reply as _};
+use cartel_redis::value::source::{Bytes as _, Reader as _, Reply as _};
 use dope::core::driver::life::recovery;
 use dope::runtime::executor::session::Completion;
 use std::{iter, num::NonZero, time::Duration};
 
 use cartel_redis::{
-    client::{ops::scripts::Invocation as _, settings::init::Plan},
+    client::{
+        GeoCoord,
+        nonempty::Slice,
+        ops::scripts::{self, Invocation as _},
+        settings::init::Plan,
+    },
     request, value,
 };
 use common::{
@@ -44,13 +49,18 @@ fn eval_owned() {
             socket
                 .write_all(b"-ERR retained\r\n")
                 .expect("raw error response");
+            for reply in PAIR_REPLIES {
+                socket.read_exact(&mut got).expect("pair EVAL request");
+                assert_eq!(got, EXPECTED);
+                socket.write_all(reply).expect("pair response");
+            }
         },
         |server| {
             let addr = server.addr();
 
             {
                 let prepared = topology::try_new::<Env>(
-                    try_config().expect("test configuration"),
+                    common::command::list::try_config(2).expect("test configuration"),
                     addr,
                     Plan::new(),
                 )
@@ -94,6 +104,47 @@ fn eval_owned() {
                                         Some(value::Event::Error(b"ERR retained"))
                                     ));
                                     assert!(reader.finish().is_ok());
+                                    drop(reply);
+                                    let (first, second) = runtime
+                                        .block_on(redis.scripts().eval::<(
+                                            value::Bytes<'_, '_, '_>,
+                                            value::Bytes<'_, '_, '_>,
+                                        ), _, _>(b"return 17", &keys, &args))
+                                        .expect("pair decoder completed")
+                                        .ok()
+                                        .expect("two retained bulk owners");
+                                    assert!(matches!(
+                                        runtime.block_on(redis.scripts().eval::<GeoCoord, _, _>(
+                                            b"return 17", &keys, &args
+                                        )),
+                                        Ok(Ok(value)) if value.longitude == 1.25 && value.latitude == -2.0
+                                    ));
+                                    assert!(matches!(
+                                        runtime.block_on(redis.scripts().eval::<(
+                                            value::Bytes<'_, '_, '_>,
+                                            value::Bytes<'_, '_, '_>,
+                                        ), _, _>(b"return 17", &keys, &args)),
+                                        Ok(Err(value::reply::Failure::Decode(
+                                            value::reply::Decode::Expected {
+                                                expected: value::reply::Expectation::Bulk,
+                                                actual: value::reply::Actual::Array { len: 3 },
+                                            }
+                                        )))
+                                    ));
+                                    assert_eq!(&*first, b"first");
+                                    drop(first);
+                                    assert!(matches!(
+                                        runtime.block_on(redis.scripts().eval::<GeoCoord, _, _>(
+                                            b"return 17", &keys, &args
+                                        )),
+                                        Ok(Err(value::reply::Failure::Decode(
+                                            value::reply::Decode::Expected {
+                                                expected: value::reply::Expectation::Float,
+                                                actual: value::reply::Actual::Array { len: 3 },
+                                            }
+                                        )))
+                                    ));
+                                    assert_eq!(&*second, b"second");
                                 })
                             })
                         })
@@ -111,6 +162,19 @@ fn eval_owned() {
 
 #[test]
 fn request_failure_recycles() {
+    let unread = iter::repeat_with(|| panic!("length iterator advanced"));
+    for (keys, arguments, expected) in PREFIX_ERRORS {
+        assert_eq!(
+            scripts::wire_len(b"", keys, unread.clone(), arguments, unread.clone()),
+            Err(expected)
+        );
+    }
+    for (count, lengths, expected) in KEY_LENGTH_ERRORS {
+        assert_eq!(
+            scripts::wire_len(b"", count, lengths.iter().copied(), 1, unread.clone()),
+            Err(expected)
+        );
+    }
     const EXPECTED: &[u8] = b"*4\r\n$4\r\nEVAL\r\n$9\r\nreturn 17\r\n$1\r\n0\r\n$2\r\nok\r\n";
     const HASH: &[u8] = b"*4\r\n$4\r\nHSET\r\n$3\r\nkey\r\n$5\r\nfield\r\n$5\r\nvalue\r\n";
     const DELETE: &[u8] = b"*3\r\n$3\r\nDEL\r\n$3\r\none\r\n$3\r\ntwo\r\n";
@@ -121,6 +185,9 @@ fn request_failure_recycles() {
             socket.read_exact(&mut hash).expect("valid HSET request");
             assert_eq!(hash, HASH);
             socket.write_all(b":1\r\n").expect("HSET response");
+            socket.read_exact(&mut hash).expect("fixed HSET request");
+            assert_eq!(hash, HASH);
+            socket.write_all(b":0\r\n").expect("HSET update response");
             let mut delete = [0; DELETE.len()];
             socket.read_exact(&mut delete).expect("valid DEL request");
             assert_eq!(delete, DELETE);
@@ -129,10 +196,16 @@ fn request_failure_recycles() {
             socket.read_exact(&mut add).expect("valid SADD request");
             assert_eq!(add, ADD);
             socket.write_all(b":2\r\n").expect("SADD response");
+            let mut ack = [0; ACK.len()];
+            socket.read_exact(&mut ack).expect("valid XACK request");
+            assert_eq!(ack, ACK);
+            socket.write_all(b":2\r\n").expect("XACK response");
             let mut got = [0; EXPECTED.len()];
-            socket.read_exact(&mut got).expect("valid EVAL request");
-            assert_eq!(got, EXPECTED);
-            socket.write_all(b":17\r\n").expect("integer response");
+            for reply in EMPTY_REPLIES {
+                socket.read_exact(&mut got).expect("empty EVAL request");
+                assert_eq!(got, EXPECTED);
+                socket.write_all(reply).expect("empty credit response");
+            }
         },
         |server| {
             let addr = server.addr();
@@ -222,6 +295,12 @@ fn request_failure_recycles() {
                                         )
                                     };
                                     assert!(matches!(runtime.block_on(hash), Ok(Ok(1))));
+                                    assert!(matches!(
+                                        runtime.block_on(
+                                            redis.hashes().set(b"key", b"field", b"value")
+                                        ),
+                                        Ok(Ok(false))
+                                    ));
                                     let delete = {
                                         let keys = [String::from("one"), String::from("two")];
                                         redis.basic().del_iter(
@@ -241,19 +320,40 @@ fn request_failure_recycles() {
                                     };
                                     assert!(matches!(runtime.block_on(add), Ok(Ok(2))));
 
-                                    assert!(
-                                        matches!(
-                                            runtime.block_on(
-                                                redis.scripts().eval::<i64, &[u8], _>(
+                                    let ack = {
+                                        let key = String::from("key");
+                                        let group = String::from("group");
+                                        let ids = [String::from("1-0"), String::from("2-0")];
+                                        redis.streams().ack(
+                                            key.as_bytes(),
+                                            group.as_bytes(),
+                                            Slice::from_pair(&ids),
+                                        )
+                                    };
+                                    assert!(matches!(runtime.block_on(ack), Ok(Ok(2))));
+                                    let empty = runtime
+                                        .block_on(
+                                            redis
+                                                .scripts()
+                                                .eval::<value::Bytes<'_, '_, '_>, &[u8], _>(
                                                     b"return 17",
                                                     &[],
                                                     &[b"ok".as_slice()],
-                                                )
-                                            ),
-                                            Ok(Ok(17))
-                                        ),
-                                        "recycled frame must remain reusable"
-                                    );
+                                                ),
+                                        )
+                                        .expect("empty response completed")
+                                        .ok()
+                                        .expect("empty bulk");
+                                    let clone = empty.try_clone().expect("empty clone");
+                                    assert!(matches!(
+                                        runtime.block_on(redis.scripts().eval::<i64, &[u8], _>(
+                                            b"return 17",
+                                            &[],
+                                            &[b"ok".as_slice()],
+                                        )),
+                                        Ok(Ok(17))
+                                    ));
+                                    assert!(empty.is_empty() && clone.is_empty());
                                 })
                             })
                         })
@@ -272,136 +372,133 @@ fn request_failure_recycles() {
 #[test]
 fn bulk_boundary() {
     let call = Owned {
-        keys: [],
         args: [vec![b'x'; 300 * 1024]],
     };
     let need = call.wire_len().expect("test operation must succeed");
     assert!(need > 256 * 1024);
 
-    TcpScript::with(
-        move |socket| {
-            let mut got = vec![0_u8; need];
-            socket.read_exact(&mut got).expect("bulk EVAL request");
-            assert!(
-                got[need - 2 - 300 * 1024..need - 2]
-                    .iter()
-                    .all(|byte| *byte == b'x')
-            );
-            socket.write_all(b":17\r\n").expect("integer response");
-        },
-        |server| {
-            let addr = server.addr();
-
-            {
-                let prepared = topology::try_new::<Env>(
-                    try_bulk_config(need).expect("bulk configuration"),
-                    addr,
-                    Plan::new(),
-                )
-                .expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let redis = runtime.root_client();
-
-                                    assert!(matches!(
-                                        runtime.block_on(redis.wait_active()),
-                                        Ok(Ok(()))
-                                    ));
-                                    assert!(matches!(
-                                        runtime
-                                            .block_on(redis.scripts().eval_call::<i64, _>(&call)),
-                                        Ok(Ok(17))
-                                    ));
+    for capacity in [need, need - 1] {
+        TcpScript::with(
+            move |socket| {
+                if capacity == need {
+                    let mut got = vec![0_u8; need];
+                    socket.read_exact(&mut got).expect("bulk EVAL request");
+                    assert!(
+                        got[need - 2 - 300 * 1024..need - 2]
+                            .iter()
+                            .all(|byte| *byte == b'x')
+                    );
+                    socket.write_all(b":17\r\n").expect("integer response");
+                } else {
+                    let mut byte = [0_u8; 1];
+                    assert_eq!(socket.read(&mut byte).expect("connection close"), 0);
+                }
+            },
+            |server| {
+                let addr = server.addr();
+                {
+                    let prepared = topology::try_new::<Env>(
+                        try_bulk_config(capacity).expect("bulk configuration"),
+                        addr,
+                        Plan::new(),
+                    )
+                    .expect("topology fixture completed");
+                    let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+                    let mut report = Completion::new();
+                    prepared.with_local(
+                        |worker| {
+                            worker.lend(|node, stage| {
+                                node.install(stage, |host, stage| {
+                                    stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+                                        let redis = runtime.root_client();
+                                        assert!(matches!(
+                                            runtime.block_on(redis.wait_active()),
+                                            Ok(Ok(()))
+                                        ));
+                                        let result = runtime
+                                            .block_on(redis.scripts().eval_call::<i64, _>(&call));
+                                        if capacity == need {
+                                            assert!(matches!(result, Ok(Ok(17))));
+                                        } else {
+                                            assert!(
+                                                matches!(
+                                                    result,
+                                                    Ok(Err(value::reply::Failure::Control(
+                                                        cartel_redis::Error::Request(
+                                                            request::Error::Capacity(cause)
+                                                        )
+                                                    ))) if {
+                                                        let (actual, cap) = cause.into_parts();
+                                                        actual.get() == need && cap == need - 1
+                                                    }
+                                                ),
+                                                "oversized EVAL must fail before submission"
+                                            );
+                                        }
+                                    })
                                 })
                             })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-                );
-                reports.events().expect("valid reclaim observations");
-            };
-            server.finish().expect("finish Redis peer");
-        },
-    )
-    .expect("spawn Redis peer");
-
-    TcpScript::with(
-        move |socket| {
-            let mut byte = [0_u8; 1];
-            assert_eq!(socket.read(&mut byte).expect("connection close"), 0);
-        },
-        |server| {
-            let addr = server.addr();
-            {
-                let prepared = topology::try_new::<Env>(
-                    try_bulk_config(need - 1).expect("bulk configuration"),
-                    addr,
-                    Plan::new(),
-                )
-                .expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                let redis = runtime.root_client();
-
-                assert!(matches!(runtime.block_on(redis.wait_active()), Ok(Ok(()))));
-                assert!(matches!(
-                    runtime.block_on(redis.scripts().eval_call::<i64, _>(&call)),
-                    Ok(Err(value::reply::Failure::Control(cartel_redis::Error::Request(
-                        cartel_redis::request::Error::Capacity(cause)
-                    )))) if {
-                        let (actual, cap) = cause.into_parts();
-                        actual.get() == need && cap == need - 1
-                    }
-                ), "oversized EVAL must fail before submission");
-
-                            })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-                );
-                reports.events().expect("valid reclaim observations");
-            };
-            server.finish().expect("finish Redis peer");
-        },
-    )
-    .expect("spawn Redis peer");
+                        },
+                        recovery::Policy::new(|event| reports.push(event), recover),
+                        |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
+                    );
+                    reports.events().expect("valid reclaim observations");
+                };
+                server.finish().expect("finish Redis peer");
+            },
+        )
+        .expect("spawn Redis peer");
+    }
 }
 
 #[test]
 fn split_is_one_bulk() {
-    const EXPECTED: &[u8] =
-        b"*4\r\n$4\r\nEVAL\r\n$9\r\nreturn 17\r\n$1\r\n0\r\n$12\r\nfirst\0second\r\n";
-
-    let call = SPLIT;
-    assert!(matches!(call.wire_len(), Ok(len) if len == EXPECTED.len()));
-
     TcpScript::with(
         move |socket| {
+            let mut got =
+                [0; KEY_COUNTS[2].1.len() + KEY_COUNTS[2].0 * KEY_BULK.len() + SPLIT_BULK.len()];
+            for (count, header) in KEY_COUNTS {
+                let got = &mut got[..header.len() + count * KEY_BULK.len() + SPLIT_BULK.len()];
+                assert_eq!(
+                    scripts::wire_len(
+                        SPLIT.script(),
+                        count,
+                        iter::repeat_n(1, count),
+                        1,
+                        iter::once(SPLIT.args[0].len),
+                    ),
+                    Ok(got.len())
+                );
+                socket.read_exact(got).expect("EVAL request");
+                let (actual, rest) = got.split_at(header.len());
+                assert_eq!(actual, header);
+                let (keys, argument) = rest.split_at(count * KEY_BULK.len());
+                assert!(keys.chunks_exact(KEY_BULK.len()).all(|key| key == KEY_BULK));
+                assert_eq!(argument, SPLIT_BULK);
+                socket.write_all(b":17\r\n").expect("integer response");
+            }
             let lengths = [0, 9, 10, 99, 100].map(|len| {
-                format!(
+                let expected = format!(
                     "*4\r\n$4\r\nEVAL\r\n$9\r\nreturn 17\r\n$1\r\n0\r\n${len}\r\n{}\r\n",
                     "x".repeat(len)
-                )
+                );
+                assert_eq!(
+                    scripts::wire_len(SPLIT.script(), 0, iter::empty(), 1, iter::once(len)),
+                    Ok(expected.len())
+                );
+                expected
             });
             let arity = format!(
                 "*10\r\n$4\r\nEVAL\r\n$9\r\nreturn 17\r\n$1\r\n0\r\n{}",
                 "$0\r\n\r\n".repeat(7)
             );
-            for expected in iter::once(EXPECTED)
-                .chain(lengths.iter().map(String::as_bytes))
+            assert_eq!(
+                scripts::wire_len(SPLIT.script(), 0, iter::empty(), 7, iter::repeat_n(0, 7)),
+                Ok(arity.len())
+            );
+            for expected in lengths
+                .iter()
+                .map(String::as_bytes)
                 .chain(iter::once(arity.as_bytes()))
             {
                 let mut got = vec![0_u8; expected.len()];
@@ -433,14 +530,23 @@ fn split_is_one_bulk() {
                                         runtime.block_on(redis.wait_active()),
                                         Ok(Ok(()))
                                     ));
-                                    assert!(matches!(
-                                        runtime
-                                            .block_on(redis.scripts().eval_call::<i64, _>(&call)),
-                                        Ok(Ok(17))
-                                    ));
+                                    let keys = [b"k".as_slice(); 10];
+                                    for (count, header) in KEY_COUNTS {
+                                        let call = Split {
+                                            keys: &keys[..count],
+                                            ..SPLIT
+                                        };
+                                        assert!(matches!(call.wire_len(), Ok(len)
+                                            if len == header.len() + count * KEY_BULK.len() + SPLIT_BULK.len()));
+                                        assert!(matches!(
+                                            runtime.block_on(
+                                                redis.scripts().eval_call::<i64, _>(&call)
+                                            ),
+                                            Ok(Ok(17))
+                                        ));
+                                    }
                                     for len in [0, 9, 10, 99, 100] {
                                         let call = Owned {
-                                            keys: [],
                                             args: [vec![b'x'; len]],
                                         };
                                         assert!(matches!(

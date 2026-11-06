@@ -1,5 +1,3 @@
-use core::convert::Infallible;
-
 use bindings::endpoint;
 use cartel_core::reply;
 use codec::mode;
@@ -13,14 +11,14 @@ use dope::{
         },
         service::bindings,
     },
-    net::link::{egress, event, pool::change::opening},
+    net::link::{egress, pool::change::opening},
 };
 use driver::schedule::{self, app::Work, clock};
 use o3::{
     base::{Call, cell::region, time::Positive},
     buffer::{self, hold, write::consume::scope},
 };
-use policy::{admit, output};
+use policy::admit;
 use port::{CONNECTOR_CONNECTION_LIMIT, Port, replies, requests};
 
 use crate::{
@@ -141,7 +139,7 @@ impl<
             session::Input,
         )>,
     > {
-        Some(output::Flush::<Infallible, _>::Context(
+        Some(
             |(owner, ctx, input): (
                 &mut Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
                 &mut Context<'_, '_, 'life, 'd, I, ID>,
@@ -151,7 +149,7 @@ impl<
                     failure::Failure::in_context(owner.root(), ctx).apply(error);
                 }
             },
-        ))
+        )
     }
 }
 impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
@@ -223,7 +221,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
     fn failed(
         owner: &mut Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
         key: attempt::Completion<'_, 'd, KeyTag<ID>>,
-        cause: event::ConnectFault,
+        cause: attempt::ConnectFault,
         _: &mut driver::Context<'_, 'd>,
     ) {
         let shared = &owner.root().shared;
@@ -371,11 +369,11 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
     > for Session
 {
     fn quiesce<'a>(
-        owner: &Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
+        _: &Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
         barrier: app::Barrier<'a, 'd, KeyTag<ID>>,
-        region: &mut region::Token<region::Identity<'d>>,
+        _: &mut region::Token<region::Identity<'d>>,
     ) -> app::Drain<'a, 'd, KeyTag<ID>> {
-        owner.root().quiesce(barrier, region)
+        barrier.ready()
     }
 }
 impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
@@ -395,12 +393,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
             region::Token<region::Identity<'d, 1>>,
         ),
     ) {
-        if let Some(released) = owner.root().maintain(work, &mut region.0) {
-            let signals = &owner.root().shared.signals;
-            if let Err(cause) = signals.egress.release(released) {
-                signals.record_fatal(crate::Error::EgressSlot(cause));
-            }
-        }
+        owner.root().maintain(work, &mut region.0);
         owner.root().shared.waiters().flush(work);
     }
     fn shutdown(owner: &mut Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>) {

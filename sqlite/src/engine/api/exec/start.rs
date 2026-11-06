@@ -3,7 +3,7 @@ use api::{exec, stmt, work};
 use dope_fiber::context;
 use exec::machine::{self, call};
 use retry::lease;
-use std::{mem, pin, result, task};
+use std::{mem, ops, pin, result, task};
 use stmt::target::Target;
 use work::cleanup;
 
@@ -48,12 +48,11 @@ impl<'query, 'connection, 'd, I: catalogs::Catalog> Start<'query, 'connection, '
             // lease back preserves its budget and alarm without detaching it.
             (self.engine, self.work, self.retry) = run.into_parts();
             match polled {
-                task::Poll::Pending => return machine::Next::Pending(self),
-                task::Poll::Ready(Err(error)) => return machine::Next::Ready(Err(error)),
-                task::Poll::Ready(Ok(())) => {}
+                task::Poll::Pending => return Ok(ops::ControlFlow::Continue(self)),
+                task::Poll::Ready(result) => result?,
             }
         }
-        machine::Next::Ready(self.prepare())
+        Ok(ops::ControlFlow::Break(self.prepare()?))
     }
 
     fn prepare(self) -> result::Result<machine::Ready<'query, 'connection, 'd, I>, crate::Error> {

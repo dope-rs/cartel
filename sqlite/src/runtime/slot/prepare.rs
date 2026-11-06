@@ -57,7 +57,12 @@ impl<'slot, 'd, I: catalogs::Catalog> Prepare<'slot, 'd, I> {
         self.held.value.prepare.retire_one()
     }
 
-    pub(crate) fn retry(&mut self) -> lease::Lease<'_, 'd, lease::Open> {
-        self.held.lease.open()
+    pub(crate) fn retry(
+        &mut self,
+    ) -> (
+        &guard::Guard<'slot, open::Open>,
+        lease::Lease<'_, 'd, lease::Open>,
+    ) {
+        (&self.held.value.guard, self.held.lease.open())
     }
 }

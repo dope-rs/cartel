@@ -1,6 +1,5 @@
 use crate::api::{Client, decode};
 use crate::client::nonempty;
-use crate::request::encode::write::value::set;
 use std::num;
 
 #[derive(Clone, Copy)]
@@ -21,8 +20,9 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Sets<C, ID> {
         I: Iterator<Item = M> + Clone,
         M: AsRef<[u8]>,
     {
-        self.0
-            .encode::<u64>(move |out| set::Writer::new(out).add(key, count.get(), members))
+        self.0.encode::<u64>(move |out| {
+            out.sequence(&[b"SADD", key], count.get(), members.map(|member| [member]))
+        })
     }
 
     pub fn remove(self, key: &[u8], members: nonempty::Slice<'_, &[u8]>) -> C::Call<u64> {

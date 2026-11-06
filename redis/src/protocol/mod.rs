@@ -267,7 +267,7 @@ impl<'storage, 'g> codec::Stateful for Codec<'storage, 'g> {
             let decoded = match head {
                 Ok(frame) => match frame.into_stored(self.keep) {
                     Ok((frame, lane)) => Decoded::Frame(frame, lane),
-                    Err((_, error)) => Decoded::Retain(error),
+                    Err(error) => Decoded::Retain(error),
                 },
                 Err(failure) => Decoded::Rejected(failure),
             };

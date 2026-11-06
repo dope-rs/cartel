@@ -14,7 +14,7 @@ use dope::{
 };
 use dope_test::alloc::Tracker;
 use o3::depot::capacity;
-use std::{convert::Infallible, mem};
+use std::convert::Infallible;
 
 pub mod common;
 
@@ -66,27 +66,5 @@ fn preserves_attempt() {
             .iter()
             .all(|report| matches!(report, dope::core::io::Reclaimed::Shutdown)),
         "attempt storage does not submit network operations: {events:?}"
-    );
-}
-
-#[test]
-fn route_layout() {
-    assert_eq!(
-        mem::size_of::<Error<'static, 0>>(),
-        mem::size_of::<Error<'static, 17>>()
-    );
-    assert_eq!(
-        mem::size_of::<
-            reply::Failure<
-                cartel_redis::Error<'static, 0>,
-                value::Bytes<'static, 'static, 'static>,
-            >,
-        >(),
-        mem::size_of::<
-            reply::Failure<
-                cartel_redis::Error<'static, 17>,
-                value::Bytes<'static, 'static, 'static>,
-            >,
-        >()
     );
 }

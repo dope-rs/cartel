@@ -1,5 +1,4 @@
 use crate::backend;
-use crate::pred::sql;
 
 pub(super) enum Literal<'a> {
     Int(&'a syn::LitInt),
@@ -31,23 +30,23 @@ impl<'a> Literal<'a> {
         None
     }
 
-    pub(super) fn render(self, dialect: &backend::Dialect) -> sql::Sql {
+    pub(super) fn render(self, dialect: &backend::Dialect) -> proc_macro2::TokenStream {
         match self {
             Self::Int(literal) => {
-                let value = literal.base10_digits().to_string();
-                sql::Sql::tokens(vec![quote::quote! { #value }])
+                let value = literal.base10_digits();
+                quote::quote! { #value }
             }
             Self::Float(literal) => {
-                let value = literal.base10_digits().to_string();
-                sql::Sql::tokens(vec![quote::quote! { #value }])
+                let value = literal.base10_digits();
+                quote::quote! { #value }
             }
             Self::Bool(literal) => {
                 let keyword = if literal.value { "TRUE" } else { "FALSE" };
-                sql::Sql::tokens(vec![dialect.kw(keyword)])
+                dialect.kw(keyword)
             }
             Self::String(literal) => {
                 let value = format!("'{}'", literal.value().replace('\'', "''"));
-                sql::Sql::tokens(vec![quote::quote! { #value }])
+                quote::quote! { #value }
             }
         }
     }

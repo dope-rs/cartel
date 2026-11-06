@@ -3,10 +3,9 @@ use crate::backend;
 pub(super) struct Retain(pub(super) proc_macro2::TokenStream);
 
 impl Retain {
-    pub(super) fn of(first: &syn::Type, fields: &[backend::TableField<'_>]) -> Self {
-        fields.iter().fold(Self(Self::field(first)), |mode, field| {
+    pub(super) fn of(first: &syn::Type, types: &[syn::Type]) -> Self {
+        types.iter().fold(Self(Self::field(first)), |mode, ty| {
             let mode = mode.0;
-            let ty = field.ty;
             Self(quote::quote! {
                 <#mode as ::cartel_sqlite::row::modes::Kind>::With<
                     <#ty as ::cartel_sqlite::row::raw::Decode>::Retention
@@ -17,14 +16,14 @@ impl Retain {
 
     pub(super) fn bind(
         first: &syn::Type,
-        fields: &[backend::TableField<'_>],
+        types: &[syn::Type],
         generics: &mut syn::Generics,
         names: &mut backend::Names,
     ) -> Self {
         let mut mode = Self::field(first);
-        for field in fields {
+        for ty in types {
             let next = names.fresh("__Retain");
-            let ty = Self::field(field.ty);
+            let ty = Self::field(ty);
             generics.params.push(syn::parse_quote!(#next));
             generics
                 .make_where_clause()

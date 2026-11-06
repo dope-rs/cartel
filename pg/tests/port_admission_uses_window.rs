@@ -6,7 +6,7 @@ use std::{
 };
 
 use cartel_pg::{api, port, port::config, reply};
-use common::{port::*, topology};
+use common::{port::*, postgres::startup::Stream as _, topology};
 use dope::{
     core::driver::route::Id,
     manifold::{app::env::Bundle, timing::Throughput},
@@ -14,12 +14,72 @@ use dope::{
     runtime::executor::session::Completion,
 };
 use dope_fiber::BlockOn as _;
-use dope_test::{harness::GUARD, reclaim::Reports};
+use dope_test::{
+    fibers,
+    harness::{GUARD, peer::AcceptScript},
+    reclaim::Reports,
+};
 use o3::base::time::Positive;
 
 type Env = Bundle<Tcp, Identity, Throughput>;
 
 pub mod common;
+
+#[test]
+fn full_request_pool_allows_startup() {
+    AcceptScript::with(
+        |listener| {
+            let mut socket = listener.accept()?;
+            socket.try_start(None)?;
+            socket.recover()
+        },
+        |server| {
+            let mut capacity = Queries::try_cancel().expect("PG capacity").capacities();
+            capacity.inflight = 1;
+            capacity.requests.frames = 1;
+            let prepared = topology::try_new::<_, Env>(
+                port::Port::<Queries>::plan(
+                    Queries::try_config().expect("database config"),
+                    config::Config::new(capacity).expect("single request frame"),
+                ),
+                server.addr(),
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+            )
+            .expect("PG topology");
+            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+            let mut report = Completion::new();
+            prepared.with_local(
+                |worker| {
+                    worker.lend(|node, stage| {
+                        node.install(stage, |host, stage| {
+                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+                                let client = runtime.root_client();
+                                let query = client.unchecked().command("SELECT 1");
+                                let result = fibers::TEST
+                                    .try_run(&mut runtime, query)
+                                    .expect("admission driver");
+                                assert!(
+                                    result.is_ok(),
+                                    "startup with full request pool: {:?}",
+                                    result.as_ref().err().map(reply::Error::kind)
+                                );
+                            })
+                        })
+                    })
+                },
+                recovery::Policy::new(|event| reports.push(event), common::recover),
+                |result| assert!(matches!(result, Ok(Ok(Ok(()))))),
+            );
+            assert!(reports.events().expect("native reclamation").is_empty());
+            server
+                .finish()
+                .expect("PG peer worker")
+                .expect("startup and query wire");
+        },
+    )
+    .expect("PG peer");
+}
 
 #[test]
 fn admission_uses_window() {

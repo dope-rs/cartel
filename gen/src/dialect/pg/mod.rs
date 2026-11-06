@@ -38,7 +38,7 @@ impl PgBackend {
     }
 
     pub(super) fn emit_query(
-        q: &GroupQuery,
+        q: GroupQuery,
         attrs: &[syn::Attribute],
     ) -> syn::Result<proc_macro2::TokenStream> {
         let GroupQuery {
@@ -52,11 +52,11 @@ impl PgBackend {
         let ids = &code.param_ids;
         let tys = &code.param_tys;
         let caps = &code.captures;
-        let plan = &code.plan;
+        let plan = code.plan;
         let stmt = format!("{ident}.{method}");
-        let query = marker;
+        let query = &marker;
         let mut names = backend::Names::default();
-        names.visit_type(group);
+        names.visit_type(&group);
         names.visit_ident(query);
         names.visit_return_type(&plan.output);
         names.visit_block(&code.block);
@@ -124,8 +124,6 @@ impl PgBackend {
             quote::quote! {}
         };
 
-        let bound = param::Param::<false>::apply(tys.clone(), &input);
-        let params = quote::quote! { ( #( #bound, )* ) };
         let values = quote::quote! { ( #( #ids, )* ) };
 
         let parts = &plan.sql_parts;
@@ -142,6 +140,12 @@ impl PgBackend {
                 quote::quote! { ::core::option::Option<::cartel_pg::api::results::Row<<#caller::Results as ::cartel_pg::api::results::Storage>::Payload, #query>> },
                 quote::format_ident!("run_first"),
                 Some(quote::format_ident!("first_each")),
+            ),
+            emit::Kind::Aggregate(ty) => (
+                Some(ty),
+                quote::quote! { ::core::option::Option<::cartel_pg::api::results::Row<<#caller::Results as ::cartel_pg::api::results::Storage>::Payload, #query, true>> },
+                quote::format_ident!("run_scalar"),
+                Some(quote::format_ident!("scalar_each")),
             ),
             emit::Kind::All(ty) => (
                 Some(ty),
@@ -183,11 +187,17 @@ impl PgBackend {
                     }
                     None => quote::quote! {},
                 };
-                (
-                    quote::quote! { #ty },
-                    quote::quote! { ::cartel_pg::schema::result::Rows },
-                    codes,
-                )
+                let (row, shape) = match (&plan.dispatch, &plan.output) {
+                    (emit::Kind::Aggregate(_), syn::ReturnType::Type(_, declared)) => (
+                        quote::quote! { <#declared as ::core::iter::IntoIterator>::Item },
+                        quote::quote! { ::cartel_pg::schema::result::Rows<true> },
+                    ),
+                    _ => (
+                        quote::quote! { #ty },
+                        quote::quote! { ::cartel_pg::schema::result::Rows },
+                    ),
+                };
+                (row, shape, codes)
             }
             None => (
                 quote::quote! { () },
@@ -207,22 +217,24 @@ impl PgBackend {
             .map(|(id, ty)| quote::quote! { #id: #ty })
             .collect();
 
-        let body = match &plan.probe_override {
-            Some(block) => super::ScopeCalls::pg_assign(block),
-            None => super::ScopeCalls::pg(&code.block),
-        };
-        let output = &plan.output;
-        let scope = backend::scope();
-        let proof = quote::quote! {
-            const _: fn(
-                &::cartel_pg::dsl::Scope,
-                #( #tys, )*
-            ) #output = |
-                #scope: &::cartel_pg::dsl::Scope,
-                #( #decls, )*
-            | {
-                #body
+        let proof = {
+            let body = match (plan.probe_override, code.block) {
+                (Some(block), _) => super::ScopeCalls::pg_assign(block),
+                (None, block) => super::ScopeCalls::pg(block),
             };
+            let output = &plan.output;
+            let scope = backend::scope();
+            quote::quote! {
+                const _: fn(
+                    &::cartel_pg::dsl::Scope,
+                    #( #tys, )*
+                ) #output = |
+                    #scope: &::cartel_pg::dsl::Scope,
+                    #( #decls, )*
+                | {
+                    #body
+                };
+            }
         };
         let batch = if let Some(run) = each {
             let count = names.fresh("__CARTEL_GROUP_LEN_");
@@ -237,7 +249,7 @@ impl PgBackend {
                 ),
             };
             let grouped = if matches!(plan.dispatch, emit::Kind::One(_)) {
-                let method = group::Group::batch_method(method, "group");
+                let method = group::Group::batch_method(&method, "group");
                 quote::quote! {
                     #vis fn #method<#driver, #caller, const #route_id: u8, const #count: usize>(
                         #client: #caller,
@@ -267,7 +279,7 @@ impl PgBackend {
             } else {
                 quote::quote! {}
             };
-            let method = group::Group::batch_method(method, "each");
+            let method = group::Group::batch_method(&method, "each");
             quote::quote! {
                 #grouped
 
@@ -296,6 +308,8 @@ impl PgBackend {
         } else {
             quote::quote! {}
         };
+        let bound = param::Param::<false>::apply(code.param_tys, &input);
+        let params = quote::quote! { ( #( #bound, )* ) };
 
         Ok(quote::quote! {
             #vis struct #query;

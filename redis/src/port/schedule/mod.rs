@@ -3,7 +3,7 @@ use client::settings;
 use dope::{
     core::driver::{route, schedule::app::Work},
     manifold::client::{
-        app::{self, request},
+        app::request,
         close,
         conn::{Activation, Id},
         session::{self, turns},
@@ -13,12 +13,12 @@ use dope::{
 use dope_fiber::reply::{layout::Position, order::Depth};
 pub(crate) use lease::Lease;
 use o3::base::cell::region;
-pub(crate) use plan::{Block, Reject};
+pub(crate) use plan::Reject;
 pub(crate) use routes::Routes;
 use routes::{Access, Acquire, Bind};
 
 use crate::client::plan::Error;
-use crate::{Owner, client, port, protocol::parser::frame};
+use crate::{client, port, protocol::parser::frame};
 use routes::slot;
 
 mod lease;
@@ -38,7 +38,7 @@ enum Release {
 
 pub(crate) struct Schedule<'s, 'storage, 'b, 'c, 'd, const ID: u8> {
     pub(crate) routes: Routes<'b, 'd, ID>,
-    pub(super) queue: queue::Scoped<'b, 'd, egress::NonEmpty<Buffer>>,
+    pub(super) queue: queue::Scoped<'b, 'd, egress::NonEmpty<Buffer>, ()>,
     responses: &'storage reply::Arena<'b, 'c, 'd, frame::Stored<'s, 'd>, client::Failure<'d>>,
 }
 
@@ -51,7 +51,7 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Schedule<'s, 'storage, 'b, 'c, 'd, 
     fn requests(
         &self,
         position: Position<'b, 'd, route::KeyTag<ID>>,
-    ) -> queue::Lane<'_, 'd, egress::NonEmpty<Buffer>> {
+    ) -> queue::Lane<'_, 'd, egress::NonEmpty<Buffer>, ()> {
         self.queue.lane(position)
     }
 
@@ -63,7 +63,7 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Schedule<'s, 'storage, 'b, 'c, 'd, 
         let conns = config.connections();
         Ok(Self {
             routes: Routes::try_new(conns)?,
-            queue: queue::Arena::try_new(config.queue(), token)?
+            queue: queue::Arena::try_unweighted(config.queue(), token)?
                 .try_bind(replies.domain())
                 .map_err(Error::Queue)?,
             responses: replies,
@@ -106,13 +106,6 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Schedule<'s, 'storage, 'b, 'c, 'd, 
         active.clear_fatal(position, region);
         active.wake_all();
         Ready::Committed
-    }
-
-    pub(crate) fn retire<'r>(
-        &self,
-        proof: turns::Drained<'d, route::KeyTag<ID>, Owner<'r, 's, 'storage, 'b, 'c, 'd, ID>>,
-    ) {
-        self.routes.retire(proof);
     }
 
     pub(crate) fn responses(
@@ -294,10 +287,9 @@ fn withdraw<'s, 'b, 'c, 'd, const ID: u8>(
 fn publish<'s, 'b, 'c, 'd, const ID: u8>(
     conn: &slot::Bound<'_, 'b, 'd, ID>,
     reps: reply::Lane<'_, 'b, 'c, 'd, frame::Stored<'s, 'd>, client::Failure<'d>>,
-    reqs: queue::Lane<'_, 'd, egress::NonEmpty<Buffer>>,
+    reqs: queue::Lane<'_, 'd, egress::NonEmpty<Buffer>, ()>,
     region: &mut region::Token<region::Identity<'d>>,
 ) -> Link {
-    reps.control().activate(region);
     if reps.depth(region) != Depth::ZERO || !reqs.is_empty(region) {
         return Link::Unchanged;
     }
@@ -327,26 +319,6 @@ fn refresh<'s, 'storage, 'b, 'c, 'd, const ID: u8>(
                 conn.schedule::<1>(conn.position());
             }
             Link::Added => {}
-        }
-    }
-}
-
-impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Schedule<'s, 'storage, 'b, 'c, 'd, ID> {
-    pub(crate) fn quiesce<'a>(
-        &self,
-        barrier: app::Barrier<'a, 'd, route::KeyTag<ID>>,
-        region: &mut region::Token<region::Identity<'d>>,
-    ) -> app::Drain<'a, 'd, route::KeyTag<ID>> {
-        let token = barrier.connection();
-        let Some(conn) = self.routes.bound(token) else {
-            return barrier.pending();
-        };
-        let reqs = self.requests(conn.position());
-        let reps = self.lane(conn.position());
-        if conn.is_closing(token) && reqs.is_empty(region) && reps.depth(region) == Depth::ZERO {
-            barrier.ready()
-        } else {
-            barrier.pending()
         }
     }
 }

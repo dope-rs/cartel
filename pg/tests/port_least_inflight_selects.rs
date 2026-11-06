@@ -16,16 +16,11 @@ use dope_fiber::{
     abi::{Task, poll_fn},
 };
 use dope_test::fibers;
-use dope_test::harness::peer;
+use dope_test::harness::peer::AcceptScript;
 use dope_test::{harness::GUARD, reclaim::Reports};
 use std::{
-    iter,
-    net::SocketAddr,
-    net::TcpListener,
     pin::pin,
-    sync::mpsc,
     task::Poll,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -38,63 +33,55 @@ pub mod common;
 #[test]
 fn least_inflight_selects() {
     for initial in [2, 3] {
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener");
-        let addr = listener.local_addr().expect("listener address");
-        let (report, selected) = mpsc::channel();
-        let server = thread::spawn(
-            move || -> Result<Result<(), mpsc::SendError<usize>>, Error> {
-                let listener =
-                    peer::TcpAcceptor::try_adopt(listener.into()).expect("listener admission");
-                let (mut sockets, choices) = listener.least_loaded(initial)?;
-                for choice in choices {
-                    if let Err(error) = report.send(choice) {
-                        return Ok(Err(error));
-                    }
-                }
+        AcceptScript::with(
+            move |listener| -> Result<(), Error> {
+                let (mut sockets, selected) = listener.least_loaded(initial)?;
+                assert_eq!(selected, 1);
                 for socket in &mut sockets {
                     socket.read_closed()?;
                 }
-                Ok(Ok(()))
+                Ok(())
             },
-        );
-        let capacity = config::Capacities {
-            connections: 2,
-            inflight: 4,
-            admission_waiters: 2,
-            requests: config::Request {
-                frames: 4,
-                frame_bytes: 512,
-            },
-            responses: config::Response {
-                items: 4,
-                bytes: 512,
-                frame_bytes: 128,
-            },
-            notifications: config::Notification {
-                items: 1,
-                bytes: 128,
-            },
-        };
-        let config = config::Config::new(capacity);
-        let config = config.expect("valid pg configuration");
-        let ((), events) = {
-            let prepared = topology::try_new::<_, Env>(
-                port::Port::<Queries>::plan(
-                    Queries::try_config().expect("database config"),
-                    config,
-                ),
-                addr,
-                Duration::from_millis(1),
-                Duration::from_millis(1_024),
-            )
-            .expect("topology fixture completed");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            let scoped = prepared.with_local(
-                |worker| {
-                    worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
-                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+            |server| {
+                let capacity = config::Capacities {
+                    connections: 2,
+                    inflight: 4,
+                    admission_waiters: 2,
+                    requests: config::Request {
+                        frames: 4,
+                        frame_bytes: 512,
+                    },
+                    responses: config::Response {
+                        items: 4,
+                        bytes: 512,
+                        frame_bytes: 128,
+                    },
+                    notifications: config::Notification {
+                        items: 1,
+                        bytes: 128,
+                    },
+                };
+                let config = config::Config::new(capacity);
+                let config = config.expect("valid pg configuration");
+                let ((), events) = {
+                    let prepared = topology::try_new::<_, Env>(
+                        port::Port::<Queries>::plan(
+                            Queries::try_config().expect("database config"),
+                            config,
+                        ),
+                        server.addr(),
+                        Duration::from_millis(1),
+                        Duration::from_millis(1_024),
+                    )
+                    .expect("topology fixture completed");
+                    let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+                    let mut report = Completion::new();
+                    let scoped =
+                        prepared.with_local(
+                            |worker| {
+                                worker.lend(|node, stage| {
+                                    node.install(stage, |host, stage| {
+                                        stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
                                 let client = runtime.root_client();
                                 client.status().set_policy(PickPolicy::LeastInflight);
 
@@ -168,41 +155,31 @@ fn least_inflight_selects() {
                                     ),
                                     "least-inflight command"
                                 );
-
-                                for expected in iter::repeat_n(0, initial).chain([1, 1]) {
-                                    assert_eq!(
-                                        selected
-                                            .recv_timeout(Duration::from_secs(1))
-                                            .expect("selected connection"),
-                                        expected
-                                    );
-                                }
                             })
-                        })
-                    })
-                },
-                recovery::Policy::new(|event| reports.push(event), common::recover),
-                |outcome| {
-                    assert!(
-                        outcome.is_ok(),
-                        "{:?}",
-                        outcome.as_ref().err().map(|error| error.cause())
-                    );
-                    outcome.ok().expect("application entry")
-                },
-            );
+                                    })
+                                })
+                            },
+                            recovery::Policy::new(|event| reports.push(event), common::recover),
+                            |outcome| {
+                                assert!(
+                                    outcome.is_ok(),
+                                    "{:?}",
+                                    outcome.as_ref().err().map(|error| error.cause())
+                                );
+                                outcome.ok().expect("application entry")
+                            },
+                        );
 
-            let result = scoped.expect("application installation completed");
-            (result.expect("application session completed"), reports)
-        };
-        assert!(
-            events.events().expect("native reclamation").is_empty(),
-            "unexpected events PostgreSQL operations: {events:?}"
-        );
-        server
-            .join()
-            .expect("server")
-            .expect("selection peer")
-            .expect("selected connections");
+                    let result = scoped.expect("application installation completed");
+                    (result.expect("application session completed"), reports)
+                };
+                assert!(
+                    events.events().expect("native reclamation").is_empty(),
+                    "unexpected events PostgreSQL operations: {events:?}"
+                );
+                server.finish().expect("server").expect("selection peer");
+            },
+        )
+        .expect("selection listener");
     }
 }

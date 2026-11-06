@@ -6,14 +6,14 @@ use client::{plan, settings};
 use dope::{
     core::driver::{self, route, schedule::app},
     manifold::{
-        client::{attempt, conn},
+        client::{attempt, close, conn},
         service::bindings::{self, endpoint, failures::External},
     },
     net::link::pool::change::opening,
     runtime::client::Bound,
 };
 use dope_fiber::{context, wait};
-use o3::base::cell::region;
+use o3::{base::cell::region, depot::queue::indexed::shared};
 use parser::{limit, storage};
 
 use crate::{
@@ -28,47 +28,17 @@ mod failures;
 mod requests;
 pub(crate) mod schedule;
 
-struct Signal<'d> {
-    waiters: wait::Queue<'d>,
-    remaining: cell::Cell<usize>,
-}
-
-impl<'d> Signal<'d> {
-    fn notify(&self) {
-        self.remaining.set(self.waiters.len().get());
-    }
-
-    fn flush(&self, work: app::Work<'_, 'd>) {
-        let remaining = self.remaining.get();
-        if remaining == 0 {
-            return;
-        }
-        if self.waiters.wake_one(work) == wait::WakeStatus::Complete {
-            // Re-registering callers cannot extend this notification round.
-            self.remaining
-                .set((remaining - 1).min(self.waiters.len().get()));
-        }
-    }
-
-    fn is_pending(&self) -> bool {
-        self.remaining.get() != 0
-    }
-}
-
-const _: () = assert!(
-    mem::size_of::<Signal<'static>>()
-        == mem::size_of::<wait::Queue<'static>>() + mem::size_of::<usize>()
-);
-
 pub(super) struct Activity<'b, 'd, const ID: u8> {
-    dispatch: Signal<'d>,
-    leases: Signal<'d>,
+    dispatch: wait::Notifier<'d>,
+    leases: wait::Notifier<'d>,
     failures: region::Value<region::Identity<'d>, failures::Failures<'b, 'd, ID>>,
     terminal: cell::Cell<Option<Stop<'d, ID>>>,
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum Stop<'d, const ID: u8> {
-    Failed(client::Failure<'d>),
+    Closed(close::Reason),
+    ParserWait(shared::Bounds),
     Exhausted {
         key: attempt::Id<'d, route::KeyTag<ID>>,
         cause: opening::Exhaustion,
@@ -76,11 +46,8 @@ pub(super) enum Stop<'d, const ID: u8> {
 }
 
 const _: () = {
-    assert!(mem::size_of::<Stop<'static, 17>>() == mem::size_of::<client::Failure<'static>>());
-    assert!(
-        mem::size_of::<Option<Stop<'static, 17>>>()
-            == mem::size_of::<Option<client::Failure<'static>>>()
-    );
+    assert!(mem::size_of::<Stop<'static, 17>>() <= mem::size_of::<client::Failure<'static>>());
+    assert!(mem::size_of::<Option<Stop<'static, 17>>>() == mem::size_of::<Stop<'static, 17>>());
 };
 
 impl<'b, 'd, const ID: u8> Activity<'b, 'd, ID> {
@@ -89,7 +56,7 @@ impl<'b, 'd, const ID: u8> Activity<'b, 'd, ID> {
         waiter: pin::Pin<&wait::Waiter<'target, 'd>>,
         ctx: pin::Pin<&context::Context<'poll, 'd>>,
     ) -> Result<(), wait::Error<'d>> {
-        self.dispatch.waiters.try_register(waiter, ctx)
+        self.dispatch.try_register(waiter, ctx)
     }
 
     pub(super) fn try_lease<'target, 'poll>(
@@ -97,10 +64,9 @@ impl<'b, 'd, const ID: u8> Activity<'b, 'd, ID> {
         waiter: pin::Pin<&wait::Waiter<'target, 'd>>,
         ctx: pin::Pin<&context::Context<'poll, 'd>>,
     ) -> Result<(), wait::Error<'d>> {
-        self.leases.waiters.try_register(waiter, ctx)
+        self.leases.try_register(waiter, ctx)
     }
 
-    /// The terminal projection restores its owner before any callback or drop.
     pub(super) fn fatal_cause(
         &self,
         region: &region::Token<region::Identity<'d>>,
@@ -108,16 +74,11 @@ impl<'b, 'd, const ID: u8> Activity<'b, 'd, ID> {
         if let Some(cause) = region.borrow(&self.failures).cause() {
             return Some(cause);
         }
-        let terminal = self.terminal.take();
-        let cause = terminal.as_ref().map(|cause| match cause {
-            Stop::Failed(cause) => client::Failure::from(cause).into_error(),
-            Stop::Exhausted { key, cause } => crate::Error::ConnectionExhausted {
-                key: *key,
-                cause: *cause,
-            },
-        });
-        self.terminal.set(terminal);
-        cause
+        self.terminal.get().map(|cause| match cause {
+            Stop::Closed(reason) => client::Failure::from_close(reason).into_error(),
+            Stop::ParserWait(cause) => crate::Error::ParserWait(cause),
+            Stop::Exhausted { key, cause } => crate::Error::ConnectionExhausted { key, cause },
+        })
     }
 
     pub(super) fn clear_fatal(
@@ -140,13 +101,8 @@ impl<'b, 'd, const ID: u8> Activity<'b, 'd, ID> {
     }
 
     pub(super) fn record_stop(&self, err: Stop<'d, ID>) {
-        let previous = self.terminal.take();
-        match previous {
-            Some(previous) => {
-                self.terminal.set(Some(previous));
-                drop(err);
-            }
-            None => self.terminal.set(Some(err)),
+        if self.terminal.get().is_none() {
+            self.terminal.set(Some(err));
         }
         self.wake_all();
     }
@@ -245,21 +201,15 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Port<'s, 'storage, 'b, 'c, 'd, ID> 
             let port = {
                 let mut driver = driver(state);
                 let capacity = config.waiters();
-                let send = wait::Queue::new(driver.driver_ref(), capacity);
-                let lease = wait::Queue::new(driver.driver_ref(), capacity);
+                let send = wait::Notifier::new(driver.driver_ref(), capacity);
+                let lease = wait::Notifier::new(driver.driver_ref(), capacity);
                 let requests = requests::Requests::try_new(config)?;
                 let failures = failures::Failures::try_new(replies.domain())?;
                 Port {
                     schedule: schedule::Schedule::try_new(config, driver.region_token(), replies)?,
                     activity: Activity {
-                        dispatch: Signal {
-                            waiters: send,
-                            remaining: cell::Cell::new(0),
-                        },
-                        leases: Signal {
-                            waiters: lease,
-                            remaining: cell::Cell::new(0),
-                        },
+                        dispatch: send,
+                        leases: lease,
                         failures: driver.region_token().bind(failures),
                         terminal: cell::Cell::new(None),
                     },

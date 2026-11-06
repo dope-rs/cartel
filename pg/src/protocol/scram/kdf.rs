@@ -1,311 +1,356 @@
 use crate::protocol::scram::{self, secret32};
-use dope::{core::driver::route, manifold::client::conn};
-use hmac::{HmacReset, Mac as _};
-use o3::base::cell::region;
-use o3::depot::queue::indexed::shared;
-use sha2::Sha256;
-use std::{mem, num};
+use dope::{
+    core::driver::{route, route::table::conn::Capacity},
+    manifold::client::conn,
+};
+use o3::{
+    alloc,
+    base::{cell::region, num::bounded},
+    depot::{
+        array,
+        queue::{
+            indexed::shared,
+            round::{self, values},
+        },
+    },
+};
+use sha2::block_api::compress256;
+use std::{iter, mem, num};
+use zeroize::Zeroizing;
 
-const ITERATIONS_PER_TURN: u32 = 256;
+const ITERATIONS_PER_POLL: u32 = 256;
 const MIN_ITERATIONS: u32 = 4_096;
 const MAX_ITERATIONS: u32 = 100_000;
 const CACHE_ENTRIES: usize = 2;
 const KDF_LANES: usize = 4;
+const ENTRIES: usize = KDF_LANES + CACHE_ENTRIES;
+type Index = array::Index<ENTRIES>;
+const LANES: [bounded::U32<0, 6>; ENTRIES] = [
+    bounded::U32::exact::<0>(),
+    bounded::U32::exact::<1>(),
+    bounded::U32::exact::<2>(),
+    bounded::U32::exact::<3>(),
+    bounded::U32::exact::<4>(),
+    bounded::U32::exact::<5>(),
+];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Iterations(num::NonZero<u32>);
-
-impl Iterations {
-    fn from_server(value: num::NonZero<u32>) -> Result<Self, crate::Error> {
-        if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&value.get()) {
-            return Err(crate::Error::ScramIterations {
-                actual: value.get(),
-                minimum: MIN_ITERATIONS,
-                maximum: MAX_ITERATIONS,
-            });
-        }
-        Ok(Self(value))
-    }
+fn lane(index: Option<Index>) -> bounded::U32<0, 6> {
+    index.map_or(bounded::U32::exact::<6>(), |index| *index.get(&LANES))
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(in crate::protocol) struct KdfKey {
-    first: secret32::Secret32,
-    iterations: Iterations,
+    pub(super) first: secret32::Secret32,
+    pub(super) iterations: bounded::NonZeroU32<MIN_ITERATIONS, MAX_ITERATIONS>,
 }
 
-impl KdfKey {
-    pub(super) fn from_server(
-        first: &[u8; 32],
-        rounds: num::NonZero<u32>,
-    ) -> Result<Self, crate::Error> {
-        let count = Iterations::from_server(rounds)?;
-        Ok(Self {
-            first: secret32::Secret32::copy(first),
-            iterations: count,
-        })
-    }
-}
-
-#[repr(transparent)]
-pub(super) struct Salted(secret32::Secret32);
-
-impl Salted {
-    pub(super) fn as_array(&self) -> &[u8; 32] {
-        self.0.as_array()
-    }
+pub(super) fn try_iterations(
+    rounds: num::NonZero<u32>,
+) -> Result<bounded::NonZeroU32<MIN_ITERATIONS, MAX_ITERATIONS>, crate::Error> {
+    bounded::NonZeroU32::new(rounds.get()).ok_or(crate::Error::ScramIterations {
+        actual: rounds.get(),
+        minimum: MIN_ITERATIONS,
+        maximum: MAX_ITERATIONS,
+    })
 }
 
 struct Kdf {
-    prf: HmacReset<Sha256>,
+    prf: [Zeroizing<[u32; 8]>; 2],
     previous: secret32::Secret32,
     output: secret32::Secret32,
     remaining: u32,
 }
 
 impl Kdf {
-    fn new(password: &[u8], key: &KdfKey) -> Self {
-        Self {
-            prf: scram::hmac(password),
-            previous: key.first.clone(),
-            output: key.first.clone(),
-            remaining: key.iterations.0.get() - 1,
-        }
-    }
-
-    fn advance(&mut self, budget: u32) -> Option<Salted> {
-        for _ in 0..self.remaining.min(budget) {
-            self.prf.update(self.previous.as_array());
-            let output = self.prf.finalize_reset();
-            self.previous = secret32::Secret32::copy(output.as_bytes().as_ref());
-            for (output, next) in self.output.iter_mut().zip(self.previous.iter().copied()) {
-                *output ^= next;
+    fn advance(&mut self) -> Option<&[u8; 32]> {
+        let rounds = self.remaining.min(ITERATIONS_PER_POLL);
+        let mut block = Zeroizing::new([0u8; 64]);
+        let mut state = Zeroizing::new([0u32; 8]);
+        block[..32].copy_from_slice(self.previous.as_array());
+        scram::pad(&mut state, &mut block, 96);
+        for _ in 0..rounds {
+            for seed in &self.prf {
+                *state = **seed;
+                compress256(&mut state, std::slice::from_ref(&*block));
+                scram::write_state(&state, &mut block.as_chunks_mut::<32>().0[0]);
             }
-            self.remaining -= 1;
+            for (output, word) in iter::zip(
+                self.output.as_array_mut().as_chunks_mut::<4>().0,
+                state.iter(),
+            ) {
+                *output = (u32::from_be_bytes(*output) ^ *word).to_be_bytes();
+            }
         }
-        (self.remaining == 0).then(|| Salted(self.output.clone()))
+        self.previous.as_array_mut().copy_from_slice(&block[..32]);
+        self.remaining -= rounds;
+        (self.remaining == 0).then(|| self.output.as_array())
     }
 }
 
-struct CacheEntry {
+enum State {
+    Computing(Kdf),
+    Ready(scram::Keys),
+}
+
+struct Entry {
     key: KdfKey,
-    keys: scram::Keys,
+    state: State,
 }
 
-struct Cache {
-    entries: [Option<CacheEntry>; CACHE_ENTRIES],
-    next: Next,
+#[derive(Default)]
+struct Coordinator {
+    entries: [Option<Entry>; ENTRIES],
+    cached: [Option<Index>; CACHE_ENTRIES],
+    second: bool,
 }
 
-enum Next {
-    First,
-    Second,
-}
-
-impl Cache {
-    const fn new() -> Self {
-        Self {
-            entries: [const { None }; CACHE_ENTRIES],
-            next: Next::First,
+impl Coordinator {
+    fn select(&mut self, key: &KdfKey, password: Option<&[u8]>) -> Option<Index> {
+        for index in self.cached.iter().copied().flatten() {
+            if index
+                .get(&self.entries)
+                .as_ref()
+                .is_some_and(|entry| &entry.key == key)
+            {
+                return Some(index);
+            }
         }
-    }
-
-    fn get(&self, key: &KdfKey) -> Option<scram::Keys> {
-        self.entries
-            .iter()
-            .flatten()
-            .find(|entry| &entry.key == key)
-            .map(|entry| entry.keys.clone())
-    }
-
-    fn insert(&mut self, key: KdfKey, salted: Salted) -> scram::Keys {
-        let keys = scram::Keys::new(salted);
-        let entry = Some(CacheEntry {
-            key,
-            keys: keys.clone(),
+        let mut empty = None;
+        let mut computing = 0;
+        for index in Index::iter() {
+            if self.cached.contains(&Some(index)) {
+                continue;
+            }
+            let Some(entry) = index.get(&self.entries) else {
+                empty = Some(index);
+                continue;
+            };
+            if &entry.key == key {
+                return Some(index);
+            }
+            computing += usize::from(matches!(entry.state, State::Computing(_)));
+        }
+        let password = password?;
+        if computing == KDF_LANES {
+            return None;
+        }
+        let index = match empty {
+            Some(index) => index,
+            None => {
+                let index = self.cached[usize::from(self.second)]
+                    .take()
+                    .or_else(|| self.cached[usize::from(!self.second)].take())?;
+                index
+            }
+        };
+        let Entry { key: owned, state } = index.get_mut(&mut self.entries).insert(Entry {
+            key: KdfKey {
+                first: secret32::Secret32::new([0; 32]),
+                iterations: key.iterations,
+            },
+            state: State::Computing(Kdf {
+                prf: [Zeroizing::new(scram::IV), Zeroizing::new(scram::IV)],
+                previous: secret32::Secret32::new([0; 32]),
+                output: secret32::Secret32::new([0; 32]),
+                remaining: key.iterations.get() - 1,
+            }),
         });
-        match self.next {
-            Next::First => {
-                self.entries[0] = entry;
-                self.next = Next::Second;
-            }
-            Next::Second => {
-                self.entries[1] = entry;
-                self.next = Next::First;
-            }
+        let State::Computing(kdf) = state else {
+            unreachable!("kdf")
+        };
+        let [inner, outer] = &mut kdf.prf;
+        scram::hmac(password, inner, outer);
+        for output in [&mut owned.first, &mut kdf.previous, &mut kdf.output] {
+            output.as_array_mut().copy_from_slice(key.first.as_array());
         }
-        keys
+        Some(index)
+    }
+
+    fn cache(&mut self, index: Index) {
+        let previous = self.cached[usize::from(self.second)].replace(index);
+        self.second = !self.second;
+        if let Some(previous) = previous {
+            *previous.get_mut(&mut self.entries) = None;
+        }
     }
 }
 
-struct Running<'d, const ID: u8> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Member<'d, const ID: u8> {
     owner: conn::Id<'d, route::KeyTag<ID>>,
-    key: KdfKey,
-    kdf: Kdf,
+    job: Option<Index>,
 }
 
-#[repr(transparent)]
-struct Lanes<'d, const ID: u8>([Option<Running<'d, ID>>; KDF_LANES]);
-
-impl<'d, const ID: u8> Lanes<'d, ID> {
-    const fn new() -> Self {
-        Self([const { None }; KDF_LANES])
-    }
-
-    fn remove(&mut self, owner: conn::Id<'d, route::KeyTag<ID>>) -> Option<Vacant<'_, 'd, ID>> {
-        for slot in &mut self.0 {
-            let Some(running) = slot else { continue };
-            if running.owner == owner {
-                *slot = None;
-                return Some(Vacant(slot));
-            }
-        }
-        None
-    }
-
-    fn vacant(&mut self) -> Option<Vacant<'_, 'd, ID>> {
-        self.0.iter_mut().find(|slot| slot.is_none()).map(Vacant)
-    }
+pub(crate) struct Runtime<'d, const ID: u8> {
+    waiters: values::Values<Member<'d, ID>, 1, { ENTRIES + 1 }>,
+    state: region::Value<region::Identity<'d>, Coordinator>,
 }
 
-struct Vacant<'a, 'd, const ID: u8>(&'a mut Option<Running<'d, ID>>);
-
-impl<'d, const ID: u8> Vacant<'_, 'd, ID> {
-    fn fill(self, running: Running<'d, ID>) {
-        *self.0 = Some(running);
+impl<'d, const ID: u8> Runtime<'d, ID> {
+    pub(in crate::protocol) fn try_new(
+        cap: Capacity,
+        proof: region::Proof<region::Identity<'d>>,
+    ) -> Result<Self, alloc::Error> {
+        Ok(Self {
+            waiters: values::Values::try_fixed(cap.entries().get())?,
+            state: proof.bind(Coordinator::default()),
+        })
     }
-}
 
-pub(in crate::protocol) enum Drive<'d, const ID: u8> {
-    Waiting,
-    Running(conn::Id<'d, route::KeyTag<ID>>),
-    Ready {
-        keys: scram::Keys,
-        wake: Option<conn::Id<'d, route::KeyTag<ID>>>,
-    },
-}
+    pub(super) fn try_entry(
+        &self,
+        owner: conn::Id<'d, route::KeyTag<ID>>,
+    ) -> Result<Ticket<'_, 'd, ID>, shared::Bounds> {
+        let waiter =
+            self.waiters
+                .try_slot(owner.index().into_usize())
+                .map_err(|error| match error {
+                    round::Bounds::Slot { index, capacity } => shared::Bounds { index, capacity },
+                    round::Bounds::Lane { .. } => unreachable!("slot"),
+                })?;
+        waiter.write(Member { owner, job: None });
+        Ok(Ticket {
+            runtime: self,
+            waiter,
+        })
+    }
 
-pub(super) struct Coordinator<'d, const ID: u8> {
-    lanes: Lanes<'d, ID>,
-    cache: Cache,
+    fn front(&self, index: Option<Index>) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
+        self.waiters
+            .lane(lane(index))
+            .front()
+            .map(|(_, member)| member.owner)
+    }
 }
 
 pub(in crate::protocol) struct Ticket<'a, 'd, const ID: u8> {
-    pub(super) runtime: &'a scram::Runtime<'d, ID>,
-    pub(super) waiter: shared::Slot<'a, conn::Id<'d, route::KeyTag<ID>>>,
-    pub(super) owner: conn::Id<'d, route::KeyTag<ID>>,
-}
-
-impl<'d, const ID: u8> Coordinator<'d, ID> {
-    pub(super) fn new() -> Self {
-        Self {
-            lanes: Lanes::new(),
-            cache: Cache::new(),
-        }
-    }
+    runtime: &'a Runtime<'d, ID>,
+    waiter: values::Slot<'a, Member<'d, ID>, 1, { ENTRIES + 1 }>,
 }
 
 impl<'d, const ID: u8> Ticket<'_, 'd, ID> {
-    pub(in crate::protocol) fn poll(
+    pub(in crate::protocol) fn poll<R>(
         &self,
         key: &KdfKey,
         password: &[u8],
         token: &mut region::Token<region::Identity<'d>>,
-    ) -> Drive<'d, ID> {
-        let Coordinator { lanes, cache } = token.borrow_mut(&self.runtime.state);
-        let conn = self.owner;
-        if let Some(keys) = cache.get(key) {
-            let front = self.runtime.waiters.front::<0>() == Some(conn);
-            if self.waiter.get::<0>() == Some(conn) {
-                self.waiter.clear::<0>();
+        mut wake: impl FnMut(conn::Id<'d, route::KeyTag<ID>>),
+        ready: impl FnOnce(&scram::Keys) -> R,
+    ) -> Option<R> {
+        let member = self.waiter.get()?;
+        let coordinator = token.borrow_mut(&self.runtime.state);
+        let index = match member.job {
+            Some(index) => index,
+            None => {
+                let front = self.runtime.front(None);
+                let admission = front
+                    .is_none_or(|front| front == member.owner)
+                    .then_some(password);
+                let Some(index) = coordinator.select(key, admission) else {
+                    self.waiter.lane(lane(None)).set(|_| Some(()));
+                    return None;
+                };
+                index
             }
-            let owned = lanes.remove(conn).is_some();
-            let wake = (owned || (front && lanes.vacant().is_some()))
-                .then(|| self.runtime.waiters.front::<0>())
-                .flatten();
-            return Drive::Ready { keys, wake };
-        }
-        for slot in &mut lanes.0 {
-            let Some(running) = slot else { continue };
-            if running.owner != conn {
-                continue;
-            }
-            if &running.key != key {
-                *slot = None;
-                break;
-            }
-            let Some(salted) = running.kdf.advance(ITERATIONS_PER_TURN) else {
-                return Drive::Running(conn);
-            };
-            let key = running.key.clone();
-            *slot = None;
-            let keys = cache.insert(key, salted);
-            return Drive::Ready {
-                keys,
-                wake: self.runtime.waiters.front::<0>(),
-            };
-        }
-        let Some(slot) = lanes.vacant() else {
-            if self.waiter.get::<0>() != Some(conn) {
-                self.waiter.push::<0>(conn);
-            }
-            return Drive::Waiting;
         };
-        if let Some(front) = self.runtime.waiters.front::<0>() {
-            if front != conn {
-                if self.waiter.get::<0>() != Some(conn) {
-                    self.waiter.push::<0>(conn);
+        let Some(entry) = index.get_mut(&mut coordinator.entries) else {
+            unreachable!("kdf")
+        };
+        let completed = if let State::Computing(kdf) = &mut entry.state {
+            if member.job.is_none() {
+                let front = self.runtime.front(None) == Some(member.owner);
+                self.waiter.lane(lane(Some(index))).push(Member {
+                    job: Some(index),
+                    ..member
+                });
+                if front && let Some(next) = self.runtime.front(None) {
+                    wake(next);
                 }
-                return Drive::Waiting;
             }
-            self.waiter.clear::<0>();
-        }
-        let mut kdf = Kdf::new(password, key);
-        if let Some(salted) = kdf.advance(ITERATIONS_PER_TURN) {
-            let keys = cache.insert(key.clone(), salted);
-            return Drive::Ready {
-                keys,
-                wake: self.runtime.waiters.front::<0>(),
+            if self.runtime.front(Some(index)) != Some(member.owner) {
+                return None;
+            }
+            let Some(salted) = kdf.advance() else {
+                wake(member.owner);
+                return None;
             };
+            let mut inner = Zeroizing::new(scram::IV);
+            let mut outer = Zeroizing::new(scram::IV);
+            scram::hmac(salted, &mut inner, &mut outer);
+            entry.state = State::Ready(scram::Keys {
+                client: secret32::Secret32::new([0; 32]),
+                stored: secret32::Secret32::new([0; 32]),
+                server: secret32::Secret32::new([0; 32]),
+            });
+            let State::Ready(keys) = &mut entry.state else {
+                unreachable!("ready")
+            };
+            keys.write(&inner, &outer);
+            true
+        } else {
+            false
+        };
+        let (next, remaining) = self.release(coordinator);
+        if let Some(next) = next {
+            wake(next);
         }
-        slot.fill(Running {
-            owner: conn,
-            key: key.clone(),
-            kdf,
-        });
-        Drive::Running(conn)
+        if completed
+            && remaining
+            && let Some(next) = self.runtime.front(None)
+        {
+            wake(next);
+        }
+        let Some(Entry {
+            state: State::Ready(keys),
+            ..
+        }) = index.get(&coordinator.entries)
+        else {
+            unreachable!("ready")
+        };
+        Some(ready(keys))
     }
 
     pub(in crate::protocol) fn cancel(
         &self,
         token: &mut region::Token<region::Identity<'d>>,
     ) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
-        let state = token.borrow_mut(&self.runtime.state);
-        let conn = self.owner;
-        let front = self.runtime.waiters.front::<0>() == Some(conn);
-        if self.waiter.get::<0>() == Some(conn) {
-            self.waiter.clear::<0>();
+        self.release(token.borrow_mut(&self.runtime.state)).0
+    }
+
+    fn release(
+        &self,
+        coordinator: &mut Coordinator,
+    ) -> (Option<conn::Id<'d, route::KeyTag<ID>>>, bool) {
+        let Some(member) = self.waiter.get() else {
+            return (None, false);
+        };
+        let front = self.runtime.front(member.job) == Some(member.owner);
+        self.waiter.take();
+        if let Some(index) = member.job {
+            let next = self.runtime.front(Some(index));
+            if next.is_none() {
+                if matches!(
+                    index.get(&coordinator.entries),
+                    Some(Entry {
+                        state: State::Ready(_),
+                        ..
+                    })
+                ) {
+                    coordinator.cache(index);
+                } else {
+                    *index.get_mut(&mut coordinator.entries) = None;
+                }
+                return (self.runtime.front(None), false);
+            }
+            return (front.then_some(next).flatten(), true);
         }
-        let owned = state.lanes.remove(conn).is_some();
-        (owned || (front && state.lanes.vacant().is_some()))
-            .then(|| self.runtime.waiters.front::<0>())
-            .flatten()
+        (front.then(|| self.runtime.front(None)).flatten(), false)
     }
 }
 
-const _: () = assert!(mem::size_of::<Salted>() == 32);
 const _: () = assert!(mem::size_of::<KdfKey>() == 36);
-const _: () = assert!(
-    mem::size_of::<Drive<'static, 0>>()
-        == mem::size_of::<scram::Keys>() + 3 * mem::size_of::<usize>()
-);
-const _: () = assert!(
-    mem::size_of::<Lanes<'static, 0>>()
-        == mem::size_of::<[Option<Running<'static, 0>>; KDF_LANES]>()
-);
-
 const _: () = {
-    assert!(mem::size_of::<Ticket<'static, 'static, 0>>() == 5 * mem::size_of::<usize>());
+    assert!(mem::size_of::<Ticket<'static, 'static, 0>>() == 3 * mem::size_of::<usize>());
     assert!(
         mem::size_of::<Option<Ticket<'static, 'static, 0>>>()
             == mem::size_of::<Ticket<'static, 'static, 0>>()

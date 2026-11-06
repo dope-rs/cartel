@@ -17,8 +17,13 @@ impl<'slot, 'd, I: catalogs::Catalog> Opening<'slot, 'd, I> {
         self.held.lease.lease.config()
     }
 
-    pub(crate) fn retry(&mut self) -> lease::Lease<'_, 'd, lease::Open> {
-        self.held.lease.lease.open()
+    pub(crate) fn retry(
+        &mut self,
+    ) -> (
+        &guard::Guard<'slot, open::Open>,
+        lease::Lease<'_, 'd, lease::Open>,
+    ) {
+        (&self.held.value, self.held.lease.lease.open())
     }
 
     pub(crate) fn call<'a>(&'a self) -> Call<'a, 'a, 'slot> {

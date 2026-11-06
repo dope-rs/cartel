@@ -107,7 +107,7 @@ impl<'d> Slot<'d> {
         }
     }
 
-    pub(super) fn park(&self, now: clock::Moment<'d>) -> Park {
+    pub(crate) fn park(&self, now: clock::Moment<'d>) -> Park {
         match &self.0 {
             Mode::Yield(_) => Park::Ready,
             Mode::Timer(timer) => timer.park(now),
@@ -124,7 +124,7 @@ impl<'d> Slot<'d> {
         }
     }
 
-    pub(super) fn progress(&self) -> schedule::Progress<'d> {
+    pub(crate) fn progress(&self) -> schedule::Progress<'d> {
         match &self.0 {
             Mode::Yield(_) => schedule::Progress::Runnable,
             Mode::Timer(timer) => timer.progress(),

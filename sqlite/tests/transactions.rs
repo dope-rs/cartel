@@ -12,21 +12,29 @@ use dope_core::driver::{life::recovery::Policy, settings};
 use dope_manifold::timing::Throughput;
 use dope_runtime::executor::session;
 use dope_test::fibers;
-use std::{cell, mem, ops, pin, sync::OnceLock};
+use std::{cell, mem, ops, pin};
 
 pub mod common;
 
-/// Only Cartel uses installed SQLite; Core handles and allocations remain
-/// exclusively owned by their originating worker while the installed hooks can run.
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
-
 #[test]
-fn transaction_queries() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn transactions() -> Result<(), plan::Error> {
+    // Only Cartel uses installed SQLite; Core handles and allocations remain
+    // exclusively owned by their originating worker while the installed hooks can run.
+    // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
+    transaction_queries(runtime)?;
+    released_work_applies(runtime)?;
+    scopes_restore_owner(runtime)?;
+    unpolled_restore(runtime)?;
+    savepoints_retire_order(runtime)?;
+    shutdown_drains_scope(runtime)?;
+    cleanup_stays_failed(runtime)?;
+    forgotten_client_drains(runtime)?;
+    tail_transaction_drains(runtime)
+}
+
+fn transaction_queries(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -62,13 +70,7 @@ fn transaction_queries() -> Result<(), plan::Error> {
     }
 }
 
-#[test]
-fn released_work_applies() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn released_work_applies(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -158,13 +160,7 @@ fn released_work_applies() -> Result<(), plan::Error> {
     }
 }
 
-#[test]
-fn scopes_restore_owner() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn scopes_restore_owner(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (mut limits, memory) = schema::try_settings()?;
         limits.savepoints = 1;
@@ -207,13 +203,7 @@ fn scopes_restore_owner() -> Result<(), plan::Error> {
     }
 }
 
-#[test]
-fn unpolled_restore() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn unpolled_restore(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -260,13 +250,7 @@ fn unpolled_restore() -> Result<(), plan::Error> {
     }
 }
 
-#[test]
-fn savepoints_retire_order() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn savepoints_retire_order(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -310,13 +294,7 @@ fn savepoints_retire_order() -> Result<(), plan::Error> {
     }
 }
 
-#[test]
-fn shutdown_drains_scope() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn shutdown_drains_scope(runtime: Runtime) -> Result<(), plan::Error> {
     {
         let (limits, memory) = schema::try_settings()?;
         let plan =
@@ -347,13 +325,7 @@ fn shutdown_drains_scope() -> Result<(), plan::Error> {
     }
 }
 
-#[test]
-fn cleanup_stays_failed() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn cleanup_stays_failed(runtime: Runtime) -> Result<(), plan::Error> {
     let (limits, memory) = schema::try_settings()?;
     let plan = plan::Plan::<IntegrationDatabase>::try_new(schema::open(runtime)?, limits, memory)?;
     let result = plan.try_run(
@@ -406,13 +378,7 @@ fn cleanup_stays_failed() -> Result<(), plan::Error> {
     result.expect("SQLite terminal cleanup installation")
 }
 
-#[test]
-fn forgotten_client_drains() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn forgotten_client_drains(runtime: Runtime) -> Result<(), plan::Error> {
     let (limits, memory) = schema::try_settings()?;
     let plan = plan::Plan::<IntegrationDatabase>::try_new(schema::open(runtime)?, limits, memory)?;
     plan.try_run(
@@ -460,13 +426,7 @@ fn forgotten_client_drains() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn tail_transaction_drains() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: initialization excludes other SQLite calls; this binary preserves native custody.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn tail_transaction_drains(runtime: Runtime) -> Result<(), plan::Error> {
     let (limits, memory) = schema::try_settings()?;
     let plan = schema::open(runtime)?
         .plan::<IntegrationDatabase>(limits, memory)
@@ -475,6 +435,7 @@ fn tail_transaction_drains() -> Result<(), plan::Error> {
         .map_err(plan::Error::Claim)?;
     let entered = cell::Cell::new(false);
     plan.try_create(
+        (),
         |worker| {
             let mut cleanup = open::Completion::new();
             let mut complete = session::Completion::new();

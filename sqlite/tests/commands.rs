@@ -6,22 +6,31 @@ use dope_core::driver::life::recovery::Policy;
 use dope_runtime::topology;
 use dope_test::fibers;
 use dope_test::harness::support::file::Directory;
-use std::{path::Path, sync::OnceLock};
+use std::path::Path;
 
 pub mod common;
 
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
-
 #[test]
-fn plan_keeps_file_absent() -> Result<(), plan::Error> {
+fn commands() -> Result<(), plan::Error> {
+    // SAFETY: this is the binary's only SQLite test and installs before any native call.
+    // Core handles and allocations remain exclusively owned by their originating worker.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
+    plan_keeps_file_absent(runtime)?;
+    commands_before_queries(runtime)?;
+    failed_command_releases(runtime)?;
+    sql_errors_keep_offsets(runtime)?;
+    nul_rejected_before_open(runtime)?;
+    require_statement(runtime)?;
+    reject_parameters(runtime)?;
+    reject_result_columns(runtime)?;
+    preserve_authorization(runtime)?;
+    catalog_preserves_authorization(runtime)?;
+    Ok(())
+}
+
+fn plan_keeps_file_absent(runtime: Runtime) -> Result<(), plan::Error> {
     let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
     let dir = Directory::try_with(base, "cartel-sqlite-pure-plan", |removed| {
         removed.expect("temporary directory cleanup")
     })
@@ -40,16 +49,8 @@ fn plan_keeps_file_absent() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn commands_before_queries() -> Result<(), plan::Error> {
+fn commands_before_queries(runtime: Runtime) -> Result<(), plan::Error> {
     let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
     let dir = Directory::try_with(base, "cartel-sqlite-commands-open", |removed| {
         removed.expect("temporary directory cleanup")
     })
@@ -85,16 +86,8 @@ fn commands_before_queries() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn failed_command_releases() -> Result<(), plan::Error> {
+fn failed_command_releases(runtime: Runtime) -> Result<(), plan::Error> {
     let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
     let dir = Directory::try_with(base, "cartel-sqlite-command-failure", |removed| {
         removed.expect("temporary directory cleanup")
     })
@@ -142,16 +135,8 @@ fn failed_command_releases() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn sql_errors_keep_offsets() -> Result<(), plan::Error> {
+fn sql_errors_keep_offsets(runtime: Runtime) -> Result<(), plan::Error> {
     let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
     let dir = Directory::try_with(base, "cartel-sqlite-sql-errors", |removed| {
         removed.expect("temporary directory cleanup")
     })
@@ -223,16 +208,8 @@ fn sql_errors_keep_offsets() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn nul_rejected_before_open() -> Result<(), plan::Error> {
+fn nul_rejected_before_open(runtime: Runtime) -> Result<(), plan::Error> {
     let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
     let dir = Directory::try_with(base, "cartel-sqlite-command-nul", |removed| {
         removed.expect("temporary directory cleanup")
     })
@@ -246,16 +223,8 @@ fn nul_rejected_before_open() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn require_statement() -> Result<(), plan::Error> {
+fn require_statement(runtime: Runtime) -> Result<(), plan::Error> {
     let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
     let dir = Directory::try_with(base, "cartel-sqlite-command-empty", |removed| {
         removed.expect("temporary directory cleanup")
     })
@@ -275,16 +244,8 @@ fn require_statement() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn reject_parameters() -> Result<(), plan::Error> {
+fn reject_parameters(runtime: Runtime) -> Result<(), plan::Error> {
     let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
     let dir = Directory::try_with(base, "cartel-sqlite-command-parameters", |removed| {
         removed.expect("temporary directory cleanup")
     })
@@ -307,16 +268,8 @@ fn reject_parameters() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn reject_result_columns() -> Result<(), plan::Error> {
+fn reject_result_columns(runtime: Runtime) -> Result<(), plan::Error> {
     let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
     let dir = Directory::try_with(base, "cartel-sqlite-command-columns", |removed| {
         removed.expect("temporary directory cleanup")
     })
@@ -339,16 +292,8 @@ fn reject_result_columns() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn preserve_authorization() -> Result<(), plan::Error> {
+fn preserve_authorization(runtime: Runtime) -> Result<(), plan::Error> {
     let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
     let dir = Directory::try_with(base, "cartel-sqlite-command-authorization", |removed| {
         removed.expect("temporary directory cleanup")
     })
@@ -370,15 +315,7 @@ fn preserve_authorization() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn catalog_preserves_authorization() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn catalog_preserves_authorization(runtime: Runtime) -> Result<(), plan::Error> {
     for result in [
         plan::Plan::<Unauthorized<false>>::try_new(
             cartel_sqlite::OpenOptions::new()

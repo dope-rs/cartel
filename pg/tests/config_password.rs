@@ -7,17 +7,22 @@ static ALLOCATOR: Tracker = Tracker::new();
 
 #[test]
 fn password_failures() {
-    for allows in 0..=3 {
-        let user = "user".to_owned();
-        let password = "\u{c0}".repeat(128);
-        let database = "database".to_owned();
-        let (error, activity) = Tracker::activity(|| {
-            Tracker::fail_after(allows, || Config::new(user, password, database)).err()
-        });
-        let expected = (allows < 3).then_some(ConfigError::Allocation(alloc::Error::Exhausted));
-        assert_eq!(error, expected);
-        assert_eq!(activity.allocations, allows);
-        assert_eq!(activity.deallocations, allows + 3);
+    for (value, allocations) in [("\u{c0}", 1), ("\u{2168}", 2)] {
+        for allows in 0..=allocations {
+            let user = "user".to_owned();
+            let password = value.repeat(128);
+            let database = "database".to_owned();
+            let (error, activity) = Tracker::activity(|| {
+                Tracker::fail_after(allows, || Config::new(user, password, database)).err()
+            });
+            let expected =
+                (allows < allocations).then_some(ConfigError::Allocation(alloc::Error::Exhausted));
+            assert_eq!(error, expected);
+            assert_eq!(activity.allocations, allows);
+            // Both decompose to 256 ordered chars; only À can reuse its exact UTF-8 capacity.
+            assert_eq!(activity.allocated_bytes, [0, 1024, 1280][allows]);
+            assert_eq!(activity.deallocations, allows + 3);
+        }
     }
 
     let user = "user".to_owned();

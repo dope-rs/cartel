@@ -1,6 +1,7 @@
 pub(crate) enum Kind {
     One(syn::Type),
     First(syn::Type),
+    Aggregate(syn::Type),
     All(syn::Type),
     Stream(syn::Type),
     NoRows,

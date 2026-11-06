@@ -9,14 +9,14 @@ use std::{cell, num, pin};
 use crate::port::pool::{access, slot};
 use crate::port::replies;
 use crate::protocol;
-use crate::protocol::runtime::{ready, tx::poll, waiters};
+use crate::protocol::runtime::{ready, tx::poll};
 use cartel_core::reply::order::Depth;
 use ready::{plan, storage};
 
 pub(crate) struct Set<'d, const ID: u8> {
     index: storage::Index<'d, ID>,
     policy: cell::Cell<protocol::PickPolicy>,
-    pub(in crate::protocol) waiters: waiters::Queue<'d>,
+    pub(in crate::protocol) waiters: wait::Notifier<'d>,
 }
 
 #[derive(Clone, Copy)]
@@ -34,7 +34,7 @@ impl<'d, const ID: u8> Set<'d, ID> {
         Ok(Self {
             index: storage::Index::try_new(plan)?,
             policy: cell::Cell::new(protocol::PickPolicy::default()),
-            waiters: waiters::Queue::new(driver, cap),
+            waiters: wait::Notifier::new(driver, cap),
         })
     }
 
@@ -68,9 +68,6 @@ impl<'d, const ID: u8> Set<'d, ID> {
         let Some(entry) = self.index.entry(id.index().into_usize()) else {
             return Bind::Rejected;
         };
-        if entry.is_listed() {
-            return Bind::Rejected;
-        }
         match entry.slot().bind(id, target) {
             slot::Bind::Bound => Bind::Bound,
             slot::Bind::Occupied => Bind::Rejected,
@@ -78,21 +75,35 @@ impl<'d, const ID: u8> Set<'d, ID> {
     }
 
     pub(crate) fn pick<const GROUP: bool>(&self) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
-        match (self.policy.get(), GROUP) {
-            (protocol::PickPolicy::RoundRobin, false) => self.index.next(),
-            (protocol::PickPolicy::LeastInflight, false) => self.index.minimum(),
-            (protocol::PickPolicy::RoundRobin, true) => self.index.next_group(),
-            (protocol::PickPolicy::LeastInflight, true) => self.index.least_group(),
+        if GROUP {
+            return self.pick_where(slot::Slot::is_synced);
+        }
+        match self.policy.get() {
+            protocol::PickPolicy::RoundRobin => self.index.next(),
+            protocol::PickPolicy::LeastInflight => self.index.minimum(),
+        }
+    }
+
+    pub(crate) fn pick_begin(&self) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
+        self.pick_where(slot::Slot::can_begin)
+    }
+
+    fn pick_where(
+        &self,
+        eligible: impl Fn(&slot::Slot<'d, ID>) -> bool,
+    ) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
+        match self.policy.get() {
+            protocol::PickPolicy::RoundRobin => self.index.next_where(eligible),
+            protocol::PickPolicy::LeastInflight => self.index.least_where(eligible),
         }
     }
 
     pub(crate) fn try_ready(
         &self,
         id: conn::Id<'d, route::KeyTag<ID>>,
-        depth: usize,
     ) -> Result<(), protocol::Reason> {
-        self.index.try_ready(id, depth)?;
-        self.waiters.wake();
+        self.index.try_ready(id)?;
+        self.waiters.notify();
         Ok(())
     }
 
@@ -148,7 +159,7 @@ impl<'d, const ID: u8> Set<'d, ID> {
         depth: impl FnOnce() -> Depth,
     ) {
         if self.index.set_receiving(id, receiving, depth) {
-            self.waiters.wake();
+            self.waiters.notify();
         }
     }
 

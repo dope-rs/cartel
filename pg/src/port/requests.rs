@@ -10,10 +10,7 @@ use o3::{
     base::cell::region,
     buffer::{Residency, pool},
 };
-use port::{
-    pool::slot::{self, Change},
-    replies,
-};
+use port::{pool::slot, replies};
 use reply::{order, recv::attach};
 
 use crate::{error, port, port::Disposition, protocol::encode, schema};
@@ -22,6 +19,7 @@ use crate::{error, port, port::Disposition, protocol::encode, schema};
 #[repr(u8)]
 pub(crate) enum Boundary {
     Close,
+    Begin,
     Commit,
     Group,
     Open,
@@ -64,30 +62,36 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         Self { port }
     }
 
-    fn frame(&self) -> Result<pool::Cursor, error::Error> {
-        self.port
-            .requests
-            .cursor()
-            .ok_or(error::Error::RequestCapacity)
+    fn frame<T>(
+        pool: &pool::Pool,
+        kind: frame::Sensitivity,
+        write: impl FnOnce(&mut encode::Writer) -> Result<T, encode::Error>,
+    ) -> Result<(Complete<'d>, T), error::Error> {
+        let cursor = pool.cursor().ok_or(error::Error::RequestCapacity)?;
+        let (frame, value) =
+            encode::Writer::encode(cursor, kind, write).map_err(error::Error::Request)?;
+        Ok((Complete::try_new(frame)?, value))
     }
 
     pub(crate) fn encode(
         &self,
         write: impl FnOnce(&mut encode::Writer) -> Result<(), encode::Error>,
     ) -> Result<Complete<'d>, error::Error> {
-        let (frame, ()) = encode::Writer::encode(self.frame()?, frame::Sensitivity::Plain, write)
-            .map_err(error::Error::Request)?;
-        Complete::try_new(frame)
+        Self::frame(&self.port.requests, frame::Sensitivity::Plain, write).map(|(frame, ())| frame)
+    }
+
+    pub(crate) fn control(
+        &self,
+        write: impl FnOnce(&mut encode::Writer) -> Result<(), encode::Error>,
+    ) -> Result<Complete<'d>, error::Error> {
+        Self::frame(&self.port.controls, frame::Sensitivity::Plain, write).map(|(frame, ())| frame)
     }
 
     pub(crate) fn secret<T>(
         &self,
         write: impl FnOnce(&mut encode::Writer) -> Result<T, encode::Error>,
     ) -> Result<(Complete<'d>, T), error::Error> {
-        let (frame, value) =
-            encode::Writer::encode(self.frame()?, frame::Sensitivity::Secret, write)
-                .map_err(error::Error::Request)?;
-        Ok((Complete::try_new(frame)?, value))
+        Self::frame(&self.port.controls, frame::Sensitivity::Secret, write)
     }
 
     fn request_lane(
@@ -99,35 +103,74 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
             .lane_for(self.port.lane(token.lane()))
     }
 
-    pub(crate) fn prepare<'turn>(
+    pub(crate) fn try_with<J, K, R>(
         &self,
-        context: ReplyContext<'turn, 'd, ID>,
+        context: ReplyContext<'_, 'd, ID>,
         weight: usize,
-    ) -> Result<Prepared<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>, error::Error> {
+        input: J,
+        prepare: impl FnOnce(
+            &mut region::Token<region::Identity<'d>>,
+            reply::Lane<
+                'life,
+                'b,
+                'c,
+                'd,
+                replies::Row<'d>,
+                replies::ReplyFailure<'d>,
+                replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
+            >,
+            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
+            J,
+        ) -> Result<(order::Depth, K), (attach::Error, J)>,
+        build: impl FnOnce(K) -> (Complete<'d>, R),
+    ) -> Result<R, (error::Error, J)> {
         let ReplyContext {
             token,
             boundary,
             region,
         } = context;
-        let conn = self.port.conn(token).ok_or(error::Error::Closed)?;
-        let ready = conn.ready(token)?;
-        let requests = self.request_lane(token);
-        let queued = requests.weight(region);
-        let permit = ready.try_reply(boundary)?;
+        let permit = match self
+            .port
+            .conn(token)
+            .ok_or(error::Error::Closed)
+            .and_then(|conn| conn.ready(token)?.try_reply(boundary))
+        {
+            Ok(permit) => permit,
+            Err(error) => return Err((error, input)),
+        };
         let replies = self.port.lane(token.lane());
-        let lane = handoff::Lane::new(&self.port.request_queue, replies)
+        let cause = match handoff::Lane::new(&self.port.request_queue, replies)
             .try_prepare(region, weight)
-            .map_err(|cause| error::Error::RequestQueue { queued, cause })?;
-        Ok(Prepared {
-            lane,
-            commit: Commit {
-                port: self.port,
-                token,
-                permit,
+        {
+            Ok(lane) => {
+                let conn = permit.slot();
+                let (batch, boundary) = permit.parts();
+                let tag = replies::Tag::new(batch, boundary);
+                let result = lane.try_with(tag, input, prepare, |input, depth| {
+                    let (bytes, done) = build(input);
+                    if !permit.commit() {
+                        self.port.shared.wake_ready();
+                    }
+                    self.port.shared.reindex(token, depth);
+                    (bytes.into_frame(), done)
+                });
+                return match result {
+                    Ok(done) => {
+                        conn.wake();
+                        Ok(done)
+                    }
+                    Err((cause, input)) => Err((error::Error::Reply(cause), input)),
+                };
+            }
+            Err(cause) => cause,
+        };
+        Err((
+            error::Error::RequestQueue {
+                queued: self.port.request_queue.lane_for(replies).weight(region),
+                cause,
             },
-            conn,
-            boundary,
-        })
+            input,
+        ))
     }
 
     pub(crate) fn try_reply<S, R>(
@@ -146,11 +189,17 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         context: ReplyContext<'_, 'd, ID>,
         seal: impl FnOnce(S) -> R,
     ) -> Result<R, (error::Error, Complete<'d>, S)> {
-        let prepared = match self.prepare(context, bytes.as_ref().len()) {
-            Ok(prepared) => prepared,
-            Err(error) => return Err((error, bytes, state)),
-        };
-        prepared.try_reply(bytes, state, reply, seal)
+        self.try_with(
+            context,
+            bytes.as_ref().len(),
+            (bytes, state),
+            |token, lane, tag, input| match reply.try_ordered(token, lane, tag) {
+                Ok(depth) => Ok((depth, input)),
+                Err(cause) => Err((cause, input)),
+            },
+            |(bytes, state)| (bytes, seal(state)),
+        )
+        .map_err(|(error, (bytes, state))| (error, bytes, state))
     }
 
     pub(crate) fn try_enqueue(
@@ -205,22 +254,23 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
     pub(crate) fn try_sync(
         &self,
         token: conn::Id<'d, KeyTag<ID>>,
-        bytes: Complete<'d>,
         region: &mut region::Token<region::Identity<'d>>,
     ) -> Result<(), error::Error> {
+        let bytes = egress::NonEmpty::try_new(Frame::from(encode::COPY_DONE_SYNC.as_slice()))
+            .map_err(error::Error::RequestLoad)?;
         let Some(conn) = self.port.conn(token) else {
             return Err(error::Error::Closed);
         };
         let sync = conn.ready(token)?.try_finish()?;
         let requests = self.request_lane(token);
         let queued = requests.weight(region);
-        let request = match requests.try_reserve(region, bytes.as_ref().len()) {
+        let request = match requests.try_reserve(region, encode::COPY_DONE_SYNC.len()) {
             Ok(request) => request,
             Err(cause) => return Err(error::Error::RequestQueue { queued, cause }),
         };
-        let eligible = sync.commit();
-        request.publish(bytes.into_frame());
-        if matches!(eligible, Change::Available) {
+        let unchanged = sync.commit();
+        request.publish(bytes);
+        if !unchanged {
             self.port.shared.wake_ready();
         }
         conn.wake();
@@ -245,7 +295,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
             return Ok(());
         }
         send(region)?;
-        if matches!(sync.commit(), Change::Available) {
+        if !sync.commit() {
             self.port.shared.wake_ready();
         }
         Ok(())
@@ -264,150 +314,6 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         match requests.clear(work, region, drop) {
             queue::Drain::Empty => egress::Cleared::Done,
             queue::Drain::Exhausted => egress::Cleared::Retry,
-        }
-    }
-}
-
-/// A request whose connection, Sync transition, and queue vacancy are established.
-/// No reply order is installed until `try_reply` publishes the same frame.
-pub(crate) struct Prepared<
-    'turn,
-    'life,
-    'g,
-    'r,
-    's,
-    'b,
-    'c,
-    'd: 'life,
-    I: schema::QuerySet,
-    const ID: u8,
-> {
-    lane: handoff::Prepared<
-        'turn,
-        'life,
-        'life,
-        'b,
-        'c,
-        'd,
-        egress::NonEmpty<Frame<'d>>,
-        replies::Row<'d>,
-        replies::ReplyFailure<'d>,
-        replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-    >,
-    commit: Commit<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
-    conn: &'life slot::Slot<'d, ID>,
-    boundary: Boundary,
-}
-
-struct Commit<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8> {
-    port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
-    token: conn::Id<'d, KeyTag<ID>>,
-    permit: slot::Permit<'life>,
-}
-
-impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
-    Commit<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
-{
-    fn finish<J, R, F: FnOnce(J) -> (Complete<'d>, R)>(
-        (this, input, build): (Self, J, F),
-        depth: order::Depth,
-    ) -> (egress::NonEmpty<Frame<'d>>, R) {
-        let (bytes, done) = build(input);
-        if matches!(this.permit.commit(), Change::Available) {
-            this.port.shared.wake_ready();
-        }
-        this.port.shared.reindex(this.token, depth);
-        (bytes.into_frame(), done)
-    }
-}
-
-fn seal<'d, S, R, F: FnOnce(S) -> R>(
-    (bytes, state, seal): (Complete<'d>, S, F),
-) -> (Complete<'d>, R) {
-    (bytes, seal(state))
-}
-
-impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
-    Prepared<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
-{
-    pub(crate) fn try_reply<S, R>(
-        self,
-        bytes: Complete<'d>,
-        state: S,
-        reply: &mut impl attach::Attach<
-            'life,
-            'b,
-            'c,
-            'd,
-            replies::Row<'d>,
-            replies::ReplyFailure<'d>,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-        >,
-        finish: impl FnOnce(S) -> R,
-    ) -> Result<R, (error::Error, Complete<'d>, S)> {
-        self.try_publish(reply, (bytes, state, finish), seal)
-            .map_err(|(error, (bytes, state, _))| (error, bytes, state))
-    }
-
-    pub(crate) fn try_publish<J, R>(
-        self,
-        reply: &mut impl attach::Attach<
-            'life,
-            'b,
-            'c,
-            'd,
-            replies::Row<'d>,
-            replies::ReplyFailure<'d>,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-        >,
-        input: J,
-        build: impl FnOnce(J) -> (Complete<'d>, R),
-    ) -> Result<R, (error::Error, J)> {
-        self.try_with(
-            input,
-            |token, lane, tag, input| match reply.try_ordered(token, lane, tag) {
-                Ok(depth) => Ok((depth, input)),
-                Err(cause) => Err((cause, input)),
-            },
-            build,
-        )
-    }
-
-    pub(crate) fn try_with<J, K, R>(
-        self,
-        input: J,
-        prepare: impl FnOnce(
-            &mut region::Token<region::Identity<'d>>,
-            reply::Lane<
-                'life,
-                'b,
-                'c,
-                'd,
-                replies::Row<'d>,
-                replies::ReplyFailure<'d>,
-                replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-            >,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-            J,
-        ) -> Result<(order::Depth, K), (attach::Error, J)>,
-        build: impl FnOnce(K) -> (Complete<'d>, R),
-    ) -> Result<R, (error::Error, J)> {
-        let tag = replies::Tag::new(self.commit.permit.batch(), self.boundary);
-        let result = self.lane.try_with(
-            tag,
-            (self.commit, input, build),
-            |token, lane, tag, (commit, input, build)| match prepare(token, lane, tag, input) {
-                Ok((depth, output)) => Ok((depth, (commit, output, build))),
-                Err((cause, input)) => Err((cause, (commit, input, build))),
-            },
-            Commit::finish,
-        );
-        match result {
-            Ok(done) => {
-                self.conn.wake();
-                Ok(done)
-            }
-            Err((cause, (_, input, _))) => Err((error::Error::Reply(cause), input)),
         }
     }
 }

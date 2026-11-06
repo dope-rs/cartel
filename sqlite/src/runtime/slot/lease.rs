@@ -1,4 +1,4 @@
-use crate::runtime::slot::{self, local::Owned};
+use crate::runtime::slot::local::Owned;
 use crate::{api::work, catalogs, config, open, retry};
 use o3::mem::{self, lease::Open};
 use std::{marker, ptr};
@@ -15,7 +15,8 @@ pub(super) struct Lease<'slot, 'd, I: catalogs::Catalog, P> {
 struct Inner<'slot, 'd, I: catalogs::Catalog> {
     work: &'slot work::Work,
     retry: retry::raw::Loan<'slot, 'd>,
-    conn: slot::Reclaim<'slot, I>,
+    conn: ptr::NonNull<Owned<I>>,
+    lifetime: marker::PhantomData<&'slot mut Owned<I>>,
 }
 
 /// Delivers after borrowed statements, retry state, connection, and allocator scope are released.
@@ -47,7 +48,8 @@ impl<'slot, 'd, I: catalogs::Catalog> Lease<'slot, 'd, I, Open> {
                 Inner {
                     work,
                     retry,
-                    conn: slot::Reclaim::new(owned),
+                    conn: owned,
+                    lifetime: marker::PhantomData,
                 },
             ),
             phase: marker::PhantomData,
@@ -72,8 +74,8 @@ impl<'d, I: catalogs::Catalog> Lease<'_, 'd, I, Ready> {
         self.inner.item_mut().retry.cleanup()
     }
 
-    pub(super) const fn cleanup_ref(&self) -> lease::Ref<'_, 'd> {
-        self.inner.item().retry.cleanup_ref()
+    pub(super) const fn cleanup_ref(&self) -> &retry::Slot<'d> {
+        self.inner.item().retry.slot()
     }
 }
 
@@ -84,10 +86,14 @@ impl<'slot, 'd, I: catalogs::Catalog> mem::Return for Delivery<'slot, 'd, I> {
         let Inner {
             work,
             mut retry,
-            conn,
+            mut conn,
+            lifetime: marker::PhantomData,
         } = item;
         retry.finish();
-        drop(conn);
+        // SAFETY: this pointer targets the pinned local slot for `'slot`.
+        // Held drops every borrower before this Lease, and the owning Scope
+        // stays active until its statements and connection have been released.
+        unsafe { conn.as_mut() }.finish();
         if let Some(errors) = work.take_errors() {
             self.0.complete(errors);
         }
@@ -100,7 +106,6 @@ const _: () = {
     let word = mem::size_of::<usize>();
     assert!(mem::size_of::<Delivery<'_, '_, catalogs::Empty>>() == word);
     assert!(mem::size_of::<Inner<'_, '_, catalogs::Empty>>() == word * 3);
-    assert!(mem::size_of::<slot::Reclaim<'_, catalogs::Empty>>() == word);
     assert!(mem::size_of::<Lease<'_, '_, catalogs::Empty, Open>>() == word * 4);
     assert!(
         mem::align_of::<Lease<'_, '_, catalogs::Empty, Open>>()

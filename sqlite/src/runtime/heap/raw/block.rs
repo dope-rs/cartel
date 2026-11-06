@@ -60,9 +60,10 @@ impl<'a> Segment<'a> {
 impl Vacant<'_> {
     /// This capability owns a detached block absent from the live count.
     /// Each live allocation consumes at least one of this arena's bounded units.
+    /// The units plus the single runtime owner fit usize.
     pub(super) fn publish(self) -> *mut u8 {
         let pointer = self.block.write();
-        self.source.allocations += 1;
+        self.source.references += 1;
         pointer
     }
 
@@ -82,18 +83,58 @@ impl Occupied<'_> {
     /// This capability owns one native-admitted live block in this exact state.
     /// Consuming it removes that counted allocation exactly once.
     pub(super) fn release(self) -> Option<Memory> {
-        self.source.allocations -= 1;
-        self.source.recycle(self.block.into_segment());
-        if self.source.is_empty() {
-            self.source.release.take()
-        } else {
-            None
+        let memory = self.source.release();
+        if memory.is_none() {
+            self.source.recycle(self.block.into_segment());
         }
+        memory
     }
 
-    pub(super) fn grow(self, order: heap::raw::Order) -> *mut u8 {
+    pub(super) fn grow(mut self, order: heap::raw::Order) -> *mut u8 {
+        if let Some(pointer) = self.grow_adjacent(order) {
+            return pointer;
+        }
         let Self { source, block } = self;
         source.reserve(block.arena, order, |next| next.replace(block))
+    }
+
+    fn grow_adjacent(&mut self, order: heap::raw::Order) -> Option<*mut u8> {
+        let start = self.block.index.get();
+        let width = 1usize << order.index();
+        let base = start & !(width - 1);
+        let arena = self.block.arena;
+        if width > arena.units() - base {
+            return None;
+        }
+        let previous = self.block.order;
+        let buddies = (previous.index()..order.index()).map(|position| {
+            let width = 1usize << position;
+            let buddy = (start ^ width) & !(width - 1);
+            // SAFETY: the complete target extent admits every sibling's one-based start.
+            let index = heap::raw::Index(unsafe { NonZero::new_unchecked(buddy + 1) });
+            (index, heap::raw::Level::mask(position as u8))
+        });
+        for (index, level) in buddies.clone() {
+            heap::raw::State::free(arena, index, level)?;
+        }
+        for (index, level) in buddies {
+            // SAFETY: exclusive state preserves every admitted free buddy;
+            // distinct-order unlinks cannot touch the original live payload.
+            let free = unsafe { heap::raw::Free::new(arena, index, level) };
+            self.source.unlink(free);
+        }
+        self.block.order = order;
+        if base == start {
+            return Some(self.block.write_order());
+        }
+        let original = self.block.pointer();
+        // SAFETY: the admitted target begins inside the original arena.
+        self.block.index = heap::raw::Index(unsafe { NonZero::new_unchecked(base + 1) });
+        let pointer = self.block.write();
+        // SAFETY: these starts differ by at least the old block width, so the
+        // original payload and its destination are disjoint inside the admitted union.
+        unsafe { ptr::copy_nonoverlapping(original, pointer, heap::raw::payload_bytes(previous)) };
+        Some(pointer)
     }
 }
 
@@ -104,17 +145,18 @@ impl<'a> Block<'a> {
     }
 
     fn write(&self) -> *mut u8 {
-        self.arena.set_control(self.index, self.order.index() as u8);
-        // SAFETY: the vacancy exclusively owns this complete block in its original arena.
+        let header = self.arena.block(self.index).cast::<heap::raw::Header>();
+        // SAFETY: initialize this retained block's owner before its payload escapes.
         unsafe {
-            self.arena
-                .block(self.index)
-                .cast::<heap::raw::Header>()
-                .write(heap::raw::Header::new(
-                    heap::raw::Owner::new(self.arena),
-                    self.order,
-                ))
+            (&raw mut (*header).owner).write(Some(heap::raw::Owner::new(self.arena)));
         };
+        self.write_order()
+    }
+
+    fn write_order(&self) -> *mut u8 {
+        let header = self.arena.block(self.index).cast::<heap::raw::Header>();
+        // SAFETY: this retained block's owner is initialized and unchanged.
+        unsafe { (&raw mut (*header).metadata.order).write(self.order) };
         self.pointer()
     }
 

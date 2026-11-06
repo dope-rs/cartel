@@ -5,6 +5,7 @@ mod lists;
 mod server;
 mod sets;
 mod sorted;
+mod streams;
 pub mod strings;
 
 pub use hashes::Hashes;
@@ -13,3 +14,4 @@ pub use lists::Lists;
 pub use server::Server;
 pub use sets::Sets;
 pub use sorted::Sorted;
+pub use streams::Streams;

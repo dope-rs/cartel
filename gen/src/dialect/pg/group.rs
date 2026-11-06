@@ -75,7 +75,7 @@ impl Group {
                 method: name,
                 vis: fun.vis.clone(),
             };
-            queries.push((marker, pg::PgBackend::emit_query(&q, &fun.attrs)?));
+            queries.push((marker, pg::PgBackend::emit_query(q, &fun.attrs)?));
         }
         Ok(queries)
     }
@@ -142,7 +142,7 @@ impl Group {
                 "#[query_group] impl block must not be generic",
             ));
         }
-        let group = (*block.self_ty).clone();
+        let group = *block.self_ty;
         let owner = match &group {
             syn::Type::Path(tp) => tp
                 .path

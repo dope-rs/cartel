@@ -69,15 +69,14 @@ impl QueryMeta<'_> {
         let mut formats = desc::Formats::new(Q::RESULT_FORMAT_CODES, Q::N_RESULT_COLS);
         <Q::Row as desc::Validate>::formats(&mut formats)?;
         formats.finish()?;
-        Ok(Admission {
-            count: Q::N_PARAMS,
-            query: PhantomData,
-        })
+        Ok(Admission(PhantomData))
     }
 
     const fn check<Q: TypedQuery>() -> Result<(), Error> {
         let result = <Q::Result as result::Shape>::KIND;
-        if matches!(result, result::Kind::Rows) != (Q::N_RESULT_COLS != 0) {
+        if matches!(result, result::Kind::Rows) != (Q::N_RESULT_COLS != 0)
+            || (<Q::Result as result::Shape>::SCALAR && Q::N_RESULT_COLS != 1)
+        {
             return Err(Error::ResultShape {
                 kind: result,
                 columns: Q::N_RESULT_COLS,
@@ -160,18 +159,15 @@ impl QueryMeta<'_> {
 
 /// The parameter count and format relation checked for this exact query type.
 #[repr(transparent)]
-pub(crate) struct Admission<Q> {
-    count: i16,
-    query: PhantomData<fn(Q) -> Q>,
-}
+pub(crate) struct Admission<Q>(PhantomData<fn(Q) -> Q>);
 
-impl<Q> Admission<Q> {
+impl<Q: TypedQuery> Admission<Q> {
     pub(crate) const fn count(&self) -> i16 {
-        self.count
+        Q::N_PARAMS
     }
 }
 
-const _: () = assert!(mem::size_of::<Admission<()>>() == mem::size_of::<i16>());
+const _: () = assert!(mem::size_of::<Admission<()>>() == 0);
 
 #[derive(Clone, Copy)]
 enum FormatKind {

@@ -179,6 +179,8 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         'app: 'target,
         'd: 'target,
     {
+        self.port
+            .maintain(ctx.as_ref().work(), ctx.as_mut().region_token());
         let next = {
             let region = ctx.as_mut().region_token();
             req.attempt(self, reply, region)
@@ -237,7 +239,10 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
         >::with(context);
         let next = api::Pending::typed::<Q, I, ID>(self.port, params, X::BOUNDARY);
-        task::Call::from_core(task::Core::new(self, target, reply, next))
+        task::Call::from_core(
+            task::Core::new(self, target, reply, next),
+            self.port.lifecycle.deadline,
+        )
     }
 
     pub(in crate::api) fn group<Q, const N: usize>(
@@ -272,6 +277,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     {
         task::Call::from_core(
             self.raw_core_as::<X, conn::Id<'d, KeyTag<ID>>, lease::Detached>(target, req),
+            self.port.lifecycle.deadline,
         )
     }
 
@@ -316,48 +322,6 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         >::new();
         let next = api::Pending::raw(self.port, req);
         task::Core::new(self, target, reply, next)
-    }
-
-    pub(in crate::api) fn pending<X, S, A, P>(
-        self,
-        target: Option<api::Target<'d, ID>>,
-        req: api::Pending<'d, S>,
-    ) -> task::Core<
-        'app,
-        'g,
-        'r,
-        's,
-        'b,
-        'c,
-        'd,
-        B,
-        I,
-        Response<'app, 'g, 'r, 's, 'b, 'c, 'd, X>,
-        ID,
-        S,
-        A,
-        P,
-    >
-    where
-        X: recv::Extract<
-                'app,
-                'b,
-                'c,
-                'd,
-                replies::Row<'d>,
-                replies::ReplyFailure<'d>,
-                Context = (),
-            >,
-        A: Target<'d, ID>,
-        P: Policy,
-    {
-        let reply = recv::Response::<
-            replies::Row<'_>,
-            X,
-            replies::ReplyFailure<'_>,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-        >::new();
-        task::Core::new(self, target, reply, Ok(req))
     }
 
     pub(in crate::api) fn stream<Q, X>(

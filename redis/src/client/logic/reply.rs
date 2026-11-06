@@ -9,8 +9,7 @@ use dope::{
 use o3::buffer::write::consume::scope;
 
 use crate::{
-    client,
-    client::logic::{Pending, init},
+    client::{self, logic::Pending, settings::init::Plan},
     protocol,
 };
 
@@ -43,7 +42,7 @@ pub(super) fn push<'e, 's, 'b, 'c, 'd, const ID: u8>(
             front: order::Front::Detached,
         }) => drop(value),
         Err(usage::InsertError::Backpressure { value, .. }) => {
-            return Some(Pending::new(value, pending.1));
+            return Some(Pending(value, pending.1));
         }
         Err(usage::InsertError::Capacity { cause, .. }) => {
             fail(port, client::Failure::ResponseCapacity(cause), ctx);
@@ -62,7 +61,7 @@ pub(super) fn push<'e, 's, 'b, 'c, 'd, const ID: u8>(
 }
 
 pub(super) fn deliver<'e, 's, 'b, 'c, 'd, const ID: u8>(
-    init: &init::Init,
+    init: &Plan,
     port: &crate::Port<'s, '_, 'b, 'c, 'd, ID>,
     decoded: Result<protocol::Decoded<'s, 'd, 'd>, scope::Error>,
     ctx: &mut turns::Context<'_, 'e, 'd, protocol::ConnState, Buffer, route::KeyTag<ID>>,
@@ -70,7 +69,9 @@ pub(super) fn deliver<'e, 's, 'b, 'c, 'd, const ID: u8>(
     match ctx.close_status() {
         conn::CloseStatus::Open
         | conn::CloseStatus::Closing(
-            conn::ClosePhase::Requested | conn::ClosePhase::Quarantining,
+            conn::ClosePhase::Withdrawing
+            | conn::ClosePhase::Requested
+            | conn::ClosePhase::Quarantining,
             _,
         ) => {}
         conn::CloseStatus::Closing(conn::ClosePhase::Retiring, directive)
@@ -91,7 +92,7 @@ pub(super) fn deliver<'e, 's, 'b, 'c, 'd, const ID: u8>(
     }
     match decoded {
         Ok(protocol::Decoded::Frame(frame, lane)) => {
-            let pending = Pending::new(frame, lane);
+            let pending = Pending(frame, lane);
             match ctx.state.phase() {
                 protocol::Phase::Init(step) => {
                     init.response(port, step, pending.0, ctx);

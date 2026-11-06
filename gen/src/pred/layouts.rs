@@ -31,12 +31,12 @@ impl<'a> Rows<'a> {
         Ok(Self { source, idents })
     }
 
-    fn scope(self) -> pred::RowScope {
+    fn scope<'s>(self) -> pred::RowScope<'s> {
         pred::RowScope::for_bindings(self.source, self.idents)
     }
 }
 
-impl pred::RowScope {
+impl<'a> pred::RowScope<'a> {
     pub(crate) fn single(ident: syn::Ident) -> Self {
         Self {
             vars: vec![var::Var {
@@ -46,7 +46,7 @@ impl pred::RowScope {
             agg_var: None,
             outer: None,
             alias_depth: None,
-            unnest_cols: Vec::new(),
+            unnest_cols: &[],
         }
     }
 
@@ -77,32 +77,28 @@ impl pred::RowScope {
         parent: &Self,
         inputs: &punctuated::Punctuated<syn::Pat, token::Comma>,
     ) -> syn::Result<Self> {
-        let mut rows = parent.vars.iter();
+        if inputs.len() != parent.vars.len() {
+            return Err(syn::Error::new(
+                inputs.span(),
+                format!(
+                    "`.order_by(|...|)` closure must take {} arg(s), matching the surrounding scope",
+                    parent.vars.len()
+                ),
+            ));
+        }
         let mut vars = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            let row = rows.next().ok_or_else(|| {
-                syn::Error::new(
-                    input.span(),
-                    "order closure has more parameters than its source scope",
-                )
-            })?;
+        for (input, row) in inputs.iter().zip(&parent.vars) {
             vars.push(var::Var {
                 ident: input.ident()?.clone(),
                 table_const: row.table_const.clone(),
             });
         }
-        if let Some(row) = rows.next() {
-            return Err(syn::Error::new(
-                row.ident.span(),
-                "order closure has fewer parameters than its source scope",
-            ));
-        }
         Ok(Self {
             vars,
             agg_var: None,
-            outer: None,
+            outer: parent.outer,
             alias_depth: parent.alias_depth,
-            unnest_cols: Vec::new(),
+            unnest_cols: &[],
         })
     }
 
@@ -111,23 +107,23 @@ impl pred::RowScope {
         self
     }
 
-    pub(crate) fn with_unnest(mut self, cols: Vec<syn::Ident>) -> Self {
+    pub(crate) fn with_unnest(mut self, cols: &'a [syn::Ident]) -> Self {
         self.unnest_cols = cols;
         self
     }
 
-    pub(super) fn unnest_ref(&self, expr: &syn::Expr) -> Option<Vec<proc_macro2::TokenStream>> {
+    pub(super) fn unnest_ref(&self, expr: &syn::Expr) -> Option<proc_macro2::TokenStream> {
         let id = expr::Path::new(expr)?.single()?;
         let pos = self
             .unnest_cols
             .iter()
             .position(|column| column.unraw() == id.unraw())?;
         let col = format!("__d.f{pos}");
-        Some(vec![quote::quote! { #col }])
+        Some(quote::quote! { #col })
     }
 
-    pub(crate) fn with_outer(mut self, outer: Self) -> Self {
-        self.outer = Some(Box::new(outer));
+    pub(crate) fn with_outer(mut self, outer: &'a Self) -> Self {
+        self.outer = Some(outer);
         self
     }
 
@@ -135,7 +131,7 @@ impl pred::RowScope {
         if let Some(c) = self.local_ref(expr) {
             return Some(c);
         }
-        self.outer.as_ref().and_then(|o| o.column_ref(expr))
+        self.outer.and_then(|o| o.column_ref(expr))
     }
 
     fn local_ref(&self, expr: &syn::Expr) -> Option<pred::SqlColRef> {
@@ -153,7 +149,7 @@ impl pred::RowScope {
             .vars
             .iter()
             .find(|var| var.ident.unraw() == base.unraw())?;
-        let col_str = col.unraw().to_string();
+        let col_str = crate::ext::name(col);
         match &var.table_const {
             None => Some(pred::SqlColRef::Bare(col_str)),
             Some(tc) => Some(pred::SqlColRef::Qualified(tc.clone(), col_str)),

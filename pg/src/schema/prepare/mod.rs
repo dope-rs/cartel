@@ -122,10 +122,8 @@ const fn unique(groups: &[&[schema::QueryMeta<'_>]]) -> Result<(), encode::Error
 }
 
 impl<'a> Prepare<'a> {
-    const SYNC: &'static [u8] = &[b'S', 0, 0, 0, 4];
-
     pub const EMPTY: Self = Self {
-        wire: Self::SYNC,
+        wire: encode::SYNC,
         statements: 0,
         groups: &[],
         flags: 0,
@@ -152,7 +150,7 @@ impl<'a> Prepare<'a> {
     }
 
     pub const fn try_wire_len(groups: &[&[schema::QueryMeta<'_>]]) -> Result<usize, encode::Error> {
-        let mut total = Self::SYNC.len();
+        let mut total = encode::SYNC.len();
         if dynamic(groups) & desc::DYNAMIC_LTREE != 0 {
             let lengths = match statement_lengths(schema::LTREE_PROBE_NAME, LTREE_PROBE_SQL, &[]) {
                 Ok(lengths) => lengths,
@@ -232,7 +230,7 @@ impl<'a> Prepare<'a> {
             }
             group_i += 1;
         }
-        write_slice(&mut out, &mut at, Self::SYNC);
+        write_slice(&mut out, &mut at, encode::SYNC);
         Ok(schema::Wire::new(out, stmts, groups, flags))
     }
 

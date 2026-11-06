@@ -1,8 +1,6 @@
 use dope_test::harness::peer;
 
 use cartel_redis::client::settings::init::Step;
-use dope_fiber::abi::Fiber;
-use dope_test::fibers::Yield;
 
 const AUTH: &[u8] = b"*3\r\n$4\r\nAUTH\r\n$5\r\nalice\r\n$9\r\nswordfish\r\n";
 
@@ -25,12 +23,4 @@ pub fn read_request(socket: &peer::Stream<'_>, len: usize) -> Result<Vec<u8>, pe
     let mut bytes = vec![0; len];
     socket.read_exact(&mut bytes)?;
     Ok(bytes)
-}
-
-pub fn yield_turns<'d>(turns: usize) -> impl Fiber<'d, Output = ()> {
-    dope_fiber::fiber!('d => async move {
-        for _ in 0..turns {
-            Yield::new().await;
-        }
-    })
 }

@@ -23,7 +23,7 @@ use crate::reply::group::Resolution;
 
 pub(crate) struct Active<'r, 's> {
     records: Unique<'r, group::Records<'s>, recycle::Header<group::Records<'s>>>,
-    bytes: pool::Cursor,
+    bytes: pool::Span,
 }
 
 pub(crate) struct State<'r, 's, 'b, 'c, 'd> {
@@ -33,11 +33,8 @@ pub(crate) struct State<'r, 's, 'b, 'c, 'd> {
 }
 
 type Header<'r, 's, 'b, 'c, 'd> = shared::Header<State<'r, 's, 'b, 'c, 'd>>;
-type Resident<'r, 's, 'b, 'c, 'd> = shared::Resident<State<'r, 's, 'b, 'c, 'd>>;
-
 pub(crate) struct Owner<'g, 'r, 's, 'b, 'c, 'd> {
-    state:
-        Shared<'g, Resident<'r, 's, 'b, 'c, 'd>, Header<'r, 's, 'b, 'c, 'd>, shared::Initialized>,
+    state: Shared<'g, State<'r, 's, 'b, 'c, 'd>>,
 }
 
 /// The sole admission authority for a newly initialized, unpublished collector.
@@ -77,7 +74,7 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Access<'g, 'r, 's, 'b, 'c, 'd> {
             .ok_or(crate::Error::GroupRecordCapacity)?;
         let bytes = self
             .bytes
-            .cursor()
+            .acquire()
             .ok_or(crate::Error::GroupBytesCapacity)?;
         records.get_mut().get_mut().clear();
         let active = Cell::new(Some(Active { records, bytes }));
@@ -140,10 +137,13 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Owner<'g, 'r, 's, 'b, 'c, 'd> {
         };
         let Active { records, bytes } = active;
         drop(self.state.reservation.take());
+        if records.get().get_ref().len() == 0 {
+            return group::Ledger::empty();
+        }
         group::Ledger {
             inner: Some(group::Retained {
                 records,
-                bytes: bytes.freeze(),
+                bytes: bytes.freeze().into_shared(),
             }),
         }
     }
@@ -169,7 +169,8 @@ impl Active<'_, '_> {
         let Some(record) = records.vacancy() else {
             return Err(crate::Error::GroupDiagnosticRecords { capacity });
         };
-        let start = self.bytes.len();
+        // Span retains both initialized lengths as u32 in its owned lease.
+        let start = self.bytes.len() as u32;
         let append = self
             .bytes
             .try_append(plan.as_slice())
@@ -178,7 +179,7 @@ impl Active<'_, '_> {
         record.commit(group::Record {
             position,
             start,
-            end: self.bytes.len(),
+            end: self.bytes.len() as u32,
         });
         Ok(())
     }

@@ -1,11 +1,12 @@
 use crate::api::stmt::{Binder, Prepared, access::Access};
 use crate::{api, config, row};
 use api::exec;
-use std::{mem, num, result};
+use std::{marker, mem, num, result};
 
 pub(crate) struct Bound<'statement, 'connection, P> {
     statement: &'statement mut Prepared<'connection>,
-    params: P,
+    // Bind admits only scalar values and external storage borrows.
+    params: marker::PhantomData<P>,
 }
 
 impl<'statement, 'connection, P: api::Bind> Bound<'statement, 'connection, P> {
@@ -34,19 +35,18 @@ impl<'statement, 'connection, P: api::Bind> Bound<'statement, 'connection, P> {
                 actual: P::COUNT,
             });
         }
-        let bound = Self {
-            statement: stmt,
-            params,
-        };
         let result = {
-            let mut binder = Binder::new(bound.statement, config.param_bytes());
-            bound.params.bind(&mut binder, 1)
+            let mut binder = Binder::new(stmt, config.param_bytes());
+            params.bind(&mut binder, 1)
         };
         if let Err(error) = result {
-            bound.statement.clear();
+            stmt.clear();
             return Err(error);
         }
-        Ok(bound)
+        Ok(Self {
+            statement: stmt,
+            params: marker::PhantomData,
+        })
     }
 }
 

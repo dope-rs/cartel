@@ -28,7 +28,7 @@ pub struct TextQuery;
 
 pub struct MixedQuery;
 
-pub struct ArrayQuery;
+pub struct ArrayQuery<const SCALAR: bool = false>;
 
 pub struct Group;
 
@@ -64,12 +64,12 @@ impl schema::TypedQuery for MixedQuery {
     }
 }
 
-impl schema::TypedQuery for ArrayQuery {
+impl<const SCALAR: bool> schema::TypedQuery for ArrayQuery<SCALAR> {
     type Params<'p> = ();
     type Row = Vec<String>;
-    type Result = result::Rows;
+    type Result = result::Rows<SCALAR>;
     type Group = Group;
-    const STATEMENT_NAME: &str = "namearray";
+    const STATEMENT_NAME: &str = if SCALAR { "scalararray" } else { "namearray" };
     const SQL: &str = "SELECT 1";
     const PARAM_OIDS: &[u32] = &[];
     const N_PARAMS: i16 = 0;
@@ -80,12 +80,18 @@ impl schema::TypedQuery for ArrayQuery {
 }
 
 impl schema::QueryGroup for Group {
-    type Items =
-        groups::Item<TextQuery, groups::Item<MixedQuery, groups::Item<ArrayQuery, groups::Empty>>>;
+    type Items = groups::Item<
+        TextQuery,
+        groups::Item<
+            MixedQuery,
+            groups::Item<ArrayQuery, groups::Item<ArrayQuery<true>, groups::Empty>>,
+        >,
+    >;
     const QUERIES: &[schema::QueryMeta<'_>] = &[
         schema::QueryMeta::fixed::<TextQuery>(),
         schema::QueryMeta::fixed::<MixedQuery>(),
         schema::QueryMeta::fixed::<ArrayQuery>(),
+        schema::QueryMeta::fixed::<ArrayQuery<true>>(),
     ];
 }
 
@@ -205,6 +211,8 @@ impl MixedRow {
 }
 
 impl ArrayQuery {
+    pub const NULL: &[u8] = b"\0\x01\xff\xff\xff\xff";
+
     pub fn wire(values: &[&[u8]], trailing: &[u8]) -> Vec<u8> {
         let length =
             20 + values.iter().map(|value| 4 + value.len()).sum::<usize>() + trailing.len();
@@ -261,6 +269,21 @@ impl Database {
         Self::serve(socket, [rows])
     }
 
+    pub fn serve_timer_queries(socket: &peer::Stream<'_>, row: &[u8]) -> Result<(), Error> {
+        Self::serve(
+            socket,
+            (0..4).map(|index| {
+                iter::once(row).inspect(move |_| {
+                    if index == 3 {
+                        socket
+                            .write_all(&Frame::new(b'A', b"\0\0\0\x01next\0ready\0").encode())
+                            .expect("fourth query notification");
+                    }
+                })
+            }),
+        )
+    }
+
     pub(in crate::common) fn start(socket: &peer::Stream<'_>) -> Result<(), Error> {
         startup::read(socket)?;
         socket.write_all(&Frame::new(b'R', &0u32.to_be_bytes()).encode())?;
@@ -279,7 +302,9 @@ impl Database {
                     }
                     let oids: &[u32] = if body.get(1..) == Some(b"text\0") {
                         &[20, 25]
-                    } else if body.get(1..) == Some(b"namearray\0") {
+                    } else if body.get(1..) == Some(b"namearray\0")
+                        || body.get(1..) == Some(b"scalararray\0")
+                    {
                         &[1009]
                     } else {
                         &[20, 23, 16, 3802, 20]
@@ -295,7 +320,7 @@ impl Database {
         Ok(())
     }
 
-    fn serve<'a, R: IntoIterator<Item = &'a [u8]>>(
+    pub(crate) fn serve<'a, R: IntoIterator<Item = &'a [u8]>>(
         socket: &peer::Stream<'_>,
         queries: impl IntoIterator<Item = R>,
     ) -> Result<(), Error> {

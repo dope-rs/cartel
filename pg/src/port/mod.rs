@@ -4,11 +4,7 @@ use cartel_core::{deadline, queue, reply};
 use dope::{
     core::driver::{route::KeyTag, schedule::app::Work},
     manifold::{
-        client::{
-            app::{Barrier, Drain},
-            conn,
-            side::registry,
-        },
+        client::{conn, side::registry},
         service::bindings::endpoint,
     },
     net::link::egress,
@@ -75,6 +71,7 @@ pub struct Port<'e, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8 = 
     pub(super) lifecycle: Lifecycle<'d, ID>,
     request_queue: queue::Scoped<'b, 'd, egress::NonEmpty<requests::Frame<'d>>>,
     requests: Pool,
+    controls: Pool,
     responses: &'e reply::Arena<
         'b,
         'c,
@@ -184,33 +181,17 @@ impl<'e, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8>
         Some(depth + conn.barriers())
     }
 
-    pub(super) fn settle(&self, token: conn::Id<'d, KeyTag<ID>>) -> slot::Settle {
-        match self.conn(token) {
-            Some(conn) => conn.settle(token),
-            None => slot::Settle::Stale,
-        }
-    }
-
-    pub(super) fn quiesce<'a>(
-        &self,
-        barrier: Barrier<'a, 'd, KeyTag<ID>>,
-        region: &mut region::Token<region::Identity<'d>>,
-    ) -> Drain<'a, 'd, KeyTag<ID>> {
-        match self.responses(barrier.connection()) {
-            None => barrier.ready(),
-            Some(lane) => match lane.attachment(region) {
-                reply::Attachment::Detached => barrier.ready(),
-                reply::Attachment::Attached => barrier.pending(),
-            },
-        }
-    }
-
     pub(crate) fn maintain(
         &self,
         work: Work<'_, 'd>,
         region: &mut region::Token<region::Identity<'d>>,
-    ) -> Option<reply::Released<'b>> {
-        self.responses.maintain(work, region)
+    ) {
+        if let Some(released) = self.responses.maintain(work, region) {
+            let signals = &self.shared.signals;
+            if let Err(cause) = signals.egress.release(released) {
+                signals.record_fatal(crate::Error::EgressSlot(cause));
+            }
+        }
     }
 
     pub(crate) fn maint(&self) -> reply::Work {

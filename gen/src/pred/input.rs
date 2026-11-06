@@ -88,9 +88,10 @@ pub(super) enum Null<'a> {
 impl Null<'_> {
     pub(super) fn parse(
         self,
-        scope: &pred::RowScope,
+        scope: &pred::RowScope<'_>,
         context: &pred::WhereContext<'_>,
-    ) -> syn::Result<sql::Sql> {
+        sql: &mut sql::Sql,
+    ) -> syn::Result<()> {
         let (syntax, keyword) = match self {
             Self::Present(syntax) => (syntax, "IS_NOT_NULL"),
             Self::Absent(syntax) => (syntax, "IS_NULL"),
@@ -113,19 +114,21 @@ impl Null<'_> {
                 "null predicates do not take arguments",
             ));
         }
-        let column = scope
-            .parse(
-                &syntax.receiver,
-                None,
-                context.param_tys,
-                context.dialect,
-                context.cte_map,
-            )?
-            .required(syn::Error::new(
+        if !scope.parse_into(
+            &syntax.receiver,
+            None,
+            context.param_tys,
+            context.dialect,
+            context.cte_map,
+            sql,
+        )? {
+            return Err(syn::Error::new(
                 syntax.receiver.span(),
                 "null predicate receiver must be a column or column-derived expression",
-            ))?;
-        Ok(column.push(context.dialect.kw(keyword)))
+            ));
+        }
+        sql.push(context.dialect.kw(keyword));
+        Ok(())
     }
 }
 

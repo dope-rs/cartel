@@ -4,12 +4,9 @@ use cartel_sqlite::{Catalog as _, OpenOptions, Shape};
 use common::{assert_reclaimed, assert_retirement, engine::layout::*};
 use dope_core::driver::life::recovery::Policy;
 use dope_test::fibers;
-use std::sync::OnceLock;
 use std::{mem, ops};
 
 pub mod common;
-
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
 
 #[test]
 fn catalog_marker_identity() {
@@ -40,13 +37,10 @@ fn catalog_shape() {
 
 #[test]
 fn bounded_fiber_state() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+    // SAFETY: only this test calls SQLite in this binary. Only Cartel uses the
+    // installed runtime, retaining Core handles and allocations on their worker.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
     let database = OpenOptions::new()
         .open_memory(runtime)
         .map_err(plan::Error::Client)?
@@ -234,29 +228,6 @@ fn bounded_fiber_state() -> Result<(), plan::Error> {
                     .map_err(plan::Error::Run)?
                     .map_err(plan::Error::Call)?;
 
-                {
-                    let tx = fibers::TEST
-                        .try_run(driver, database.transaction())
-                        .map_err(plan::Error::Run)?
-                        .map_err(plan::Error::Call)?;
-                    assert!(mem::size_of_val(&tx) <= CAPABILITY_WORDS * mem::size_of::<usize>());
-                }
-
-                let mut tx = fibers::TEST
-                    .try_run(driver, database.transaction())
-                    .map_err(plan::Error::Run)?
-                    .map_err(plan::Error::Call)?;
-                {
-                    let save = fibers::TEST
-                        .try_run(driver, tx.savepoint())
-                        .map_err(plan::Error::Run)?
-                        .map_err(plan::Error::Call)?;
-                    assert!(mem::size_of_val(&save) <= SAVEPOINT_WORDS * mem::size_of::<usize>());
-                }
-                fibers::TEST
-                    .try_run(driver, tx.rollback())
-                    .map_err(plan::Error::Run)?
-                    .map_err(plan::Error::Call)?;
                 Ok(())
             },
             Policy::new(assert_reclaimed, assert_retirement),

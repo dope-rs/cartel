@@ -1,9 +1,6 @@
 use crate::api::{Client, decode};
 use crate::client::nonempty;
-use crate::request::encode::{
-    self,
-    write::{key, space},
-};
+use crate::request::encode;
 use std::num;
 
 #[derive(Clone, Copy)]
@@ -24,13 +21,13 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Basic<C, ID> {
     pub fn set_seconds(self, key: &[u8], value: &[u8], ttl: num::NonZero<u64>) -> C::Call<()> {
         let seconds = ttl.get();
         self.0
-            .encode::<()>(move |out| key::Writer::new(out).set_ttl(key, value, b"EX", seconds))
+            .encode::<()>(move |out| out.set_ttl(key, value, b"EX", seconds))
     }
 
     pub fn set_millis(self, key: &[u8], value: &[u8], ttl: num::NonZero<u64>) -> C::Call<()> {
         let millis = ttl.get();
         self.0
-            .encode::<()>(move |out| key::Writer::new(out).set_ttl(key, value, b"PX", millis))
+            .encode::<()>(move |out| out.set_ttl(key, value, b"PX", millis))
     }
 
     pub fn set_absent(self, key: &[u8], value: &[u8]) -> C::Call<bool> {
@@ -51,7 +48,7 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Basic<C, ID> {
         K: AsRef<[u8]>,
     {
         self.0
-            .encode::<u64>(move |out| key::Writer::new(out).del(count.get(), keys))
+            .encode::<u64>(move |out| out.sequence(&[b"DEL"], count.get(), keys.map(|key| [key])))
     }
 
     pub fn exists(self, keys: nonempty::Slice<'_, &[u8]>) -> C::Call<u64> {
@@ -71,19 +68,28 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Basic<C, ID> {
     }
 
     pub fn incr_by(self, key: &[u8], by: i64) -> C::Call<i64> {
-        self.0
-            .encode::<i64>(move |out| key::Writer::new(out).incr_by(key, by))
+        self.0.encode::<i64>(move |out| {
+            let mut buffer = core::fmt::NumBuffer::new();
+            let by = by.format_into(&mut buffer).as_bytes();
+            out.command(&[b"INCRBY", key, by])
+        })
     }
 
     pub fn incr_float(self, key: &[u8], by: f64) -> C::Call<f64> {
-        self.0
-            .encode::<f64>(move |out| key::Writer::new(out).incr_float(key, by))
+        self.0.encode::<f64>(move |out| {
+            let mut buffer = ryu::Buffer::new();
+            let by = encode::format_float(&mut buffer, by);
+            out.command(&[b"INCRBYFLOAT", key, by])
+        })
     }
 
     pub fn expire(self, key: &[u8], ttl: num::NonZero<u64>) -> C::Call<bool> {
         let seconds = ttl.get();
-        self.0
-            .encode::<bool>(move |out| space::Writer::new(out).expire(key, seconds))
+        self.0.encode::<bool>(move |out| {
+            let mut buffer = core::fmt::NumBuffer::new();
+            let seconds = seconds.format_into(&mut buffer).as_bytes();
+            out.command(&[b"EXPIRE", key, seconds])
+        })
     }
 
     pub fn ttl(self, key: &[u8]) -> C::Call<i64> {
@@ -99,7 +105,7 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Basic<C, ID> {
     pub fn mset(self, kv: nonempty::Slice<'_, (&[u8], &[u8])>) -> C::Call<()> {
         let kv = kv.as_slice();
         self.0
-            .encode::<()>(move |out| key::Writer::new(out).mset(kv))
+            .encode::<()>(move |out| out.sequence(&[b"MSET"], kv.len(), kv.iter().copied()))
     }
 }
 
@@ -133,20 +139,15 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Bits<C, ID> {
 
     /// Counts set bits in the inclusive byte range.
     pub fn count_range(self, key: &[u8], start: i64, end: i64) -> C::Call<u64> {
-        self.0.encode::<u64>(move |out| {
-            let mut first = [0; 21];
-            let start = encode::format_int_into(&mut first, start);
-            let mut last = [0; 21];
-            let end = encode::format_int_into(&mut last, end);
-            out.command(&[b"BITCOUNT", key, start, end])
-        })
+        self.0
+            .encode::<u64>(move |out| out.range(b"BITCOUNT", &[], key, start, end))
     }
 
     /// Sets one bit and returns its previous value.
     pub fn set(self, key: &[u8], offset: u64, value: bool) -> C::Call<decode::Changed> {
         self.0.encode::<decode::Changed>(move |out| {
-            let mut buffer = [0; 20];
-            let offset = encode::format_uint_into(&mut buffer, offset);
+            let mut buffer = core::fmt::NumBuffer::new();
+            let offset = offset.format_into(&mut buffer).as_bytes();
             let value: &[u8] = if value { b"1" } else { b"0" };
             out.command(&[b"SETBIT", key, offset, value])
         })
@@ -154,8 +155,8 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Bits<C, ID> {
 
     pub fn get(self, key: &[u8], offset: u64) -> C::Call<decode::Changed> {
         self.0.encode::<decode::Changed>(move |out| {
-            let mut buffer = [0; 20];
-            let offset = encode::format_uint_into(&mut buffer, offset);
+            let mut buffer = core::fmt::NumBuffer::new();
+            let offset = offset.format_into(&mut buffer).as_bytes();
             out.command(&[b"GETBIT", key, offset])
         })
     }

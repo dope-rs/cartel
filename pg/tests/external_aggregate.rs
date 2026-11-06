@@ -1,11 +1,17 @@
-use cartel_pg::api::traits::Client as _;
+use cartel_pg::{api::traits::Client as _, protocol::Reason, schema::TypedQuery as _};
 use common::{external::runtime::check, recover};
 use dope_fiber::BlockOn as _;
 use std::env::var_os;
 
 use crate::common::{
     env::{self, Env},
-    external::{own, own::Convert as _, reports::Aggregate, row::Widget, runtime::Plan},
+    external::{
+        own,
+        own::Convert as _,
+        reports::{Aggregate, AggregateRejectId},
+        row::Widget,
+        runtime::Plan,
+    },
 };
 
 pub mod common;
@@ -78,26 +84,64 @@ fn aggregates() {
                         Aggregate::sum_ages(client.query())
                             .await
                             .try_own()?,
-                        Some(30 + 25 + 40 + 22 + 29)
+                        Some(Some(30 + 25 + 40 + 22 + 29))
                     );
-                    let s = Aggregate::sum_doubled(client.query(), 0)
-                        .await
-                        .try_own()?;
-                    assert_eq!(s, Some((30 + 25 + 40 + 22 + 29) * 2));
+                    let cases = [
+                        (0, 1, 0, Some(Some((30 + 25 + 40 + 22 + 29) * 2))),
+                        (51, 1, 0, Some(None)),
+                        (0, 0, 0, None),
+                        (0, 1, 1, None),
+                    ];
+                    let mut pool = dope_fiber::task::batch::Pool::<4>::acquire().await
+                        .expect("aggregate task credits");
+                    let values = Aggregate::sum_doubled_each(
+                        client.query(),
+                        &mut pool,
+                        cases.map(|(min, limit, offset, _)| (min, limit, offset)),
+                    ).await.expect("aggregate tasks");
+                    for (value, (_, _, _, expected)) in values.zip(cases) {
+                        let value = value.map_err(own::Error::Query)?;
+                        assert_eq!(
+                            value.as_ref().map(|row| row.decode()).transpose()
+                                .map_err(own::Error::Decode)?,
+                            expected.map(|value| value.map(|value| (value, ())))
+                        );
+                        let value = value.map(|row| row.into_owned()).transpose()
+                            .map_err(own::Error::Decode)?;
+                        assert_eq!(value.map(|row| row.map(|value| value.id)), expected);
+                    }
+                    assert_eq!(AggregateRejectId::RESULT_FORMAT_CODES, &[0]);
+                    for (min, null) in [(0, false), (6, true)] {
+                        let row = Aggregate::reject_id(client.query(), min)
+                            .await
+                            .map_err(own::Error::Query)?
+                            .expect("aggregate row");
+                        for result in [row.decode(), row.into_owned()] {
+                            assert!(match result {
+                                Ok(None) => null,
+                                Err(cartel_pg::Error::Protocol(Reason::ColumnNull {
+                                    column: 0,
+                                })) => !null,
+                                _ => false,
+                            });
+                        }
+                    }
                     let avg = Aggregate::avg_score(client.query())
                         .await
                         .try_own()?
+                        .expect("aggregate row")
                         .expect("users are nonempty");
                     assert!((avg - (9.5 + 7.0 + 8.2 + 6.1 + 5.0) / 5.0).abs() < 1e-6);
                     assert_eq!(
                         Aggregate::min_age(client.query())
                             .await
                             .try_own()?,
-                        Some(22)
+                        Some(Some(22))
                     );
                     let m = Aggregate::max_score(client.query())
                         .await
                         .try_own()?
+                        .expect("aggregate row")
                         .expect("users are nonempty");
                     assert!((m - 9.5).abs() < 1e-9);
                     assert_eq!(

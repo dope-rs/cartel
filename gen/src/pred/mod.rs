@@ -16,7 +16,6 @@ pub(super) mod sql;
 mod subquery;
 pub(super) mod var;
 
-use expr::Parsed;
 use input::{Input, Method, Op};
 use var::Var;
 
@@ -24,12 +23,7 @@ pub(super) struct WhereContext<'a> {
     pub(super) fn_params: &'a [syn::Ident],
     pub(super) param_tys: &'a [syn::Type],
     pub(super) dialect: &'a backend::Dialect,
-    pub(super) cte_map: &'a collections::HashMap<String, syn::Path>,
-}
-
-pub(super) enum ComparedRhs {
-    Capture(syn::Ident),
-    Column(sql::Sql),
+    pub(super) cte_map: &'a collections::BTreeMap<String, syn::Path>,
 }
 
 pub(super) enum SqlColRef {
@@ -38,49 +32,39 @@ pub(super) enum SqlColRef {
 }
 
 impl SqlColRef {
-    pub(super) fn append_to(&self, out: &mut Vec<proc_macro2::TokenStream>) {
-        match self {
+    pub(super) fn into_parts(self) -> impl Iterator<Item = proc_macro2::TokenStream> {
+        let (first, second) = match self {
             Self::Bare(s) => {
                 let lit = s.quoted();
-                out.push(quote::quote! { #lit });
+                (quote::quote! { #lit }, None)
             }
             Self::Qualified(table, col) => {
-                out.push(table.clone());
                 let dot_col = format!(".{}", col.quoted());
-                out.push(quote::quote! { #dot_col });
+                (table, Some(quote::quote! { #dot_col }))
             }
-        }
-    }
-
-    fn into_parts(self) -> Vec<proc_macro2::TokenStream> {
-        let mut out = Vec::new();
-        self.append_to(&mut out);
-        out
-    }
-}
-
-impl ComparedRhs {
-    fn sql(self, lhs: sql::Sql, op: cmp::Cmp, dialect: &backend::Dialect) -> sql::Sql {
-        let mut out = lhs.push(op.sql_ref(dialect));
-        match self {
-            Self::Capture(ident) => {
-                out = out.append(sql::Sql::captured(ident));
-                if op.is_ltree() {
-                    out = out.push(dialect.kw("CAST_LTREE_SUFFIX"));
-                }
-            }
-            Self::Column(column) => out = out.append(column),
-        }
-        out
+        };
+        std::iter::once(first).chain(second)
     }
 }
 
 pub(super) fn build(
     expr: &syn::Expr,
-    scope: &RowScope,
+    scope: &RowScope<'_>,
     columns: bool,
     context: &WhereContext<'_>,
 ) -> syn::Result<sql::Sql> {
+    let mut sql = sql::Sql::new();
+    build_into(expr, scope, columns, context, &mut sql)?;
+    Ok(sql)
+}
+
+fn build_into(
+    expr: &syn::Expr,
+    scope: &RowScope<'_>,
+    columns: bool,
+    context: &WhereContext<'_>,
+    sql: &mut sql::Sql,
+) -> syn::Result<()> {
     let params = context.fn_params;
     let types = context.param_tys;
     let dialect = context.dialect;
@@ -110,7 +94,7 @@ pub(super) fn build(
                     format!("`{name}(...)` takes one argument: a `Table::filter(|t| ...)` source"),
                 ));
             }
-            scope.exists(source, negate, context)
+            scope.exists(source, negate, context, sql)
         }
         Input::Binary { syntax, op } => {
             if let Some(attr) = syntax.attrs.first() {
@@ -128,32 +112,32 @@ pub(super) fn build(
                     } else {
                         "OR_PAREN_WRAP"
                     };
-                    let left = build(left, scope, columns, context)?;
-                    let right = build(right, scope, columns, context)?;
-                    Ok(sql::Sql::infix(left, dialect.kw(keyword), right, dialect))
+                    sql.push(dialect.kw("PAREN_OPEN"));
+                    build_into(left, scope, columns, context, sql)?;
+                    sql.push(dialect.kw(keyword));
+                    build_into(right, scope, columns, context, sql)?;
+                    sql.push(dialect.kw("PAREN_CLOSE"));
+                    Ok(())
                 }
                 Op::Compare(op) => {
-                    let Parsed::Sql(lhs) =
-                        scope.parse(left, Some(params), types, dialect, cte_map)?
-                    else {
+                    if !scope.parse_into(left, Some(params), types, dialect, cte_map, sql)? {
                         return Err(syn::Error::new(
                             syntax.span(),
                             "expected at least one side of the comparison to be a column / arithmetic / function expression",
                         ));
-                    };
-                    let rhs = match scope.parse(right, None, types, dialect, cte_map)? {
-                        Parsed::Sql(parts) => {
-                            if !columns && scope.has_column(left) && scope.has_column(right) {
-                                return Err(syn::Error::new(
-                                    syntax.span(),
-                                    "both sides reference the row scope; column-to-column compare is only allowed in JOIN ON clauses",
-                                ));
-                            }
-                            ComparedRhs::Column(parts)
+                    }
+                    sql.push(op.sql_ref(dialect));
+                    if scope.parse_into(right, None, types, dialect, cte_map, sql)? {
+                        if !columns && scope.has_column(left) && scope.has_column(right) {
+                            return Err(syn::Error::new(
+                                syntax.span(),
+                                "both sides reference the row scope; column-to-column compare is only allowed in JOIN ON clauses",
+                            ));
                         }
-                        Parsed::Unsupported => ComparedRhs::Capture(params.resolve(right)?),
-                    };
-                    Ok(rhs.sql(lhs, op, dialect))
+                    } else {
+                        op.capture(params.resolve(right)?, sql, dialect);
+                    }
+                    Ok(())
                 }
                 Op::Unsupported(operator) => Err(syn::Error::new(
                     operator.span(),
@@ -169,7 +153,8 @@ pub(super) fn build(
                 ));
             }
             let keyword = if value.value() { "TRUE" } else { "FALSE" };
-            Ok(sql::Sql::tokens(vec![dialect.kw(keyword)]))
+            sql.push(dialect.kw(keyword));
+            Ok(())
         }
         Input::Field { expr, syntax } => {
             if let Some(attr) = syntax.attrs.first() {
@@ -178,14 +163,15 @@ pub(super) fn build(
                     "attributes are not supported on a boolean column predicate",
                 ));
             }
-            let col =
-                scope
-                    .parse(expr, None, types, dialect, cte_map)?
-                    .required(syn::Error::new(
-                        syntax.span(),
-                        "boolean predicate must reference a column",
-                    ))?;
-            Ok(col.push(dialect.kw("EQ")).push(dialect.kw("TRUE")))
+            if !scope.parse_into(expr, None, types, dialect, cte_map, sql)? {
+                return Err(syn::Error::new(
+                    syntax.span(),
+                    "boolean predicate must reference a column",
+                ));
+            }
+            sql.push(dialect.kw("EQ"));
+            sql.push(dialect.kw("TRUE"));
+            Ok(())
         }
         Input::Not(syntax) => {
             if let Some(attr) = syntax.attrs.first() {
@@ -194,13 +180,15 @@ pub(super) fn build(
                     "attributes are not supported on a negated predicate",
                 ));
             }
-            let col = scope
-                .parse(&syntax.expr, None, types, dialect, cte_map)?
-                .required(syn::Error::new(
+            if !scope.parse_into(&syntax.expr, None, types, dialect, cte_map, sql)? {
+                return Err(syn::Error::new(
                     syntax.expr.span(),
                     "negated boolean predicate must reference a column",
-                ))?;
-            Ok(col.push(dialect.kw("EQ")).push(dialect.kw("FALSE")))
+                ));
+            }
+            sql.push(dialect.kw("EQ"));
+            sql.push(dialect.kw("FALSE"));
+            Ok(())
         }
         Input::Paren(syntax) => {
             if let Some(attr) = syntax.attrs.first() {
@@ -209,7 +197,7 @@ pub(super) fn build(
                     "attributes are not supported on a parenthesized predicate",
                 ));
             }
-            build(&syntax.expr, scope, columns, context)
+            build_into(&syntax.expr, scope, columns, context, sql)
         }
         Input::Block(syntax) => {
             if let Some(attr) = syntax.attrs.first() {
@@ -244,9 +232,9 @@ pub(super) fn build(
                     "predicate block must end with a tail expression, not a semicolon",
                 ));
             }
-            build(inner, scope, columns, context)
+            build_into(inner, scope, columns, context, sql)
         }
-        Input::Null(null) => null.parse(scope, context),
+        Input::Null(null) => null.parse(scope, context, sql),
         Input::Method { syntax, kind } => {
             if let Some(attr) = syntax.attrs.first() {
                 return Err(syn::Error::new(
@@ -274,14 +262,14 @@ pub(super) fn build(
                     format!("method `.{name}(arg)` requires exactly one argument"),
                 ));
             }
-            let col = scope
-                .parse(&syntax.receiver, Some(params), types, dialect, cte_map)?
-                .required(syn::Error::new(
+            if !scope.parse_into(&syntax.receiver, Some(params), types, dialect, cte_map, sql)? {
+                return Err(syn::Error::new(
                     syntax.receiver.span(),
                     format!(
                         "`.{name}(arg)` receiver must be a column or column-derived expression"
                     ),
-                ))?;
+                ));
+            }
             dialect.reject_op(&name, syntax.method.span())?;
             match kind {
                 Method::In | Method::NotIn => {
@@ -291,22 +279,23 @@ pub(super) fn build(
                     } else {
                         "NE_ALL_OPEN"
                     };
-                    Ok(col
-                        .push(dialect.kw(keyword))
-                        .append(sql::Sql::captured(capture))
-                        .push(dialect.kw("PAREN_CLOSE")))
+                    sql.push(dialect.kw(keyword));
+                    sql.capture(capture);
+                    sql.push(dialect.kw("PAREN_CLOSE"));
                 }
                 Method::Fts => {
-                    let rhs = match scope.parse(arg, Some(params), types, dialect, cte_map)? {
-                        Parsed::Sql(parts) => ComparedRhs::Column(parts),
-                        Parsed::Unsupported => ComparedRhs::Capture(params.resolve_ref(arg)?),
-                    };
-                    Ok(rhs.sql(col, cmp::Cmp::FtsMatch, dialect))
+                    sql.push(cmp::Cmp::FtsMatch.sql_ref(dialect));
+                    if !scope.parse_into(arg, Some(params), types, dialect, cte_map, sql)? {
+                        sql.capture(params.resolve_ref(arg)?);
+                    }
                 }
                 Method::Compare(op) => {
-                    Ok(ComparedRhs::Capture(params.resolve_ref(arg)?).sql(col, op, dialect))
+                    let capture = params.resolve_ref(arg)?;
+                    sql.push(op.sql_ref(dialect));
+                    op.capture(capture, sql, dialect);
                 }
             }
+            Ok(())
         }
         Input::UnsupportedMethod(syntax) => Err(syn::Error::new(
             syntax.method.span(),
@@ -322,16 +311,15 @@ pub(super) fn build(
     }
 }
 
-#[derive(Clone)]
-pub(super) struct RowScope {
+pub(super) struct RowScope<'a> {
     pub(super) vars: Vec<Var>,
     pub(super) agg_var: Option<syn::Ident>,
-    pub(super) outer: Option<Box<Self>>,
+    pub(super) outer: Option<&'a Self>,
     pub(super) alias_depth: Option<usize>,
-    pub(super) unnest_cols: Vec<syn::Ident>,
+    pub(super) unnest_cols: &'a [syn::Ident],
 }
 
-impl RowScope {
+impl RowScope<'_> {
     fn for_bindings(source: &shape::QuerySource, idents: &[syn::Ident]) -> Self {
         let vars = idents
             .iter()
@@ -346,7 +334,7 @@ impl RowScope {
             agg_var: None,
             outer: None,
             alias_depth: Some(source.alias_depth),
-            unnest_cols: Vec::new(),
+            unnest_cols: &[],
         }
     }
 

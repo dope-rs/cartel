@@ -29,6 +29,10 @@ pub trait Client<'d, const ID: u8 = 0>: Storage + Copy {
         commands::Sorted(self)
     }
 
+    fn streams(self) -> commands::Streams<Self, ID> {
+        commands::Streams(self)
+    }
+
     fn keyspace(self) -> commands::Keyspace<Self, ID> {
         commands::Keyspace(self)
     }

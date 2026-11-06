@@ -1,7 +1,7 @@
 use cartel_pg::api::traits::{Client as _, Status as _, Unchecked as _};
 use dope::core::driver::life::recovery;
 pub mod fixtures;
-mod limits;
+pub mod limits;
 use std::{
     convert::Infallible,
     iter, marker,

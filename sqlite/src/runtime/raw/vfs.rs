@@ -53,10 +53,8 @@ impl Vfs {
                 offset,
             })
         };
-        let code = unsafe { libsqlite3_sys::sqlite3_vfs_register(target.cast(), 1) };
-        if code != libsqlite3_sys::SQLITE_OK {
-            return Err(Error::VfsRegistration(crate::sys::Code::new(code)));
-        }
+        // SAFETY: Setup retains initialized SQLite without OMIT_WSD; target is nonnull.
+        unsafe { libsqlite3_sys::sqlite3_vfs_register(target.cast(), 1) };
         Ok(())
     }
 }

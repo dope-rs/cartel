@@ -9,7 +9,7 @@ use common::{
 };
 use dope::manifold::client::session::codec::Stateful as _;
 use dope::manifold::client::session::{codec, response};
-use o3::buffer::{storage::Shared, storage::range, write::consume::scope};
+use o3::buffer::{hold, resident, storage::Shared, storage::range, write::consume::scope};
 use std::cell::Cell;
 
 pub mod common;
@@ -21,8 +21,8 @@ fn source_reuse() {
     let mut input = rejected::Cursor::new(Shared::try_copy(bytes).expect("first input"));
     let next = Shared::try_copy(b"$1\r\nx\r\n").expect("second input");
     let store =
-        Storage::try_new(capacity::Capacity::try_new(1, 2, 2).expect("capacity")).expect("storage");
-    let codec = new_codec(config(32, 2).expect("limits"), &store);
+        Storage::try_new(capacity::Capacity::try_new(1, 1, 0).expect("capacity")).expect("storage");
+    let codec = new_codec(config(32, 1).expect("limits"), &store);
     try_with_budget(|budget| {
         let mut state = codec.state(budget);
         let limit = staging_limit(&codec).expect("staging");
@@ -41,6 +41,22 @@ fn source_reuse() {
         assert!(emitted.get());
         assert!(!step.has_consumed());
         assert_eq!(input.as_ref(), bytes);
+        let step: codec::Step<response::Direct> =
+            codec.decode(&mut input, &mut state, &budget, limit, |_| {
+                codec::Admission::Ready(
+                    |decoded: Result<protocol::Decoded<'_, '_, '_>, scope::Error>,
+                     _: &mut parser::Parser<'_, '_>| {
+                        assert!(matches!(
+                            decoded,
+                            Ok(protocol::Decoded::Retain(hold::Error::Resident(
+                                resident::AllocError::Budget(error)
+                            ))) if error.into_parts() == (bytes.len().try_into().expect("nonempty"), 0)
+                        ));
+                    },
+                )
+            });
+        assert!(step.has_consumed());
+        assert!(input.as_ref().is_empty());
         let (rest, step) = parse_chunk(&codec, &mut state, &next, |decoded| {
             let frame = match decoded {
                 Ok(protocol::Decoded::Frame(frame, _)) => Some(frame),

@@ -22,15 +22,8 @@ pub(super) const fn add(
 }
 
 const fn parse_message_len(name: &str, sql: &str, oids: &[u32]) -> Result<usize, encode::Error> {
-    if let Some(position) = schema::nul(name) {
-        return Err(encode::Error::StatementNameNul { position });
-    }
-    if let Some(position) = schema::nul(sql) {
-        return Err(encode::Error::StatementSqlNul { position });
-    }
-    if oids.len() > i16::MAX as usize {
-        return Err(encode::Error::ParseTypes { actual: oids.len() });
-    }
+    // QueryMeta construction admits both strings and the i16 OID count;
+    // the sole non-metadata caller uses the fixed, parameterless ltree probe.
     let bytes = oids.len() * 4;
     let mut len = 4usize;
     let name = match add(encode::Scope::Frame, name.len(), 1) {

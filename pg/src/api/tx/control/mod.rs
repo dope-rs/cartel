@@ -52,17 +52,9 @@ impl<'tx, 'd: 'tx, const ID: u8> CancelToken<'tx, 'd, ID> {
             backend: self.backend,
             buffer: self.buffer,
             wake: self.wake,
-            phase: Phase::New,
+            pending: false,
         }
     }
-}
-
-#[derive(Clone, Copy)]
-#[repr(u8)]
-enum Phase {
-    New,
-    Pending,
-    Done,
 }
 
 #[must_use = "a cancellation request does nothing unless it is driven"]
@@ -71,7 +63,7 @@ pub struct Cancel<'tx, 'd: 'tx, const ID: u8 = 0> {
     backend: backend::Bound<'tx, 'd, ID>,
     buffer: &'tx Storage,
     wake: ready::Target<'d>,
-    phase: Phase,
+    pending: bool,
 }
 
 impl<const ID: u8> Unpin for Cancel<'_, '_, ID> {}
@@ -83,61 +75,50 @@ impl<'tx, 'd: 'tx, const ID: u8> abi::Fiber<'d> for Cancel<'tx, 'd, ID> {
         let (this, cx) = call.into_parts();
         let this = this.get_mut();
         let waiter = cx.as_ref().completion();
-        match this.phase {
-            Phase::New => {
-                let intent = match this.backend.try_current(this.buffer) {
-                    Ok(intent) => intent,
-                    Err(error) => {
-                        this.phase = Phase::Done;
-                        return task::Poll::Ready(Err(Error {
-                            failure: Failure::Backend(error),
-                        }));
-                    }
-                };
-                if let Err(error) = this.port.try_reserve(intent, waiter) {
-                    this.phase = Phase::Done;
+        if !this.pending {
+            let intent = match this.backend.try_current(this.buffer) {
+                Ok(intent) => intent,
+                Err(error) => {
                     return task::Poll::Ready(Err(Error {
-                        failure: Failure::Reserve {
-                            backend: this.backend,
-                            cause: error,
-                        },
+                        failure: Failure::Backend(error),
                     }));
                 }
-                this.phase = Phase::Pending;
-                this.wake.wake();
-                task::Poll::Pending
+            };
+            if let Err(error) = this.port.try_reserve(intent, waiter) {
+                return task::Poll::Ready(Err(Error {
+                    failure: Failure::Reserve {
+                        backend: this.backend,
+                        cause: error,
+                    },
+                }));
             }
-            Phase::Pending => match this.port.poll(this.backend.target(), waiter) {
-                task::Poll::Ready(result) => {
-                    this.phase = Phase::Done;
-                    task::Poll::Ready(result.map_err(|cause| Error {
-                        failure: Failure::Delivery {
-                            backend: this.backend,
-                            cause,
-                        },
-                    }))
-                }
-                task::Poll::Pending => task::Poll::Pending,
-            },
-            Phase::Done => task::Poll::Pending,
+            this.pending = true;
+            this.wake.wake();
+            return task::Poll::Pending;
+        }
+        match this.port.poll(this.backend.target(), waiter) {
+            task::Poll::Ready(result) => {
+                this.pending = false;
+                task::Poll::Ready(result.map_err(|cause| Error {
+                    failure: Failure::Delivery {
+                        backend: this.backend,
+                        cause,
+                    },
+                }))
+            }
+            task::Poll::Pending => task::Poll::Pending,
         }
     }
 }
 
 impl<const ID: u8> Drop for Cancel<'_, '_, ID> {
     fn drop(&mut self) {
-        match self.phase {
-            Phase::Pending => {
-                self.port.abandon(self.backend.target());
-                self.wake.wake();
-            }
-            Phase::New | Phase::Done => {}
+        if self.pending {
+            self.port.abandon(self.backend.target());
+            self.wake.wake();
         }
     }
 }
-
-const _: () = assert!(std::mem::size_of::<Phase>() == std::mem::size_of::<bool>());
-const _: () = assert!(std::mem::align_of::<Phase>() == std::mem::align_of::<bool>());
 
 /// A savepoint lease whose operation views cannot outlive the savepoint.
 /// Call [`Self::release`] or [`Self::rollback`] to preserve the transaction.

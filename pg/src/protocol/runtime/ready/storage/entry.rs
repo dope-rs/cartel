@@ -26,10 +26,6 @@ impl<'a, 'd, const ID: u8> Entry<'a, 'd, ID> {
         }
     }
 
-    pub(in crate::protocol::runtime::ready) fn is_listed(&self) -> bool {
-        self.node().priority.get().is_some()
-    }
-
     pub(super) fn listed(self) -> Option<Listed<'a, 'd, ID>> {
         let rank = self.node().priority.get()?;
         Some(Listed {

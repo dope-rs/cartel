@@ -1,7 +1,7 @@
 mod vfs;
 
 use crate::{
-    runtime::{self, Error, heap, local},
+    runtime::{self, Error, heap},
     sys,
 };
 use heap::layout::Layout;
@@ -14,7 +14,7 @@ struct Unit {
 }
 
 pub(crate) struct Memory {
-    memory: alloc::array::Block<mem::MaybeUninit<Unit>, usize>,
+    _memory: alloc::array::Block<mem::MaybeUninit<Unit>, usize>,
 }
 
 pub(crate) struct Span {
@@ -152,11 +152,7 @@ impl Memory {
         let rounded = Self::round(collect)?;
         let aside = Self::round(aside)?;
         let arena = sqlite.backing().ok_or(runtime::Error::CapacityOverflow)?;
-        let control = local::State::<crate::catalogs::Empty>::RETENTION_BYTES;
-        let start = control
-            .checked_add(phase_bytes)
-            .ok_or(runtime::Error::CapacityOverflow)?;
-        let retain = start
+        let retain = phase_bytes
             .checked_add(arena)
             .ok_or(runtime::Error::CapacityOverflow)?;
         let bytes = retain
@@ -172,11 +168,18 @@ impl Memory {
         let collect = Span::new(base, retain, collect);
         let stmts = Span::new(base, retain + rounded, stmts);
         let aside = Span::new(base, retain + rounded + stmts.len(), aside);
-        let phase = Span::new(base, control, phase.size());
-        let start = Span::new(base, start, arena).base();
+        let phase = Span::new(base, 0, phase.size());
+        let start = Span::new(base, phase_bytes, arena).base();
         // SAFETY: start and Layout describe the checked SQLite partition in this allocation.
         let sqlite = unsafe { heap::raw::Span::new(start, sqlite) };
-        Ok((Self { memory }, sqlite, collect, stmts, aside, phase))
+        Ok((
+            Self { _memory: memory },
+            sqlite,
+            collect,
+            stmts,
+            aside,
+            phase,
+        ))
     }
 
     fn round(bytes: usize) -> Result<usize, runtime::Error> {
@@ -184,11 +187,6 @@ impl Memory {
             .checked_add(Span::ALIGNMENT - 1)
             .map(|rounded| rounded / Span::ALIGNMENT * Span::ALIGNMENT)
             .ok_or(runtime::Error::CapacityOverflow)
-    }
-
-    pub(in crate::runtime) fn base(&mut self) -> ptr::NonNull<u8> {
-        // SAFETY: Memory always owns at least one aligned Unit.
-        unsafe { ptr::NonNull::new_unchecked(self.memory.as_mut_ptr().cast()) }
     }
 }
 

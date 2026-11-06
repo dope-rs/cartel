@@ -47,7 +47,7 @@ impl Conflict {
                     state.fn_params,
                     state.param_tys,
                     state.dialect,
-                    state.cte_map,
+                    &state.cte_map,
                 )?;
                 if assigns.is_empty() {
                     return Err(syn::Error::new(
@@ -62,11 +62,11 @@ impl Conflict {
         }
     }
 
-    pub(in crate::plan) fn render<'a>(
+    pub(in crate::plan) fn render(
         self,
-        mut state: plan::State<'a>,
-    ) -> plan::Step<'a, Vec<proc_macro2::TokenStream>> {
-        let value = match self {
+        state: &mut plan::State<'_>,
+    ) -> Vec<proc_macro2::TokenStream> {
+        match self {
             Self::None => Vec::new(),
             Self::DoNothing => vec![state.dialect.kw("ON_CONFLICT_DO_NOTHING")],
             Self::Target(sql) => vec![quote::quote! { #sql }],
@@ -82,7 +82,6 @@ impl Conflict {
                 }
                 parts
             }
-        };
-        plan::Step { state, value }
+        }
     }
 }

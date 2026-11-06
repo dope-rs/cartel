@@ -1,6 +1,6 @@
 use std::{array, mem::MaybeUninit, ops::ControlFlow, pin::Pin, task::Poll};
 
-use cartel_core::reply;
+use cartel_core::{deadline, reply};
 use dope::{
     core::driver::{route::KeyTag, schedule::clock::timer},
     manifold::client::conn,
@@ -33,7 +33,7 @@ use crate::{
     schema,
 };
 
-use crate::api::task::{Dispatch, State, lease};
+use crate::api::task::{State, lease};
 
 type Output<'r, 's, 'b, 'c, 'd, const ID: u8, const N: usize> =
     GroupFailure<Option<replies::Payload<'b, 'c, 'd>>, Error<'d, ID>, Ledger<'r, 's>, N>;
@@ -66,7 +66,7 @@ impl<'app, 'b, 'c: 'b, 'd: 'c, const ID: u8>
     }
 }
 
-type Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, const ID: u8, const N: usize> = Dispatch<
+type Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, const ID: u8, const N: usize> = State<
     'app,
     'g,
     'r,
@@ -111,34 +111,6 @@ fn collect<'app, 'g, 'r, 's, 'b, 'c: 'b, 'd: 'c, const ID: u8, const N: usize>(
         })
 }
 
-fn poll_deadline<
-    'app,
-    'g,
-    'r,
-    's,
-    'b,
-    'c,
-    'd: 'app,
-    B: ?Sized,
-    I: schema::QuerySet + 'd,
-    const ID: u8,
-    const N: usize,
->(
-    admit: &mut Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, N>,
-    guard: Pin<&mut Result<timer::Alarm<'d>, timer::Exhausted>>,
-    cx: Pin<&mut context::Context<'_, 'd>>,
-) -> Option<Stop<'d, ID>> {
-    let guard = match guard.get_mut() {
-        Ok(guard) => Pin::new(guard),
-        Err(error) => return Some(Stop::Deadline(crate::Error::Deadline(*error))),
-    };
-    let phase = admit.phase();
-    match admit.deadline.poll_expired(guard, cx, phase) {
-        Poll::Ready(time) => Some(Stop::Deadline(crate::Error::RequestTimeout(time))),
-        Poll::Pending => None,
-    }
-}
-
 /// Snapshots before detachment and cancellation can retire another order.
 fn complete<
     'app,
@@ -155,7 +127,7 @@ fn complete<
 >(
     admit: &mut Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, N>,
     reply: &mut Response<'app, 'g, 'r, 's, 'b, 'c, 'd, api::ExtractUnit<ID>>,
-    guard: Pin<&mut Result<timer::Alarm<'d>, timer::Exhausted>>,
+    guard: Pin<&mut Result<deadline::Guard<'d>, timer::Exhausted>>,
     waiter: Pin<&wait::Waiter<'app, 'd>>,
     stop: Stop<'d, ID>,
     sync: Option<Result<(), Error<'d, ID>>>,
@@ -171,7 +143,7 @@ fn complete<
         Some(Err(error)) => (Sync::Unobserved, Some(error)),
         None => (Sync::Unobserved, None),
     };
-    let ledger = match &admit.state {
+    let ledger = match &*admit {
         State::Admitted(_, owner) => owner.snapshot(),
         _ => Ledger::empty(),
     };
@@ -179,9 +151,9 @@ fn complete<
     match abort {
         Some(error) => cause = Some(admit.cancel(error)),
         None => {
-            admit.state.take();
+            admit.take();
             if let Ok(guard) = guard.get_mut() {
-                guard.clear();
+                guard.complete();
             }
         }
     }
@@ -221,7 +193,6 @@ impl<'g, 'r, 's, 'b, 'c, 'd, const N: usize> Ready<'g, 'r, 's, 'b, 'c, 'd, N> {
     pub(in crate::api) fn new(
         access: &groups::Access<'g, 'r, 's, 'b, 'c, 'd>,
     ) -> Result<Self, crate::Error> {
-        const { assert!(N > 0 && N < u32::MAX as usize) };
         let owner = access.prepare()?;
         let mut storage = MaybeUninit::uninit();
         let mut guard = init::Guard::<_, N>::new(&mut storage);
@@ -306,7 +277,7 @@ pub(in crate::api) struct Group<
     admission: Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, N>,
     reply: Replies<'app, 'g, 'r, 's, 'b, 'c, 'd, ID, N>,
     #[pin]
-    deadline: Result<timer::Alarm<'d>, timer::Exhausted>,
+    deadline: Result<deadline::Guard<'d>, timer::Exhausted>,
     #[pin]
     waiter: wait::Waiter<'app, 'd>,
 }
@@ -330,8 +301,8 @@ impl<
         target: Option<api::Target<'d, ID>>,
         next: Result<api::Pending<'d, Ready<'g, 'r, 's, 'b, 'c, 'd, N>>, crate::Error>,
     ) -> Self {
-        let admit = Dispatch::new(client, target, next);
-        let deadline = admit.deadline.guard();
+        let admit = State::new(client, target, next);
+        let deadline = client.port.lifecycle.deadline.guard();
         Self {
             admission: admit,
             reply: Replies::new(),
@@ -361,7 +332,14 @@ impl<
         let (this, mut cx) = call.into_parts();
         let mut this = this.project();
         let mut sync = None;
-        let stop = match poll_deadline(this.admission, this.deadline.as_mut(), cx.as_mut()) {
+        let expired = match this.deadline.as_mut().get_mut() {
+            Ok(guard) => match Pin::new(guard).poll_expired(cx.as_mut(), this.admission.phase()) {
+                Poll::Ready(time) => Some(Stop::Deadline(crate::Error::RequestTimeout(time))),
+                Poll::Pending => None,
+            },
+            Err(error) => Some(Stop::Deadline(crate::Error::Deadline(*error))),
+        };
+        let stop = match expired {
             Some(stop) => stop,
             None => {
                 match this.admission.poll_with(
@@ -374,22 +352,12 @@ impl<
                             state: ready,
                         } = request;
                         let context = requests::ReplyContext::new(conn, boundary, region);
-                        let prepared =
-                            match client.port.request().prepare(context, frame.as_ref().len()) {
-                                Ok(prepared) => prepared,
-                                Err(error) => {
-                                    return Err((
-                                        error,
-                                        api::Pending {
-                                            frame,
-                                            boundary,
-                                            state: ready,
-                                        },
-                                    ));
-                                }
-                            };
-                        prepared
+                        client
+                            .port
+                            .request()
                             .try_with(
+                                context,
+                                frame.as_ref().len(),
                                 (frame, ready),
                                 |token, lane, tag, (frame, ready)| match ready
                                     .try_attach(this.reply, token, lane, tag)
@@ -398,13 +366,10 @@ impl<
                                     Err((error, ready)) => Err((error, (frame, ready))),
                                 },
                                 |(frame, owner)| {
-                                    admit.state = State::Admitted(
-                                        lease::Lease::admit((), client, conn),
-                                        owner,
-                                    );
-                                    (frame, ())
+                                    (frame, (lease::Lease::admit((), client, conn), owner))
                                 },
                             )
+                            .map(|(lease, owner)| *admit = State::Admitted(lease, owner))
                             .map_err(|(error, (frame, ready))| {
                                 (
                                     error,

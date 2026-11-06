@@ -9,7 +9,7 @@ use crate::ext::ExprExt as _;
 impl shape::SelectBranch {
     pub(super) fn parse_set(
         expr: &syn::Expr,
-        cte_map: &collections::HashMap<String, syn::Path>,
+        cte_map: &collections::BTreeMap<String, syn::Path>,
     ) -> syn::Result<shape::SetQuery> {
         let mut links = Vec::new();
         let mut current = expr;
@@ -174,7 +174,7 @@ impl qualify::State {
                         ));
                     }
                     let (arg, body) = mc.args[0].closure_one("distinct_on")?;
-                    parsed.distinct = qualify::Distinct::On(arg, body);
+                    parsed.distinct = qualify::Distinct::On(arg.clone(), body.clone());
                 }
                 Method::Lock(lock) => {
                     if !mc.args.is_empty() {

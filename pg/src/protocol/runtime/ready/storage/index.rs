@@ -94,14 +94,15 @@ impl<'d, const ID: u8> Index<'d, ID> {
         }))
     }
 
-    pub(in crate::protocol::runtime::ready) fn next_group(
+    pub(in crate::protocol::runtime::ready) fn next_where(
         &self,
+        eligible: impl Fn(&slot::Slot<'d, ID>) -> bool,
     ) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
         let first = self.ring.first()?;
         let mut index = first;
         loop {
             let (next, slot) = self.step(index);
-            if slot.is_synced() {
+            if eligible(slot) {
                 // SAFETY: step retains this ring member's initialized binding.
                 return Some(access::Access::listed(unsafe {
                     depot::raw::Proof::new(slot)
@@ -114,8 +115,9 @@ impl<'d, const ID: u8> Index<'d, ID> {
         }
     }
 
-    pub(in crate::protocol::runtime::ready) fn least_group(
+    pub(in crate::protocol::runtime::ready) fn least_where(
         &self,
+        eligible: impl Fn(&slot::Slot<'d, ID>) -> bool,
     ) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
         use o3::depot::index::bitmap::Access as _;
 
@@ -132,7 +134,7 @@ impl<'d, const ID: u8> Index<'d, ID> {
                     index: index.position(),
                 };
                 let slot = entry.slot();
-                if slot.is_synced() {
+                if eligible(slot) {
                     // SAFETY: bucket links retain this owner's initialized binding.
                     return Some(access::Access::listed(unsafe {
                         depot::raw::Proof::new(slot)
@@ -150,17 +152,16 @@ impl<'d, const ID: u8> Index<'d, ID> {
     pub(in crate::protocol::runtime::ready) fn try_ready(
         &self,
         id: conn::Id<'d, route::KeyTag<ID>>,
-        depth: usize,
     ) -> Result<(), protocol::Reason> {
         let entry = self
             .entry(id.index().into_usize())
             .ok_or(protocol::Reason::PrepareReady)?;
         entry.slot().try_ready(id)?;
-        entry.insert(depth);
+        entry.insert(0);
         // SAFETY: only Handshaking -> Ready succeeds above. That uncounted
         // resident makes live strictly smaller than this fixed connection domain.
         self.live
-            .set(unsafe { bounded::raw::Proof::assume(self.live.get().get() + 1) }.retain());
+            .set(unsafe { bounded::raw::u32(self.live.get().get() + 1) });
         Ok(())
     }
 
@@ -180,8 +181,7 @@ impl<'d, const ID: u8> Index<'d, ID> {
                 // SAFETY: the exact Reserved -> Shared transition consumes one
                 // counted blocker; stale generations never reach this branch.
                 let left = self.blockers.get().get() - 1;
-                self.blockers
-                    .set(unsafe { bounded::raw::Proof::assume(left) }.retain());
+                self.blockers.set(unsafe { bounded::raw::u32(left) });
                 access::Release::Released
             }
             access::Release::Stale => access::Release::Stale,
@@ -204,9 +204,8 @@ impl<'d, const ID: u8> Index<'d, ID> {
                 listed.remove();
                 // SAFETY: Shared -> Reserved adds one previously uncounted
                 // blocker in the same fixed connection domain.
-                self.blockers.set(
-                    unsafe { bounded::raw::Proof::assume(self.blockers.get().get() + 1) }.retain(),
-                );
+                self.blockers
+                    .set(unsafe { bounded::raw::u32(self.blockers.get().get() + 1) });
             }
             access::Reserve::Exhausted => listed.remove(),
             access::Reserve::Rejected => {}
@@ -262,8 +261,7 @@ impl<'d, const ID: u8> Index<'d, ID> {
         if let access::Finalization::Pending(_) = state {
             // SAFETY: Held -> Finalizing consumes the original counted blocker.
             let left = self.blockers.get().get() - 1;
-            self.blockers
-                .set(unsafe { bounded::raw::Proof::assume(left) }.retain());
+            self.blockers.set(unsafe { bounded::raw::u32(left) });
         }
         state
     }
@@ -285,8 +283,7 @@ impl<'d, const ID: u8> Index<'d, ID> {
             slot::Closed::Reserved(_) | slot::Closed::Held(_) => {
                 // SAFETY: both returned phases own one counted blocker.
                 let left = self.blockers.get().get() - 1;
-                self.blockers
-                    .set(unsafe { bounded::raw::Proof::assume(left) }.retain());
+                self.blockers.set(unsafe { bounded::raw::u32(left) });
             }
             slot::Closed::Shared | slot::Closed::Finalizing(_) | slot::Closed::Draining => {}
             slot::Closed::Handshaking | slot::Closed::Closing => return Some(close),
@@ -294,8 +291,7 @@ impl<'d, const ID: u8> Index<'d, ID> {
         // SAFETY: every remaining Closed variant consumed one Ready resident;
         // repeated close and stale generations return before this subtraction.
         let left = self.live.get().get() - 1;
-        self.live
-            .set(unsafe { bounded::raw::Proof::assume(left) }.retain());
+        self.live.set(unsafe { bounded::raw::u32(left) });
         Some(close)
     }
 

@@ -1,4 +1,3 @@
-use crate::runtime::raw::Memory;
 use std::ptr;
 
 pub(crate) struct Retained(ptr::NonNull<super::Arena>);
@@ -7,12 +6,12 @@ impl Retained {
     pub(super) const fn new(arena: ptr::NonNull<super::Arena>) -> Self {
         Self(arena)
     }
+}
 
-    pub(in crate::runtime) fn arm(self, memory: Memory) {
-        // SAFETY: Retained carries the exact live arena pointer until this handoff.
-        let arena = unsafe { self.0.as_ref() };
-        let memory = arena.arm(memory);
-        // The arena borrow ends before its backing is reclaimed.
+impl Drop for Retained {
+    fn drop(&mut self) {
+        let memory = super::Owner(self.0).with_state(|_, state| state.release());
+        // All arena and allocator-state borrows end before reclaiming the backing.
         drop(memory);
     }
 }

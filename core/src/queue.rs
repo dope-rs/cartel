@@ -1,6 +1,6 @@
 //! Fair, region-owned request queues and their affine transfer guards.
 
-use std::{cell, marker, mem::size_of, num::NonZero};
+use std::{marker, mem::size_of, num::NonZero};
 
 use dope::{
     core::driver::{
@@ -41,20 +41,58 @@ pub struct Rejected<T> {
     pub cause: Rejection,
 }
 
-struct Entry<T> {
+mod sealed {
+    pub trait Weight {}
+    impl Weight for usize {}
+    impl Weight for () {}
+}
+
+/// The supported per-entry charges: usize weights or no weight accounting.
+pub trait Weight: sealed::Weight + Copy {
+    fn try_add(self, other: Self) -> Result<Self, Cause<usize>>;
+    fn wrapping_sub(self, other: Self) -> Self;
+}
+
+impl Weight for usize {
+    #[inline]
+    fn try_add(self, other: Self) -> Result<Self, Cause<usize>> {
+        self.checked_add(other).ok_or(Cause::Overflow {
+            axis: Axis::at::<0>(),
+            held: self,
+            requested: other,
+        })
+    }
+
+    #[inline]
+    fn wrapping_sub(self, other: Self) -> Self {
+        self.wrapping_sub(other)
+    }
+}
+
+impl Weight for () {
+    #[inline]
+    fn try_add(self, _: Self) -> Result<Self, Cause<usize>> {
+        Ok(())
+    }
+
+    #[inline]
+    fn wrapping_sub(self, _: Self) -> Self {}
+}
+
+struct Entry<T, W> {
     value: T,
-    weight: usize,
+    weight: W,
 }
 
 /// Region-owned fixed storage shared fairly by a fixed number of FIFO lanes.
-pub struct Arena<'d, T> {
-    items: fair::Lanes<'d, Entry<T>, cell::Cell<usize>>,
+pub struct Arena<'d, T, W: Weight = usize> {
+    items: fair::Lanes<'d, Entry<T, W>, W>,
 }
 
 /// A request arena admitted to one exact reply lane domain.
 #[repr(transparent)]
-pub struct Scoped<'b, 'd, T> {
-    arena: Arena<'d, T>,
+pub struct Scoped<'b, 'd, T, W: Weight = usize> {
+    arena: Arena<'d, T, W>,
     domain: marker::PhantomData<fn(&'b ()) -> &'b ()>,
 }
 
@@ -66,22 +104,22 @@ pub struct Mismatch {
 }
 
 /// A zero-cost typed view of one [`Arena`] lane.
-pub struct Lane<'a, 'd, T> {
-    binding: fair::Binding<'a, 'd, Entry<T>, cell::Cell<usize>>,
+pub struct Lane<'a, 'd, T, W: Weight = usize> {
+    binding: fair::Binding<'a, 'd, Entry<T, W>, W>,
 }
 
 /// Ownership of one queue entry and its fair-lane charge until publication.
 #[must_use = "a queue reservation must be published or released"]
-pub struct Reservation<'turn, 'lane, 'd, T: Unpin> {
-    lease: mem::Lease<Undo<'turn, 'lane, 'd, T>, lease::Open>,
+pub struct Reservation<'turn, 'lane, 'd, T: Unpin, W: Weight = usize> {
+    lease: mem::Lease<Undo<'turn, 'lane, 'd, T, W>, lease::Open>,
 }
 
-struct Undo<'turn, 'lane, 'd, T: Unpin> {
-    front: Front<'lane, 'd, T>,
+struct Undo<'turn, 'lane, 'd, T: Unpin, W: Weight> {
+    front: Front<'lane, 'd, T, W>,
     region: &'turn mut region::Token<region::Identity<'d>>,
 }
 
-impl<'d, T: Unpin> Undo<'_, '_, 'd, T> {
+impl<'d, T: Unpin, W: Weight> Undo<'_, '_, 'd, T, W> {
     fn publish(self, item: T) {
         self.front.permit.push_back(
             self.region,
@@ -95,14 +133,14 @@ impl<'d, T: Unpin> Undo<'_, '_, 'd, T> {
 
 /// Ownership of a detached lane head until its charge is released.
 #[must_use]
-struct Front<'lane, 'd, T> {
-    permit: fair::Permit<'lane, 'd, Entry<T>, cell::Cell<usize>>,
-    weight: usize,
+struct Front<'lane, 'd, T, W> {
+    permit: fair::Permit<'lane, 'd, Entry<T, W>, W>,
+    weight: W,
 }
 
-impl<T> Copy for Lane<'_, '_, T> {}
+impl<T, W: Weight> Copy for Lane<'_, '_, T, W> {}
 
-impl<T> Clone for Lane<'_, '_, T> {
+impl<T, W: Weight> Clone for Lane<'_, '_, T, W> {
     fn clone(&self) -> Self {
         *self
     }
@@ -118,14 +156,29 @@ impl<'d, T: Unpin> Arena<'d, T> {
         })
     }
 
-    pub fn lane(&self, lane: usize) -> Option<Lane<'_, 'd, T>> {
+    /// Creates fair queue storage without retaining or accounting entry weights.
+    pub fn try_unweighted(
+        config: fair::Plan,
+        token: &region::Token<region::Identity<'d>>,
+    ) -> Result<Arena<'d, T, ()>, alloc::Error> {
+        Ok(Arena {
+            items: fair::Lanes::try_new(config, token)?,
+        })
+    }
+}
+
+impl<'d, T: Unpin, W: Weight> Arena<'d, T, W> {
+    pub fn lane(&self, lane: usize) -> Option<Lane<'_, 'd, T, W>> {
         Some(Lane {
             binding: self.items.bind(lane)?,
         })
     }
 
     /// Checks the common immutable extent once, retaining its generative domain.
-    pub fn try_bind<'b>(self, domain: layout::Domain<'b>) -> Result<Scoped<'b, 'd, T>, Mismatch> {
+    pub fn try_bind<'b>(
+        self,
+        domain: layout::Domain<'b>,
+    ) -> Result<Scoped<'b, 'd, T, W>, Mismatch> {
         let expected = domain.capacity();
         let actual = self.items.capacity();
         if actual != expected {
@@ -141,8 +194,8 @@ impl<'d, T: Unpin> Arena<'d, T> {
     }
 }
 
-impl<'b, 'd, T: Unpin> Scoped<'b, 'd, T> {
-    pub fn lane<ID: Identity>(&self, position: layout::Position<'b, 'd, ID>) -> Lane<'_, 'd, T> {
+impl<'b, 'd, T: Unpin, W: Weight> Scoped<'b, 'd, T, W> {
+    pub fn lane<ID: Identity>(&self, position: layout::Position<'b, 'd, ID>) -> Lane<'_, 'd, T, W> {
         let index = position.connection().index().into_usize();
         // SAFETY: Position retains a checked index in the exact invariant domain
         // whose immutable extent try_bind matched to this original owner.
@@ -155,7 +208,7 @@ impl<'b, 'd, T: Unpin> Scoped<'b, 'd, T> {
     pub fn lane_for<D, E, K>(
         &self,
         reply: reply::Lane<'_, 'b, '_, 'd, D, E, K>,
-    ) -> Lane<'_, 'd, T> {
+    ) -> Lane<'_, 'd, T, W> {
         let index = reply.index().get();
         // SAFETY: the admitted reply lane retains this invariant domain's exact
         // physical index; try_bind matched its extent to this original owner.
@@ -166,7 +219,13 @@ impl<'b, 'd, T: Unpin> Scoped<'b, 'd, T> {
     }
 }
 
-impl<'lane, 'd, T: Unpin> Lane<'lane, 'd, T> {
+impl<'d, T: Unpin> Lane<'_, 'd, T> {
+    pub fn weight(self, token: &region::Token<region::Identity<'d>>) -> usize {
+        *self.binding.view(token).state().value()
+    }
+}
+
+impl<'lane, 'd, T: Unpin, W: Weight> Lane<'lane, 'd, T, W> {
     pub const fn index(self) -> usize {
         self.binding.index()
     }
@@ -179,15 +238,11 @@ impl<'lane, 'd, T: Unpin> Lane<'lane, 'd, T> {
         self.len(token) == 0
     }
 
-    pub fn weight(self, token: &region::Token<region::Identity<'d>>) -> usize {
-        self.binding.view(token).state().value().get()
-    }
-
     pub fn try_push(
         self,
         token: &mut region::Token<region::Identity<'d>>,
         item: T,
-        weight: usize,
+        weight: W,
     ) -> Result<(), Rejected<T>> {
         let slot = match self.try_reserve(token, weight) {
             Ok(slot) => slot,
@@ -200,22 +255,15 @@ impl<'lane, 'd, T: Unpin> Lane<'lane, 'd, T> {
     pub fn try_reserve<'turn>(
         self,
         token: &'turn mut region::Token<region::Identity<'d>>,
-        weight: usize,
-    ) -> Result<Reservation<'turn, 'lane, 'd, T>, Rejection> {
-        let state = self.binding.view(token).state().value();
-        let held = state.get();
-        let Some(total) = held.checked_add(weight) else {
-            return Err(Rejection::Weight {
-                lane: self.index(),
-                cause: Cause::Overflow {
-                    axis: Axis::at::<0>(),
-                    held,
-                    requested: weight,
-                },
-            });
-        };
+        weight: W,
+    ) -> Result<Reservation<'turn, 'lane, 'd, T, W>, Rejection> {
+        let held = *self.binding.view(token).state().value();
+        let total = held.try_add(weight).map_err(|cause| Rejection::Weight {
+            lane: self.index(),
+            cause,
+        })?;
         let permit = self.binding.reserve().map_err(Rejection::Capacity)?;
-        state.set(total);
+        *permit.state_mut(token) = total;
         Ok(Reservation {
             lease: mem::Lease::open(
                 Undo {
@@ -236,7 +284,7 @@ impl<'lane, 'd, T: Unpin> Lane<'lane, 'd, T> {
     fn take_front(
         self,
         token: &mut region::Token<region::Identity<'d>>,
-    ) -> Option<(T, Front<'lane, 'd, T>)> {
+    ) -> Option<(T, Front<'lane, 'd, T, W>)> {
         let (entry, permit) = self.binding.take_front(token)?;
         let Entry { value, weight } = entry;
         Some((value, Front { permit, weight }))
@@ -252,13 +300,16 @@ impl<'lane, 'd, T: Unpin> Lane<'lane, 'd, T> {
             match work.run(|| self.pop_front(token)) {
                 quota::Admission::Item(item) => release(item),
                 quota::Admission::Empty => return Drain::Empty,
+                quota::Admission::Exhausted if self.is_empty(token) => return Drain::Empty,
                 quota::Admission::Exhausted => return Drain::Exhausted,
             }
         }
     }
 }
 
-impl<'lane, 'd, T: Unpin + data::raw::Payload<'d>> Lane<'lane, 'd, egress::NonEmpty<T>> {
+impl<'lane, 'd, T: Unpin + data::raw::Payload<'d>, W: Weight>
+    Lane<'lane, 'd, egress::NonEmpty<T>, W>
+{
     /// Moves source heads through owned exact final-link admission.
     pub fn drain<const ID: u8>(
         self,
@@ -269,14 +320,14 @@ impl<'lane, 'd, T: Unpin + data::raw::Payload<'d>> Lane<'lane, 'd, egress::NonEm
                 return Ok(());
             };
             let (value, result) = match requests.admit(value) {
-                request::Admission::Ready(ready) => {
+                Ok(request::Admission::Ready(ready)) => {
                     ready.push_with(|token| front.release(token));
                     continue;
                 }
-                request::Admission::Exhausted(value) | request::Admission::Saturated(value) => {
+                Err(value) | Ok(request::Admission::Saturated(value)) => {
                     (value, Ok(()))
                 }
-                request::Admission::Rejected(rejected) => {
+                Ok(request::Admission::Rejected(rejected)) => {
                     let (value, cause) = rejected.into_parts();
                     (value, Err(cause))
                 }
@@ -287,7 +338,7 @@ impl<'lane, 'd, T: Unpin + data::raw::Payload<'d>> Lane<'lane, 'd, egress::NonEm
     }
 }
 
-impl<'d, T: Unpin> Front<'_, 'd, T> {
+impl<'d, T: Unpin, W: Weight> Front<'_, 'd, T, W> {
     fn restore(self, token: &mut region::Token<region::Identity<'d>>, value: T) {
         self.permit.push_front(
             token,
@@ -303,11 +354,11 @@ impl<'d, T: Unpin> Front<'_, 'd, T> {
     /// A forgotten guard can only leave excess held weight.
     fn release(self, token: &mut region::Token<region::Identity<'d>>) {
         let held = self.permit.state_mut(token);
-        held.set(held.get().wrapping_sub(self.weight));
+        *held = held.wrapping_sub(self.weight);
     }
 }
 
-impl<'turn, 'lane, 'd, T: Unpin> Reservation<'turn, 'lane, 'd, T> {
+impl<'turn, 'lane, 'd, T: Unpin, W: Weight> Reservation<'turn, 'lane, 'd, T, W> {
     pub fn publish(self, item: T) {
         let (undo, ()) = self.lease.into_parts();
         undo.publish(item);
@@ -328,7 +379,7 @@ impl<'turn, 'lane, 'd, T: Unpin> Reservation<'turn, 'lane, 'd, T> {
     }
 }
 
-impl<T: Unpin> mem::Return for Undo<'_, '_, '_, T> {
+impl<T: Unpin, W: Weight> mem::Return for Undo<'_, '_, '_, T, W> {
     type Item = ();
 
     fn return_item(self, (): Self::Item) {
@@ -340,10 +391,12 @@ const _: () = {
     const WORD: usize = size_of::<usize>();
 
     assert!(usize::BITS >= u32::BITS);
-    assert!(size_of::<Entry<u64>>() == 2 * WORD);
-    assert!(size_of::<Arena<'static, u64>>() == 6 * WORD);
+    assert!(size_of::<Entry<usize, usize>>() == 2 * WORD);
+    assert!(size_of::<Entry<usize, ()>>() == WORD);
+    assert!(size_of::<Arena<'static, u64>>() == 5 * WORD);
     assert!(size_of::<Scoped<'static, 'static, u64>>() == size_of::<Arena<'static, u64>>());
     assert!(size_of::<Lane<'static, 'static, u64>>() == 2 * WORD);
     assert!(size_of::<Reservation<'static, 'static, 'static, u64>>() == 4 * WORD);
-    assert!(size_of::<Front<'static, 'static, u64>>() == 3 * WORD);
+    assert!(size_of::<Reservation<'static, 'static, 'static, u64, ()>>() == 3 * WORD);
+    assert!(size_of::<Front<'static, 'static, u64, usize>>() == 3 * WORD);
 };

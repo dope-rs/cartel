@@ -6,21 +6,24 @@ use dope_core::driver::life::recovery::Policy;
 use dope_runtime::topology;
 use dope_test::fibers;
 use std::mem;
-use std::sync::OnceLock;
 
 pub mod common;
 
-static RUNTIME: OnceLock<Result<Runtime, runtime::Error>> = OnceLock::new();
-
 #[test]
-fn integer_error_is_exact() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn capacity_rows() -> Result<(), plan::Error> {
+    // SAFETY: this binary's only SQLite test initializes it before any other call.
+    // Only Cartel uses installed SQLite; Core handles and allocations remain
+    // exclusively owned by their originating worker.
+    let runtime = Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
+        .map_err(plan::Error::Runtime)?;
+    integer_error_is_exact(runtime)?;
+    vm_work_is_interrupted(runtime)?;
+    row_layout_and_payload(runtime)?;
+    validate_shape_once(runtime)?;
+    prepare_failure_retires(runtime)
+}
+
+fn integer_error_is_exact(runtime: Runtime) -> Result<(), plan::Error> {
     let (limits, memory) = try_settings(64, 2, 1 << 10, 2, 4 << 10, 100)?;
     {
         plan::Plan::<CapacityDatabase>::try_new(open(runtime)?, limits, memory)?.try_run(
@@ -74,15 +77,7 @@ fn integer_error_is_exact() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn vm_work_is_interrupted() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn vm_work_is_interrupted(runtime: Runtime) -> Result<(), plan::Error> {
     let (limits, memory) = try_settings(4 << 10, 2, 1 << 10, 2, 4 << 10, 1)?;
     {
         plan::Plan::<CapacityDatabase>::try_new(open(runtime)?, limits, memory)?.try_run(
@@ -108,15 +103,7 @@ fn vm_work_is_interrupted() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn row_layout_and_payload() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn row_layout_and_payload(runtime: Runtime) -> Result<(), plan::Error> {
     let name = "abc";
     let exact = mem::size_of::<EntryRef<'_, String>>() + mem::size_of::<i64>() + name.len();
     let (limits, memory) = try_settings(4 << 10, 1, exact, 1, 4 << 10, 100)?;
@@ -169,15 +156,7 @@ fn row_layout_and_payload() -> Result<(), plan::Error> {
     Ok(())
 }
 
-#[test]
-fn validate_shape_once() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn validate_shape_once(runtime: Runtime) -> Result<(), plan::Error> {
     let (limits, memory) = try_settings(4 << 10, 1, 1 << 10, 1, 4 << 10, 1)?;
     {
         plan::Plan::<CapacityDatabase>::try_new(open(runtime)?, limits, memory)?.try_run(
@@ -254,15 +233,7 @@ fn catalog_reservation() {
     assert!(reserved.targets.retained <= reserved.sqlite_capacity);
 }
 
-#[test]
-fn prepare_failure_retires() -> Result<(), plan::Error> {
-    let runtime = (*RUNTIME.get_or_init(|| {
-        // SAFETY: no SQLite call can pass this binary's initializer before it returns.
-        // Only Cartel uses installed SQLite; Core handles and allocations remain
-        // exclusively owned by their originating worker.
-        Runtime::install(unsafe { runtime::raw::Permit::exclusive() })
-    }))
-    .map_err(plan::Error::Runtime)?;
+fn prepare_failure_retires(runtime: Runtime) -> Result<(), plan::Error> {
     let (limits, mut memory) = try_settings(128, 4, 256, 2, 512, 10)?;
     memory.statement_bytes = 4 << 10;
     let result = plan::Plan::<CapacityDatabase>::try_new(open(runtime)?, limits, memory)?

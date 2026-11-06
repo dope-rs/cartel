@@ -6,10 +6,9 @@ use dope::manifold::client::session::{
 };
 
 use crate::{
-    Port,
     client::{
         CONNECTOR_CONNECTION_LIMIT, Logic,
-        logic::{Owner, reply},
+        logic::{Owner, Root, reply},
     },
     protocol::{
         self,
@@ -23,29 +22,23 @@ pub struct Pending<'s, 'd>(
     pub(super) storage::Lane<'s, 'd>,
 );
 
-impl<'s, 'd> Pending<'s, 'd> {
-    pub(super) fn new(frame: frame::Stored<'s, 'd>, lane: storage::Lane<'s, 'd>) -> Self {
-        Self(frame, lane)
-    }
-}
-
-impl<'life, 's, 'storage, 'b, 'c, 'd: 'life, const ID: u8>
-    response::Action<
-        'life,
-        'd,
-        Port<'s, 'storage, 'b, 'c, 'd, ID>,
-        Logic<'s, 'd>,
-        route::KeyTag<ID>,
-        CONNECTOR_CONNECTION_LIMIT,
-    > for Pending<'s, 'd>
+impl<'life, 's, 'storage, 'b, 'c, 'd: 'life, P, const ID: u8>
+    response::Action<'life, 'd, P, Logic<'s, 'd>, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT>
+    for Pending<'s, 'd>
+where
+    's: 'b,
+    'b: 'storage,
+    'c: 'b,
+    'd: 'c,
+    P: Root<'d, ID, Port = crate::Port<'s, 'storage, 'b, 'c, 'd, ID>>,
 {
     fn settle<'e, A: work::Admission>(
         item: response::Item<Self>,
-        owner: &mut Owner<'life, 's, 'storage, 'b, 'c, 'd, ID>,
+        owner: &mut Owner<'life, 's, 'd, P, ID>,
         work: &mut A,
         ctx: &mut turns::Context<'_, 'e, 'd, protocol::ConnState, Buffer, route::KeyTag<ID>>,
     ) -> response::Settlement<Self> {
-        let port = owner.root();
+        let port = owner.root().port();
         match work.admit_with(item.into_inner(), |pending| {
             match reply::push(port, pending, ctx) {
                 Some(pending) => response::Settlement::Blocked(pending),

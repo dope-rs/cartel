@@ -1,4 +1,4 @@
-use std::{mem, num::NonZero};
+use std::num::NonZero;
 
 mod error;
 use cartel_core::{
@@ -27,25 +27,22 @@ pub const DEFAULT_OPERATION_WINDOW: Positive = Positive::from_secs::<30>();
 
 #[derive(Clone)]
 pub struct Config {
-    capacities: Bounds,
+    connections: side::Capacity,
+    inflight: usize,
+    admission_waiters: usize,
+    request_frame_bytes: usize,
+    response_items: usize,
+    response_wire:
+        bounded::NonZeroU32<{ FRAME_HEADER_BYTES as u32 }, { transfer::MAX_BYTES as u32 }>,
     pub(super) operation_window: Positive,
     memory_bound: Memory,
     runtime: Runtime,
 }
 
 #[derive(Clone, Copy)]
-struct Bounds {
-    connections: side::Capacity,
-    inflight: usize,
-    admission_waiters: usize,
-    requests: Request,
-    responses: Frames,
-    notifications: Notification,
-}
-
-#[derive(Clone, Copy)]
 pub(super) struct Runtime {
     request_pool: pool::Layout,
+    control_pool: pool::Layout,
     request_queue: fair::Plan,
     response_arena: layout::Layout,
     ready: plan::Plan,
@@ -75,13 +72,6 @@ pub struct Response {
     pub bytes: usize,
     /// Largest complete backend frame, including type and length fields.
     pub frame_bytes: usize,
-}
-
-#[derive(Clone, Copy)]
-struct Frames {
-    items: usize,
-    bytes: usize,
-    wire: bounded::NonZeroU32<{ FRAME_HEADER_BYTES as u32 }, { transfer::MAX_BYTES as u32 }>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -156,7 +146,7 @@ impl Config {
         if waiters == 0 {
             return Err(Error::AdmissionWaitersZero);
         }
-        if frames < conns || frames > u32::MAX as usize / 2 {
+        if frames > u32::MAX as usize / 2 {
             return Err(Error::RequestFrames {
                 actual: frames,
                 minimum: conns,
@@ -170,6 +160,8 @@ impl Config {
             });
         }
         let pool = pool::Layout::new(frames, frame).map_err(Error::RequestPool)?;
+        let control =
+            pool::Layout::new(capacity.scale::<3>().get(), frame).map_err(Error::RequestPool)?;
         let queue = fair::Plan::new(frames, conns).map_err(Error::RequestQueue)?;
         if items < inflight || items > u32::MAX as usize {
             return Err(Error::ResponseItems {
@@ -218,7 +210,8 @@ impl Config {
                 available_payload_bytes: limit,
             });
         }
-        let request = pool.bytes();
+        // Each admitted allocation fits isize::MAX, so their sum fits usize.
+        let request = pool.bytes() + control.bytes();
         let cancel = conns
             .checked_mul(16)
             .ok_or(Error::CancelBytesOverflow { connections: conns })?;
@@ -252,18 +245,12 @@ impl Config {
         let total = resident.try_add(fixed).map_err(Error::ResidentFixed)?;
         let total = total.try_add(wire).map_err(Error::ResidentDiagnostic)?;
         Ok(Self {
-            capacities: Bounds {
-                connections: sides,
-                inflight,
-                admission_waiters: waiters,
-                requests: caps.requests,
-                responses: Frames {
-                    items,
-                    bytes,
-                    wire: bound,
-                },
-                notifications: caps.notifications,
-            },
+            connections: sides,
+            inflight,
+            admission_waiters: waiters,
+            request_frame_bytes: frame,
+            response_items: items,
+            response_wire: bound,
             operation_window: window,
             memory_bound: Memory {
                 request_bytes: request,
@@ -277,6 +264,7 @@ impl Config {
             },
             runtime: Runtime {
                 request_pool: pool,
+                control_pool: control,
                 request_queue: queue,
                 response_arena: arena,
                 ready,
@@ -287,18 +275,23 @@ impl Config {
     }
 
     pub const fn capacities(&self) -> Capacities {
-        let bounds = self.capacities;
         Capacities {
-            connections: bounds.connections.primary().entries().get(),
-            inflight: bounds.inflight,
-            admission_waiters: bounds.admission_waiters,
-            requests: bounds.requests,
-            responses: Response {
-                items: bounds.responses.items,
-                bytes: bounds.responses.bytes,
-                frame_bytes: bounds.responses.wire.into_usize(),
+            connections: self.connections.primary().entries().get(),
+            inflight: self.inflight,
+            admission_waiters: self.admission_waiters,
+            requests: Request {
+                frames: self.runtime.request_pool.slots() as usize,
+                frame_bytes: self.request_frame_bytes,
             },
-            notifications: bounds.notifications,
+            responses: Response {
+                items: self.response_items,
+                bytes: self.memory_bound.response_bytes,
+                frame_bytes: self.response_wire.into_usize(),
+            },
+            notifications: Notification {
+                items: self.runtime.notifications.get() as usize,
+                bytes: self.memory_bound.notification_bytes,
+            },
         }
     }
 
@@ -347,7 +340,7 @@ impl Config {
     }
 
     pub(crate) const fn frame_limit(&self) -> u32 {
-        self.capacities.responses.wire.get()
+        self.response_wire.get()
     }
 
     pub(crate) const fn ready_layout(&self) -> plan::Plan {
@@ -361,11 +354,11 @@ impl Config {
     /// Maximum connector sockets reserved by this port: one session and one
     /// bounded cancellation socket for every logical connection.
     pub const fn socket_limit(&self) -> usize {
-        self.capacities.connections.primary().scale::<2>().get()
+        self.connections.primary().scale::<2>().get()
     }
 
     pub(crate) const fn side(&self) -> side::Capacity {
-        self.capacities.connections
+        self.connections
     }
 
     pub(super) const fn runtime(&self) -> &Runtime {
@@ -379,6 +372,10 @@ impl Runtime {
     }
     pub(super) const fn request_pool(&self) -> pool::Layout {
         self.request_pool
+    }
+
+    pub(super) const fn control_pool(&self) -> pool::Layout {
+        self.control_pool
     }
 
     pub(super) const fn queue(&self) -> fair::Plan {
@@ -395,5 +392,3 @@ pub enum Connection {
     Primary(table::Invalid),
     Side(table::Invalid),
 }
-
-const _: () = assert!(mem::size_of::<Bounds>() == mem::size_of::<Capacities>());

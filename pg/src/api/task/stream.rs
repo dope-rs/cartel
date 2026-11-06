@@ -1,4 +1,4 @@
-use crate::api::task::{Core, State, lease};
+use crate::api::task::{Budget, Core, State, lease};
 use crate::port::replies;
 use crate::{api, reply::Error, schema};
 use cartel_core::reply;
@@ -34,6 +34,7 @@ where
         >,
         ID,
     >,
+    budget: Budget<'d>,
 }
 
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, X, const ID: u8>
@@ -59,6 +60,7 @@ where
     ) -> Self {
         Self {
             core: Core::new(client, target, reply, next),
+            budget: Budget::new(client.port.lifecycle.deadline),
         }
     }
 }
@@ -85,9 +87,9 @@ where
         M: FnMut(Result<Option<T>, Error<'d, ID>>) -> U + 'a,
     {
         Next {
-            deadline: match self.core.admission.state {
+            deadline: match self.core.admission {
                 State::Done => Ok(None),
-                _ => self.core.guard().map(Some),
+                _ => self.budget.guard().map(Some),
             },
             stream: self,
             waiter: wait::Waiter::new(),
@@ -119,7 +121,7 @@ where
             .map(Option::transpose);
         if matches!(&next, Poll::Ready(Ok(None)) | Poll::Ready(Err(_))) {
             self.core.reply.detach();
-            self.core.admission.state = State::Done;
+            self.core.admission = State::Done;
         }
         next
     }
@@ -169,10 +171,10 @@ where
             }
         };
         let phase = this.stream.core.phase();
-        if let Poll::Ready(time) = this
-            .stream
-            .core
-            .poll_time(guard.as_mut(), cx.as_mut(), phase)
+        if let Poll::Ready(time) =
+            this.stream
+                .budget
+                .poll_expired(guard.as_mut(), cx.as_mut(), phase)
         {
             waiter.unregister();
             return Poll::Ready((this.map)(Err(this.stream.core.expire(time))));

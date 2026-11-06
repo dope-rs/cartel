@@ -1,3 +1,4 @@
+pub(crate) use crate::sys::Step;
 use crate::{
     api::{self, stmt},
     catalogs, config, sys,
@@ -277,15 +278,15 @@ const _: () = {
     assert!(mem::size_of::<Prefix<'static, catalogs::Empty>>() == 3 * word);
     assert!(mem::size_of::<Prepare<'static, catalogs::Empty>>() == 6 * word);
     assert!(mem::size_of::<Retirement<'static>>() == 2 * word);
-    assert!(mem::size_of::<Slot<'static>>() == 4 * word);
-    assert!(mem::size_of::<Prepared<'static>>() == 4 * word);
+    assert!(mem::size_of::<Slot<'static>>() == 3 * word);
+    assert!(mem::size_of::<Prepared<'static>>() == 3 * word);
 };
 
 pub(crate) struct Prepared<'connection> {
     statement: ptr::NonNull<libsqlite3_sys::sqlite3_stmt>,
     work: &'connection work::Work,
-    parameters: usize,
-    columns: usize,
+    parameters: u32,
+    columns: u32,
     connection: marker::PhantomData<&'connection crate::sys::Connection>,
 }
 
@@ -321,11 +322,11 @@ impl<'connection> Prepared<'connection> {
                 tail.check()?;
                 // SAFETY: this prepared owner retains the live statement and database.
                 prepared.parameters = unsafe { sys::statement_parameters(stmt, params) }?;
-                prepared.columns = prepared.columns::<true>();
-                if columns != usize::MAX && prepared.columns != columns {
+                prepared.columns = unsafe { sys::statement_columns(stmt) };
+                if columns != usize::MAX && prepared.columns as usize != columns {
                     return Err(crate::Error::ColumnCount {
                         expected: columns,
-                        actual: prepared.columns,
+                        actual: prepared.columns as usize,
                     });
                 }
                 Ok(prepared)
@@ -348,15 +349,15 @@ impl<'connection> Prepared<'connection> {
     }
 
     fn params(&self) -> usize {
-        self.parameters
+        self.parameters as usize
     }
 
     fn columns<const CURRENT: bool>(&self) -> usize {
         if !CURRENT {
-            return self.columns;
+            return self.columns as usize;
         }
         // SAFETY: this owner retains the live statement and original database.
-        unsafe { sys::statement_columns(self.statement) }
+        unsafe { sys::statement_columns(self.statement) as usize }
     }
 
     pub(crate) fn step<A: Access>(
@@ -405,9 +406,4 @@ impl Drop for Prepared<'_> {
             self.work.finalized(fault);
         }
     }
-}
-
-pub(crate) enum Step {
-    Row,
-    Done,
 }

@@ -131,6 +131,35 @@ pub trait Query<'d, const ID: u8 = 0>: Sealed + Copy {
         batch::Join::from_map(pool, params, |params| self.run_first::<Q>(params))
     }
 
+    fn run_scalar<Q>(
+        self,
+        params: Q::Params<'_>,
+    ) -> impl Fiber<'d, Output = results::FirstResult<'d, Self::Results, Q, ID, true>>
+    + use<'d, Self, Q, ID>
+    where
+        Q: schema::TypedQuery<Result = result::Rows<true>>,
+        Self::Schema: schema::HasGroup<Q::Group>,
+        Q::Group: schema::QueryGroup;
+
+    fn scalar_each<'pool, Q, const N: usize>(
+        self,
+        pool: &'pool mut batch::Pool<'d, N>,
+        params: [Q::Params<'_>; N],
+    ) -> batch::Join<
+        'pool,
+        'd,
+        impl Fiber<'d, Output = results::FirstResult<'d, Self::Results, Q, ID, true>>
+        + use<'d, Self, Q, ID, N>,
+        N,
+    >
+    where
+        Q: schema::TypedQuery<Result = result::Rows<true>>,
+        Self::Schema: schema::HasGroup<Q::Group>,
+        Q::Group: schema::QueryGroup,
+    {
+        batch::Join::from_map(pool, params, |params| self.run_scalar::<Q>(params))
+    }
+
     fn run_all<Q>(
         self,
         params: Q::Params<'_>,

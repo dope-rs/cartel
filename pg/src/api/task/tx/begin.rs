@@ -101,6 +101,34 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                 waiter.unregister();
                 return task::Poll::Ready(Err(error));
             }
+            if matches!(this.state, State::Pending { .. }) {
+                let task::Poll::Ready(next) =
+                    pin::Pin::new(&mut *this.reply).poll_reply(ctx.as_mut())
+                else {
+                    return task::Poll::Pending;
+                };
+                let State::Pending { lease } = mem::replace(this.state, State::Done) else {
+                    unreachable!("pending");
+                };
+                guard.as_mut().complete();
+                return task::Poll::Ready(match next {
+                    Ok(()) => {
+                        let target = lease.target();
+                        if matches!(
+                            client.port.shared.transaction().current(target.conn),
+                            crate::port::pool::access::Current::Held(current) if current == target
+                        ) {
+                            Ok(lease)
+                        } else {
+                            let error =
+                                crate::Error::Protocol(crate::protocol::Reason::TransactionLease);
+                            lease.abort(error);
+                            Err(error.into())
+                        }
+                    }
+                    Err(error) => Err(error),
+                });
+            }
             match mem::replace(this.state, State::Done) {
                 State::Waiting(req) => match client.retry_tx(ctx.as_mut(), waiter, this.reply, req)
                 {
@@ -112,43 +140,17 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                         *this.state = State::Pending { lease };
                     }
                     api::TxRetry::Failed(error) => {
-                        guard.as_ref().complete();
+                        guard.as_mut().complete();
                         return task::Poll::Ready(Err(error));
                     }
                 },
-                State::Pending { lease } => {
-                    match pin::Pin::new(&mut *this.reply).poll_reply(ctx.as_mut()) {
-                        task::Poll::Pending => {
-                            *this.state = State::Pending { lease };
-                            return task::Poll::Pending;
-                        }
-                        task::Poll::Ready(Ok(())) => {
-                            guard.as_ref().complete();
-                            let target = lease.target();
-                            if !matches!(
-                                client.port.shared.transaction().current(target.conn),
-                                crate::port::pool::access::Current::Held(current) if current == target
-                            ) {
-                                let error = crate::Error::Protocol(
-                                    crate::protocol::Reason::TransactionLease,
-                                );
-                                lease.abort(error);
-                                return task::Poll::Ready(Err(error.into()));
-                            }
-                            return task::Poll::Ready(Ok(lease));
-                        }
-                        task::Poll::Ready(Err(error)) => {
-                            guard.as_ref().complete();
-                            return task::Poll::Ready(Err(error));
-                        }
-                    }
-                }
+                State::Pending { .. } => unreachable!("pending"),
                 State::Failed(error) => {
-                    guard.as_ref().complete();
+                    guard.as_mut().complete();
                     return task::Poll::Ready(Err(error));
                 }
                 State::Done => {
-                    guard.as_ref().complete();
+                    guard.as_mut().complete();
                     return task::Poll::Ready(Err(crate::Error::Closed.into()));
                 }
             }

@@ -18,9 +18,9 @@ pub mod common;
 
 #[test]
 fn rejects_wire() {
-    for (bytes, expected) in auth::REJECTED {
+    for (code, bytes, expected) in auth::REJECTED {
         TcpScript::with(
-            |socket| auth::reject(socket, bytes),
+            |socket| auth::reject(socket, code, bytes),
             |server| {
                 let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
                     port::Port::<Queries>::plan(

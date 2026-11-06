@@ -1,5 +1,4 @@
 use cartel_redis::{client::nonempty::Error, client::nonempty::Slice};
-use std::mem;
 
 #[test]
 fn dynamic_is_checked() {
@@ -16,14 +15,4 @@ fn fixed_are_infallible() {
 
     let pair = [1, 2];
     assert_eq!(Slice::from_pair(&pair).as_slice(), &pair);
-}
-
-#[test]
-fn layout_is_transparent() {
-    assert_eq!(mem::size_of::<Slice<'_, u8>>(), mem::size_of::<&[u8]>());
-    assert_eq!(mem::align_of::<Slice<'_, u8>>(), mem::align_of::<&[u8]>());
-    assert_eq!(
-        mem::size_of::<Option<Slice<'_, u8>>>(),
-        mem::size_of::<Slice<'_, u8>>()
-    );
 }

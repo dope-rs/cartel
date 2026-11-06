@@ -93,6 +93,11 @@ impl Connection {
         unsafe { libsqlite3_sys::sqlite3_limit(self.raw.as_ptr(), id, value) }
     }
 
+    pub(crate) fn autocheckpoint(&self, pages: i32) {
+        // SAFETY: the live connection admits this infallible setter; it does not run the hook.
+        unsafe { libsqlite3_sys::sqlite3_wal_autocheckpoint(self.raw.as_ptr(), pages) };
+    }
+
     pub(crate) fn exec(&self, sql: &str) -> Completion<()> {
         Statement::run(self, Sql::new(sql), Statement::drain)
     }
@@ -202,20 +207,16 @@ impl Connection {
                 sys::Action::TrustedSchema,
             ),
         };
-        let mut applied: std::ffi::c_int = 0;
+        // These native flag cases apply enabled exactly; no readback is needed.
         let code = unsafe {
-            libsqlite3_sys::sqlite3_db_config(self.raw.as_ptr(), option, enabled, &mut applied)
+            libsqlite3_sys::sqlite3_db_config(
+                self.raw.as_ptr(),
+                option,
+                enabled,
+                ptr::null_mut::<std::ffi::c_int>(),
+            )
         };
-        self.result(action, code)?;
-        if applied == enabled {
-            return Ok(());
-        }
-        let actual = applied;
-        Err(match policy {
-            Policy::ForeignKeys => crate::Error::ForeignKeys { actual },
-            Policy::Defensive => crate::Error::Defensive { actual },
-            Policy::TrustedSchema => crate::Error::TrustedSchema { actual },
-        })
+        self.result(action, code)
     }
 }
 
@@ -284,20 +285,23 @@ impl Filename {
 pub(crate) unsafe fn statement_parameters(
     stmt: ptr::NonNull<libsqlite3_sys::sqlite3_stmt>,
     expected: usize,
-) -> Result<usize, crate::Error> {
-    // SAFETY: the retained native statement owns its parsed, nonnegative nVar.
-    let actual = unsafe { libsqlite3_sys::sqlite3_bind_parameter_count(stmt.as_ptr()) } as usize;
-    if expected != usize::MAX && actual != expected {
-        return Err(crate::Error::ParameterCount { expected, actual });
+) -> Result<u32, crate::Error> {
+    // SAFETY: the retained native statement owns its nonnegative signed nVar.
+    let actual = unsafe { libsqlite3_sys::sqlite3_bind_parameter_count(stmt.as_ptr()) } as u32;
+    if expected != usize::MAX && actual as usize != expected {
+        return Err(crate::Error::ParameterCount {
+            expected,
+            actual: actual as usize,
+        });
     }
     Ok(actual)
 }
 
 /// # Safety
 /// The statement and its original connection must remain live for this call.
-pub(crate) unsafe fn statement_columns(stmt: ptr::NonNull<libsqlite3_sys::sqlite3_stmt>) -> usize {
+pub(crate) unsafe fn statement_columns(stmt: ptr::NonNull<libsqlite3_sys::sqlite3_stmt>) -> u32 {
     // SAFETY: the live native statement returns its current u16 nResColumn.
-    unsafe { libsqlite3_sys::sqlite3_column_count(stmt.as_ptr()) as usize }
+    unsafe { libsqlite3_sys::sqlite3_column_count(stmt.as_ptr()) as u32 }
 }
 
 impl<'connection> Statement<'connection> {
@@ -384,7 +388,7 @@ impl<'connection> Statement<'connection> {
 
     fn columns(&self, expected: usize) -> Result<(), crate::Error> {
         // SAFETY: this owner retains its live statement and original connection.
-        let actual = unsafe { statement_columns(self.raw) };
+        let actual = unsafe { statement_columns(self.raw) } as usize;
         if actual != expected {
             return Err(crate::Error::ColumnCount { expected, actual });
         }

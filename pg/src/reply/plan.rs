@@ -46,10 +46,7 @@ impl<'input, 'd, R: buffer::Cursor> Plan<'input, 'd, R> {
         })
     }
 
-    pub(crate) fn try_build(
-        self,
-        policy: hold::Policy,
-    ) -> Result<(server::Diagnostic<'d>, reply::Class), hold::Error>
+    pub(crate) fn try_build(self) -> Result<(server::Diagnostic<'d>, reply::Class), hold::Error>
     where
         R: hold::raw::Retain<'d>,
     {
@@ -58,7 +55,10 @@ impl<'input, 'd, R: buffer::Cursor> Plan<'input, 'd, R> {
             class,
             scope: _,
         } = self;
-        let payload = payload.into_inner().bind(policy).try_into()?;
+        let payload = payload
+            .into_inner()
+            .bind(cartel_core::memory::RETENTION)
+            .try_into()?;
         Ok((server::Diagnostic { payload }, class))
     }
 }

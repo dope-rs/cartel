@@ -1,3 +1,4 @@
+use crate::api::work::guard::{Guard, open};
 use crate::api::{state, stmt};
 use crate::{catalogs, conn, retry, runtime, sys};
 use dope_core::driver::{
@@ -57,18 +58,24 @@ impl<'local, 'd: 'local, I: catalogs::Catalog> Open<'local, 'd, I> {
 impl<'local, 'd: 'local, I: catalogs::Catalog> Phase<'local, 'd, I> {
     fn retry(&mut self) -> Option<lease::Lease<'_, 'd, lease::Open>> {
         match self {
-            Self::Opening(opening) => Some(opening.retry()),
-            Self::Prepare(slot) => Some(slot.retry()),
+            Self::Opening(opening) => Some(opening.retry().1),
+            Self::Prepare(slot) => Some(slot.retry().1),
             Self::Failing(_) => None,
         }
     }
 
     fn defer(
-        mut retry: lease::Lease<'_, 'd, lease::Open>,
+        (guard, mut retry): (
+            &Guard<'local, open::Open>,
+            lease::Lease<'_, 'd, lease::Open>,
+        ),
         now: clock::Moment<'d>,
         wake: wake::Waker<'d>,
         fault: sys::Fault,
     ) -> task::Poll<Result<(), crate::Error>> {
+        if guard.check(Ok(())).is_err() {
+            return task::Poll::Ready(Err(fault.busy()));
+        }
         retry.defer(now, fault)?;
         retry.poll(now, wake)
     }
@@ -106,7 +113,7 @@ impl<'local, 'd: 'local, I: catalogs::Catalog> Phase<'local, 'd, I> {
             },
             Self::Prepare(slot) => match slot.advance() {
                 Ok(stmt::Progress::Pending(slot)) => Next::Pending(Self::Prepare(slot)),
-                Ok(stmt::Progress::Ready(ready)) => Next::Ready(state::State::new(ready)),
+                Ok(stmt::Progress::Ready(ready)) => Next::Ready(ready),
                 Err((mut slot, crate::Error::Busy { action, code })) => {
                     let fault = sys::Fault::new(action, code);
                     match Self::defer(slot.retry(), now, target.into(), fault) {
