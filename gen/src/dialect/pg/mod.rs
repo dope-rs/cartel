@@ -128,42 +128,36 @@ impl PgBackend {
 
         let parts = &plan.sql_parts;
         let cols = &plan.n_result_cols;
-        let (row, value, run, each) = match &plan.dispatch {
+        let (row, value, run) = match &plan.dispatch {
             emit::Kind::One(ty) => (
                 Some(ty),
                 quote::quote! { ::cartel_pg::api::results::Row<<#caller::Results as ::cartel_pg::api::results::Storage>::Payload, #query> },
                 quote::format_ident!("run_one"),
-                Some(quote::format_ident!("one_each")),
             ),
             emit::Kind::First(ty) => (
                 Some(ty),
                 quote::quote! { ::core::option::Option<::cartel_pg::api::results::Row<<#caller::Results as ::cartel_pg::api::results::Storage>::Payload, #query>> },
                 quote::format_ident!("run_first"),
-                Some(quote::format_ident!("first_each")),
             ),
             emit::Kind::Aggregate(ty) => (
                 Some(ty),
                 quote::quote! { ::core::option::Option<::cartel_pg::api::results::Row<<#caller::Results as ::cartel_pg::api::results::Storage>::Payload, #query, true>> },
                 quote::format_ident!("run_scalar"),
-                Some(quote::format_ident!("scalar_each")),
             ),
             emit::Kind::All(ty) => (
                 Some(ty),
                 quote::quote! { ::cartel_pg::api::results::Collection<<#caller::Results as ::cartel_pg::api::results::Storage>::Batch, #query> },
                 quote::format_ident!("run_all"),
-                Some(quote::format_ident!("all_each")),
             ),
             emit::Kind::Stream(ty) => (
                 Some(ty),
                 quote::quote! { () },
                 quote::format_ident!("run_stream"),
-                None,
             ),
             emit::Kind::NoRows => (
                 None,
                 quote::quote! { () },
                 quote::format_ident!("run_no_rows"),
-                Some(quote::format_ident!("command_each")),
             ),
         };
         let response = quote::quote! {
@@ -236,16 +230,18 @@ impl PgBackend {
                 };
             }
         };
-        let batch = if let Some(run) = each {
+        let batch = if !matches!(plan.dispatch, emit::Kind::Stream(_)) {
             let count = names.fresh("__CARTEL_GROUP_LEN_");
-            let (params, values) = match tys.as_slice() {
+            let (params, values, item) = match tys.as_slice() {
                 [ty] => (
                     quote::quote! { [#ty; #count] },
                     quote::quote! { #args.map(|#argument| (#argument,)) },
+                    quote::quote! { (#argument,) },
                 ),
                 _ => (
                     quote::quote! { [(#(#tys,)*); #count] },
                     quote::quote! { #args },
+                    quote::quote! { #argument },
                 ),
             };
             let grouped = if matches!(plan.dispatch, emit::Kind::One(_)) {
@@ -298,10 +294,10 @@ impl PgBackend {
                     #caller: ::cartel_pg::api::traits::Query<#driver, #route_id>,
                     #caller::Schema: ::cartel_pg::schema::HasGroup<Self>,
                 {
-                    ::cartel_pg::api::traits::Query::#run::<#query, #count>(
-                        #client,
+                    ::cartel_pg::dope_fiber::task::batch::Join::from_map(
                         #pool,
-                        #values,
+                        #args,
+                        |#argument| ::cartel_pg::api::traits::Query::#run::<#query>(#client, #item),
                     )
                 }
             }

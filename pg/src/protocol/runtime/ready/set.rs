@@ -1,17 +1,58 @@
-use crate::port::Disposition;
+use crate::{api, api::task::lease::Target as _, port::Disposition};
 use dope::core::driver::{self, route, schedule::ready::Target};
 use dope::manifold::client::conn;
 use dope_fiber::wait::Capacity;
 use dope_fiber::{context, wait};
-use o3::alloc::Error;
+use o3::{alloc::Error, base::cell::region};
 use std::{cell, num, pin};
 
 use crate::port::pool::{access, slot};
 use crate::port::replies;
+use crate::port::requests::Boundary;
 use crate::protocol;
 use crate::protocol::runtime::{ready, tx::poll};
 use cartel_core::reply::order::Depth;
 use ready::{plan, storage};
+
+enum Source<'a, 'd, const ID: u8> {
+    Shared(storage::Listed<'a, 'd, ID>),
+    Exclusive(slot::Ready<'a, 'd, ID>),
+}
+
+pub(crate) struct ReplyContext<'turn, 'a, 'd, const ID: u8> {
+    source: Source<'a, 'd, ID>,
+    boundary: Boundary,
+    region: &'turn mut region::Token<region::Identity<'d>>,
+}
+
+impl<'turn, 'a: 'turn, 'd, const ID: u8> ReplyContext<'turn, 'a, 'd, ID> {
+    pub(crate) fn reserved(
+        proof: &ready::Reservation<'a, 'd, ID>,
+        boundary: Boundary,
+        region: &'turn mut region::Token<region::Identity<'d>>,
+    ) -> Self {
+        Self {
+            source: Source::Exclusive(proof.ready()),
+            boundary,
+            region,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        slot::Ready<'turn, 'd, ID>,
+        Option<storage::Listed<'turn, 'd, ID>>,
+        Boundary,
+        &'turn mut region::Token<region::Identity<'d>>,
+    ) {
+        let (ready, listed) = match self.source {
+            Source::Shared(listed) => (slot::Ready::listed(&listed), Some(listed)),
+            Source::Exclusive(ready) => (ready, None),
+        };
+        (ready, listed, self.boundary, self.region)
+    }
+}
 
 pub(crate) struct Set<'d, const ID: u8> {
     index: storage::Index<'d, ID>,
@@ -74,7 +115,47 @@ impl<'d, const ID: u8> Set<'d, ID> {
         }
     }
 
-    pub(crate) fn pick<const GROUP: bool>(&self) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
+    pub(crate) fn select<'turn, 'a: 'turn>(
+        &'a self,
+        target: &Option<api::Target<'d, ID>>,
+        boundary: Boundary,
+        region: &'turn mut region::Token<region::Identity<'d>>,
+    ) -> Result<Option<ReplyContext<'turn, 'a, 'd, ID>>, api::Target<'d, ID>> {
+        let source = if let Some(target) = *target {
+            let token = target.connection();
+            let generation = target.transaction().map(|tx| tx.generation);
+            let entry = self.index.entry(token.index().into_usize()).ok_or(target)?;
+            let slot = entry.slot();
+            let ready = slot.select(token, generation).ok_or(target)?;
+            if slot.is_receiving() {
+                return Ok(None);
+            }
+            if generation.is_some() {
+                Source::Exclusive(ready)
+            } else {
+                let Some(listed) = entry.listed() else {
+                    return Ok(None);
+                };
+                Source::Shared(listed)
+            }
+        } else {
+            let selected = match boundary {
+                Boundary::Group => self.pick::<true>(),
+                _ => self.pick::<false>(),
+            };
+            let Some(listed) = selected else {
+                return Ok(None);
+            };
+            Source::Shared(listed)
+        };
+        Ok(Some(ReplyContext {
+            source,
+            boundary,
+            region,
+        }))
+    }
+
+    fn pick<const GROUP: bool>(&self) -> Option<storage::Listed<'_, 'd, ID>> {
         if GROUP {
             return self.pick_where(slot::Slot::is_synced);
         }
@@ -84,14 +165,14 @@ impl<'d, const ID: u8> Set<'d, ID> {
         }
     }
 
-    pub(crate) fn pick_begin(&self) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
+    pub(crate) fn pick_begin(&self) -> Option<storage::Listed<'_, 'd, ID>> {
         self.pick_where(slot::Slot::can_begin)
     }
 
     fn pick_where(
         &self,
         eligible: impl Fn(&slot::Slot<'d, ID>) -> bool,
-    ) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
+    ) -> Option<storage::Listed<'_, 'd, ID>> {
         match self.policy.get() {
             protocol::PickPolicy::RoundRobin => self.index.next_where(eligible),
             protocol::PickPolicy::LeastInflight => self.index.least_where(eligible),
@@ -105,21 +186,6 @@ impl<'d, const ID: u8> Set<'d, ID> {
         self.index.try_ready(id)?;
         self.waiters.notify();
         Ok(())
-    }
-
-    pub(crate) fn release(
-        &self,
-        proof: access::Reservation<'_, 'd, ID>,
-        depth: usize,
-    ) -> access::Release {
-        self.index.release(proof, depth)
-    }
-
-    pub(crate) fn reserve(
-        &self,
-        id: conn::Id<'d, route::KeyTag<ID>>,
-    ) -> access::Reserve<'_, 'd, ID> {
-        self.index.reserve(id)
     }
 
     pub(in crate::protocol) fn poll_ready(

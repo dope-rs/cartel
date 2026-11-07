@@ -33,6 +33,22 @@ fn capacities_match() {
 }
 
 #[test]
+fn staging_resident_includes_warm_pool() {
+    let cap = settings::Capacities {
+        connections: 1,
+        admission_waiters: 1,
+        inflight: 5,
+        request_frame_bytes: 1,
+        response_bytes: 32_768,
+        response_values: 5,
+        response_frame_bytes: 32_768,
+        response_frame_values: 1,
+    };
+    let config = Builder::new(cap).build().expect("valid staging capacity");
+    assert_eq!(config.memory_bound().resident_bytes.bytes(), 245_760);
+}
+
+#[test]
 fn parser_tape_bound() {
     let cap = settings::Capacities {
         connections: 2,

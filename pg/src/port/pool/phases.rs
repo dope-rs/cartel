@@ -5,9 +5,11 @@ use o3::depot::{self, index::Initialized};
 
 use crate::port::{
     Disposition,
-    pool::{access, slot, slot::Phase},
+    pool::{slot, slot::Phase},
     replies,
 };
+
+pub(crate) mod access;
 
 #[derive(Clone, Copy)]
 enum Lifecycle {
@@ -91,6 +93,13 @@ impl<'d, const ID: u8> State<'d, ID> {
         self.phase.set(phase);
     }
 
+    fn set_access(&self, access: access::State) {
+        self.phase.set(Lifecycle::Ready {
+            access,
+            receiving: self.is_receiving(),
+        });
+    }
+
     pub(super) fn is_receiving(&self) -> bool {
         matches!(
             self.phase.get(),
@@ -121,12 +130,10 @@ impl<'d, const ID: u8> State<'d, ID> {
         true
     }
 
-    pub(super) fn listed(
+    pub(super) fn bound(
         proof: depot::raw::Proof<&slot::Slot<'d, ID>, Initialized<slot::Bound<'d, ID>>>,
     ) -> slot::Bound<'d, ID> {
-        // SAFETY: ready storage publishes a selector member only after bind
-        // initialized this exact slot. Its membership proof is retained for
-        // this synchronous selection; no generation transition intervenes.
+        // SAFETY: the synchronous Ready proof retains this exact initialized binding.
         unsafe { proof.into_inner().phase.bound.get().assume_init() }
     }
 }

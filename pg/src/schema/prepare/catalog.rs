@@ -6,9 +6,9 @@ use crate::schema::{self, desc, groups};
 pub(crate) struct Catalog<I>(PhantomData<fn(I) -> I>);
 
 /// An admitted position in `I::PREPARE`, retained across protocol transitions.
-#[repr(transparent)]
 pub(crate) struct Cursor<I> {
-    position: schema::QueryCursor,
+    group: u32,
+    query: u32,
     catalog: PhantomData<fn(I) -> I>,
 }
 
@@ -37,7 +37,8 @@ impl<I: schema::QuerySet> Catalog<I> {
         while (group as usize) < groups.len() {
             if groups[group as usize].get(query as usize).is_some() {
                 return schema::Step::Query(Cursor {
-                    position: schema::QueryCursor { group, query },
+                    group,
+                    query,
                     catalog: PhantomData,
                 });
             }
@@ -56,13 +57,13 @@ impl<I: schema::QuerySet> Cursor<I> {
         unsafe {
             *I::PREPARE
                 .groups
-                .get_unchecked(self.position.group as usize)
-                .get_unchecked(self.position.query as usize)
+                .get_unchecked(self.group as usize)
+                .get_unchecked(self.query as usize)
         }
     }
 
     pub(crate) fn next(self) -> schema::Step<I> {
-        Catalog::<I>::at(self.position.group, self.position.query + 1)
+        Catalog::<I>::at(self.group, self.query + 1)
     }
 
     pub(crate) fn validate(
@@ -71,11 +72,10 @@ impl<I: schema::QuerySet> Cursor<I> {
         registry: desc::Registry,
     ) -> Result<(), crate::Error> {
         let input = desc::Input {
-            cursor: self.position,
             payload,
             registry,
         };
-        <I::Groups as groups::List>::validate(self.position.group, input)
+        <I::Groups as groups::List>::validate(self.group, self.query, input)
     }
 }
 

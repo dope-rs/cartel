@@ -41,7 +41,7 @@ pub(crate) const MAX_SAVEPOINTS: usize = usize::MAX >> 2;
 pub(crate) struct Work {
     pub open: Budget,
     pub call: Budget,
-    pub cleanup: Budget,
+    pub cleanup: crate::limits::Progress,
     pub savepoints: bounded::NonZeroUsize<1, MAX_SAVEPOINTS>,
 }
 
@@ -94,12 +94,8 @@ impl Contention {
 
 impl Work {
     pub(crate) const fn alarm(&self) -> Alarm {
-        match (
-            self.open.contention.delay,
-            self.call.contention.delay,
-            self.cleanup.contention.delay,
-        ) {
-            (Delay::Yield, Delay::Yield, Delay::Yield) => Alarm::Omit,
+        match (self.open.contention.delay, self.call.contention.delay) {
+            (Delay::Yield, Delay::Yield) => Alarm::Omit,
             _ => Alarm::Reserve,
         }
     }
@@ -179,7 +175,7 @@ impl Config {
             work: Work {
                 open: budget(limits.work.open, Operation::Open)?,
                 call: budget(limits.work.call, Operation::Call)?,
-                cleanup: budget(limits.work.cleanup, Operation::Cleanup)?,
+                cleanup: limits.work.cleanup,
                 savepoints: depth,
             },
             program_ops: limits.program.sqlite_ops(),
@@ -273,6 +269,6 @@ const _: () = {
     assert!(mem::size_of::<Delay>() == 2 * word);
     assert!(mem::size_of::<Contention>() == 5 * word);
     assert!(mem::size_of::<Budget>() == 6 * word);
-    assert!(mem::size_of::<Work>() == 19 * word);
-    assert!(mem::size_of::<Config>() == 27 * word);
+    assert!(mem::size_of::<Work>() == 14 * word);
+    assert!(mem::size_of::<Config>() == 22 * word);
 };

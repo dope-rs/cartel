@@ -21,7 +21,7 @@ impl<'d> Queue<'d> {
         items: NonZero<u32>,
         bytes: usize,
         waiters: Capacity,
-        proof: region::Proof<region::Identity<'d>>,
+        proof: region::Identity<'d>,
     ) -> Result<Self, alloc::Error> {
         Ok(Self {
             buffer: proof.bind(buffer::Buffer::try_new(items, bytes)?),

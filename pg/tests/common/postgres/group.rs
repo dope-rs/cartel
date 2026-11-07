@@ -76,8 +76,15 @@ pub fn transaction(socket: &mut &peer::Stream<'_>) -> Result<(), Error> {
 pub fn late_error(socket: &mut &peer::Stream<'_>) -> Result<(), Error> {
     Database::start(&mut *socket)?;
     read_empty(socket, b'S')?;
-    complete(socket, 3, b"first")?;
-    complete(socket, 7, b"second")?;
+    for (id, name) in [(3, b"first".as_slice()), (7, b"second".as_slice())] {
+        socket.write_all(&Frame::new(b'2', &[]).encode())?;
+        socket.write_all(&Frame::new(b'D', &TextRow::wire(id, name)).encode())?;
+        for tail in 0..16 {
+            socket
+                .write_all(&Frame::new(b'D', &TextRow::wire(id * 100 + tail, b"tail")).encode())?;
+        }
+        socket.write_all(&Frame::new(b'C', b"SELECT 17\0").encode())?;
+    }
     socket.write_all(&Frame::new(b'E', COMMAND_ERROR).encode())?;
     socket.write_all(&Frame::new(b'Z', b"I").encode())?;
     socket.read_closed()

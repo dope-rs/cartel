@@ -3,7 +3,6 @@ use crate::{
     runtime::{self, heap, slot},
 };
 use dope_core::driver::storage;
-use heap::layout::Layout;
 use std::{cell, marker, mem, pin};
 
 /// Pinned SQLite resources owned by one generative driver domain.
@@ -28,24 +27,16 @@ pub(super) struct Settings {
 impl<'d, I: catalogs::Catalog> State<'d, I> {
     pub(in crate::runtime) fn new(
         context: &mut storage::Context<'_, 'd>,
-        settings: Settings,
-        sqlite: Layout,
-        database: database::Target<'d>,
-        stmts: usize,
-        aside: crate::memory::Lookaside,
+        layout: runtime::Layout<'d, I>,
     ) -> Result<Self, runtime::Error> {
+        let (memory, sqlite, collect, stmts, storage, phase) =
+            runtime::raw::Memory::new(&layout)?;
+        let (settings, database, aside) = layout.into_parts();
         let Settings {
             config,
             value_bytes: values,
             statement_sql_bytes: sql,
         } = settings;
-        let (memory, sqlite, collect, stmts, storage, phase) = runtime::raw::Memory::new(
-            sqlite,
-            config.result_bytes(),
-            stmts,
-            aside.bytes(),
-            conn::raw::Vacant::<'_, 'd, I>::LAYOUT,
-        )?;
         let retry = retry::raw::Configured::new(config, || {
             context
                 .timer()

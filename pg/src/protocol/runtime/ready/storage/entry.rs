@@ -10,10 +10,10 @@ pub(in crate::protocol::runtime::ready) struct Entry<'a, 'd, const ID: u8> {
 }
 
 /// The exact entry and bucket retained while its linked transition is committed.
-pub(super) struct Listed<'a, 'd, const ID: u8> {
-    core: &'a storage::Index<'d, ID>,
-    index: NonZero<u32>,
-    rank: storage::Rank,
+pub(crate) struct Listed<'a, 'd, const ID: u8> {
+    pub(super) core: &'a storage::Index<'d, ID>,
+    pub(super) index: NonZero<u32>,
+    pub(super) rank: storage::Rank,
 }
 
 impl<'a, 'd, const ID: u8> Entry<'a, 'd, ID> {
@@ -26,7 +26,7 @@ impl<'a, 'd, const ID: u8> Entry<'a, 'd, ID> {
         }
     }
 
-    pub(super) fn listed(self) -> Option<Listed<'a, 'd, ID>> {
+    pub(in crate::protocol::runtime::ready) fn listed(self) -> Option<Listed<'a, 'd, ID>> {
         let rank = self.node().priority.get()?;
         Some(Listed {
             core: self.core,
@@ -36,13 +36,17 @@ impl<'a, 'd, const ID: u8> Entry<'a, 'd, ID> {
     }
 
     pub(super) fn insert(self, depth: usize) {
-        let bucket = entry::Row::clamp(&self.core.allocation, depth);
+        let rank = storage::Rank::new(entry::Row::clamp(&self.core.allocation, depth));
+        self.insert_rank(rank);
+    }
+
+    pub(super) fn insert_rank(self, rank: storage::Rank) {
         let round = storage::Round(&self.core.allocation);
         // SAFETY: the completed slot transition admits this exact previously unlisted connection.
         unsafe {
             depot::raw::Hooks::cycle_push(&round, &self.core.ring, links::Index::from(self.index))
         };
-        self.attach(bucket);
+        self.attach(rank.row(&self.core.allocation));
     }
 
     pub(super) fn reprioritize(self, depth: usize) {
@@ -99,7 +103,7 @@ impl<'a, 'd, const ID: u8> Entry<'a, 'd, ID> {
 }
 
 impl<'a, 'd, const ID: u8> Listed<'a, 'd, ID> {
-    pub(super) fn slot(&self) -> &'a slot::Slot<'d, ID> {
+    pub(crate) fn slot(&self) -> &'a slot::Slot<'d, ID> {
         Entry {
             core: self.core,
             index: self.index,
@@ -107,15 +111,15 @@ impl<'a, 'd, const ID: u8> Listed<'a, 'd, ID> {
         .slot()
     }
 
-    pub(super) fn remove(self) {
+    pub(super) fn remove(self) -> (Entry<'a, 'd, ID>, storage::Rank) {
         let Self { core, index, rank } = self;
         let round = storage::Round(&core.allocation);
         // SAFETY: this capability owns the original listed entry until removal.
         unsafe { depot::raw::Hooks::cycle_unlink(&round, &core.ring, links::Index::from(index)) };
-        Entry { core, index }.detach(rank);
+        (Entry { core, index }.detach(rank), rank)
     }
 
-    fn reprioritize(self, depth: usize) {
+    pub(crate) fn reprioritize(self, depth: usize) {
         let bucket = entry::Row::clamp(&self.core.allocation, depth);
         let rank = bucket.index();
         let head = unsafe { bucket.source().heads().get_unchecked(rank) };

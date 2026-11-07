@@ -1,10 +1,10 @@
 mod vfs;
 
 use crate::{
+    catalogs, conn,
     runtime::{self, Error, heap},
     sys,
 };
-use heap::layout::Layout;
 use o3::alloc;
 use std::{mem, ptr};
 
@@ -118,58 +118,46 @@ impl Setup {
         unsafe {
             libsqlite3_sys::sqlite3_config(libsqlite3_sys::SQLITE_CONFIG_MALLOC, &raw const hooks);
         }
-        let scope = raw::Foreign::enter();
-        let code = unsafe { libsqlite3_sys::sqlite3_initialize() };
-        let result = if code == libsqlite3_sys::SQLITE_OK {
-            unsafe { Vfs::install() }
-        } else {
-            Err(Error::Initialization(sys::Code::new(code)))
-        };
-        if result.is_err() {
-            // SAFETY: Setup retains exclusive startup authority and rejects OMIT_WSD,
-            // the only native build path where shutdown can return a non-OK code.
-            unsafe { libsqlite3_sys::sqlite3_shutdown() };
-        }
-        drop(scope);
-        result?;
+        raw::foreign(|| {
+            let code = unsafe { libsqlite3_sys::sqlite3_initialize() };
+            let result = if code == libsqlite3_sys::SQLITE_OK {
+                unsafe { Vfs::install() }
+            } else {
+                Err(Error::Initialization(sys::Code::new(code)))
+            };
+            if result.is_err() {
+                // SAFETY: Setup retains exclusive startup authority and rejects OMIT_WSD,
+                // the only native build path where shutdown can return a non-OK code.
+                unsafe { libsqlite3_sys::sqlite3_shutdown() };
+            }
+            result
+        })?;
         Ok(self.0)
     }
 }
 
 impl Memory {
-    /// Layout retains statement bytes already aligned by stmt::bytes.
-    pub(in crate::runtime) fn new(
-        sqlite: Layout,
-        collect: usize,
-        stmts: usize,
-        aside: usize,
-        phase: std::alloc::Layout,
+    pub(in crate::runtime) fn new<I: catalogs::Catalog>(
+        layout: &runtime::Layout<'_, I>,
     ) -> Result<(Self, heap::raw::Span, Span, Span, Span, Span), runtime::Error> {
-        if phase.align() > Span::ALIGNMENT {
-            return Err(runtime::Error::Layout);
-        }
-        let phase_bytes = Self::round(phase.size())?;
-        let rounded = Self::round(collect)?;
-        let aside = Self::round(aside)?;
-        let arena = sqlite.backing().ok_or(runtime::Error::CapacityOverflow)?;
-        let retain = phase_bytes
-            .checked_add(arena)
-            .ok_or(runtime::Error::CapacityOverflow)?;
-        let bytes = retain
-            .checked_add(rounded)
-            .and_then(|total| total.checked_add(stmts))
-            .and_then(|total| total.checked_add(aside))
-            .ok_or(runtime::Error::CapacityOverflow)?;
-        let units = bytes.div_ceil(Span::ALIGNMENT);
+        // Layout's private constructor retains Memory::admit's exact partition proof.
+        let (sqlite, collect_bytes, statement_bytes, lookaside_bytes) = layout.dimensions();
+        let phase = conn::raw::Vacant::<'_, '_, I>::LAYOUT;
+        let prefix = phase.size().next_multiple_of(Span::ALIGNMENT);
+        let collect = prefix + heap::layout::Layout::PREFIX_BYTES + sqlite.bytes();
+        let stmts = collect + collect_bytes.next_multiple_of(Span::ALIGNMENT);
+        let aside = stmts + statement_bytes;
+        let bytes = aside + lookaside_bytes.next_multiple_of(Span::ALIGNMENT);
+        let units = bytes / Span::ALIGNMENT;
         let mut memory =
             alloc::array::Block::try_new(units, ()).map_err(runtime::Error::Allocation)?;
         // SAFETY: a nonempty checked byte total produces at least one allocated Unit.
         let base = unsafe { ptr::NonNull::new_unchecked(memory.as_mut_ptr().cast()) };
-        let collect = Span::new(base, retain, collect);
-        let stmts = Span::new(base, retain + rounded, stmts);
-        let aside = Span::new(base, retain + rounded + stmts.len(), aside);
+        let start = Span::new(base, prefix, collect - prefix).base();
+        let collect = Span::new(base, collect, collect_bytes);
+        let stmts = Span::new(base, stmts, aside - stmts);
+        let aside = Span::new(base, aside, bytes - aside);
         let phase = Span::new(base, 0, phase.size());
-        let start = Span::new(base, phase_bytes, arena).base();
         // SAFETY: start and Layout describe the checked SQLite partition in this allocation.
         let sqlite = unsafe { heap::raw::Span::new(start, sqlite) };
         Ok((
@@ -180,13 +168,6 @@ impl Memory {
             aside,
             phase,
         ))
-    }
-
-    fn round(bytes: usize) -> Result<usize, runtime::Error> {
-        bytes
-            .checked_add(Span::ALIGNMENT - 1)
-            .map(|rounded| rounded / Span::ALIGNMENT * Span::ALIGNMENT)
-            .ok_or(runtime::Error::CapacityOverflow)
     }
 }
 

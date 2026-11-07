@@ -105,6 +105,26 @@ pub fn copy_finish(listener: &mut peer::TcpAcceptor<'_>) -> Result<(), Error> {
     socket.read_closed()
 }
 
+pub fn copy_out_done(listener: &mut peer::TcpAcceptor<'_>, extra: Option<u8>) -> Result<(), Error> {
+    let mut socket = listener.accept()?;
+    socket.try_start(None)?;
+    read_empty(&socket, b'S')?;
+    let mut reply = [
+        Frame::new(b'1', &[]).encode(),
+        Frame::new(b'2', &[]).encode(),
+        Frame::new(b'H', b"\0\0\0").encode(),
+        Frame::new(b'c', &[]).encode(),
+    ]
+    .concat();
+    if let Some(tag) = extra {
+        reply.extend(Frame::new(tag, if tag == b'd' { b"x" } else { b"" }).encode());
+    }
+    reply.extend(Frame::new(b'C', b"COPY 0\0").encode());
+    reply.extend(Frame::new(b'Z', b"I").encode());
+    socket.write_all(&reply)?;
+    socket.read_closed()
+}
+
 pub fn queued_cancel_reuse(listener: &mut peer::TcpAcceptor<'_>) -> Result<(), Error> {
     const PID: i32 = 0x1020_3040;
     const SECRET: i32 = 0x5060_7080;

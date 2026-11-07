@@ -3,7 +3,6 @@ use subtle::ConstantTimeEq as _;
 use zeroize;
 
 #[repr(transparent)]
-#[derive(Clone)]
 pub(super) struct Secret32(zeroize::Zeroizing<[u8; 32]>);
 
 impl Secret32 {

@@ -1,17 +1,23 @@
+use dope::manifold::client::session::ingress::{self, Source as _};
 use o3::{
-    buffer::hold::{Policy, limits},
+    buffer::{
+        hold::{Policy, limits},
+        resident::staging,
+    },
     depot::capacity,
 };
 
 pub const RETENTION: Policy = Policy::new(4 * 1024, 2);
 
+pub fn try_staging(frame: usize) -> Result<staging::Plan, staging::Error> {
+    staging::Plan::new(frame.min(16 * 1024), frame)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
-    policy: Policy,
     admitted_bytes: limits::Bound,
     ingress_bytes: usize,
     retained_bytes: limits::Bound,
-    resident_bytes: limits::Bound,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -30,7 +36,7 @@ pub enum Error {
     },
     RetainedPending(limits::Error),
     RetainedExact(limits::Error),
-    ResidentIngress(limits::Error),
+    Staging(staging::Error),
 }
 
 impl Layout {
@@ -48,18 +54,11 @@ impl Layout {
         })?;
         let retained = admit.try_add(input).map_err(Error::RetainedPending)?;
         let retained = retained.try_add(exact).map_err(Error::RetainedExact)?;
-        let resident = retained.try_add(input).map_err(Error::ResidentIngress)?;
         Ok(Self {
-            policy,
             admitted_bytes: admit,
             ingress_bytes: input,
             retained_bytes: retained,
-            resident_bytes: resident,
         })
-    }
-
-    pub const fn policy(self) -> Policy {
-        self.policy
     }
 
     pub const fn admitted(self) -> limits::Bound {
@@ -77,11 +76,18 @@ impl Layout {
             owners,
         }
     }
+}
 
-    pub const fn resident(self) -> limits::Bound {
-        self.resident_bytes
+impl Ingress {
+    pub fn try_resident(self, conns: usize, frame: usize) -> Result<limits::Bound, Error> {
+        let plan = try_staging(frame).map_err(Error::Staging)?;
+        let shared = ingress::Local::new(self.owners)
+            .shared(ingress::Bytes::from_limit(self.retained), plan.warm());
+        let layout = staging::Layout::new(conns, plan, shared.get(), self.retained.bytes())
+            .map_err(Error::Staging)?;
+        Ok(limits::Bound::new(layout.resident().get()))
     }
 }
 
-const _: () = assert!(core::mem::size_of::<Layout>() == 6 * core::mem::size_of::<usize>());
+const _: () = assert!(core::mem::size_of::<Layout>() == 3 * core::mem::size_of::<usize>());
 const _: () = assert!(core::mem::size_of::<Ingress>() == 3 * core::mem::size_of::<usize>());

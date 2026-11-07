@@ -18,12 +18,12 @@ impl Sensitivity {
 
 /// A completed request whose initialized bytes retain their clearing policy.
 pub struct Buffer {
-    data: pool::Cursor,
+    data: pool::Span,
     kind: Sensitivity,
 }
 
 impl Buffer {
-    pub const fn new(data: pool::Cursor, kind: Sensitivity) -> Self {
+    pub const fn new(data: pool::Span, kind: Sensitivity) -> Self {
         Self { data, kind }
     }
 }
@@ -36,13 +36,13 @@ impl AsRef<[u8]> for Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        self.kind.clear(self.data.as_mut());
+        self.kind.clear(self.data.as_mut_slice());
     }
 }
 
 impl Residency for Buffer {
     fn resident(&self) -> usize {
-        self.data.resident()
+        self.data.capacity().get() as usize
     }
 }
 
@@ -51,6 +51,6 @@ impl Residency for Buffer {
 unsafe impl<'d> data::raw::Contiguous<'d> for Buffer {}
 
 const _: () = {
-    assert!(mem::size_of::<Buffer>() == mem::size_of::<pool::Cursor>() + mem::size_of::<usize>());
-    assert!(mem::align_of::<Buffer>() == mem::align_of::<pool::Cursor>());
+    assert!(mem::size_of::<Buffer>() == mem::size_of::<pool::Span>() + mem::size_of::<usize>());
+    assert!(mem::align_of::<Buffer>() == mem::align_of::<pool::Span>());
 };

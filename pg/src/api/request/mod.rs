@@ -1,11 +1,8 @@
 pub(in crate::api) mod stateful;
 
 use crate::api::{sql, tx};
-use crate::port::replies;
 use crate::{api, port, protocol, schema};
-use api::task::{group, tx::Reserve};
-use cartel_core::reply::recv::attach::Attach;
-use o3::base::cell::region;
+use api::task::group;
 use port::requests;
 use protocol::encode;
 
@@ -212,64 +209,6 @@ impl<'d, S> Pending<'d, S> {
 }
 
 impl<'d> Pending<'d> {
-    pub(in crate::api) fn attempt<'app, 'g, 'r, 's, 'b, 'c, B: ?Sized, I, const ID: u8>(
-        self,
-        client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-        reply: &mut impl Attach<
-            'app,
-            'b,
-            'c,
-            'd,
-            replies::Row<'d>,
-            replies::ReplyFailure<'d>,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-        >,
-        region: &mut region::Token<region::Identity<'d>>,
-    ) -> api::TxOutcome<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
-    where
-        I: schema::QuerySet + 'd,
-        'd: 'app,
-    {
-        let req = self;
-        if let Err(error) = api::check_open(client) {
-            return api::TxOutcome::Failed(error);
-        }
-        let shared = &client.port.shared;
-        let Some(hold) = Reserve::acquire(client, region) else {
-            return match shared.ready.blocking() {
-                Some(count) => api::TxOutcome::Failed(client.port.backpressure(count).into()),
-                None => api::TxOutcome::NoConn { request: req },
-            };
-        };
-        let conn = hold.sink().connection();
-        let api::Pending {
-            frame,
-            boundary,
-            state: (),
-        } = req;
-        let ctx = requests::ReplyContext::new(conn, boundary, region);
-        match client
-            .port
-            .request()
-            .try_reply(frame, hold, reply, ctx, Reserve::commit)
-        {
-            Ok(lease) => api::TxOutcome::Enqueued { lease },
-            Err((error, frame, hold)) => {
-                let req = api::Pending {
-                    frame,
-                    boundary,
-                    state: hold,
-                };
-                match api::Throttle::new(conn, error, req) {
-                    Ok(throttle) => api::TxOutcome::Throttled {
-                        throttle: throttle.release(),
-                    },
-                    Err(error) => api::TxOutcome::Failed(error.into()),
-                }
-            }
-        }
-    }
-
     pub(in crate::api) fn typed<Q: schema::TypedQuery, I: schema::QuerySet, const ID: u8>(
         port: &port::Port<'_, '_, '_, '_, '_, '_, 'd, I, ID>,
         params: Q::Params<'_>,

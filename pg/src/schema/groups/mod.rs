@@ -29,7 +29,7 @@ pub trait List: Proof {
 
     fn contains<Q: schema::TypedQuery>() -> bool;
 
-    fn validate(group: u32, input: desc::Input<'_>) -> Result<(), crate::Error>;
+    fn validate(group: u32, query: u32, input: desc::Input<'_>) -> Result<(), crate::Error>;
 }
 
 #[doc(hidden)]
@@ -50,7 +50,7 @@ impl List for End {
         false
     }
 
-    fn validate(_group: u32, _input: desc::Input<'_>) -> Result<(), crate::Error> {
+    fn validate(_group: u32, _query: u32, _input: desc::Input<'_>) -> Result<(), crate::Error> {
         Err(crate::Error::QueryMetadata)
     }
 }
@@ -110,11 +110,11 @@ where
         Head::Items::contains::<Q>() || Tail::contains::<Q>()
     }
 
-    fn validate(group: u32, input: desc::Input<'_>) -> Result<(), crate::Error> {
+    fn validate(group: u32, query: u32, input: desc::Input<'_>) -> Result<(), crate::Error> {
         if group == 0 {
-            Head::Items::validate(input.cursor.query(), input)
+            Head::Items::validate(query, input)
         } else {
-            Tail::validate(group - 1, input)
+            Tail::validate(group - 1, query, input)
         }
     }
 }

@@ -4,20 +4,12 @@ use o3::mem::{self, lease};
 use std::{marker, task};
 
 pub(crate) trait Role {
-    const RELEASE: Release;
+    const FINISH: bool;
 
-    fn limits(config: &config::Config) -> config::Contention;
-}
-
-pub(crate) enum Release {
-    Preserve,
-    Detach,
-    Finish,
+    fn limits(config: &config::Config) -> &config::Contention;
 }
 
 pub(crate) enum Open {}
-
-pub(crate) enum Cleanup {}
 
 pub(crate) enum Call {}
 
@@ -34,7 +26,7 @@ impl<'slot, 'd, R: Role> Lease<'slot, 'd, R> {
         }
     }
 
-    pub(crate) const fn config(&self) -> &'slot config::Config {
+    pub(crate) fn config(&self) -> &'slot config::Config {
         self.slot.item().config()
     }
 
@@ -42,9 +34,13 @@ impl<'slot, 'd, R: Role> Lease<'slot, 'd, R> {
         &mut self,
         now: clock::Moment<'d>,
         fault: sys::Fault,
-    ) -> Result<(), crate::Error> {
+        wake: wake::Waker<'d>,
+    ) -> task::Poll<Result<(), crate::Error>> {
         let limits = R::limits(self.config());
-        self.slot.item_mut().slot_mut().defer(limits, now, fault)
+        self.slot
+            .item_mut()
+            .slot_mut()
+            .defer(limits, now, fault, wake)
     }
 
     pub(crate) fn wait(&self) -> retry::Wait {
@@ -58,65 +54,36 @@ impl<'slot, 'd, R: Role> Lease<'slot, 'd, R> {
     ) -> task::Poll<Result<(), crate::Error>> {
         self.slot.item_mut().slot_mut().poll(now, wake)
     }
-
-    pub(crate) fn finish(&mut self) {
-        self.slot.item_mut().finish();
-    }
-}
-
-impl<'slot, 'd> Lease<'slot, 'd, Cleanup> {
-    pub(crate) fn into_call(mut self) -> Lease<'slot, 'd, Call> {
-        self.finish();
-        Lease::new(self.slot.into_parts().1)
-    }
-
-    pub(crate) fn poll_park(
-        &mut self,
-        now: clock::Moment<'d>,
-    ) -> task::Poll<Result<(), crate::Error>> {
-        self.slot.item_mut().slot_mut().poll_park(now)
-    }
 }
 
 impl<'slot, 'd, R: Role> mem::Return for Return<'slot, 'd, R> {
     type Item = retry::raw::Loan<'slot, 'd>;
 
     fn return_item(self, mut slot: Self::Item) {
-        match R::RELEASE {
-            Release::Preserve => {}
-            Release::Detach => slot.slot_mut().detach(),
-            Release::Finish => slot.finish(),
+        if R::FINISH {
+            slot.finish();
         }
     }
 }
 
 impl Role for Open {
-    const RELEASE: Release = Release::Preserve;
+    const FINISH: bool = false;
 
-    fn limits(config: &config::Config) -> config::Contention {
-        config.work.open.contention
-    }
-}
-
-impl Role for Cleanup {
-    const RELEASE: Release = Release::Detach;
-
-    fn limits(config: &config::Config) -> config::Contention {
-        config.work.cleanup.contention
+    fn limits(config: &config::Config) -> &config::Contention {
+        &config.work.open.contention
     }
 }
 
 impl Role for Call {
-    const RELEASE: Release = Release::Finish;
+    const FINISH: bool = true;
 
-    fn limits(config: &config::Config) -> config::Contention {
-        config.work.call.contention
+    fn limits(config: &config::Config) -> &config::Contention {
+        &config.work.call.contention
     }
 }
 
 const _: () = {
     let word = size_of::<usize>();
     assert!(size_of::<Lease<'static, 'static, Open>>() == word);
-    assert!(size_of::<Lease<'static, 'static, Cleanup>>() == word);
     assert!(size_of::<Lease<'static, 'static, Call>>() == word);
 };

@@ -33,11 +33,11 @@ where
 }
 
 pub(crate) fn eval<K, A>(
-    mut out: encode::Writer,
+    out: &mut encode::Writer,
     script: &[u8],
     keys: &[K],
     args: &[A],
-) -> Result<encode::Complete, crate::request::Error>
+) -> Result<(), crate::request::Error>
 where
     K: AsRef<[u8]>,
     A: crate::request::Bulk,
@@ -55,7 +55,7 @@ where
     for argument in args {
         out.bulk(argument)?;
     }
-    out.complete()
+    Ok(())
 }
 
 #[inline(always)]

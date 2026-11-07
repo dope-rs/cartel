@@ -2,26 +2,22 @@ use std::num;
 
 use cartel_core::frame::{Buffer, Sensitivity};
 use dope::net::link::egress;
-use o3::{
-    buffer::pool,
-    mem::{self, lease},
-};
+use o3::buffer::pool;
 
 use crate::request;
 
 pub struct Encoder {
-    frame: pool::Cursor,
+    frame: pool::Span,
 }
 
-mod draft;
 pub struct Complete(egress::NonEmpty<Buffer>);
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
-pub struct Length(usize);
+pub struct Length(num::NonZero<usize>);
 
 pub struct Writer {
-    out: mem::Lease<draft::Draft, lease::Open>,
+    out: pool::Limit<pool::Span, Sensitivity>,
 }
 
 #[derive(Clone, Copy)]
@@ -67,7 +63,7 @@ impl Number {
 }
 
 impl Encoder {
-    pub(crate) const fn new(frame: pool::Cursor) -> Self {
+    pub(crate) const fn new(frame: pool::Span) -> Self {
         Self { frame }
     }
 
@@ -121,12 +117,13 @@ impl Encoder {
         for argument in prefix.iter().chain(tail) {
             length = length.bulk(argument.len())?;
         }
-        let mut out = self.admit_with(length, kind)?;
-        out.array(count)?;
-        for argument in prefix.iter().chain(tail) {
-            out.bulk(*argument)?;
-        }
-        out.complete()
+        self.admit_with(length, kind, |out| {
+            out.array(count)?;
+            for argument in prefix.iter().chain(tail) {
+                out.bulk(*argument)?;
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn sequence<I, const P: usize>(
@@ -152,33 +149,53 @@ impl Encoder {
             }
         }
         check_items(declared, actual)?;
-        let mut out = self.admit(length)?;
-        out.array(count)?;
-        for value in prefix {
-            out.bulk(*value)?;
-        }
-        let mut actual = 0;
-        for item in items {
-            actual = next_item(declared, actual)?;
-            for value in item.values() {
-                out.bulk(value)?;
+        self.admit_with(length, Sensitivity::Plain, |out| {
+            out.array(count)?;
+            for value in prefix {
+                out.bulk(*value)?;
             }
-        }
-        check_items(declared, actual)?;
-        out.complete()
+            let mut actual = 0;
+            for item in items {
+                actual = next_item(declared, actual)?;
+                for value in item.values() {
+                    out.bulk(value)?;
+                }
+            }
+            check_items(declared, actual)
+        })
     }
 
-    fn admit(self, length: Length) -> Result<Writer, request::Error> {
-        self.admit_with(length, Sensitivity::Plain)
-    }
-
-    fn admit_with(self, length: Length, kind: Sensitivity) -> Result<Writer, request::Error> {
-        let out = draft::Draft::try_new(self.frame, length.0, kind)?;
-        Ok(Writer { out })
+    pub(crate) fn admit_with(
+        self,
+        length: Length,
+        kind: Sensitivity,
+        encode: impl FnOnce(&mut Writer) -> Result<(), request::Error>,
+    ) -> Result<Complete, request::Error> {
+        let out = pool::Limit::try_from(self.frame, length.get(), kind)
+            .map_err(|(_, _, cause)| request::Error::Capacity(cause))?;
+        Complete::encode(out, encode)
     }
 }
 
 impl Complete {
+    pub(crate) fn encode(
+        out: pool::Limit<pool::Span, Sensitivity>,
+        encode: impl FnOnce(&mut Writer) -> Result<(), request::Error>,
+    ) -> Result<Self, request::Error> {
+        let mut out = Writer { out };
+        let result = encode(&mut out);
+        let remaining = out.out.remaining();
+        let (span, kind) = out.out.into_parts();
+        let frame = Buffer::new(span, kind);
+        result?;
+        if let Some(remaining) = num::NonZero::new(remaining) {
+            return Err(request::Error::Incomplete { remaining });
+        }
+        egress::NonEmpty::try_new(frame)
+            .map(Self)
+            .map_err(request::Error::Egress)
+    }
+
     pub(crate) fn into_frame(self) -> egress::NonEmpty<Buffer> {
         self.0
     }
@@ -188,7 +205,9 @@ impl Length {
     #[inline]
     fn array(count: usize) -> Result<Self, request::Error> {
         let count = Number::new(count)?;
-        Ok(Self(3 + count.digits()))
+        Ok(Self(
+            num::NonZero::<usize>::MIN.saturating_add(2 + count.digits()),
+        ))
     }
 
     #[inline(always)]
@@ -198,28 +217,28 @@ impl Length {
     }
 
     fn add(self, amount: usize) -> Result<Self, request::Error> {
-        add_count(self.0, amount).map(Self)
+        self.0
+            .checked_add(amount)
+            .map(Self)
+            .ok_or(request::Error::Add {
+                left: self.get(),
+                right: amount,
+            })
     }
 
     pub(crate) const fn get(self) -> usize {
+        self.0.get()
+    }
+
+    pub(crate) const fn nonzero(self) -> num::NonZero<usize> {
         self.0
     }
 }
 
 impl Writer {
-    pub(crate) fn try_acquire(pool: &pool::Pool, length: Length) -> Result<Self, request::Error> {
-        let out = draft::Draft::try_acquire(pool, length.0)?;
-        Ok(Self { out })
-    }
-
     #[inline]
     fn extend(&mut self, bytes: &[u8]) -> Result<(), request::Error> {
-        self.out
-            .parts_mut()
-            .0
-            .out
-            .try_extend(bytes)
-            .map_err(request::Error::Write)
+        self.out.try_extend(bytes).map_err(request::Error::Write)
     }
 
     fn bulk(&mut self, payload: &(impl request::Bulk + ?Sized)) -> Result<(), request::Error> {
@@ -255,15 +274,6 @@ impl Writer {
     fn array(&mut self, count: usize) -> Result<(), request::Error> {
         let mut header = [0; 23];
         self.extend(format_header_into(&mut header, b'*', count as u64))
-    }
-
-    fn complete(self) -> Result<Complete, request::Error> {
-        if let Some(left) = num::NonZero::new(self.out.sink().out.remaining()) {
-            return Err(request::Error::Incomplete { remaining: left });
-        }
-        let (out, ()) = self.out.into_parts();
-        let frame = egress::NonEmpty::try_new(out.finish()).map_err(request::Error::Egress)?;
-        Ok(Complete(frame))
     }
 }
 
@@ -326,7 +336,7 @@ fn check_items(declared: usize, actual: usize) -> Result<(), request::Error> {
 
 const _: () = assert!(usize::BITS <= u64::BITS);
 const _: () = assert!(std::mem::size_of::<Length>() == std::mem::size_of::<usize>());
-const _: () = assert!(std::mem::size_of::<Writer>() == 4 * std::mem::size_of::<usize>());
+const _: () = assert!(std::mem::size_of::<Writer>() == 3 * std::mem::size_of::<usize>());
 const _: () = assert!(
     std::mem::size_of::<Complete>()
         == std::mem::size_of::<Buffer>() + std::mem::size_of::<egress::Geometry>()

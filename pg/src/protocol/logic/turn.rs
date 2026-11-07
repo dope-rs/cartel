@@ -1,6 +1,6 @@
 use cartel_core::reply::order;
 use dope::{
-    core::driver::{self, route},
+    core::driver::route,
     manifold::client::{
         self, conn,
         session::{Input, response::Delivery, turns},
@@ -17,7 +17,7 @@ use crate::{
     port::{self, pool::key, replies, requests::Frame},
     protocol::{
         Reason, Wire, encode, frame,
-        logic::{Pending, State, failure, payloads, ready, state},
+        logic::{Pending, State, payloads, state},
         messages,
         runtime::tx::poll,
         scram,
@@ -39,11 +39,11 @@ pub(super) struct Turn<
     I: schema::QuerySet,
     const ID: u8,
 > {
-    port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
-    conn: conn::Id<'d, route::KeyTag<ID>>,
-    state: &'turn mut State<'life, 'd, I, ID>,
+    pub(super) port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
+    pub(super) conn: conn::Id<'d, route::KeyTag<ID>>,
+    pub(super) state: &'turn mut State<'life, 'd, I, ID>,
     sink: egress::Queue<'turn, 'e, 'd, { client::IOV_CAP }, Frame<'d>>,
-    driver: driver::Context<'turn, 'd>,
+    pub(super) region: &'turn mut region::Token<region::Identity<'d>>,
 }
 
 impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
@@ -66,7 +66,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             conn: parts.conn_id,
             state: parts.state,
             sink: parts.sink,
-            driver: parts.driver,
+            region: &mut parts.driver.into_regions().0,
         }
     }
 
@@ -81,7 +81,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             conn,
             state: ctx.state,
             sink: ctx.sink,
-            driver: ctx.driver,
+            region: &mut ctx.driver.into_regions().0,
         }
     }
 
@@ -95,18 +95,13 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 sql::Timeout::DEFAULT.milliseconds(),
             )
         });
-        match frame.and_then(|frame| {
-            Self::enqueue(&self.sink, self.driver.region_token(), frame.into_frame())
-        }) {
+        match frame.and_then(|frame| Self::enqueue(&self.sink, self.region, frame)) {
             Ok(()) => self.state.phase = state::Phase::StartupSent,
-            Err(error) => {
-                failure::Failure::new(self.port, self.conn, self.state, self.driver.region_token())
-                    .apply(error)
-            }
+            Err(error) => self.fail(error),
         }
     }
 
-    pub(super) fn try_flush(mut self, input: Input) -> Result<(), crate::Error> {
+    pub(super) fn try_flush(self, input: Input) -> Result<(), crate::Error> {
         if matches!(
             self.state.phase,
             state::Phase::Ready | state::Phase::CopyInActive | state::Phase::CopyOutActive
@@ -117,33 +112,27 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 .ok_or(crate::Error::Protocol(Reason::ResponseUnknown))?;
             let receiving = match input {
                 Input::Empty => false,
-                Input::Partial => lane
-                    .front(self.state.batch, self.driver.region_token())?
-                    .0
-                    .is_none(),
+                Input::Partial => lane.front(self.state.batch, self.region)?.0.is_none(),
                 Input::Yield | Input::Blocked => true,
             };
             self.port
                 .shared
                 .ready
-                .set_receiving(self.conn, receiving, || {
-                    lane.depth(self.driver.region_token())
-                });
+                .set_receiving(self.conn, receiving, || lane.depth(self.region));
         }
         match &mut self.state.phase {
             state::Phase::Sasl { scram } => {
-                Self::drive_scram(self.port, &self.sink, self.driver.region_token(), scram)?
+                Self::drive_scram(self.port, &self.sink, self.region, scram)?
             }
             state::Phase::Ready => {
-                let result = self.port.request().try_flush(
-                    self.conn,
-                    self.driver.region_token(),
-                    |region| {
+                let result = self
+                    .port
+                    .request()
+                    .try_flush(self.conn, self.region, |region| {
                         let frame = egress::NonEmpty::try_new(Frame::from(encode::SYNC.as_slice()))
                             .map_err(crate::Error::RequestLoad)?;
                         Self::enqueue(&self.sink, region, frame)
-                    },
-                );
+                    });
                 if let Err(error) = result {
                     self.port
                         .connection()
@@ -175,22 +164,15 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                     .error(plan)
                     .map_or(Delivery::Committed, Delivery::Prepared),
                 Err(error) => {
-                    failure::Failure::new(
-                        self.port,
-                        self.conn,
-                        self.state,
-                        self.driver.region_token(),
-                    )
-                    .apply(error);
+                    self.fail(error);
                     Delivery::Committed
                 }
             };
         }
-        if typ == messages::Be::NOTICE_RESPONSE
-            && let Err(error) = server::Fields::try_parse(data.wire())
-        {
-            failure::Failure::new(self.port, self.conn, self.state, self.driver.region_token())
-                .apply(error);
+        if typ == messages::Be::NOTICE_RESPONSE {
+            if let Err(error) = server::Fields::try_parse(data.wire()) {
+                self.fail(error);
+            }
             return Delivery::Committed;
         }
         let result = match self.state.phase {
@@ -202,16 +184,14 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 self.prepare(typ, data.wire(), prep).map(|()| None)
             }
             state::Phase::Ready | state::Phase::CopyInActive | state::Phase::CopyOutActive => {
-                ready::Ready::new(self.port, self.conn, self.state, self.driver.region_token())
-                    .handle(typ, data)
+                self.ready(typ, data)
             }
             state::Phase::NeedsStartup | state::Phase::Failed => Ok(None),
         };
         match result {
             Ok(next) => next.map_or(Delivery::Committed, Delivery::Prepared),
             Err(error) => {
-                failure::Failure::new(self.port, self.conn, self.state, self.driver.region_token())
-                    .apply(error);
+                self.fail(error);
                 Delivery::Committed
             }
         }
@@ -232,31 +212,22 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 let (server, class) = match plan.try_build() {
                     Ok(built) => built,
                     Err(error) => {
-                        failure::Failure::new(
-                            self.port,
-                            self.conn,
-                            self.state,
-                            self.driver.region_token(),
-                        )
-                        .apply(crate::Error::ResponseRetention(error));
+                        self.fail(crate::Error::ResponseRetention(error));
                         return None;
                     }
                 };
-                failure::Failure::new(self.port, self.conn, self.state, self.driver.region_token())
-                    .apply_server(class, server);
+                self.fail_server(class, server);
                 return None;
             }
             state::Phase::Ready | state::Phase::CopyInActive | state::Phase::CopyOutActive => {
-                ready::Ready::new(self.port, self.conn, self.state, self.driver.region_token())
-                    .error(plan)
+                self.reply_error(plan)
             }
             state::Phase::NeedsStartup | state::Phase::Failed => Ok(None),
         };
         match result {
             Ok(next) => next,
             Err(error) => {
-                failure::Failure::new(self.port, self.conn, self.state, self.driver.region_token())
-                    .apply(error);
+                self.fail(error);
                 None
             }
         }
@@ -288,12 +259,16 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                     }
                     payloads::AuthRequest::Sasl { mechanisms: set } => {
                         let mode = set.pick()?;
-                        let scram = scram::Scram::new(&self.port.shared.scram, self.conn)?;
-                        let first = scram.client_first();
-                        let frame = self.port.request().control(|frame| {
-                            frame.sasl_first(mode.as_str(), |frame| first.write_to(frame))
-                        })?;
-                        Self::enqueue(&self.sink, self.driver.region_token(), frame.into_frame())?;
+                        let scram =
+                            scram::Scram::new(&self.port.shared.scram, self.conn, |nonce| {
+                                let frame = self.port.request().control(|frame| {
+                                    frame.sasl_first(mode.as_str(), |frame| {
+                                        frame.extend(b"n,,n=,r=")?;
+                                        frame.extend(nonce)
+                                    })
+                                })?;
+                                Self::enqueue(&self.sink, self.region, frame)
+                            })?;
                         self.state.phase = state::Phase::Sasl { scram };
                         Ok(())
                     }
@@ -312,7 +287,6 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 }
                 payloads::parameter(data)
             }
-            messages::Be::NOTICE_RESPONSE => Ok(()),
             messages::Be::BACKEND_KEY_DATA => {
                 if !matches!(self.state.phase, state::Phase::AwaitingReady) {
                     return Err(crate::Error::Protocol(Reason::BackendKeyBeforeAuth));
@@ -333,7 +307,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 let set = I::PREPARE;
                 let frame = egress::NonEmpty::try_new(Frame::from(set.wire()))
                     .map_err(crate::Error::RequestLoad)?;
-                Self::enqueue(&self.sink, self.driver.region_token(), frame)?;
+                Self::enqueue(&self.sink, self.region, frame)?;
                 self.state.phase = state::Phase::Preparing {
                     remaining: state::Prepare::new(catalog),
                 };
@@ -351,7 +325,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         match (&mut self.state.phase, auth) {
             (state::Phase::Sasl { scram }, payloads::AuthRequest::SaslContinue { data }) => {
                 scram.begin(self.port.shared.database.password().as_bytes(), data)?;
-                Self::drive_scram(self.port, &self.sink, self.driver.region_token(), scram)
+                Self::drive_scram(self.port, &self.sink, self.region, scram)
             }
             (state::Phase::Sasl { scram }, payloads::AuthRequest::SaslFinal { data }) => {
                 scram.verify_final(data)
@@ -390,9 +364,8 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         else {
             return Ok(());
         };
-        scram.await_final(&sig);
-        drop(sig);
-        Self::enqueue(sink, region, frame.into_frame())
+        scram.await_final(sig);
+        Self::enqueue(sink, region, frame)
     }
 
     fn prepare(
@@ -405,9 +378,6 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
 
         if typ == messages::Be::PARAMETER_STATUS {
             return payloads::parameter(data);
-        }
-        if typ == messages::Be::NOTICE_RESPONSE {
-            return Ok(());
         }
         let next = match (prep, typ) {
             (Prepare::LtreeParse { next }, messages::Be::PARSE_COMPLETE) => {
@@ -450,7 +420,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 if !matches!(payloads::ready_status(data)?, poll::Status::Idle) {
                     return Err(crate::Error::Protocol(Reason::ReadyUnknown));
                 }
-                let Some(depth) = self.port.depth(self.conn, self.driver.region_token()) else {
+                let Some(depth) = self.port.depth(self.conn, self.region) else {
                     return Err(crate::Error::Protocol(Reason::PrepareReplies));
                 };
                 if depth != order::Depth::ZERO {

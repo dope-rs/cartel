@@ -84,6 +84,8 @@ fn native_refusal_retains_exact_first_attempt_before_starting_second_source() {
 #[test]
 fn initialization_is_terminal_and_success_keeps_connection_until_drop() {
     for auth_reply in [
+        Some(b"+OK\r\n+OK\r\n".as_slice()),
+        Some(b"+OK\r\n+OK".as_slice()),
         None,
         Some(b"-WRONGPASS invalid user\r\n".as_slice()),
         Some(b"+OK\r\n".as_slice()),
@@ -131,6 +133,9 @@ fn initialization_is_terminal_and_success_keeps_connection_until_drop() {
                                             if error.step == init::Step::Authenticate && error.kind == cartel_redis::init::Kind::Rejected
                                                 && matches!(&error.frame, Ok(frame) if frame.as_ref() == b"-WRONGPASS invalid user\r\n")
                                         )),
+                                        Some(reply) if reply != b"+OK\r\n" => assert!(matches!(result,
+                                            Err(connect::Error::Ready(cartel_redis::Error::UnexpectedResponse))
+                                        ), "buffered startup ACK must not authorize SELECT"),
                                         Some(_) => {
                                             let connected = result.ok().expect("AUTH and SELECT ready");
                                             let redis = connected.redis();
@@ -145,7 +150,7 @@ fn initialization_is_terminal_and_success_keeps_connection_until_drop() {
                                     common::connect::expect(&mut io, b"*3\r\n$4\r\nAUTH\r\n$4\r\nuser\r\n$6\r\nsecret\r\n").await;
                                     let Some(reply) = auth_reply else { return; };
                                     assert!(io.write_all(reply).await.is_ok());
-                                    if reply[0] != b'-' {
+                                    if reply == b"+OK\r\n" {
                                         common::connect::expect(&mut io, b"*2\r\n$6\r\nSELECT\r\n$1\r\n3\r\n").await;
                                         assert!(io.write_all(b"+OK\r\n").await.is_ok());
                                         common::connect::expect(&mut io, b"*1\r\n$4\r\nPING\r\n").await;

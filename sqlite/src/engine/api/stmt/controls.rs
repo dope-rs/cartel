@@ -8,9 +8,9 @@ pub(crate) struct Controls<'a, 'connection> {
 }
 
 impl<'a, 'connection> Controls<'a, 'connection> {
-    pub(super) fn new<I: catalogs::Catalog>(stmts: &'a mut stmt::Set<'connection, I>) -> Self {
+    pub(super) fn new<I: catalogs::Catalog>(engine: &'a mut stmt::Engine<'connection, I>) -> Self {
         Self {
-            slots: &mut *stmts.slots,
+            slots: &mut *engine.slots,
         }
     }
 
@@ -28,13 +28,8 @@ impl<'a, 'connection> Controls<'a, 'connection> {
     pub(crate) fn execute(&mut self, control: stmt::Control) -> result::Result<(), crate::Error> {
         let access = access::Control::new(control.retry());
         let stmt = Self::lease(&mut *self.slots, control);
-        match stmt.step(&access, exec::Tx::NONE) {
-            Ok(_) => stmt.reset(&access, exec::Tx::NONE),
-            Err(error) => {
-                stmt.clear();
-                Err(error)
-            }
-        }
+        stmt.step(&access, exec::Tx::NONE)?;
+        stmt.reset(&access, exec::Tx::NONE)
     }
 
     fn lease<'b>(

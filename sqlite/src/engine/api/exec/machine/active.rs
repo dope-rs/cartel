@@ -33,7 +33,7 @@ impl<'query, 'connection, 'd, P, A: Access> Active<'query, 'connection, 'd, P, A
             .poll(self.bound.prepared(), &self.access, context)
     }
 
-    pub(in crate::engine::api::exec) const fn config(&self) -> &config::Config {
+    pub(in crate::engine::api::exec) fn config(&self) -> &config::Config {
         self.state.config()
     }
 

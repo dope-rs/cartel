@@ -32,6 +32,15 @@ where
     'd: 'c,
     P: Root<'d, ID, Port = crate::Port<'s, 'storage, 'b, 'c, 'd, ID>>,
 {
+    fn commit<'e, A: work::Admission>(
+        item: response::Committed<Self>,
+        _: &mut Owner<'life, 's, 'd, P, ID>,
+        _: &mut A,
+        _: &mut turns::Context<'_, 'e, 'd, protocol::ConnState, Buffer, route::KeyTag<ID>>,
+    ) -> response::Settlement<Self> {
+        response::Settlement::Blocked(item.into_inner())
+    }
+
     fn settle<'e, A: work::Admission>(
         item: response::Item<Self>,
         owner: &mut Owner<'life, 's, 'd, P, ID>,

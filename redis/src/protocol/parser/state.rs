@@ -480,7 +480,7 @@ fn complete<'id, 'input, 'd, 'storage, 'g, R: buffer::Cursor>(
 where
     'd: 'input,
 {
-    let (frame, consumed) = match buf.try_prefix(count) {
+    let (frame, consumed) = match buf.try_prefix(0, count) {
         Ok(prefix) => prefix,
         Err(error) => return parser::Scan::Source(error),
     };

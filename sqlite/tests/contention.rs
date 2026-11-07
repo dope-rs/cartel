@@ -36,7 +36,6 @@ fn timer_matches_delay(runtime: Runtime) -> Result<(), plan::Error> {
 
     let (mut limits, memory) = try_settings()?;
     limits.work.open.busy.interval = Duration::ZERO;
-    limits.work.call.busy.interval = Duration::ZERO;
     let db = OpenOptions::new()
         .open_memory(runtime)
         .map_err(plan::Error::Client)?;

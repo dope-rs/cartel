@@ -264,10 +264,7 @@ unsafe impl<'id> scope::raw::Select<'id> for Selection<'id> {
 }
 
 impl<'a> ServerFirst<'a> {
-    pub(super) fn with_parts<R>(
-        self,
-        run: impl FnOnce(Self, Wire<'a>, Wire<'a>, num::NonZero<u32>) -> R,
-    ) -> R {
+    pub(super) fn into_parts(self) -> (Self, Wire<'a>, Wire<'a>, num::NonZero<u32>) {
         scope::Owner::with(self.input.as_slice(), |owner| {
             let view = owner.borrow();
             let nonce = view.get(Selection::new(self.nonce.clone())).0;
@@ -277,7 +274,7 @@ impl<'a> ServerFirst<'a> {
             // SAFETY: the salt is another projection of that exact bounded Wire.
             let salt = Wire::from_raw(unsafe { bounded::raw::Input::new(salt) });
             let count = self.iterations;
-            run(self, nonce, salt, count)
+            (self, nonce, salt, count)
         })
     }
 

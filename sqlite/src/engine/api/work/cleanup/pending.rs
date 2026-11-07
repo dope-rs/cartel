@@ -67,7 +67,7 @@ impl Pending {
             match state.0 & TAG {
                 0 => Self::encode(state.0 >> 1, Phase::Release),
                 _ => {
-                    // SAFETY: Call retains this exact source's affine debt. Native
+// SAFETY: Run retains this exact source's affine debt. Native
                     // cleanup cannot mutate depth; failure terminalizes its source
                     // before resetting, and no receipt survives a yield or retry.
                     let release = unsafe { work::raw::Release::new(depth) };

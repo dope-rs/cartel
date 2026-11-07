@@ -2,19 +2,15 @@ use crate::{api, catalogs};
 use api::{exec, stmt};
 use dope_fiber::context;
 use o3::mem;
-use std::{ops, pin, result};
+use std::{pin, result, task};
 use stmt::target::Target;
 
 mod active;
 pub(super) mod call;
-mod ready;
 pub(super) use active::Active;
-pub(super) use ready::Ready;
 
 pub(super) type Lease<'query, 'connection, 'd, P, A> =
     mem::Lease<Active<'query, 'connection, 'd, P, A>, mem::lease::Open>;
-
-pub(super) type Next<S, R> = result::Result<ops::ControlFlow<R, S>, crate::Error>;
 
 pub(super) enum State<S, A> {
     Start(S),
@@ -50,22 +46,23 @@ impl<'query, 'connection: 'query, 'd: 'connection, I: catalogs::Catalog, P: api:
     }
 
     pub(super) fn poll(
-        self,
+        &mut self,
         context: pin::Pin<&mut context::Context<'_, 'd>>,
-    ) -> Next<Self, Active<'query, 'connection, 'd, P, T::Access>> {
+    ) -> task::Poll<result::Result<(), crate::Error>> {
+        self.start.poll(context)
+    }
+
+    pub(super) fn prepare(
+        self,
+        cleaned: result::Result<(), crate::Error>,
+    ) -> result::Result<Active<'query, 'connection, 'd, P, T::Access>, crate::Error> {
         let Self {
             start,
             params,
             target,
         } = self;
-        Ok(match start.poll(context)? {
-            ops::ControlFlow::Continue(start) => ops::ControlFlow::Continue(Self {
-                start,
-                params,
-                target,
-            }),
-            ops::ControlFlow::Break(ready) => ops::ControlFlow::Break(ready.bind(target, params)?),
-        })
+        cleaned?;
+        start.prepare(params, target)
     }
 }
 

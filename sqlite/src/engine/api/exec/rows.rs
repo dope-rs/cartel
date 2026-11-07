@@ -131,20 +131,23 @@ impl<
     }
 
     fn finish<'slot, 'id>(
-        live: abi::Live<'slot, 'id, Self>,
+        mut live: abi::Live<'slot, 'id, Self>,
         ready: Self::Ready,
         mut admit: context::Admission<'_, '_, 'd>,
     ) -> abi::Transition<'id, Self::Output> {
         let mut context = admit.context();
+        let cleaned = match &mut live.get_mut().state {
+            State::Start((machine, _)) => match machine.poll(context.as_mut()) {
+                task::Poll::Pending => return live.pending(),
+                task::Poll::Ready(result) => result,
+            },
+            State::Active(_) => Ok(()),
+        };
         let (vacant, mut this) = live.take();
         let (active, policy) = match this.state {
             State::Start((machine, create)) => {
-                let active = match machine.poll(context.as_mut()) {
-                    Ok(ops::ControlFlow::Continue(machine)) => {
-                        this.state = State::Start((machine, create));
-                        return vacant.insert(this).pending();
-                    }
-                    Ok(ops::ControlFlow::Break(active)) => active,
+                let active = match machine.prepare(cleaned) {
+                    Ok(active) => active,
                     Err(error) => return vacant.complete(Err(error)),
                 };
                 if let Err(error) = active.columns::<false>(R::N_COLS) {

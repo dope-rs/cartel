@@ -1,7 +1,4 @@
-use cartel_core::{
-    frame::Buffer,
-    reply::{order, usage},
-};
+use cartel_core::frame::Buffer;
 use dope::{
     core::driver::route,
     manifold::client::{close, conn, session::turns},
@@ -19,7 +16,9 @@ pub(super) fn fail<'e, 's, 'b, 'c, 'd, const ID: u8>(
     ctx: &mut turns::Context<'_, 'e, 'd, protocol::ConnState, Buffer, route::KeyTag<ID>>,
 ) {
     let policy = match ctx.state.phase() {
-        protocol::Phase::Init(_) => cause.start_policy(),
+        protocol::Phase::Init(_) | protocol::Phase::Advance(_) | protocol::Phase::Unsolicited => {
+            cause.start_policy()
+        }
         protocol::Phase::Offline | protocol::Phase::Ready => close::Policy::Reconnect,
     };
     ctx.request(close::Directive::with_policy(cause.close_reason(), policy));
@@ -31,37 +30,22 @@ pub(super) fn push<'e, 's, 'b, 'c, 'd, const ID: u8>(
     pending: Pending<'s, 'd>,
     ctx: &mut turns::Context<'_, 'e, 'd, protocol::ConnState, Buffer, route::KeyTag<ID>>,
 ) -> Option<Pending<'s, 'd>> {
-    let Some(reps) = port.schedule.responses(ctx.conn_id) else {
-        fail(port, client::Failure::UnexpectedResponse, ctx);
-        return None;
-    };
-    match reps.select(ctx.region()).try_push(pending.0) {
-        Ok(()) => {}
-        Err(usage::InsertError::Front {
-            value,
-            front: order::Front::Detached,
-        }) => drop(value),
-        Err(usage::InsertError::Backpressure { value, .. }) => {
-            return Some(Pending(value, pending.1));
-        }
-        Err(usage::InsertError::Capacity { cause, .. }) => {
-            fail(port, client::Failure::ResponseCapacity(cause), ctx);
-            return None;
-        }
-        Err(usage::InsertError::Front { front, .. }) => {
-            fail(port, client::Failure::ResponseFront(front), ctx);
-            return None;
+    match port
+        .schedule
+        .try_reply(ctx.conn_id, pending.0, ctx.region(), &port.activity)
+    {
+        Ok(Some(frame)) => Some(Pending(frame, pending.1)),
+        Ok(None) => None,
+        Err(rejected) => {
+            let (frame, cause) = rejected.into_parts();
+            fail(port, cause, ctx);
+            drop(frame);
+            None
         }
     }
-    reps.complete(ctx.region());
-    port.activity.wake_send();
-    port.schedule
-        .complete(ctx.conn_id, ctx.region(), &port.activity);
-    None
 }
 
 pub(super) fn deliver<'e, 's, 'b, 'c, 'd, const ID: u8>(
-    init: &Plan,
     port: &crate::Port<'s, '_, 'b, 'c, 'd, ID>,
     decoded: Result<protocol::Decoded<'s, 'd, 'd>, scope::Error>,
     ctx: &mut turns::Context<'_, 'e, 'd, protocol::ConnState, Buffer, route::KeyTag<ID>>,
@@ -95,10 +79,12 @@ pub(super) fn deliver<'e, 's, 'b, 'c, 'd, const ID: u8>(
             let pending = Pending(frame, lane);
             match ctx.state.phase() {
                 protocol::Phase::Init(step) => {
-                    init.response(port, step, pending.0, ctx);
+                    Plan::response(port, step, pending.0, ctx);
                     None
                 }
-                protocol::Phase::Offline => {
+                protocol::Phase::Offline
+                | protocol::Phase::Advance(_)
+                | protocol::Phase::Unsolicited => {
                     fail(port, client::Failure::UnexpectedResponse, ctx);
                     None
                 }
@@ -112,9 +98,10 @@ pub(super) fn deliver<'e, 's, 'b, 'c, 'd, const ID: u8>(
         Ok(protocol::Decoded::Retain(error)) => {
             let failure = match ctx.state.phase() {
                 protocol::Phase::Offline => client::Failure::UnexpectedResponse,
-                protocol::Phase::Init(_) | protocol::Phase::Ready => {
-                    client::Failure::ResponseRetention(error)
-                }
+                protocol::Phase::Init(_)
+                | protocol::Phase::Advance(_)
+                | protocol::Phase::Unsolicited
+                | protocol::Phase::Ready => client::Failure::ResponseRetention(error),
             };
             fail(port, failure, ctx);
             None

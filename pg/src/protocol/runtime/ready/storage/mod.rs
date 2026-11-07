@@ -1,8 +1,10 @@
 use block::Block;
 use buckets::Buckets;
 pub(in crate::protocol::runtime::ready) use entry::Entry;
+pub(crate) use entry::Listed;
 use header::Header;
 pub(in crate::protocol::runtime::ready) use index::Index;
+pub(crate) use index::Reservation;
 pub(super) use layout::Layout;
 use node::Node;
 use o3::depot::{self, index::bitmap::entry::Row};

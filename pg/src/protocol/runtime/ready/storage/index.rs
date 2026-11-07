@@ -30,6 +30,58 @@ pub(in crate::protocol::runtime::ready) struct Index<'d, const ID: u8> {
     thread: marker::PhantomData<ThreadBound>,
 }
 
+pub(crate) struct Reservation<'a, 'd, const ID: u8> {
+    core: &'a Index<'d, ID>,
+    index: NonZero<u32>,
+    rank: storage::Rank,
+    phase: access::Reservation<'a, 'd, ID>,
+}
+
+impl<'a, 'd, const ID: u8> storage::Listed<'a, 'd, ID> {
+    pub(crate) fn reserve(self) -> Option<Reservation<'a, 'd, ID>> {
+        let phase = access::Access::reserve(&self);
+        let (entry, rank) = self.remove();
+        let phase = phase?;
+        let storage::Entry { core, index } = entry;
+        // SAFETY: this Shared -> Reserved transition adds one previously uncounted blocker.
+        core.blockers
+            .set(unsafe { bounded::raw::u32(core.blockers.get().get() + 1) });
+        Some(Reservation {
+            core,
+            index,
+            rank,
+            phase,
+        })
+    }
+}
+
+impl<'a, 'd, const ID: u8> Reservation<'a, 'd, ID> {
+    pub(crate) const fn id(&self) -> access::Transaction<'d, ID> {
+        self.phase.id()
+    }
+
+    pub(crate) fn ready(&self) -> slot::Ready<'a, 'd, ID> {
+        slot::Ready::reserved(&self.phase)
+    }
+
+    pub(crate) fn commit(self) -> access::Transaction<'d, ID> {
+        self.phase.id()
+    }
+
+    pub(crate) fn release(self) -> access::Transaction<'d, ID> {
+        let id = self.phase.release();
+        storage::Entry {
+            core: self.core,
+            index: self.index,
+        }
+        .insert_rank(self.rank);
+        // SAFETY: the consumed reservation owns this exact counted blocker.
+        let left = self.core.blockers.get().get() - 1;
+        self.core.blockers.set(unsafe { bounded::raw::u32(left) });
+        id
+    }
+}
+
 impl<'d, const ID: u8> Index<'d, ID> {
     pub(in crate::protocol::runtime::ready) fn try_new(plan: plan::Plan) -> Result<Self, Error> {
         Ok(Self {
@@ -51,20 +103,14 @@ impl<'d, const ID: u8> Index<'d, ID> {
         Some(storage::Entry { core: self, index })
     }
 
-    pub(in crate::protocol::runtime::ready) fn next(
-        &self,
-    ) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
+    pub(in crate::protocol::runtime::ready) fn next(&self) -> Option<storage::Listed<'_, 'd, ID>> {
         let index = self.ring.first()?;
-        let slot = self.step(index).1;
-        // SAFETY: this same-owner ring contains only initialized Shared bindings.
-        Some(access::Access::listed(unsafe {
-            depot::raw::Proof::new(slot)
-        }))
+        self.step(index).1.listed()
     }
 
     /// The private ring contains only this allocation's admitted entries;
     /// advancing its head preserves the same indexed owner.
-    fn step(&self, index: links::Index) -> (links::Index, &slot::Slot<'d, ID>) {
+    fn step(&self, index: links::Index) -> (links::Index, storage::Entry<'_, 'd, ID>) {
         // SAFETY: this Index owns the exact reciprocal ring and its resident domain.
         let next = unsafe {
             depot::raw::Hooks::cycle_step(&storage::Round(&self.allocation), &self.ring, index)
@@ -73,40 +119,34 @@ impl<'d, const ID: u8> Index<'d, ID> {
             core: self,
             index: index.position(),
         };
-        (next, entry.slot())
+        (next, entry)
     }
 
     pub(in crate::protocol::runtime::ready) fn minimum(
         &self,
-    ) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
+    ) -> Option<storage::Listed<'_, 'd, ID>> {
         let row = self.minimum.get()?.row(&self.allocation);
         // SAFETY: the retained rank belongs to this allocation. It is stored as
         // the minimum only while this exact bucket is occupied.
         let head = unsafe { self.allocation.heads().get_unchecked(row.index()) };
         let index = links::List::front_from(unsafe { depot::raw::Proof::new(head) });
-        let entry = storage::Entry {
+        Some(storage::Listed {
             core: self,
             index: index.position(),
-        };
-        // SAFETY: this occupied bucket contains only this owner's Shared bindings.
-        Some(access::Access::listed(unsafe {
-            depot::raw::Proof::new(entry.slot())
-        }))
+            rank: storage::Rank::new(row),
+        })
     }
 
     pub(in crate::protocol::runtime::ready) fn next_where(
         &self,
         eligible: impl Fn(&slot::Slot<'d, ID>) -> bool,
-    ) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
+    ) -> Option<storage::Listed<'_, 'd, ID>> {
         let first = self.ring.first()?;
         let mut index = first;
         loop {
-            let (next, slot) = self.step(index);
-            if eligible(slot) {
-                // SAFETY: step retains this ring member's initialized binding.
-                return Some(access::Access::listed(unsafe {
-                    depot::raw::Proof::new(slot)
-                }));
+            let (next, entry) = self.step(index);
+            if eligible(entry.slot()) {
+                return entry.listed();
             }
             if next == first {
                 return None;
@@ -118,7 +158,7 @@ impl<'d, const ID: u8> Index<'d, ID> {
     pub(in crate::protocol::runtime::ready) fn least_where(
         &self,
         eligible: impl Fn(&slot::Slot<'d, ID>) -> bool,
-    ) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
+    ) -> Option<storage::Listed<'_, 'd, ID>> {
         use o3::depot::index::bitmap::Access as _;
 
         let mut row = self.minimum.get()?.row(&self.allocation);
@@ -135,10 +175,11 @@ impl<'d, const ID: u8> Index<'d, ID> {
                 };
                 let slot = entry.slot();
                 if eligible(slot) {
-                    // SAFETY: bucket links retain this owner's initialized binding.
-                    return Some(access::Access::listed(unsafe {
-                        depot::raw::Proof::new(slot)
-                    }));
+                    return Some(storage::Listed {
+                        core: self,
+                        index: entry.index,
+                        rank: storage::Rank::new(row),
+                    });
                 }
                 let Some(next) = entry.node().bucket.next_index() else {
                     break;
@@ -163,54 +204,6 @@ impl<'d, const ID: u8> Index<'d, ID> {
         self.live
             .set(unsafe { bounded::raw::u32(self.live.get().get() + 1) });
         Ok(())
-    }
-
-    pub(in crate::protocol::runtime::ready) fn release(
-        &self,
-        proof: access::Reservation<'_, 'd, ID>,
-        depth: usize,
-    ) -> access::Release {
-        let Some(entry) = self.entry(proof.id().conn.index().into_usize()) else {
-            return access::Release::Stale;
-        };
-        match access::Access::new(entry.slot()).release(proof) {
-            access::Release::Released => {
-                if !entry.slot().is_receiving() {
-                    entry.insert(depth);
-                }
-                // SAFETY: the exact Reserved -> Shared transition consumes one
-                // counted blocker; stale generations never reach this branch.
-                let left = self.blockers.get().get() - 1;
-                self.blockers.set(unsafe { bounded::raw::u32(left) });
-                access::Release::Released
-            }
-            access::Release::Stale => access::Release::Stale,
-        }
-    }
-
-    pub(in crate::protocol::runtime::ready) fn reserve(
-        &self,
-        id: conn::Id<'d, route::KeyTag<ID>>,
-    ) -> access::Reserve<'_, 'd, ID> {
-        let Some(entry) = self.entry(id.index().into_usize()) else {
-            return access::Reserve::Rejected;
-        };
-        let Some(listed) = entry.listed() else {
-            return access::Reserve::Rejected;
-        };
-        let state = access::Access::new(listed.slot()).reserve(id);
-        match &state {
-            access::Reserve::Reserved(_) => {
-                listed.remove();
-                // SAFETY: Shared -> Reserved adds one previously uncounted
-                // blocker in the same fixed connection domain.
-                self.blockers
-                    .set(unsafe { bounded::raw::u32(self.blockers.get().get() + 1) });
-            }
-            access::Reserve::Exhausted => listed.remove(),
-            access::Reserve::Rejected => {}
-        }
-        state
     }
 
     pub(in crate::protocol::runtime::ready) fn poll_ready(
@@ -303,13 +296,13 @@ impl<'d, const ID: u8> Index<'d, ID> {
         depth: Depth,
     ) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
         let entry = self.entry(id.index().into_usize())?;
-        let load = depth.get() + entry.slot().barriers();
-        match access::Access::new(entry.slot()).current(id) {
+        let slot = entry.slot();
+        match access::Access::new(slot).current(id) {
             access::Current::Shared => {
-                entry.reprioritize(load);
+                entry.reprioritize(depth.get() + slot.barriers());
                 None
             }
-            access::Current::Draining => (load == 0).then_some(id),
+            access::Current::Draining => (depth.get() == 0 && slot.barriers() == 0).then_some(id),
             access::Current::Stale
             | access::Current::Handshaking
             | access::Current::Reserved(_)

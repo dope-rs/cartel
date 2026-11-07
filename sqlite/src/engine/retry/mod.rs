@@ -1,4 +1,4 @@
-pub(crate) use slot::{Park, Slot, Wait};
+pub(crate) use slot::{Slot, Wait};
 
 pub(crate) mod lease;
 pub(crate) mod raw;

@@ -1,7 +1,7 @@
 use o3::{alloc, mem::Rejected};
-use std::{cell, marker, mem, num};
+use std::{cell, iter, marker, mem, num};
 
-use crate::protocol::parser;
+use crate::{client::GeoCoord, protocol::parser};
 use parser::{capacity, limit};
 
 mod cursors;
@@ -256,7 +256,7 @@ impl<'a> Region<'a, Raw> {
 }
 
 impl<K> Region<'_, K> {
-    pub(in crate::protocol::parser) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len as usize
     }
 
@@ -368,30 +368,51 @@ impl Region<'_, Scored> {
     }
 }
 
-impl Region<'_, Coordinate> {
+pub struct CoordinateIter<'a, 's, 'arena, 'credits, 'region> {
+    source: &'a Region<'s, Coordinate>,
+    cursor: Cursor<Coordinate>,
+    credit: marker::PhantomData<(&'arena (), &'credits (), &'region ())>,
+}
+
+impl<'a, 's> CoordinateIter<'a, 's, '_, '_, '_> {
+    pub(crate) fn new(source: &'a Region<'s, Coordinate>) -> Self {
+        Self {
+            source,
+            cursor: source.cursor(),
+            credit: marker::PhantomData,
+        }
+    }
+}
+
+impl Iterator for CoordinateIter<'_, '_, '_, '_, '_> {
+    type Item = Option<GeoCoord>;
+
     /// Reads only shapes and float payloads established by `Tape::coordinates`.
-    pub(in crate::protocol::parser) fn coordinate(
-        &self,
-        cursor: Cursor<Coordinate>,
-    ) -> Option<Read<Option<[f64; 2]>, Coordinate>> {
-        let batch = cursor.batch::<1>()?;
-        let member = self.tape.pool.read(batch.next);
+    fn next(&mut self) -> Option<Self::Item> {
+        let batch = self.cursor.batch::<1>()?;
+        let member = self.source.tape.pool.read(batch.next);
         let (value, next) = if matches!(member.meta.tag, parser::Tag::Nil) {
             (None, member.next())
         } else {
-            let lon = self.tape.pool.read(member.next());
-            let lat = self.tape.pool.read(lon.next());
+            let lon = self.source.tape.pool.read(member.next());
+            let lat = self.source.tape.pool.read(lon.next());
             (
                 Some([f64::from_bits(lon.payload), f64::from_bits(lat.payload)]),
                 lat.next(),
             )
         };
-        Some(Read {
-            value,
-            cursor: batch.finish(next),
-        })
+        self.cursor = batch.finish(next);
+        Some(value.map(|[lng, lat]| GeoCoord::new(lng, lat)))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.cursor.remaining() as usize;
+        (len, Some(len))
     }
 }
+
+impl ExactSizeIterator for CoordinateIter<'_, '_, '_, '_, '_> {}
+impl iter::FusedIterator for CoordinateIter<'_, '_, '_, '_, '_> {}
 
 const _: [(); 32] = [(); mem::size_of::<Region<'_, Raw>>()];
 const _: [(); 24] = [(); mem::size_of::<Exact<'_, 1>>()];

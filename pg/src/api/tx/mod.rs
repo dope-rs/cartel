@@ -231,9 +231,8 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         let (backend, pid) = client.port.connection().cancel(target)?;
         let wake = client.port.lifecycle.cancel.ready_target()?;
         Some(control::CancelToken {
-            port: &client.port.lifecycle.cancel,
+            lifecycle: &client.port.lifecycle,
             backend,
-            buffer: &client.port.lifecycle.buffer,
             pid,
             wake,
         })

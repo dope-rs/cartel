@@ -411,13 +411,13 @@ fn validates_capacities() {
     ::core::assert_eq!(config.memory_bound().response_bytes, 4096);
     ::core::assert_eq!(config.memory_bound().ingress.active, 2048);
     ::core::assert_eq!(config.memory_bound().ingress.owners.get(), 17);
-    ::core::assert_eq!(config.memory_bound().resident_bytes.bytes(), 14_336);
+    ::core::assert_eq!(config.memory_bound().resident_bytes.bytes(), 28_672);
     ::core::assert_eq!(config.memory_bound().notification_bytes, 2048);
     ::core::assert_eq!(config.memory_bound().diagnostic_bytes, 1024);
     let ready = 2 * 136 + 2 * 20 + 5 * 4 + 4 + 8 + 8;
     ::core::assert_eq!(
         config.memory_bound().total_bytes.bytes(),
-        14_336 + 10240 + 32 + ready + 1024
+        28_672 + 10240 + 32 + ready + 1024
     );
     let window = Positive::from_millis::<17>();
     assert!(

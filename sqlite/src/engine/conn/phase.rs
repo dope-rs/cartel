@@ -81,7 +81,7 @@ impl<'local, 'd: 'local, I: catalogs::Catalog> Phase<'local, 'd, I> {
             Self::Empty => return schedule::Progress::Quiescent,
         };
         if STOPPING {
-            state.stopping()
+            schedule::Progress::Runnable
         } else {
             state.progress()
         }

@@ -169,6 +169,7 @@ impl Row for f64 {
 impl Row for String {
     type View<'row> = &'row str;
 
+    #[inline]
     fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<&'row str, crate::Error> {
         reader.data().read_text()
     }

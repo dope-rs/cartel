@@ -22,7 +22,7 @@ use crate::{
 use crate::reply::group::Resolution;
 
 pub(crate) struct Active<'r, 's> {
-    records: Unique<'r, group::Records<'s>, recycle::Header<group::Records<'s>>>,
+    records: Unique<'r, group::Records<'s>>,
     bytes: pool::Span,
 }
 

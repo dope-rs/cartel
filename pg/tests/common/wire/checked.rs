@@ -273,7 +273,7 @@ impl Database {
         Self::serve(
             socket,
             (0..4).map(|index| {
-                iter::once(row).inspect(move |_| {
+                iter::repeat_n(row, if matches!(index, 1 | 2) { 9 } else { 1 }).inspect(move |_| {
                     if index == 3 {
                         socket
                             .write_all(&Frame::new(b'A', b"\0\0\0\x01next\0ready\0").encode())
@@ -281,7 +281,17 @@ impl Database {
                     }
                 })
             }),
-        )
+        )?;
+        crate::common::postgres::read_empty(socket, b'S')?;
+        socket.write_all(&Frame::new(b'2', &[]).encode())?;
+        for _ in 0..9 {
+            socket.write_all(&Frame::new(b'D', row).encode())?;
+        }
+        socket.write_all(&Frame::new(b'C', b"SELECT 9\0").encode())?;
+        socket
+            .write_all(&Frame::new(b'E', crate::common::postgres::group::COMMAND_ERROR).encode())?;
+        socket.write_all(&Frame::new(b'Z', b"I").encode())?;
+        Ok(())
     }
 
     pub(in crate::common) fn start(socket: &peer::Stream<'_>) -> Result<(), Error> {

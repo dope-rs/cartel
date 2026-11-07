@@ -48,7 +48,9 @@ impl<'query, 'connection: 'query, 'd: 'connection, I: catalogs::Catalog>
         I: catalogs::HasQuery<Q>,
     {
         let machine = self.start.run(stmt, params);
-        let create = exec::Single::<R, exec::One>::new(self.arena);
+        let create = exec::Single::<R, _>::new(self.arena, |value: Option<_>| {
+            value.ok_or(crate::Error::QueryReturnedNoRows)
+        });
         exec::Rows::new(machine, create)
     }
 
@@ -63,7 +65,7 @@ impl<'query, 'connection: 'query, 'd: 'connection, I: catalogs::Catalog>
         I: catalogs::HasQuery<Q>,
     {
         let machine = self.start.run(stmt, params);
-        let create = exec::Single::<R, exec::First>::new(self.arena);
+        let create = exec::Single::<R, _>::new(self.arena, Ok);
         exec::Rows::new(machine, create)
     }
 

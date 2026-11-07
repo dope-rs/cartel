@@ -229,7 +229,7 @@ impl Config {
             })?;
         let owners = capacity::Count::try_from(owners).map_err(Error::Owners)?;
         let ingress = retained.ingress(owners);
-        let resident = retained.resident();
+        let resident = ingress.try_resident(conns, wire).map_err(Error::Memory)?;
         let base = request
             .checked_add(cancel)
             .ok_or(Error::FixedBaseOverflow {

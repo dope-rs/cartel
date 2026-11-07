@@ -1,6 +1,5 @@
 use o3::buffer::write::consume::scope;
 use o3::buffer::{self, hold, resident};
-use resident::staging;
 
 use std::{mem, num};
 
@@ -99,6 +98,8 @@ pub(crate) enum Phase {
     #[default]
     Offline,
     Init(Step),
+    Advance(Step),
+    Unsolicited,
     Ready,
 }
 
@@ -114,6 +115,22 @@ impl ConnState {
 
     pub(crate) fn begin_init(&mut self, step: Step) {
         self.phase = Phase::Init(step);
+    }
+
+    pub(crate) fn advance_init(&mut self, step: Step) {
+        self.phase = Phase::Advance(step);
+    }
+
+    pub(crate) fn received(&mut self, step: Option<Step>, has_prefix: bool) {
+        if !has_prefix
+            && match self.phase {
+                Phase::Init(expected) => step != Some(expected),
+                Phase::Advance(_) => true,
+                Phase::Offline | Phase::Unsolicited | Phase::Ready => false,
+            }
+        {
+            self.phase = Phase::Unsolicited;
+        }
     }
 
     pub(crate) const fn phase(&self) -> Phase {
@@ -160,9 +177,7 @@ impl<'storage, 'g> codec::Codec for Codec<'storage, 'g> {
     type Staging = Buffered;
 
     fn staging(&self) -> <Self::Staging as Policy>::Spec {
-        const WARM: usize = 16 * 1024;
-        let frame = self.frame.get();
-        staging::Plan::new(frame.min(WARM), frame)
+        cartel_core::memory::try_staging(self.frame.get())
     }
 }
 

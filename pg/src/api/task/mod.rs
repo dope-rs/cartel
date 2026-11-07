@@ -11,27 +11,20 @@ use dope::{
 };
 use dope_fiber::context;
 use dope_fiber::wait;
+use o3::base::cell::region;
 use reply::recv::{self, attach::Attach};
 use std::{mem, pin::Pin, task::Poll};
 
 mod call;
 mod dispatch;
-mod done;
 pub(in crate::api) mod group;
 pub(crate) mod lease;
-mod progress;
 pub(super) mod stream;
 pub(in crate::api) mod tx;
 
 pub(in crate::api) use dispatch::Budget;
 
 pub use call::Call;
-pub(super) use call::Map;
-pub(super) use done::Done;
-pub(super) use progress::Progress;
-
-type Completion<'a, 'd, T, L, const ID: u8> =
-    Poll<Result<Progress<'a, 'd, T, L, ID>, Error<'d, ID>>>;
 
 enum State<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8, S, A, P, H = ()>
 where
@@ -44,11 +37,10 @@ where
         H,
     ),
     Connecting {
-        client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         target: Option<api::Target<'d, ID>>,
         request: api::Pending<'d, S>,
     },
-    Failed(Error<'d, ID>),
+    Failed(crate::Error),
     Done,
 }
 
@@ -94,6 +86,7 @@ pub(super) struct Core<
     A: lease::Target<'d, ID>,
     P: lease::Policy,
 {
+    client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     admission: State<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, S, A, P>,
     reply: R,
 }
@@ -126,21 +119,68 @@ where
         next: Result<api::Pending<'d, S>, crate::Error>,
     ) -> Self {
         Self {
-            admission: State::new(client, target, next),
+            client,
+            admission: State::new(target, next),
             reply,
         }
+    }
+
+    pub(super) fn poll_admit<'target>(
+        &mut self,
+        cx: Pin<&mut context::Context<'_, 'd>>,
+        waiter: Pin<&wait::Waiter<'target, 'd>>,
+        seal: impl Copy
+        + Fn(
+            S,
+            api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+            conn::Id<'d, KeyTag<ID>>,
+        ) -> lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>,
+    ) -> Poll<Result<(), Error<'d, ID>>>
+    where
+        'app: 'target,
+        'd: 'target,
+    {
+        self.admission
+            .poll_with(&self.client, cx, waiter, |this, client, weight, context| {
+                client
+                    .port
+                    .request()
+                    .try_reply(weight, this, &mut self.reply, context, |this, conn| {
+                        match mem::replace(this, State::Done) {
+                            State::Connecting { request, .. } => {
+                                let api::Pending { frame, state, .. } = request;
+                                *this = State::Admitted(seal(state, client, conn), ());
+                                (frame, ())
+                            }
+                            _ => unreachable!("connecting"),
+                        }
+                    })
+                    .map_err(|(error, conn, _)| (error, conn))
+            })
     }
 
     pub(super) fn phase(&self) -> deadline::RequestPhase {
         self.admission.phase()
     }
 
-    pub(super) fn expire(&mut self, time: deadline::Elapsed) -> Error<'d, ID> {
-        self.abort(crate::Error::RequestTimeout(time))
+    pub(super) fn admitted(
+        &self,
+    ) -> Option<&lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>> {
+        self.admission.admitted()
     }
 
-    pub(super) fn no_timer(&mut self, error: timer::Exhausted) -> Error<'d, ID> {
-        self.abort(crate::Error::Deadline(error))
+    pub(super) fn fail(
+        &mut self,
+        error: crate::Error,
+        token: &region::Token<region::Identity<'d>>,
+    ) -> Error<'d, ID> {
+        if !P::RECOVER
+            && self.reply.detach_order(token) == reply::order::State::Detached
+            && matches!(self.admission, State::Admitted(..))
+        {
+            self.admission = State::Done;
+        }
+        self.abort(error)
     }
 
     pub(super) fn abort(&mut self, error: crate::Error) -> Error<'d, ID> {
@@ -165,8 +205,8 @@ where
     A: lease::Target<'d, ID>,
     P: lease::Policy,
 {
-    pub(super) fn poll<'core, 'target>(
-        &'core mut self,
+    pub(super) fn poll<'target, U>(
+        &mut self,
         mut cx: Pin<&mut context::Context<'_, 'd>>,
         waiter: Pin<&wait::Waiter<'target, 'd>>,
         seal: impl Copy
@@ -175,62 +215,36 @@ where
             api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
             conn::Id<'d, KeyTag<ID>>,
         ) -> lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>,
-    ) -> Completion<'core, 'd, T, lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>, ID>
+        finish: fn(&mut Self, Result<T, Error<'d, ID>>) -> Result<U, Error<'d, ID>>,
+    ) -> Poll<Result<U, Error<'d, ID>>>
     where
         'app: 'target,
         'd: 'target,
     {
-        match self
-            .admission
-            .poll_admit(cx.as_mut(), waiter, &mut self.reply, seal)
-        {
+        match self.poll_admit(cx.as_mut(), waiter, seal) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Ready(Ok(())) => {}
         }
-        let next = Pin::new(&mut self.reply).poll_reply(cx);
-        match next {
-            Poll::Pending => match self.admission.admitted() {
-                Some(lease) => Poll::Ready(Ok(Progress::Admitted(lease))),
-                None => Poll::Ready(Err(crate::Error::Closed.into())),
-            },
-            Poll::Ready(next) => {
-                let Some(lease) = self.admission.take() else {
-                    return Poll::Ready(Err(crate::Error::Closed.into()));
-                };
-                Poll::Ready(Ok(Progress::Complete {
-                    outcome: next,
-                    committed: lease,
-                }))
-            }
+        match Pin::new(&mut self.reply).poll_reply(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(outcome) => Poll::Ready(finish(self, outcome)),
         }
     }
 
-    pub(super) fn poll_done<'target>(
+    pub(super) fn complete(
         &mut self,
-        cx: Pin<&mut context::Context<'_, 'd>>,
-        waiter: Pin<&wait::Waiter<'target, 'd>>,
-        seal: impl Copy
-        + Fn(
-            S,
-            api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-            conn::Id<'d, KeyTag<ID>>,
-        ) -> lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>,
-    ) -> Poll<Done<'d, T, lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>, ID>>
-    where
-        'app: 'target,
-        'd: 'target,
-    {
-        match self.poll(cx, waiter, seal) {
-            Poll::Pending | Poll::Ready(Ok(Progress::Admitted(_))) => Poll::Pending,
-            Poll::Ready(Err(error)) => Poll::Ready(Done::AdmissionFailed(error)),
-            Poll::Ready(Ok(Progress::Complete {
-                outcome: next,
-                committed: lease,
-            })) => Poll::Ready(Done::Response {
-                outcome: next,
-                committed: lease,
-            }),
+        outcome: Result<T, Error<'d, ID>>,
+    ) -> Result<
+        (
+            Result<T, Error<'d, ID>>,
+            lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>,
+        ),
+        Error<'d, ID>,
+    > {
+        match self.admission.take() {
+            Some(lease) => Ok((outcome, lease)),
+            None => Err(crate::Error::Closed.into()),
         }
     }
 }

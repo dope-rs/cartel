@@ -1,4 +1,8 @@
-use cartel_core::{frame::Buffer, queue, reply};
+use cartel_core::{
+    frame::Buffer,
+    queue,
+    reply::{self, order, usage},
+};
 use client::settings;
 use dope::{
     core::driver::{route, schedule::app::Work},
@@ -10,9 +14,12 @@ use dope::{
     },
     net::link::egress,
 };
-use dope_fiber::reply::{layout::Position, order::Depth};
+use dope_fiber::reply::{
+    layout::Position,
+    order::{Cutoff, Depth},
+};
 pub(crate) use lease::Lease;
-use o3::base::cell::region;
+use o3::{base::cell::region, mem::Rejected};
 pub(crate) use plan::Reject;
 pub(crate) use routes::Routes;
 use routes::{Access, Acquire, Bind};
@@ -102,7 +109,7 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Schedule<'s, 'storage, 'b, 'c, 'd, 
         let position = conn.position();
         let reps = self.lane(position);
         let lane = self.requests(position);
-        publish(&conn, reps, lane, region);
+        publish(&conn, reps.depth(region), lane, region);
         active.clear_fatal(position, region);
         active.wake_all();
         Ready::Committed
@@ -112,23 +119,105 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Schedule<'s, 'storage, 'b, 'c, 'd, 
         &self,
         token: Id<'d, route::KeyTag<ID>>,
     ) -> Option<reply::Lane<'_, 'b, 'c, 'd, frame::Stored<'s, 'd>, client::Failure<'d>>> {
-        let conn = self.routes.bound(token)?;
+        let conn = self.routes.bound(token, |conn, _| conn)?;
         Some(self.lane(conn.position()))
+    }
+
+    pub(crate) fn try_reply(
+        &self,
+        token: Id<'d, route::KeyTag<ID>>,
+        frame: frame::Stored<'s, 'd>,
+        region: &mut region::Token<region::Identity<'d>>,
+        active: &port::Activity<'b, 'd, ID>,
+    ) -> Result<Option<frame::Stored<'s, 'd>>, Rejected<frame::Stored<'s, 'd>, client::Failure<'d>>>
+    {
+        let Some((conn, frontier)) = self.routes.bound(token, |conn, frontier| (conn, frontier))
+        else {
+            return Err(Rejected::new(frame, client::Failure::UnexpectedResponse));
+        };
+        if frontier.is_some_and(|[first, _]| first.is_empty()) {
+            return Err(Rejected::new(
+                frame,
+                client::Failure::ResponseFront(order::Front::Empty),
+            ));
+        }
+        let reps = self.lane(conn.position());
+        let push = reps.select(region);
+        let last = frontier.is_some_and(|[_, last]| push.is_cutoff(last));
+        match push.try_push(frame) {
+            Ok(()) => {}
+            Err(usage::InsertError::Front {
+                value,
+                front: order::Front::Detached,
+            }) => drop(value),
+            Err(usage::InsertError::Backpressure { value, .. }) => return Ok(Some(value)),
+            Err(usage::InsertError::Capacity { value, cause }) => {
+                return Err(Rejected::new(
+                    value,
+                    client::Failure::ResponseCapacity(cause),
+                ));
+            }
+            Err(usage::InsertError::Front { value, front }) => {
+                return Err(Rejected::new(value, client::Failure::ResponseFront(front)));
+            }
+        }
+        let depth = reps.complete(region);
+        active.wake_send();
+        let shared = conn
+            .with_frontier(token, |_, access, frontier| {
+                if last {
+                    frontier[1] = Cutoff::EMPTY;
+                }
+                frontier[0] = frontier[1];
+                access == Access::Shared
+            })
+            .unwrap_or(false);
+        if shared
+            && matches!(
+                publish(&conn, depth, self.requests(conn.position()), region),
+                Link::Added
+            )
+        {
+            active.wake_lease();
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn received(
+        &self,
+        token: Id<'d, route::KeyTag<ID>>,
+        cutoff: Cutoff<'b>,
+        has_prefix: bool,
+        region: &region::Token<region::Identity<'d>>,
+    ) {
+        let Some(conn) = self.routes.get(token.index().into_usize()) else {
+            return;
+        };
+        conn.with_frontier(token, |position, _, frontier| {
+            frontier[1] = if self.lane(position).contains_cutoff(cutoff, region) {
+                cutoff
+            } else {
+                Cutoff::EMPTY
+            };
+            if !has_prefix {
+                frontier[0] = frontier[1];
+            }
+        });
     }
 
     pub(crate) fn try_input(
         &self,
         token: Id<'d, route::KeyTag<ID>>,
         input: session::Input,
-        region: &mut region::Token<region::Identity<'d>>,
     ) -> Result<(), client::Failure<'d>> {
-        let Some(conn) = self.routes.get(token.index().into_usize()) else {
-            return Ok(());
-        };
-        let Some(position) = conn.set_input(token, input) else {
-            return Ok(());
-        };
-        if input == session::Input::Partial && self.lane(position).depth(region) == Depth::ZERO {
+        if matches!(input, session::Input::Partial)
+            && self
+                .routes
+                .bound(token, |_, frontier| {
+                    frontier.is_some_and(|[first, _]| first.is_empty())
+                })
+                .unwrap_or(false)
+        {
             return Err(client::Failure::UnexpectedResponse);
         }
         Ok(())
@@ -191,13 +280,17 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Schedule<'s, 'storage, 'b, 'c, 'd, 
         &self,
         token: Id<'d, route::KeyTag<ID>>,
         ctx: &mut turns::Retirement<'_, '_, 'd>,
+        activity: &super::Activity<'b, 'd, ID>,
     ) -> egress::Cleared {
-        let Some(conn) = self.routes.bound(token) else {
+        let Some(conn) = self.routes.bound(token, |conn, _| conn) else {
             return egress::Cleared::Done;
         };
         let reqs = self.requests(conn.position());
         let (work, region) = ctx.parts();
-        match reqs.clear(work, region, drop) {
+        match reqs.clear(work, region, |frame| {
+            drop(frame);
+            activity.wake_send();
+        }) {
             queue::Drain::Empty => egress::Cleared::Done,
             queue::Drain::Exhausted => egress::Cleared::Retry,
         }
@@ -233,7 +326,7 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Schedule<'s, 'storage, 'b, 'c, 'd, 
         reqs: &mut request::Requests<'_, '_, 'e, 'd, Buffer, route::KeyTag<ID>>,
     ) -> Result<(), client::Failure<'d>> {
         let token = reqs.connection();
-        let Some(conn) = self.routes.bound(token) else {
+        let Some(conn) = self.routes.bound(token, |conn, _| conn) else {
             return Ok(());
         };
         let lane = self.requests(conn.position());
@@ -242,23 +335,6 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Schedule<'s, 'storage, 'b, 'c, 'd, 
             return Ok(());
         }
         lane.drain(reqs).map_err(client::Failure::RequestReserve)
-    }
-
-    pub(crate) fn complete(
-        &self,
-        token: Id<'d, route::KeyTag<ID>>,
-        region: &mut region::Token<region::Identity<'d>>,
-        active: &port::Activity<'b, 'd, ID>,
-    ) {
-        let Some(conn) = self.routes.shared(token) else {
-            return;
-        };
-        let reps = self.lane(conn.position());
-        let reqs = self.requests(conn.position());
-        match publish(&conn, reps, reqs, region) {
-            Link::Unchanged => {}
-            Link::Added => active.wake_lease(),
-        }
     }
 
     pub(super) fn release(
@@ -284,13 +360,13 @@ fn withdraw<'s, 'b, 'c, 'd, const ID: u8>(
     reps.control().deactivate(region);
 }
 
-fn publish<'s, 'b, 'c, 'd, const ID: u8>(
+fn publish<'b, 'd, const ID: u8>(
     conn: &slot::Bound<'_, 'b, 'd, ID>,
-    reps: reply::Lane<'_, 'b, 'c, 'd, frame::Stored<'s, 'd>, client::Failure<'d>>,
+    depth: Depth,
     reqs: queue::Lane<'_, 'd, egress::NonEmpty<Buffer>, ()>,
     region: &mut region::Token<region::Identity<'d>>,
 ) -> Link {
-    if reps.depth(region) != Depth::ZERO || !reqs.is_empty(region) {
+    if depth != Depth::ZERO || !reqs.is_empty(region) {
         return Link::Unchanged;
     }
     conn.schedule::<0>(conn.position());
@@ -307,13 +383,13 @@ fn refresh<'s, 'storage, 'b, 'c, 'd, const ID: u8>(
             return;
         };
         let token = conn.connection();
-        if !matches!(conn.access(), Some((position, Access::Shared, _)) if position.connection() == token)
+        if !matches!(conn.access(), Some((position, Access::Shared)) if position.connection() == token)
         {
             continue;
         }
         let reps = state.lane(conn.position());
         let reqs = state.requests(conn.position());
-        match publish(&conn, reps, reqs, region) {
+        match publish(&conn, reps.depth(region), reqs, region) {
             Link::Unchanged => {
                 deferred.get_or_insert(token);
                 conn.schedule::<1>(conn.position());

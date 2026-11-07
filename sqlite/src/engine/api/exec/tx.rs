@@ -1,7 +1,7 @@
 use crate::{
     api::stmt::{
         self,
-        access::{Access, Retry},
+        access::{Access, Authority, Retry},
     },
     sys,
 };
@@ -37,7 +37,7 @@ impl<'transaction> Tx<'transaction> {
         Ok(())
     }
 
-    /// Records a failed native step/reset's exact connection state before either error escapes.
+    /// Retains native failures and the rollback owed by an invalid control scope.
     pub(crate) fn error<A: Access>(
         self,
         stmt: &stmt::Prepared<'_>,
@@ -48,17 +48,24 @@ impl<'transaction> Tx<'transaction> {
         let code = sys::Code::new(code);
         let fault = sys::Fault::new(action, code);
         let busy = code.primary() == libsqlite3_sys::SQLITE_BUSY;
-        if self.0.is_none() && !busy {
+        let control = matches!(A::AUTHORIZATION, Authority::Control);
+        if self.0.is_none() && !busy && !control {
             return fault.error();
         }
         let native = stmt.transaction();
+        let abort = match native {
+            sys::Tx::Idle => true,
+            sys::Tx::Active if control && !busy => {
+                stmt.work().pending.transaction();
+                true
+            }
+            sys::Tx::Active => false,
+        };
         if let Some(state) = self.0 {
-            match native {
-                sys::Tx::Idle => state.set(Some(fault.abort())),
-                sys::Tx::Active if busy && matches!(access.retry(), Retry::Denied) => {
-                    state.set(Some(fault));
-                }
-                sys::Tx::Active => {}
+            if abort {
+                state.set(Some(fault.abort()));
+            } else if busy && matches!(access.retry(), Retry::Denied) {
+                state.set(Some(fault));
             }
         }
         if busy {

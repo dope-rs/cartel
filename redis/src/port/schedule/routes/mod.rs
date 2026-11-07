@@ -1,14 +1,10 @@
 use std::{cell, mem};
 
-use cartel_core::reply::layout::Position;
+use cartel_core::reply::{layout::Position, order::Cutoff};
 
 use dope::{
     core::driver::{route, schedule::ready},
-    manifold::client::{
-        close,
-        conn::Id,
-        session::{self, turns},
-    },
+    manifold::client::{close, conn::Id, session::turns},
 };
 use o3::{
     alloc, depot,
@@ -212,45 +208,33 @@ impl<'b, 'd, const ID: u8> Routes<'b, 'd, ID> {
         drop(previous);
     }
 
-    pub(in crate::port) fn bound(
-        &self,
+    pub(super) fn bound<'a, R>(
+        &'a self,
         token: Id<'d, route::KeyTag<ID>>,
-    ) -> Option<slot::Bound<'_, 'b, 'd, ID>> {
+        apply: impl FnOnce(slot::Bound<'a, 'b, 'd, ID>, Option<[Cutoff<'b>; 2]>) -> R,
+    ) -> Option<R> {
         let conn = self.get(token.index().into_usize())?;
-        let position = conn
-            .position()
-            .filter(|position| position.connection() == token)?;
-        Some(slot::Bound {
-            slot: conn,
-            position,
-        })
-    }
-
-    pub(super) fn shared(
-        &self,
-        token: Id<'d, route::KeyTag<ID>>,
-    ) -> Option<slot::Bound<'_, 'b, 'd, ID>> {
-        let conn = self.get(token.index().into_usize())?;
-        let (position, access, _) = conn.access()?;
-        (position.connection() == token && access == Access::Shared).then_some(slot::Bound {
-            slot: conn,
-            position,
+        conn.0.state().bound(token, |position, frontier| {
+            apply(
+                slot::Bound {
+                    slot: conn,
+                    position,
+                },
+                frontier,
+            )
         })
     }
 
     pub(super) fn exclusive(
         &self,
         token: Id<'d, route::KeyTag<ID>>,
-    ) -> Option<(slot::Bound<'_, 'b, 'd, ID>, session::Input)> {
+    ) -> Option<slot::Bound<'_, 'b, 'd, ID>> {
         let conn = self.get(token.index().into_usize())?;
-        let (position, access, input) = conn.access()?;
-        (position.connection() == token && access == Access::Exclusive).then_some((
-            slot::Bound {
-                slot: conn,
-                position,
-            },
-            input,
-        ))
+        let (position, access) = conn.access()?;
+        (position.connection() == token && access == Access::Exclusive).then_some(slot::Bound {
+            slot: conn,
+            position,
+        })
     }
 
     pub(super) fn failure(
@@ -304,8 +288,8 @@ pub(in crate::port::schedule) enum Access {
 enum State<'b, 'd, const ID: u8> {
     Vacant,
     Initializing(Bound<'b, 'd, ID>),
-    Shared(Bound<'b, 'd, ID>, session::Input),
-    Exclusive(Bound<'b, 'd, ID>, session::Input),
+    Shared(Bound<'b, 'd, ID>, [Cutoff<'b>; 2]),
+    Exclusive(Bound<'b, 'd, ID>, [Cutoff<'b>; 2]),
     Closing(Closing<'b, 'd, ID>),
     Reconnecting(Closing<'b, 'd, ID>),
 }

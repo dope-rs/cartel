@@ -136,9 +136,9 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        task::Map::new(
-            self.client
-                .typed::<Q, api::ExtractFirst<ID>>(self.target, params, ()),
+        self.client.typed::<Q, api::ExtractFirst<_, ID>>(
+            self.target,
+            params,
             results::Row::<_, Q>::required,
         )
     }
@@ -163,7 +163,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        task::Map::new(
+        abi::Map::new(
             self.client.group::<Q, N>(self.target, params),
             results::GroupFailure::required::<Q>,
         )
@@ -184,9 +184,9 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        task::Map::new(
-            self.client
-                .typed::<Q, api::ExtractFirst<ID>>(self.target, params, ()),
+        self.client.typed::<Q, api::ExtractFirst<_, ID>>(
+            self.target,
+            params,
             results::Row::<_, Q>::optional,
         )
     }
@@ -206,9 +206,9 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        task::Map::new(
-            self.client
-                .typed::<Q, api::ExtractFirst<ID>>(self.target, params, ()),
+        self.client.typed::<Q, api::ExtractFirst<_, ID>>(
+            self.target,
+            params,
             results::Row::<_, Q, true>::optional,
         )
     }
@@ -225,7 +225,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        task::Map::new(
+        abi::Map::new(
             self.client.typed::<Q, api::ExtractAll<ID>>(
                 self.target,
                 params,

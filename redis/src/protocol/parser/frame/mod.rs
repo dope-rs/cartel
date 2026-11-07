@@ -203,16 +203,6 @@ impl<'a> Iterator for Iter<'a, '_, '_, storage::Scored> {
     }
 }
 
-impl Iterator for Iter<'_, '_, '_, storage::Coordinate> {
-    type Item = Option<[f64; 2]>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let read = self.source.nodes.coordinate(self.cursor)?;
-        self.cursor = read.cursor;
-        Some(read.value)
-    }
-}
-
 impl Stored<'_, '_, storage::Region<'_, storage::Maybe>> {
     pub(crate) fn try_array<const N: usize>(&self) -> Result<[Option<&[u8]>; N], storage::Length> {
         let batch = self
@@ -288,6 +278,8 @@ impl<'a> source::Reader<'a> for Reader<'a, '_> {
 }
 
 impl usage::Footprint for Stored<'_, '_> {
+    type Amount = usage::Usage;
+
     fn footprint(&self) -> usage::Usage {
         usage::Usage::new(
             usage::Bytes::new(self.frame.len()),

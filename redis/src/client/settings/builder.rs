@@ -267,7 +267,7 @@ impl Builder {
         let owners = Count::try_from(owners).map_err(Error::Owners)?;
         let input = retain.ingress(owners);
         let held = retain.pending();
-        let used = retain.resident();
+        let used = input.try_resident(conns, limit).map_err(Error::Retention)?;
         let tape = parse
             .checked_mul(storage::Storage::NODE_SIZE)
             .ok_or(Error::Overflow {

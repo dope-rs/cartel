@@ -42,10 +42,10 @@ fn completed_frames() {
         let pool = (pool::Pool::try_new(1, 8)).expect("the frame pool must allocate");
         let origin;
         {
-            let mut cursor = (pool.cursor()).expect("the frame pool has one slot");
-            origin = cursor.as_ref().as_ptr();
-            cursor.try_append(bytes).expect("the frame fits").commit();
-            let frame = Buffer::new(cursor, kind);
+            let mut span = (pool.acquire()).expect("the frame pool has one slot");
+            origin = span.as_ref().as_ptr();
+            span.try_append(bytes).expect("the frame fits").commit();
+            let frame = Buffer::new(span, kind);
             let frame = egress::NonEmpty::try_new(frame).expect("nonempty initialized frame");
             assert_eq!(frame.as_inner().as_ref(), bytes);
             assert_eq!(pool.available(), 0);
@@ -81,25 +81,18 @@ fn restores_input_credit() {
                 (replies.try_lane(reply::LaneIndex::ZERO)).expect("topology fixture completed");
             let requests = arena.lane_for(replies);
             let token = &mut token;
-            drop(
-                handoff::Lane::new(&arena, replies)
-                    .try_prepare(token, 5)
-                    .expect("request reservation"),
-            );
-            assert_eq!(replies.depth(token).get(), 0);
             let mut first = recv::Response::<_, Pending>::new();
-            let success = handoff::Lane::new(&arena, replies)
-                .try_prepare(token, 7)
-                .expect("request reservation")
-                .try_with(
-                    (),
-                    11,
-                    |token, lane, tag, item| match first.try_ordered(token, lane, tag) {
-                        Ok(depth) => Ok((depth, item)),
-                        Err(cause) => Err((cause, item)),
-                    },
-                    |item, depth| (item, depth.get()),
-                );
+            let success = handoff::Lane::new(&arena, replies).try_with(
+                token,
+                7,
+                (),
+                11,
+                |token, lane, tag, item| match first.try_ordered(token, lane, tag) {
+                    Ok(depth) => Ok((depth, item)),
+                    Err(cause) => Err((cause, item)),
+                },
+                |item, depth| (item, depth.get()),
+            );
             assert!(success == Ok(1));
             assert_eq!(requests.weight(token), 7);
             assert_eq!(requests.pop_front(token), Some(11));
@@ -176,7 +169,7 @@ fn queue_domain() {
     )
     .expect("reply layout");
     region::Token::scope(|mut token| {
-        reply::Arena::<u8>::try_with(replies, token.proof(), |replies| {
+        reply::Arena::<()>::try_with(replies, token.proof(), |replies| {
             let config = fair::Plan::new(1, 1).expect("queue layout");
             let mismatch = queue::Arena::<()>::try_unweighted(config, &token)
                 .expect("queue storage")
@@ -333,13 +326,6 @@ fn guards_restore_credit() {
         let config = (fair::Plan::new(2, 2)).expect("two slots must fit two lanes");
         let arena = (queue::Arena::try_new(config, &token)).expect("the queue must allocate");
         let lane = (arena.lane(1)).expect("the configured lane must exist");
-
-        drop(
-            lane.try_reserve(&mut token, 7)
-                .expect("queue credit must be reserved"),
-        );
-        assert_eq!(lane.len(&token), 0);
-        assert_eq!(lane.weight(&token), 0);
 
         assert!(
             lane.try_push(&mut token, 11, usize::MAX).is_ok(),

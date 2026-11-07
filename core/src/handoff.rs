@@ -3,24 +3,17 @@
 use std::mem;
 
 use o3::base::cell::region;
-use reply::{order, recv::attach};
+use reply::{recv::attach, usage::Footprint};
 
 use crate::{queue, reply};
 
 /// The request and reply lanes of one handoff.
-pub struct Lane<'a, 's, 'b, 'c, 'd, T, D, E, K, W: queue::Weight = usize> {
+pub struct Lane<'a, 's, 'b, 'c, 'd, T, D: Footprint, E, K, W: queue::Weight = usize> {
     requests: queue::Lane<'a, 'd, T, W>,
     replies: reply::Lane<'s, 'b, 'c, 'd, D, E, K>,
 }
 
-/// An unpublished request reservation with its matching reply lane.
-#[must_use = "a prepared handoff must be published or released"]
-pub struct Prepared<'turn, 'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K, W: queue::Weight = usize> {
-    request: queue::Reservation<'turn, 'a, 'd, T, W>,
-    replies: reply::Lane<'s, 'b, 'c, 'd, D, E, K>,
-}
-
-impl<'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K, W: queue::Weight>
+impl<'a, 's, 'b, 'c, 'd, T: Unpin, D: Footprint, E, K, W: queue::Weight>
     Lane<'a, 's, 'b, 'c, 'd, T, D, E, K, W>
 {
     pub fn new(
@@ -33,18 +26,6 @@ impl<'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K, W: queue::Weight>
         }
     }
 
-    /// Reserves the request slot and weight without attaching a reply owner.
-    pub fn try_prepare<'turn>(
-        self,
-        token: &'turn mut region::Token<region::Identity<'d>>,
-        weight: W,
-    ) -> Result<Prepared<'turn, 'a, 's, 'b, 'c, 'd, T, D, E, K, W>, queue::Rejection> {
-        Ok(Prepared {
-            request: self.requests.try_reserve(token, weight)?,
-            replies: self.replies,
-        })
-    }
-
     /// Reserves both sides before consuming input or publishing the request.
     pub fn try_publish<I, R>(
         self,
@@ -55,30 +36,12 @@ impl<'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K, W: queue::Weight>
         input: I,
         build: impl FnOnce(I) -> (T, R),
     ) -> Result<R, (Failure, I)> {
-        let prepared = match self.try_prepare(token, weight) {
-            Ok(prepared) => prepared,
-            Err(cause) => return Err((Failure::Queue(cause), input)),
-        };
-        prepared
-            .try_publish(reply, tag, input, build)
-            .map_err(|(cause, input)| (Failure::Reply(cause), input))
-    }
-}
-
-impl<'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K, W: queue::Weight>
-    Prepared<'_, 'a, 's, 'b, 'c, 'd, T, D, E, K, W>
-{
-    /// Attaches the reply owner and immediately publishes the reserved request.
-    pub fn try_publish<I, R>(
-        self,
-        reply: &mut impl attach::Attach<'s, 'b, 'c, 'd, D, E, K>,
-        tag: K,
-        input: I,
-        build: impl FnOnce(I) -> (T, R),
-    ) -> Result<R, (attach::Error, I)> {
-        self.request.try_with(
+        self.try_with(
+            token,
+            weight,
+            tag,
             input,
-            |token, input| match reply.try_tagged(token, self.replies, tag) {
+            |token, replies, tag, input| match reply.try_tagged(token, replies, tag) {
                 Ok(()) => Ok(((), input)),
                 Err(cause) => Err((cause, input)),
             },
@@ -87,8 +50,10 @@ impl<'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K, W: queue::Weight>
     }
 
     /// Retains owned preparation input until reply admission succeeds.
-    pub fn try_with<I, J, R>(
+    pub fn try_with<I, J, P, R>(
         self,
+        token: &mut region::Token<region::Identity<'d>>,
+        weight: W,
         tag: K,
         input: I,
         prepare: impl FnOnce(
@@ -96,12 +61,17 @@ impl<'a, 's, 'b, 'c, 'd, T: Unpin, D, E, K, W: queue::Weight>
             reply::Lane<'s, 'b, 'c, 'd, D, E, K>,
             K,
             I,
-        ) -> Result<(order::Depth, J), (attach::Error, I)>,
-        build: impl FnOnce(J, order::Depth) -> (T, R),
-    ) -> Result<R, (attach::Error, I)> {
-        self.request.try_with(
+        ) -> Result<(P, J), (attach::Error, I)>,
+        build: impl FnOnce(J, P) -> (T, R),
+    ) -> Result<R, (Failure, I)> {
+        self.requests.try_with(
+            token,
+            weight,
             input,
-            |token, input| prepare(token, self.replies, tag, input),
+            |token, input| {
+                prepare(token, self.replies, tag, input)
+                    .map_err(|(cause, input)| (Failure::Reply(cause), input))
+            },
             build,
         )
     }
@@ -117,4 +87,10 @@ const _: () = assert!(
 pub enum Failure {
     Reply(attach::Error),
     Queue(queue::Rejection),
+}
+
+impl From<queue::Rejection> for Failure {
+    fn from(cause: queue::Rejection) -> Self {
+        Self::Queue(cause)
+    }
 }

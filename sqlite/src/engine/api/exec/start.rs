@@ -2,15 +2,14 @@ use crate::{api, catalogs, retry};
 use api::{exec, stmt, work};
 use dope_fiber::context;
 use exec::machine::{self, call};
-use retry::lease;
-use std::{mem, ops, pin, result, task};
+use std::{mem, pin, result, task};
 use stmt::target::Target;
 use work::cleanup;
 
 pub(crate) struct Start<'query, 'connection, 'd, I: catalogs::Catalog> {
     engine: &'query mut stmt::Engine<'connection, I>,
     work: &'query work::Work,
-    retry: lease::Lease<'query, 'd, lease::Cleanup>,
+    retry: retry::raw::Loan<'query, 'd>,
     txn: exec::Tx<'query>,
 }
 
@@ -18,7 +17,7 @@ impl<'query, 'connection, 'd, I: catalogs::Catalog> Start<'query, 'connection, '
     pub(crate) const fn new(
         engine: &'query mut stmt::Engine<'connection, I>,
         work: &'query work::Work,
-        retry: lease::Lease<'query, 'd, lease::Cleanup>,
+        retry: retry::raw::Loan<'query, 'd>,
         txn: exec::Tx<'query>,
     ) -> Self {
         Self {
@@ -38,29 +37,31 @@ impl<'query, 'connection, 'd, I: catalogs::Catalog> Start<'query, 'connection, '
     }
 
     pub(super) fn poll(
-        mut self,
+        &mut self,
         context: pin::Pin<&mut context::Context<'_, 'd>>,
-    ) -> machine::Next<Self, machine::Ready<'query, 'connection, 'd, I>> {
+    ) -> task::Poll<result::Result<(), crate::Error>> {
         if matches!(self.work.pending.status(), cleanup::Status::Pending) {
-            let mut run = cleanup::Run::new(self.engine, self.work, self.retry);
-            let polled = run.poll(context);
-            // Progress stays in Work and the original retry slot. Moving this
-            // lease back preserves its budget and alarm without detaching it.
-            (self.engine, self.work, self.retry) = run.into_parts();
-            match polled {
-                task::Poll::Pending => return Ok(ops::ControlFlow::Continue(self)),
-                task::Poll::Ready(result) => result?,
-            }
+            cleanup::Run::new(self.engine, self.work, self.retry.config().work.cleanup)
+                .poll(context)
+        } else {
+            task::Poll::Ready(Ok(()))
         }
-        Ok(ops::ControlFlow::Break(self.prepare()?))
     }
 
-    fn prepare(self) -> result::Result<machine::Ready<'query, 'connection, 'd, I>, crate::Error> {
+    pub(super) fn prepare<P: api::Bind, T: Target<I>>(
+        self,
+        params: P,
+        target: T,
+    ) -> result::Result<machine::Active<'query, 'connection, 'd, P, T::Access>, crate::Error> {
         self.txn.check()?;
-        let retry = self.retry.into_call();
+        let retry = self.retry.call();
         let guard = self.work.begin(retry.config().work.call.progress)?;
-        let state = call::State::new(guard, retry, self.txn);
-        Ok(machine::Ready::new(self.engine, state))
+        let (bound, access) = target.bind(self.engine, params, retry.config(), &guard)?;
+        Ok(machine::Active::new(
+            bound,
+            call::State::new(guard, retry, self.txn),
+            access,
+        ))
     }
 }
 

@@ -243,22 +243,3 @@ impl<I> Clone for Step<I> {
         *self
     }
 }
-
-#[derive(Clone, Copy)]
-#[doc(hidden)]
-pub struct QueryCursor {
-    group: u32,
-    query: u32,
-}
-
-impl QueryCursor {
-    #[doc(hidden)]
-    pub const fn group(self) -> u32 {
-        self.group
-    }
-
-    #[doc(hidden)]
-    pub const fn query(self) -> u32 {
-        self.query
-    }
-}

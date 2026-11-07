@@ -3,7 +3,7 @@
 use crate::{api, protocol, reply, reply::Error, schema};
 use api::tx::control;
 use api::{results, sql, tx};
-use dope_fiber::{abi::Fiber, task::batch};
+use dope_fiber::abi::Fiber;
 use results::{Storage, group, source};
 use schema::result;
 use std::ops::Deref;
@@ -62,26 +62,6 @@ pub trait Query<'d, const ID: u8 = 0>: Sealed + Copy {
         Self::Schema: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup;
 
-    /// Builds independent calls in input order with their own admission and Sync.
-    fn one_each<'pool, Q, const N: usize>(
-        self,
-        pool: &'pool mut batch::Pool<'d, N>,
-        params: [Q::Params<'_>; N],
-    ) -> batch::Join<
-        'pool,
-        'd,
-        impl Fiber<'d, Output = Result<results::StoredRow<Self::Results, Q>, Error<'d, ID>>>
-        + use<'d, Self, Q, ID, N>,
-        N,
-    >
-    where
-        Q: schema::TypedQuery<Result = result::Rows>,
-        Self::Schema: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
-    {
-        batch::Join::from_map(pool, params, |params| self.run_one::<Q>(params))
-    }
-
     /// Encodes a nonempty group now and runs it with one connection, Sync, and deadline.
     /// Success waits for ReadyForQuery; later commands may be skipped after an error.
     /// Group synchronization does not promise transaction atomicity.
@@ -111,26 +91,6 @@ pub trait Query<'d, const ID: u8 = 0>: Sealed + Copy {
         Self::Schema: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup;
 
-    /// Builds independent optional-row calls in input order.
-    fn first_each<'pool, Q, const N: usize>(
-        self,
-        pool: &'pool mut batch::Pool<'d, N>,
-        params: [Q::Params<'_>; N],
-    ) -> batch::Join<
-        'pool,
-        'd,
-        impl Fiber<'d, Output = results::FirstResult<'d, Self::Results, Q, ID>>
-        + use<'d, Self, Q, ID, N>,
-        N,
-    >
-    where
-        Q: schema::TypedQuery<Result = result::Rows>,
-        Self::Schema: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
-    {
-        batch::Join::from_map(pool, params, |params| self.run_first::<Q>(params))
-    }
-
     fn run_scalar<Q>(
         self,
         params: Q::Params<'_>,
@@ -140,25 +100,6 @@ pub trait Query<'d, const ID: u8 = 0>: Sealed + Copy {
         Q: schema::TypedQuery<Result = result::Rows<true>>,
         Self::Schema: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup;
-
-    fn scalar_each<'pool, Q, const N: usize>(
-        self,
-        pool: &'pool mut batch::Pool<'d, N>,
-        params: [Q::Params<'_>; N],
-    ) -> batch::Join<
-        'pool,
-        'd,
-        impl Fiber<'d, Output = results::FirstResult<'d, Self::Results, Q, ID, true>>
-        + use<'d, Self, Q, ID, N>,
-        N,
-    >
-    where
-        Q: schema::TypedQuery<Result = result::Rows<true>>,
-        Self::Schema: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
-    {
-        batch::Join::from_map(pool, params, |params| self.run_scalar::<Q>(params))
-    }
 
     fn run_all<Q>(
         self,
@@ -170,26 +111,6 @@ pub trait Query<'d, const ID: u8 = 0>: Sealed + Copy {
         Self::Schema: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup;
 
-    /// Builds independent collected-row calls in input order.
-    fn all_each<'pool, Q, const N: usize>(
-        self,
-        pool: &'pool mut batch::Pool<'d, N>,
-        params: [Q::Params<'_>; N],
-    ) -> batch::Join<
-        'pool,
-        'd,
-        impl Fiber<'d, Output = Result<results::StoredCollection<Self::Results, Q>, Error<'d, ID>>>
-        + use<'d, Self, Q, ID, N>,
-        N,
-    >
-    where
-        Q: schema::TypedQuery<Result = result::Rows>,
-        Self::Schema: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
-    {
-        batch::Join::from_map(pool, params, |params| self.run_all::<Q>(params))
-    }
-
     fn run_no_rows<Q>(
         self,
         params: Q::Params<'_>,
@@ -198,25 +119,6 @@ pub trait Query<'d, const ID: u8 = 0>: Sealed + Copy {
         Q: schema::TypedQuery<Row = (), Result = result::Command>,
         Self::Schema: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup;
-
-    /// Builds independent command calls in input order.
-    fn command_each<'pool, Q, const N: usize>(
-        self,
-        pool: &'pool mut batch::Pool<'d, N>,
-        params: [Q::Params<'_>; N],
-    ) -> batch::Join<
-        'pool,
-        'd,
-        impl Fiber<'d, Output = Result<(), Error<'d, ID>>> + use<'d, Self, Q, ID, N>,
-        N,
-    >
-    where
-        Q: schema::TypedQuery<Row = (), Result = result::Command>,
-        Self::Schema: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
-    {
-        batch::Join::from_map(pool, params, |params| self.run_no_rows::<Q>(params))
-    }
 
     fn run_stream<Q>(self, params: Q::Params<'_>) -> Self::Stream<Q>
     where

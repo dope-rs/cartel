@@ -1,10 +1,10 @@
 use cartel_pg::api::traits::{Client as _, Notify as _, Status as _, Unchecked as _};
 use common::env::{self, Env};
 use common::{external::runtime::check, recover};
-use dope_fiber::BlockOn as _;
+use dope_fiber::{BlockOn as _, abi::poll_fn, context::raw::Live};
 use dope_test::harness::peer;
 use std::env::var_os;
-use std::{num::NonZero, thread, time::Duration};
+use std::{num::NonZero, pin::pin, task::Poll, thread, time::Duration};
 
 use crate::common::external::runtime::{Plan, Session};
 use crate::common::{port::Queries, postgres::accept::Listener as _};
@@ -22,6 +22,46 @@ use crate::common::external::{own, own::Convert as _, row::Copy, user::Lookup};
 pub mod common;
 
 #[test]
+fn copy_out_done_ends_data() {
+    for extra in [None, Some(b'c'), Some(b'd')] {
+        peer::AcceptScript::with(
+            move |listener| common::postgres::accept::copy_out_done(listener, extra),
+            |server| {
+                Session::<Queries>::new(
+                    server.addr(),
+                    Queries::try_config().expect("database config"),
+                    NonZero::<usize>::MIN,
+                    "public".to_owned(),
+                    false,
+                )
+                .try_run(
+                    |rt| {
+                        let client = rt.client();
+                        let mut copy = client.copy().copy_out("COPY items TO STDOUT");
+                        let next = rt.runtime.block_on(copy.next_chunk())?;
+                        match extra {
+                            None => assert!(matches!(next, Ok(None))),
+                            Some(tag) => assert!(matches!(
+                                next,
+                                Err(reply::Error::Driver(
+                                    cartel_pg::Error::UnexpectedReadyMessage(actual)
+                                )) if actual == tag
+                            )),
+                        }
+                        Ok(())
+                    },
+                    recover,
+                    check,
+                )
+                .expect("PostgreSQL runtime");
+                server.finish().expect("COPY peer").expect("COPY protocol");
+            },
+        )
+        .expect("COPY listener");
+    }
+}
+
+#[test]
 fn finish_with_full_request_pool() {
     peer::AcceptScript::with(common::postgres::accept::copy_finish, |server| {
         Session::<Queries>::new(
@@ -34,8 +74,28 @@ fn finish_with_full_request_pool() {
         .try_run(
             |rt| {
                 let client = rt.client();
+                assert!(rt.runtime.block_on(client.status().wait_ready())?.is_ok());
+                let timer = rt.runtime.block_on(poll_fn(|mut context| {
+                    Poll::Ready(context.as_mut().driver().driver_ref().timer())
+                }))?;
                 let mut copy = client.copy().copy_stream("COPY items FROM STDIN");
-                assert!(rt.runtime.block_on(copy.write(&[]))?.is_ok());
+                {
+                    let mut write = pin!(copy.write(&[]));
+                    let mut alarms = Vec::new();
+                    while let Ok(alarm) = timer.try_alarm() {
+                        alarms.push(alarm);
+                    }
+                    assert!(
+                        rt.runtime
+                            .block_on(poll_fn(|context| {
+                                // SAFETY: the pinned operation remains owned here, and Ready
+                                // ends this closure's polling authority.
+                                unsafe { Live::new(write.as_mut()) }.poll(context)
+                            }))?
+                            .is_ok()
+                    );
+                    let _alarm = timer.try_alarm().expect("completed COPY write timer");
+                }
                 let notice = rt
                     .runtime
                     .block_on(client.notify().next())?
@@ -51,7 +111,23 @@ fn finish_with_full_request_pool() {
                         .block_on(client.unchecked().command("SELECT 1"))?,
                     Err(reply::Error::Driver(cartel_pg::Error::RequestCapacity))
                 ));
-                assert!(rt.runtime.block_on(copy.finish())?.is_ok());
+                {
+                    let mut finish = pin!(copy.finish());
+                    let mut alarms = Vec::new();
+                    while let Ok(alarm) = timer.try_alarm() {
+                        alarms.push(alarm);
+                    }
+                    assert!(
+                        rt.runtime
+                            .block_on(poll_fn(|context| {
+                                // SAFETY: the pinned operation remains owned here, and Ready
+                                // ends this closure's polling authority.
+                                unsafe { Live::new(finish.as_mut()) }.poll(context)
+                            }))?
+                            .is_ok()
+                    );
+                    let _alarm = timer.try_alarm().expect("completed COPY finish timer");
+                }
                 let [reuse, held @ ..] = held;
                 assert!(rt.runtime.block_on(reuse)?.is_ok());
                 drop(held);

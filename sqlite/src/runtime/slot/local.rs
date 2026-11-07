@@ -1,6 +1,6 @@
 use crate::api::{batches, stmt, work};
 use crate::retry;
-use crate::runtime::slot::{Held, Opening, lease::Lease};
+use crate::runtime::slot::{Opening, lease::Lease};
 use crate::runtime::{self, Error, heap};
 use crate::{catalogs, config, sys};
 use heap::scopes::Scope;
@@ -108,44 +108,21 @@ pub(crate) struct Vacant<'slot, 'd, I: catalogs::Catalog> {
 }
 
 impl<'slot, 'd, I: catalogs::Catalog> Vacant<'slot, 'd, I> {
-    pub(super) fn insert(self, value: crate::sys::Connection) -> Occupied<'slot, 'd, I> {
-        let Self {
-            connection: db,
-            statements: stmts,
-            arena,
-            lookaside: aside,
-            lookaside_layout: layout,
-            lease,
-        } = self;
-        let db = db.insert(value);
-        Occupied {
-            connection: db,
-            statements: stmts,
-            arena,
-            lookaside: aside,
-            lookaside_layout: layout,
-            lease,
-        }
-    }
-
     pub(crate) fn open(self, db: sys::Connection) -> Result<Opening<'slot, 'd, I>, crate::Error> {
         let config = self.lease.config();
         let work = self.lease.work();
         let guard = work.begin(config.work.open.progress)?;
         work.progress(&db, config::Budget::PROGRESS_INTERVAL);
         Ok(Opening {
-            held: Held::new(guard, self.insert(db)),
+            guard,
+            connection: self.connection.insert(db),
+            statements: self.statements,
+            arena: self.arena,
+            lookaside: self.lookaside,
+            lookaside_layout: self.lookaside_layout,
+            lease: self.lease,
         })
     }
-}
-
-pub(super) struct Occupied<'slot, 'd, I: catalogs::Catalog> {
-    pub(super) connection: &'slot crate::sys::Connection,
-    pub(super) statements: &'slot mut stmt::Storage<I>,
-    pub(super) arena: batches::Arena<'slot>,
-    pub(super) lookaside: &'slot mut runtime::raw::Span,
-    pub(super) lookaside_layout: crate::memory::Lookaside,
-    pub(super) lease: Lease<'slot, 'd, I, Open>,
 }
 
 const _: () = {

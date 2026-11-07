@@ -1,9 +1,8 @@
-use crate::api::{self, task::lease::Target};
 use crate::port::Disposition;
 use crate::port::{
     config,
     pool::{access, slot},
-    replies, requests,
+    replies,
 };
 use crate::protocol::scram;
 use cartel_core::reply::order;
@@ -35,7 +34,7 @@ impl<'d, const ID: u8> Shared<'d, ID> {
         db: crate::Config,
         config: config::Config,
         driver: driver::Reference<'d>,
-        proof: region::Proof<region::Identity<'d>>,
+        proof: region::Identity<'d>,
     ) -> Result<Self, alloc::Error> {
         let caps = config.capacities();
         let cap = config.side().primary();
@@ -51,7 +50,6 @@ impl<'d, const ID: u8> Shared<'d, ID> {
             notifications: notify::Queue::try_new(driver, items, bytes, wait, proof)?,
             signals: states::Signals {
                 cause: cell::Cell::new(None),
-                failed: cell::Cell::new(false),
                 egress: waiters::Egress::try_new(driver, cap, wait)?,
             },
             scram: scram::Runtime::try_new(cap, proof)?,
@@ -88,40 +86,6 @@ impl<'d, const ID: u8> Shared<'d, ID> {
     pub(crate) fn fail(&self, error: crate::Error) {
         self.signals.record_fatal(error);
         self.waiters().wake_all();
-    }
-
-    pub(crate) fn pick_conn(
-        &self,
-        target: Option<api::Target<'d, ID>>,
-    ) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
-        if let Some(target) = target {
-            let conn = target.connection();
-            let target = target.transaction();
-            return match self.transaction().current(conn) {
-                access::Current::Shared if target.is_none() => Some(conn),
-                access::Current::Held(current) if target == Some(current) => Some(conn),
-                access::Current::Stale
-                | access::Current::Handshaking
-                | access::Current::Shared
-                | access::Current::Reserved(_)
-                | access::Current::Held(_)
-                | access::Current::Finalizing(_)
-                | access::Current::Draining
-                | access::Current::Closing => None,
-            };
-        }
-        self.ready.pick::<false>()
-    }
-
-    pub(crate) fn pick_request(
-        &self,
-        target: Option<api::Target<'d, ID>>,
-        boundary: requests::Boundary,
-    ) -> Option<conn::Id<'d, route::KeyTag<ID>>> {
-        match (target, boundary) {
-            (None, requests::Boundary::Group) => self.ready.pick::<true>(),
-            _ => self.pick_conn(target),
-        }
     }
 
     pub(crate) fn wake_ready(&self) {

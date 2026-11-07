@@ -8,14 +8,13 @@ use std::num;
 
 use crate::{
     port::replies,
-    protocol::{runtime::tx::poll, scram},
+    protocol::scram,
     schema::{self, desc},
 };
 
 pub struct State<'a, 'd, I, const ID: u8> {
     pub(super) phase: Phase<'a, 'd, I, ID>,
-    pub(super) skip: Skip,
-    pub(super) completed: bool,
+    pub(super) progress: Progress,
     pub(super) batch: replies::Batch,
 }
 
@@ -23,8 +22,7 @@ impl<I, const ID: u8> Default for State<'_, '_, I, ID> {
     fn default() -> Self {
         Self {
             phase: Phase::NeedsStartup,
-            skip: Skip::None,
-            completed: false,
+            progress: Progress::Running,
             batch: replies::Batch::default(),
         }
     }
@@ -32,21 +30,14 @@ impl<I, const ID: u8> Default for State<'_, '_, I, ID> {
 
 #[derive(Clone, Copy, Default)]
 #[repr(u8)]
-pub(super) enum Skip {
+pub(super) enum Progress {
     #[default]
-    None,
-    Pending,
+    Running,
+    Complete,
+    Skipping,
     /// ReadyForQuery can resolve this unclassified diagnostic against the ordered command.
     /// Connection loss cannot establish its scope.
     Unknown,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct Drain {
-    pub(super) skip: Skip,
-    pub(super) completed: bool,
-    pub(super) status: poll::Status,
-    pub(super) batch: replies::Batch,
 }
 
 pub(super) enum Prepare<I> {
@@ -104,12 +95,8 @@ impl<I: schema::QuerySet> Prepare<I> {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<Skip>() == std::mem::size_of::<bool>());
-const _: () = assert!(std::mem::align_of::<Skip>() == std::mem::align_of::<bool>());
-const _: () = assert!(
-    std::mem::size_of::<Drain>()
-        == std::mem::size_of::<replies::Batch>() + std::mem::align_of::<replies::Batch>()
-);
+const _: () = assert!(std::mem::size_of::<Progress>() == std::mem::size_of::<bool>());
+const _: () = assert!(std::mem::align_of::<Progress>() == std::mem::align_of::<bool>());
 
 impl<'d, I, const ID: u8> State<'_, 'd, I, ID> {
     pub(super) fn cancel(

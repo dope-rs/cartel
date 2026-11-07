@@ -106,11 +106,7 @@ unsafe extern "C" fn open(
     output: *mut std::ffi::c_int,
 ) -> std::ffi::c_int {
     let vfs = unsafe { &*vfs.cast::<Vfs>() };
-    use heap::raw::Foreign;
-
-    let scope = Foreign::enter();
-    let code = unsafe { (vfs.open)(vfs.source, name, file, flags, output) };
-    drop(scope);
+    let code = heap::raw::foreign(|| unsafe { (vfs.open)(vfs.source, name, file, flags, output) });
     if code == libsqlite3_sys::SQLITE_OK {
         unsafe { Mapping::install(file, vfs.offset) };
     }
@@ -125,12 +121,7 @@ unsafe extern "C" fn mapping(
     output: *mut *mut std::ffi::c_void,
 ) -> std::ffi::c_int {
     let mapping = unsafe { &*(*file).pMethods.cast::<Mapping>() };
-    use heap::raw::Foreign;
-
-    let scope = Foreign::enter();
-    let code = unsafe { (mapping.map)(file, page, bytes, extend, output) };
-    drop(scope);
-    code
+    heap::raw::foreign(|| unsafe { (mapping.map)(file, page, bytes, extend, output) })
 }
 
 const _: () = {

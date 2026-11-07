@@ -76,8 +76,7 @@ impl<'local, 'd: 'local, I: catalogs::Catalog> Phase<'local, 'd, I> {
         if guard.check(Ok(())).is_err() {
             return task::Poll::Ready(Err(fault.busy()));
         }
-        retry.defer(now, fault)?;
-        retry.poll(now, wake)
+        retry.defer(now, fault, wake)
     }
 
     fn advance(mut self, now: clock::Moment<'d>, target: ready::Target<'d>) -> Next<'local, 'd, I> {

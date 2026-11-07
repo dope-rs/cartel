@@ -1,7 +1,4 @@
-use std::ops;
-
-use dope::manifold::client::session::codec::Input;
-use o3::buffer::{self, bytes::bounded, hold, hold::scope, resident, storage::range};
+use o3::buffer::{self, bytes::bounded, hold, hold::scope, resident};
 
 use crate::protocol::Wire;
 
@@ -25,18 +22,9 @@ pub struct Payload<'input, 'd, R: buffer::Cursor>(scope::Deferred<'input, 'd, R>
 
 /// Immutable retained bytes carrying their original frame's extent admission.
 #[repr(transparent)]
-pub(crate) struct Retained<'d>(resident::Shared<'d>);
+pub(crate) struct Retained<'d>(hold::Retained<'d>);
 
 impl<'input, 'd, R: buffer::Cursor> Payload<'input, 'd, R> {
-    pub(super) fn plan(
-        input: &Input<'_, 'input, 'd, R>,
-        range: ops::Range<u32>,
-    ) -> Result<Self, range::Error> {
-        input
-            .try_plan(range.start as usize..range.end as usize)
-            .map(Self)
-    }
-
     pub fn as_slice(&self) -> &'input [u8] {
         self.0.as_slice()
     }
@@ -45,7 +33,7 @@ impl<'input, 'd, R: buffer::Cursor> Payload<'input, 'd, R> {
     where
         R: hold::raw::Retain<'d>,
     {
-        // SAFETY: Retain preserves the exact immutable range selected by plan.
+        // SAFETY: Retain preserves the exact immutable range selected by the codec.
         // Its original u32 endpoints bound this view's unchanged extent.
         Wire::from_raw(unsafe { bounded::raw::Input::new(self.0.as_slice()) })
     }
@@ -76,7 +64,7 @@ impl Retained<'_> {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.0.len()
+        self.0.as_slice().len()
     }
 }
 

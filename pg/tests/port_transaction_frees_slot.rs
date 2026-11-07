@@ -429,6 +429,78 @@ fn finalizer_keeps_error() {
 }
 
 #[test]
+fn completed_query_deadline_keeps_next_transaction() {
+    peer::AcceptScript::with(common::transaction::throttled, |server| {
+        let config = config::Config::with_window(
+            Queries::try_cancel().expect("PG capacity").capacities(),
+            Positive::from_millis::<100>(),
+        )
+        .expect("response deadline");
+        let prepared = topology::try_new::<_, Env>(
+            port::Port::<Queries>::plan(
+                Queries::try_config().expect("database config"),
+                config,
+            ),
+            server.addr(),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+        )
+        .expect("transaction topology");
+        let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+        let mut report = Completion::new();
+        prepared.with_local(
+            |worker| {
+                worker.lend(|node, stage| {
+                    node.install(stage, |host, stage| {
+                        stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+                            let client = runtime.root_client();
+                            assert!(matches!(
+                                runtime.block_on(client.status().wait_ready()),
+                                Ok(Ok(()))
+                            ));
+                            let mut old =
+                                pin!(Task::new(client.unchecked().command("SELECT 1")));
+                            assert!(
+                                runtime
+                                    .block_on(fibers::TEST.poll_once(old.as_mut()))
+                                    .expect("query admission driver")
+                                    .is_none()
+                            );
+                            let next = runtime
+                                .block_on(client.transaction().begin())
+                                .expect("begin driver")
+                                .ok()
+                                .expect("transaction after old ReadyForQuery");
+                            fibers::TEST
+                                .try_pause(&mut runtime, Duration::from_millis(150))
+                                .expect("old response deadline");
+                            assert!(matches!(
+                                runtime.block_on(old.as_mut()),
+                                Ok(Err(reply::Error::Driver(cartel_pg::Error::RequestTimeout(timeout))))
+                                    if timeout.phase() == cartel_pg::RequestPhase::Response
+                            ));
+                            assert!(
+                                matches!(runtime.block_on(next.commit()), Ok(Ok(()))),
+                                "the completed old query must not close the next transaction"
+                            );
+                            assert!(matches!(
+                                runtime.block_on(client.unchecked().command("SELECT 1")),
+                                Ok(Ok(()))
+                            ));
+                        })
+                    })
+                })
+            },
+            recovery::Policy::new(|event| reports.push(event), common::recover),
+            |result| assert!(matches!(result, Ok(Ok(Ok(())))), "transaction scope"),
+        );
+        assert!(reports.events().expect("reclamation").is_empty());
+        assert!(matches!(server.finish(), Ok(Ok(()))), "transaction peer");
+    })
+    .expect("spawn transaction peer");
+}
+
+#[test]
 fn retains_next_owner() {
     peer::AcceptScript::with(
         |listener| {

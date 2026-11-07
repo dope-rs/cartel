@@ -26,11 +26,11 @@ struct Delivery<'slot, 'd, I: catalogs::Catalog>(
 );
 
 impl<'slot, 'd, I: catalogs::Catalog, P> Lease<'slot, 'd, I, P> {
-    pub(super) const fn config(&self) -> &'slot config::Config {
+    pub(super) fn config(&self) -> &'slot config::Config {
         self.inner.item().retry.config()
     }
 
-    pub(super) const fn work(&self) -> &'slot work::Work {
+    pub(super) fn work(&self) -> &'slot work::Work {
         self.inner.item().work
     }
 }
@@ -61,7 +61,7 @@ impl<'slot, 'd, I: catalogs::Catalog> Lease<'slot, 'd, I, Open> {
     }
 
     pub(super) fn ready(mut self) -> Lease<'slot, 'd, I, Ready> {
-        self.inner.item_mut().retry.open().finish();
+        self.inner.item_mut().retry.finish();
         Lease {
             inner: self.inner,
             phase: marker::PhantomData,
@@ -70,12 +70,8 @@ impl<'slot, 'd, I: catalogs::Catalog> Lease<'slot, 'd, I, Open> {
 }
 
 impl<'d, I: catalogs::Catalog> Lease<'_, 'd, I, Ready> {
-    pub(super) fn cleanup(&mut self) -> lease::Lease<'_, 'd, lease::Cleanup> {
-        self.inner.item_mut().retry.cleanup()
-    }
-
-    pub(super) const fn cleanup_ref(&self) -> &retry::Slot<'d> {
-        self.inner.item().retry.slot()
+    pub(super) fn call(&mut self) -> retry::raw::Loan<'_, 'd> {
+        self.inner.item_mut().retry.reborrow()
     }
 }
 
@@ -91,7 +87,7 @@ impl<'slot, 'd, I: catalogs::Catalog> mem::Return for Delivery<'slot, 'd, I> {
         } = item;
         retry.finish();
         // SAFETY: this pointer targets the pinned local slot for `'slot`.
-        // Held drops every borrower before this Lease, and the owning Scope
+        // The slot drops every borrower before this Lease, and the owning Scope
         // stays active until its statements and connection have been released.
         unsafe { conn.as_mut() }.finish();
         if let Some(errors) = work.take_errors() {

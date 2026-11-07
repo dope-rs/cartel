@@ -5,6 +5,7 @@ use dope::{
     manifold::client::{close, conn},
 };
 use o3::base::num::bounded;
+use o3::depot;
 
 use crate::{
     port::{
@@ -195,6 +196,21 @@ impl<'a, 'd, const ID: u8> Permit<'a, 'd, ID> {
 }
 
 impl<'a, 'd, const ID: u8> Ready<'a, 'd, ID> {
+    pub(crate) fn listed(listed: &protocol::runtime::ready::Listed<'a, 'd, ID>) -> Self {
+        Self {
+            slot: listed.slot(),
+        }
+    }
+
+    pub(crate) fn reserved(proof: &access::Reservation<'a, 'd, ID>) -> Self {
+        Self { slot: proof.slot }
+    }
+
+    pub(crate) fn connection(&self) -> conn::Id<'d, KeyTag<ID>> {
+        // SAFETY: every Ready constructor retains its original initialized binding.
+        phases::State::bound(unsafe { depot::raw::Proof::new(self.slot) }).token
+    }
+
     pub(crate) fn try_reply(
         self,
         boundary: requests::Boundary,
@@ -251,9 +267,7 @@ impl<'d, const ID: u8> Slot<'d, ID> {
         if !matches!(self.phase.get(), Phase::Vacant) {
             return Bind::Occupied;
         }
-        self.sync.set(Sync::Synced);
         self.batch.set(replies::Batch::INITIAL);
-        self.pending.set(Pending::exact::<0>());
         self.phase.set(Phase::Handshaking(Bound { token, ready }));
         Bind::Bound
     }
@@ -295,10 +309,28 @@ impl<'d, const ID: u8> Slot<'d, ID> {
         }
     }
 
+    pub(crate) fn select(
+        &self,
+        token: conn::Id<'d, KeyTag<ID>>,
+        generation: Option<access::Generation>,
+    ) -> Option<Ready<'_, 'd, ID>> {
+        let Phase::Ready { bound, access } = self.phase.get() else {
+            return None;
+        };
+        if bound.token != token {
+            return None;
+        }
+        match (access, generation) {
+            (access::State::Shared(_), None) => Some(Ready { slot: self }),
+            (access::State::Held(current), Some(generation)) if current == generation => {
+                Some(Ready { slot: self })
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn barriers(&self) -> usize {
-        let open = matches!(self.phase.get(), Phase::Ready { .. })
-            && matches!(self.sync.get(), Sync::Automatic(_) | Sync::Explicit(_));
-        self.pending.get().into_usize() + usize::from(open)
+        self.pending.get().into_usize() + usize::from(!self.is_synced())
     }
 
     pub(crate) fn settle(&self, token: conn::Id<'d, KeyTag<ID>>) -> Settle {
@@ -383,6 +415,7 @@ impl<'d, const ID: u8> Slot<'d, ID> {
             }
             _ => return None,
         };
+        self.sync.set(Sync::Synced);
         self.pending.set(Pending::exact::<0>());
         self.pid.set(None);
         self.key.set(key::Key::empty());

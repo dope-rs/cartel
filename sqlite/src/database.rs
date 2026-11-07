@@ -1,5 +1,4 @@
-use crate::{catalogs, config, open, options, runtime, sys};
-use dope_runtime::topology;
+use crate::{options, runtime, sys};
 use std::{mem, time};
 
 #[derive(Debug)]
@@ -55,11 +54,9 @@ pub enum Error {
 pub enum Operation {
     Open,
     Call,
-    Cleanup,
 }
 
 pub struct Target<'sql> {
-    runtime: runtime::Runtime,
     location: Location,
     options: options::OpenOptions,
     commands: sys::Commands<'sql>,
@@ -92,12 +89,11 @@ impl Location {
 
 impl<'sql> Target<'sql> {
     pub(crate) fn new(
-        runtime: runtime::Runtime,
+        _: runtime::Runtime,
         location: Location,
         options: options::OpenOptions,
     ) -> Self {
         Self {
-            runtime,
             location,
             options,
             commands: sys::Commands::EMPTY,
@@ -110,20 +106,6 @@ impl<'sql> Target<'sql> {
     pub fn commands(mut self, sql: &'sql [&'sql str]) -> Result<Self, crate::Error> {
         self.commands = sys::Commands::try_new(sql)?;
         Ok(self)
-    }
-
-    pub fn plan<I: catalogs::Catalog>(
-        self,
-        limits: crate::Limits,
-        memory: crate::Memory,
-    ) -> Result<topology::Plan<runtime::Layout<'sql, I>, open::Plan<I>>, Error> {
-        catalogs::validate::<I>().map_err(Error::Catalog)?;
-        let config = config::Config::from_parts(limits, memory)?;
-        let runtime = self.runtime;
-        let layout = runtime
-            .layout(config, memory, self)
-            .map_err(Error::Runtime)?;
-        Ok(topology::Plan::new(layout, open::Plan::new()))
     }
 
     pub(crate) const fn sql_bytes(&self) -> usize {

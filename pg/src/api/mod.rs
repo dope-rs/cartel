@@ -18,7 +18,7 @@ use cartel_core::reply::{
 use dope::manifold::client::conn;
 use dope_fiber::wait;
 use o3::{depot::capacity, mem::credit::fair};
-use std::mem;
+use std::{marker, mem};
 
 use request::Pending;
 use task::lease;
@@ -26,48 +26,45 @@ use task::lease;
 /// Exact owner-bound destination of one request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target<'d, const ID: u8> {
-    identity: Identity<'d, ID>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Identity<'d, const ID: u8> {
-    Connection(conn::Id<'d, KeyTag<ID>>),
-    Transaction(access::Transaction<'d, ID>),
+    conn: conn::Id<'d, KeyTag<ID>>,
+    generation: Option<access::Generation>,
 }
 
 impl<'d, const ID: u8> Target<'d, ID> {
     pub(crate) const fn new(conn: conn::Id<'d, KeyTag<ID>>) -> Self {
         Self {
-            identity: Identity::Connection(conn),
+            conn,
+            generation: None,
         }
     }
 
     pub(crate) const fn from_tx(tx: access::Transaction<'d, ID>) -> Self {
         Self {
-            identity: Identity::Transaction(tx),
+            conn: tx.conn,
+            generation: Some(tx.generation),
         }
     }
 
     pub(crate) const fn transaction(self) -> Option<access::Transaction<'d, ID>> {
-        match self.identity {
-            Identity::Connection(_) => None,
-            Identity::Transaction(tx) => Some(tx),
+        match self.generation {
+            Some(generation) => Some(access::Transaction {
+                conn: self.conn,
+                generation,
+            }),
+            None => None,
         }
     }
 }
 
 impl<'d, const ID: u8> lease::Target<'d, ID> for Target<'d, ID> {
     fn connection(self) -> conn::Id<'d, KeyTag<ID>> {
-        match self.identity {
-            Identity::Connection(conn) => conn,
-            Identity::Transaction(tx) => tx.conn,
-        }
+        self.conn
     }
 
     fn current(self, tx: &Access<'_, 'd, ID>) -> Option<conn::Id<'d, KeyTag<ID>>> {
-        match self.identity {
-            Identity::Connection(conn) => Some(conn),
-            Identity::Transaction(target) => lease::Target::current(target, tx),
+        match self.transaction() {
+            Some(target) => lease::Target::current(target, tx),
+            None => Some(self.conn),
         }
     }
 }
@@ -82,8 +79,6 @@ pub mod traits;
 pub mod tx;
 
 pub use client::Client;
-
-use task::tx::Held;
 
 type Response<'app, 'g, 'r, 's, 'b, 'c, 'd, X> = recv::Response<
     'app,
@@ -169,8 +164,8 @@ impl<'app, 'b, 'c: 'b, 'd: 'c, const ID: u8>
         _: &Self::Context,
         slot: &mut Slot<'_, 'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>,
     ) -> Option<Self::Output> {
-        match slot.try_lease() {
-            Ok(Some(item)) => return Some(Ok(replies::Payload::from_lease(item))),
+        match slot.try_node() {
+            Ok(Some(item)) => return Some(Ok(replies::Payload::from_node(item))),
             Ok(None) => {}
             Err(error) => return Some(Err(crate::Error::ResponseRetain(error).into())),
         }
@@ -181,30 +176,31 @@ impl<'app, 'b, 'c: 'b, 'd: 'c, const ID: u8>
     }
 }
 
-pub(super) struct ExtractFirst<const ID: u8 = 0>;
+pub(super) struct ExtractFirst<M, const ID: u8 = 0>(marker::PhantomData<M>);
 
-impl<'app, 'b, 'c: 'b, 'd: 'c, const ID: u8>
+impl<'app, 'b, 'c: 'b, 'd: 'c, M, T, const ID: u8>
     recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>
-    for ExtractFirst<ID>
+    for ExtractFirst<M, ID>
+where
+    M: Unpin + Fn(Result<Option<replies::Payload<'b, 'c, 'd>>, reply::Error<'d, ID>>) -> T,
 {
-    type Output = Result<Option<replies::Payload<'b, 'c, 'd>>, reply::Error<'d, ID>>;
+    type Output = T;
 
-    const ACCEPTANCE: recv::Acceptance = recv::Acceptance::Collected;
+    const ACCEPTANCE: recv::Acceptance = recv::Acceptance::First;
 
-    type Context = ();
+    type Context = M;
 
     fn extract(
-        _: &Self::Context,
+        map: &Self::Context,
         slot: &mut Slot<'_, 'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>,
     ) -> Option<Self::Output> {
-        match slot.terminal()? {
-            Terminal::Failed(failure) => Some(Err(failure.into_error().into_error())),
-            Terminal::Complete(mut done) => Some(
-                done.try_lease()
-                    .map(|payload| payload.map(replies::Payload::from_lease))
-                    .map_err(|error| crate::Error::ResponseRetain(error).into()),
-            ),
-        }
+        Some(map(match slot.terminal()? {
+            Terminal::Failed(failure) => Err(failure.into_error().into_error()),
+            Terminal::Complete(mut done) => done
+                .try_node()
+                .map(|payload| payload.map(replies::Payload::from_node))
+                .map_err(|error| crate::Error::ResponseRetain(error).into()),
+        }))
     }
 }
 
@@ -214,7 +210,7 @@ pub(in crate::api) trait Sync {
 
 impl<const ID: u8> Sync for ExtractAll<ID> {}
 impl<const ID: u8> Sync for ExtractUnit<ID> {}
-impl<const ID: u8> Sync for ExtractFirst<ID> {}
+impl<M, const ID: u8> Sync for ExtractFirst<M, ID> {}
 
 impl<const ID: u8> Sync for ExtractOne<ID> {
     const BOUNDARY: Boundary = Boundary::Open;
@@ -226,8 +222,7 @@ pub(in crate::api) enum Boundary {
     Open,
 }
 
-pub(super) struct Throttle<'d, const ID: u8, S = ()> {
-    request: Pending<'d, S>,
+pub(super) struct Throttle<'d, const ID: u8> {
     conn: conn::Id<'d, KeyTag<ID>>,
     cause: Pressure,
 }
@@ -245,11 +240,10 @@ pub(super) enum Pressure {
     },
 }
 
-impl<'d, const ID: u8, S> Throttle<'d, ID, S> {
+impl<'d, const ID: u8> Throttle<'d, ID> {
     pub(in crate::api) fn new(
         conn: conn::Id<'d, KeyTag<ID>>,
         error: crate::Error,
-        request: Pending<'d, S>,
     ) -> Result<Self, crate::Error> {
         let cause = match error {
             crate::Error::Reply(attach::Error::Full { len, capacity }) => {
@@ -271,11 +265,7 @@ impl<'d, const ID: u8, S> Throttle<'d, ID, S> {
             },
             error => return Err(error),
         };
-        Ok(Self {
-            request,
-            conn,
-            cause,
-        })
+        Ok(Self { conn, cause })
     }
 
     fn fail(self, error: wait::Error<'d>) -> reply::Error<'d, ID> {
@@ -283,23 +273,6 @@ impl<'d, const ID: u8, S> Throttle<'d, ID, S> {
             conn: self.conn,
             cause: self.cause.attach(),
             error,
-        }
-    }
-
-    fn release(self) -> Throttle<'d, ID> {
-        let Self {
-            request,
-            conn,
-            cause,
-        } = self;
-        Throttle {
-            request: Pending {
-                frame: request.frame,
-                boundary: request.boundary,
-                state: (),
-            },
-            conn,
-            cause,
         }
     }
 }
@@ -333,41 +306,13 @@ const _: () = {
     );
 };
 
-enum TxOutcome<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8>
-where
-    I: schema::QuerySet + 'd,
-{
-    Enqueued {
-        lease: Held<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-    },
-    Throttled {
-        throttle: Throttle<'d, ID>,
-    },
-    NoConn {
-        request: Pending<'d>,
-    },
-    Failed(reply::Error<'d, ID>),
-}
-
-enum TxRetry<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8>
-where
-    I: schema::QuerySet + 'd,
-{
-    Waiting(Pending<'d>),
-    Enqueued {
-        lease: Held<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-    },
-    Failed(reply::Error<'d, ID>),
-}
-
 const _: () = assert!(
     mem::size_of::<Target<'static, 0>>() == mem::size_of::<access::Transaction<'static, 0>>()
 );
 const _: () = assert!(
     mem::align_of::<Target<'static, 0>>() == mem::align_of::<access::Transaction<'static, 0>>()
 );
-const _: () = assert!(
-    mem::size_of::<Option<Target<'static, 0>>>() == mem::size_of::<(Target<'static, 0>, u8)>()
-);
+const _: () =
+    assert!(mem::size_of::<Option<Target<'static, 0>>>() == mem::size_of::<Target<'static, 0>>());
 const _: () = assert!(mem::size_of::<Boundary>() == mem::size_of::<bool>());
 const _: () = assert!(mem::align_of::<Boundary>() == mem::align_of::<bool>());

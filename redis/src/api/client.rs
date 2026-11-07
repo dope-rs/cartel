@@ -12,6 +12,7 @@ use dope_fiber::abi::Fiber;
 pub trait Client<'d, const ID: u8 = 0>: Storage + Copy {
     type Call<D: Decode<Self>>: Fiber<'d, Output = Result<D::Output, Self::Error>>;
     type Connection: Connection<'d, ID, Error = Self::Error, Bytes = Self::Bytes>;
+    type Reserved: scripts::Reserved<'d, Self, ID>;
 
     fn basic(self) -> strings::Basic<Self, ID> {
         strings::Basic(self)
@@ -65,6 +66,12 @@ pub trait Client<'d, const ID: u8 = 0>: Storage + Copy {
     fn wait_active(self) -> impl Fiber<'d, Output = Result<(), Self::DriverError>>;
 
     #[doc(hidden)]
+    fn try_reserve_bulk(
+        self,
+        required: std::num::NonZero<usize>,
+    ) -> Result<impl Fiber<'d, Output = Result<Self::Reserved, Self::DriverError>>, request::Error>;
+
+    #[doc(hidden)]
     fn encode<D: Decode<Self>>(
         self,
         encode: impl FnOnce(encode::Encoder) -> Result<encode::Complete, request::Error>,
@@ -74,6 +81,6 @@ pub trait Client<'d, const ID: u8 = 0>: Storage + Copy {
     fn encode_sized<D: Decode<Self>>(
         self,
         len: Result<encode::Length, request::Error>,
-        encode: impl FnOnce(encode::Writer) -> Result<encode::Complete, request::Error>,
+        encode: impl FnOnce(&mut encode::Writer) -> Result<(), request::Error>,
     ) -> Self::Call<D>;
 }

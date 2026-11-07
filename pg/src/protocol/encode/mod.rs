@@ -69,14 +69,14 @@ pub(crate) struct Writer<'a>(write::Spare<'a>);
 impl Writer<'_> {
     /// Commits initialized partial writes before the frame's secret clearing.
     pub(crate) fn encode<T>(
-        mut cursor: pool::Cursor,
+        mut span: pool::Span,
         kind: frame::Sensitivity,
         write: impl FnOnce(&mut Writer<'_>) -> Result<T, Error>,
     ) -> Result<(frame::Buffer, T), Error> {
-        let mut writer = Writer(cursor.spare());
+        let mut writer = Writer(span.spare());
         let result = write(&mut writer);
         writer.0.commit();
-        let frame = frame::Buffer::new(cursor, kind);
+        let frame = frame::Buffer::new(span, kind);
         Ok((frame, result?))
     }
 

@@ -141,7 +141,7 @@ pub struct Port<'s, 'storage, 'b, 'c, 'd, const ID: u8 = 0> {
     pub(super) deadline: deadline::Source<'d>,
     pub(super) limits: Limits,
     pub(super) parser: &'s storage::Storage<'d>,
-    requests: requests::Requests,
+    pub(super) requests: requests::Requests,
 }
 
 impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Port<'s, 'storage, 'b, 'c, 'd, ID> {
@@ -252,9 +252,15 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Port<'s, 'storage, 'b, 'c, 'd, ID> 
     pub(super) fn encode_sized(
         &self,
         length: encode::Length,
-        encode: impl FnOnce(encode::Writer) -> Result<encode::Complete, request::Error>,
+        encode: impl FnOnce(&mut encode::Writer) -> Result<(), request::Error>,
     ) -> Result<encode::Complete, request::Error> {
-        encode(self.requests.sized(length)?)
+        encode::Complete::encode(self.requests.sized(length)?, encode)
+            .inspect_err(|_| self.activity.wake_send())
+    }
+
+    pub(super) fn discard<T>(&self, value: T) {
+        drop(value);
+        self.activity.wake_send();
     }
 }
 

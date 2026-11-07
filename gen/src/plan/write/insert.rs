@@ -11,22 +11,6 @@ use crate::ext::SqlIdent as _;
 use crate::plan::write::reply::Op;
 use crate::plan::write::{Conflict, reply};
 
-pub(in crate::plan) struct From<'a> {
-    pub(in crate::plan) table: &'a syn::Path,
-    pub(in crate::plan) source: Source<'a>,
-    pub(in crate::plan) target: &'a syn::Ident,
-    pub(in crate::plan) body: &'a syn::Expr,
-    pub(in crate::plan) returning: shape::Returning,
-    pub(in crate::plan) conflict: &'a shape::Conflict,
-}
-
-pub(in crate::plan) struct Source<'a> {
-    pub(in crate::plan) query: &'a shape::QuerySource,
-    pub(in crate::plan) pred_idents: &'a [syn::Ident],
-    pub(in crate::plan) predicate: &'a syn::Expr,
-    pub(in crate::plan) idents: &'a [syn::Ident],
-}
-
 #[derive(Clone, Copy)]
 enum Kind {
     Single,
@@ -116,22 +100,19 @@ fn insert(
 
 pub(in crate::plan) fn from(
     state: &mut plan::State<'_>,
-    input: From<'_>,
+    input: &shape::mutation::From,
+    ret: shape::Returning,
+    conflict: &shape::Conflict,
 ) -> syn::Result<emit::Plan> {
-    let From {
+    let shape::mutation::From {
         table,
-        source,
-        target,
-        body,
-        returning: ret,
-        conflict,
-    } = input;
-    let Source {
-        query,
+        source: query,
         pred_idents: preds,
         predicate: pred,
-        idents,
-    } = source;
+        target,
+        source_idents: idents,
+        body,
+    } = input;
     let output = reply::validate(state, Op::Insert, ret, table)?;
 
     let scope = pred::RowScope::for_source(query, idents)?;

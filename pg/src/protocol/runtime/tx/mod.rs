@@ -1,5 +1,11 @@
 use crate::port::Disposition;
-use crate::port::{pool::access, replies};
+use crate::{
+    port::{
+        pool::{access, slot},
+        replies,
+    },
+    protocol::runtime::ready,
+};
 use dope::core::driver::route;
 use dope::manifold::client::conn;
 use dope_fiber::context;
@@ -29,11 +35,12 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
 
     pub(crate) fn reserve(
         &self,
-        slot: conn::Id<'d, route::KeyTag<ID>>,
-        load: usize,
-    ) -> access::Reserve<'a, 'd, ID> {
-        let state = self.shared.ready.reserve(slot);
-        if matches!(state, access::Reserve::Exhausted) && load == 0 {
+        listed: ready::Listed<'a, 'd, ID>,
+        load: impl FnOnce(conn::Id<'d, route::KeyTag<ID>>) -> Option<usize>,
+    ) -> Option<ready::Reservation<'a, 'd, ID>> {
+        let slot = slot::Ready::listed(&listed).connection();
+        let state = listed.reserve();
+        if state.is_none() && load(slot) == Some(0) {
             self.shared.wake_close(
                 slot,
                 replies::Failure::from_error(crate::Error::Closed),
@@ -43,13 +50,8 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
         state
     }
 
-    pub(crate) fn release(&self, proof: access::Reservation<'_, 'd, ID>, load: usize) {
-        let id = proof.id();
-        match self.shared.ready.release(proof, load) {
-            access::Release::Released => {}
-            access::Release::Stale => return,
-        }
-        self.shared.wake_tx(id);
+    pub(crate) fn release(&self, proof: ready::Reservation<'_, 'd, ID>) {
+        self.shared.wake_tx(proof.release());
     }
 
     #[inline]

@@ -8,7 +8,7 @@ pub(crate) use controls::Controls;
 use guard::open;
 pub(crate) use progress::Progress;
 use std::{marker, mem, ptr, result};
-use stmt::access::Access;
+use stmt::access::{Access, Authority};
 use work::guard;
 
 pub(crate) mod access;
@@ -30,8 +30,9 @@ pub(crate) enum Inventory {
 }
 
 pub(crate) struct Engine<'connection, I: catalogs::Catalog> {
-    statements: Set<'connection, I>,
+    slots: &'connection mut [Slot<'connection>],
     connection: &'connection crate::sys::Connection,
+    marker: marker::PhantomData<I>,
 }
 
 impl<'connection, I: catalogs::Catalog> Engine<'connection, I> {
@@ -40,19 +41,42 @@ impl<'connection, I: catalogs::Catalog> Engine<'connection, I> {
     }
 
     pub(crate) fn controls(&mut self) -> Controls<'_, 'connection> {
-        Controls::new(&mut self.statements)
+        Controls::new(self)
     }
 
-    pub(crate) fn retire(self) -> Retirement<'connection> {
-        self.statements.retire()
+    pub(crate) fn retire(mut self) -> Retirement<'connection> {
+        Retirement {
+            slots: mem::take(&mut self.slots),
+        }
+    }
+
+    fn lease<Q: catalogs::TypedQuery>(
+        &mut self,
+        key: catalogs::Statement<I, Q>,
+    ) -> &mut Prepared<'connection>
+    where
+        I: catalogs::HasQuery<Q>,
+    {
+        let slot = key.slot();
+        let index = config::CONTROL_STATEMENT_ITEMS + slot;
+        // SAFETY: admission binds this key to I, and this completed owner retains
+        // every initialized control and catalog slot until consuming retirement.
+        unsafe {
+            self.slots
+                .get_unchecked_mut(index)
+                .as_mut_slice()
+                .get_unchecked_mut(0)
+        }
     }
 }
 
 pub(crate) struct Prepare<'connection, I: catalogs::Catalog> {
-    statements: Prefix<'connection, I>,
+    slots: &'connection mut [Slot<'connection>],
+    live: usize,
     connection: &'connection crate::sys::Connection,
     capacity: config::Capacity,
     used: usize,
+    marker: marker::PhantomData<I>,
 }
 
 impl<'connection, I: catalogs::Catalog> Prepare<'connection, I> {
@@ -65,14 +89,12 @@ impl<'connection, I: catalogs::Catalog> Prepare<'connection, I> {
         bytes: config::Capacity,
     ) -> Self {
         Self {
-            statements: Prefix {
-                slots: storage.slots(),
-                live: 0,
-                marker: marker::PhantomData,
-            },
+            slots: storage.slots(),
+            live: 0,
             connection: db,
             capacity: bytes,
             used: 0,
+            marker: marker::PhantomData,
         }
     }
 
@@ -82,11 +104,12 @@ impl<'connection, I: catalogs::Catalog> Prepare<'connection, I> {
     ) -> result::Result<Progress<Self, Engine<'connection, I>>, (Self, crate::Error)> {
         match self.insert(guard) {
             Ok(true) => {
-                // SAFETY: insertion completed the exact catalog's entire backing slice.
-                let stmts = unsafe { self.statements.finish() };
+                let slots = mem::take(&mut self.slots);
+                self.live = 0;
                 Ok(Progress::Ready(Engine {
-                    statements: stmts,
+                    slots,
                     connection: self.connection,
+                    marker: marker::PhantomData,
                 }))
             }
             Ok(false) => Ok(Progress::Pending(self)),
@@ -98,7 +121,7 @@ impl<'connection, I: catalogs::Catalog> Prepare<'connection, I> {
         &mut self,
         guard: &guard::Guard<'connection, open::Open>,
     ) -> result::Result<bool, crate::Error> {
-        let index = self.statements.live;
+        let index = self.live;
         let call = guard.call(self.connection);
         let prepare = |sql, params, columns| {
             call.check(Prepared::new(
@@ -133,85 +156,14 @@ impl<'connection, I: catalogs::Catalog> Prepare<'connection, I> {
         }
         // SAFETY: pending preparation retains its bounded initialized prefix and
         // the next empty slot; completion consumes it before another insertion.
-        let slot = unsafe { self.statements.slots.get_unchecked_mut(index) };
+        let slot = unsafe { self.slots.get_unchecked_mut(index) };
         *slot = Some(stmt);
         self.used = required;
-        self.statements.live = index + 1;
-        Ok(self.statements.live == self.statements.slots.len())
+        self.live = index + 1;
+        Ok(self.live == self.slots.len())
     }
 
     pub(crate) fn retire_one(&mut self) -> Inventory {
-        self.statements.retire_one()
-    }
-}
-
-struct Set<'connection, I: catalogs::Catalog> {
-    slots: &'connection mut [Slot<'connection>],
-    marker: marker::PhantomData<I>,
-}
-
-struct Prefix<'connection, I: catalogs::Catalog> {
-    slots: &'connection mut [Slot<'connection>],
-    live: usize,
-    marker: marker::PhantomData<I>,
-}
-
-/// Consumed catalog ownership; no statement can be queried after this transition.
-pub(crate) struct Retirement<'connection> {
-    slots: &'connection mut [Slot<'connection>],
-}
-
-pub(super) type Slot<'connection> = Option<Prepared<'connection>>;
-
-impl<'connection, I: catalogs::Catalog> Set<'connection, I> {
-    fn lease<Q: catalogs::TypedQuery>(
-        &mut self,
-        key: catalogs::Statement<I, Q>,
-    ) -> &mut Prepared<'connection>
-    where
-        I: catalogs::HasQuery<Q>,
-    {
-        let slot = key.slot();
-        let index = config::CONTROL_STATEMENT_ITEMS + slot;
-        // SAFETY: admission binds this key to I, and this completed owner retains
-        // every initialized control and catalog slot until consuming retirement.
-        unsafe {
-            self.slots
-                .get_unchecked_mut(index)
-                .as_mut_slice()
-                .get_unchecked_mut(0)
-        }
-    }
-
-    fn retire(mut self) -> Retirement<'connection> {
-        Retirement {
-            slots: mem::take(&mut self.slots),
-        }
-    }
-}
-
-impl<I: catalogs::Catalog> Drop for Set<'_, I> {
-    fn drop(&mut self) {
-        Retirement {
-            slots: mem::take(&mut self.slots),
-        }
-        .retire_all();
-    }
-}
-
-impl<'connection, I: catalogs::Catalog> Prefix<'connection, I> {
-    /// # Safety
-    /// Every slot in this exact retained backing has been initialized.
-    unsafe fn finish(mut self) -> Set<'connection, I> {
-        let slots = mem::take(&mut self.slots);
-        self.live = 0;
-        Set {
-            slots,
-            marker: marker::PhantomData,
-        }
-    }
-
-    fn retire_one(&mut self) -> Inventory {
         // SAFETY: preparation advances only this backing's exact initialized prefix.
         let live = unsafe { self.slots.get_unchecked_mut(..self.live) };
         let Some((slot, rest)) = live.split_last_mut() else {
@@ -226,7 +178,23 @@ impl<'connection, I: catalogs::Catalog> Prefix<'connection, I> {
     }
 }
 
-impl<I: catalogs::Catalog> Drop for Prefix<'_, I> {
+/// Consumed catalog ownership; no statement can be queried after this transition.
+pub(crate) struct Retirement<'connection> {
+    slots: &'connection mut [Slot<'connection>],
+}
+
+pub(super) type Slot<'connection> = Option<Prepared<'connection>>;
+
+impl<I: catalogs::Catalog> Drop for Engine<'_, I> {
+    fn drop(&mut self) {
+        Retirement {
+            slots: mem::take(&mut self.slots),
+        }
+        .retire_all();
+    }
+}
+
+impl<I: catalogs::Catalog> Drop for Prepare<'_, I> {
     fn drop(&mut self) {
         let slots = mem::take(&mut self.slots);
         // SAFETY: this owner retains precisely its initialized prefix and backing.
@@ -273,9 +241,7 @@ pub(crate) fn bytes(items: usize) -> Option<usize> {
 
 const _: () = {
     let word = mem::size_of::<usize>();
-    assert!(mem::size_of::<Set<'static, catalogs::Empty>>() == 2 * word);
     assert!(mem::size_of::<Engine<'static, catalogs::Empty>>() == 3 * word);
-    assert!(mem::size_of::<Prefix<'static, catalogs::Empty>>() == 3 * word);
     assert!(mem::size_of::<Prepare<'static, catalogs::Empty>>() == 6 * word);
     assert!(mem::size_of::<Retirement<'static>>() == 2 * word);
     assert!(mem::size_of::<Slot<'static>>() == 3 * word);
@@ -299,6 +265,11 @@ impl<'connection> Prepared<'connection> {
         // SAFETY: this prepared owner retains its live statement and original database.
         unsafe { sys::statement_tx(self.statement) }
     }
+
+    pub(in crate::engine::api) const fn work(&self) -> &'connection work::Work {
+        self.work
+    }
+
     pub(crate) fn new(
         db: &'connection crate::sys::Connection,
         work: &'connection work::Work,
@@ -385,7 +356,9 @@ impl<'connection> Prepared<'connection> {
         txn: exec::Tx<'_>,
     ) -> result::Result<(), crate::Error> {
         let code = unsafe { libsqlite3_sys::sqlite3_reset(self.statement.as_ptr()) };
-        self.clear();
+        if matches!(A::AUTHORIZATION, Authority::Plain) {
+            self.clear();
+        }
         if code == libsqlite3_sys::SQLITE_OK {
             Ok(())
         } else {

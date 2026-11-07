@@ -2,10 +2,7 @@
 
 use std::{mem::MaybeUninit, slice};
 
-use o3::{
-    buffer::storage,
-    depot::arena::pool::{self, recycle},
-};
+use o3::{buffer::storage, depot::arena::pool};
 
 use crate::api::results::group::{self, Diagnostic, Position};
 
@@ -103,7 +100,7 @@ pub struct Ledger<'r, 's> {
 }
 
 pub(crate) struct Retained<'r, 's> {
-    pub(crate) records: pool::Unique<'r, Records<'s>, recycle::Header<Records<'s>>>,
+    pub(crate) records: pool::Unique<'r, Records<'s>>,
     pub(crate) bytes: storage::Shared,
 }
 

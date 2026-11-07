@@ -255,10 +255,6 @@ pub(crate) enum ErrorRoute<'input, 'd, R: buffer::Cursor> {
     },
 }
 
-fn row_usage(bytes: usize) -> usage::Usage {
-    usage::Usage::new(usage::Bytes::new(bytes), usage::Values::new(1))
-}
-
 pub(crate) struct RowPlan<'input, 'd, R: buffer::Cursor> {
     payload: frame::Payload<'input, 'd, R>,
 }
@@ -284,8 +280,8 @@ impl<'input, 'd, R: buffer::Cursor> RowPlan<'input, 'd, R> {
 impl<'d, R: buffer::Cursor + hold::raw::Retain<'d>> usage::Build<Row<'d>> for RowPlan<'_, 'd, R> {
     type Error = hold::Error;
 
-    fn usage(&self) -> usage::Usage {
-        row_usage(self.payload.as_slice().len())
+    fn usage(&self) -> usage::Bytes {
+        usage::Bytes::new(self.payload.as_slice().len())
     }
 
     fn try_build(self) -> Result<Row<'d>, (Self, Self::Error)> {
@@ -298,11 +294,11 @@ impl<'d, R: buffer::Cursor + hold::raw::Retain<'d>> usage::Build<Row<'d>> for Ro
 }
 
 #[doc(hidden)]
-pub struct Payload<'b, 'c, 'd>(retain::Lease<'b, 'c, 'd, Row<'d>>);
+pub struct Payload<'b, 'c, 'd>(retain::Node<'b, 'c, 'd, Row<'d>>);
 
 impl<'b, 'c, 'd> Payload<'b, 'c, 'd> {
-    pub(crate) const fn from_lease(lease: retain::Lease<'b, 'c, 'd, Row<'d>>) -> Self {
-        Self(lease)
+    pub(crate) const fn from_node(node: retain::Node<'b, 'c, 'd, Row<'d>>) -> Self {
+        Self(node)
     }
 }
 
@@ -325,15 +321,22 @@ impl<'d> ReplyFailure<'d> {
 }
 
 impl usage::Footprint for Row<'_> {
-    fn footprint(&self) -> usage::Usage {
-        row_usage(self.0.len())
+    type Amount = usage::Bytes;
+
+    fn footprint(&self) -> usage::Bytes {
+        usage::Bytes::new(self.0.len())
     }
 }
 
 impl usage::Footprint for ReplyFailure<'_> {
+    type Amount = usage::Usage;
+
     fn footprint(&self) -> usage::Usage {
         match self {
-            Self::Server(error) => row_usage(error.payload.resident()),
+            Self::Server(error) => usage::Usage::new(
+                usage::Bytes::new(error.payload.resident()),
+                usage::Values::new(1),
+            ),
             Self::GroupServer | Self::Failed(_) => usage::Usage::ZERO,
         }
     }

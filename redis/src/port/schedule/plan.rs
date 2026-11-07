@@ -1,8 +1,5 @@
 use cartel_core::{handoff, reply};
-use dope::{
-    core::driver::route,
-    manifold::client::{conn::Id, session::Input},
-};
+use dope::{core::driver::route, manifold::client::conn::Id};
 use o3::base::cell::region;
 use reply::recv::attach;
 
@@ -33,14 +30,12 @@ impl<'app, 's, 'b, 'c, 'd, const ID: u8> schedule::Schedule<'s, 'app, 'b, 'c, 'd
                 attach::Error::IdentityExhausted,
             )));
         }
-        schedule::refresh(self, region);
         let mut blocked = Block::Pool;
         for _ in 0..self.routes.len() {
             let Some(conn) = self.routes.next() else {
                 break;
             };
-            let Some((position, Access::Shared, Input::Empty | Input::Partial)) = conn.access()
-            else {
+            let Some((position, Access::Shared)) = conn.access() else {
                 continue;
             };
             let token = position.connection();
@@ -93,15 +88,9 @@ impl<'app, 's, 'b, 'c, 'd, const ID: u8> schedule::Schedule<'s, 'app, 'b, 'c, 'd
         reply: &mut impl attach::Attach<'app, 'b, 'c, 'd, frame::Stored<'s, 'd>, client::Failure<'d>>,
         token: Id<'d, route::KeyTag<ID>>,
     ) -> Result<Id<'d, route::KeyTag<ID>>, Reject<'d, ID>> {
-        let Some((conn, input)) = self.routes.exclusive(token) else {
+        let Some(conn) = self.routes.exclusive(token) else {
             return Err(Reject::Failed(Error::Unavailable));
         };
-        if matches!(input, Input::Yield | Input::Blocked) {
-            return Err(Reject::Blocked {
-                cause: Block::Pool,
-                frame,
-            });
-        }
         let reps = self.lane(conn.position());
         match handoff::Lane::new(&self.queue, reps).try_publish(
             region,

@@ -16,16 +16,6 @@ use crate::plan::read::filter;
 use crate::plan::write::reply;
 use crate::plan::write::reply::Op;
 
-pub(in crate::plan) struct Each<'a> {
-    pub(in crate::plan) source: &'a shape::QuerySource,
-    pub(in crate::plan) data: &'a [syn::Expr],
-    pub(in crate::plan) row: &'a syn::Ident,
-    pub(in crate::plan) cols: &'a [syn::Ident],
-    pub(in crate::plan) predicate: &'a syn::Expr,
-    pub(in crate::plan) body: &'a syn::Expr,
-    pub(in crate::plan) returning: shape::Returning,
-}
-
 fn table(source: &shape::QuerySource) -> syn::Result<&syn::Path> {
     if let Some(alias) = &source.primary_alias {
         return Err(syn::Error::new(
@@ -170,16 +160,16 @@ pub(in crate::plan) fn delete(
 
 pub(in crate::plan) fn each(
     state: &mut plan::State<'_>,
-    input: Each<'_>,
+    input: &shape::mutation::Each,
+    ret: shape::Returning,
 ) -> syn::Result<emit::Plan> {
-    let Each {
+    let shape::mutation::Each {
         source,
         data,
         row: row_var,
         cols: col_vars,
         predicate: pred,
         body: set_body,
-        returning: ret,
     } = input;
     let table = &source.primary_path;
     let output = reply::validate(state, Op::Update, ret, table)?;

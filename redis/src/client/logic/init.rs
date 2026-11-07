@@ -1,7 +1,10 @@
 use cartel_core::frame::Buffer;
 use dope::{
     core::driver::route,
-    manifold::client::{close, session::turns},
+    manifold::client::{
+        close, conn,
+        session::{self, turns},
+    },
     net::link::egress,
 };
 use parser::frame;
@@ -23,7 +26,6 @@ type Turn<'a, 'e, 'd, const ID: u8> =
 
 impl Plan {
     fn send<'e, 's, 'b, 'c, 'd, const ID: u8>(
-        &self,
         port: &crate::Port<'s, '_, 'b, 'c, 'd, ID>,
         command: Command<'_>,
         turn: &mut Turn<'_, 'e, 'd, ID>,
@@ -67,13 +69,12 @@ impl Plan {
     }
 
     fn begin<'e, 's, 'b, 'c, 'd, const ID: u8>(
-        &self,
         port: &crate::Port<'s, '_, 'b, 'c, 'd, ID>,
         command: Command<'_>,
         turn: &mut Turn<'_, 'e, 'd, ID>,
     ) {
         turn.state.begin_init(command.step());
-        if let Err(error) = self.send(port, command, turn) {
+        if let Err(error) = Self::send(port, command, turn) {
             Self::fail(port, error, turn);
         }
     }
@@ -94,22 +95,14 @@ impl Plan {
     }
 
     pub(super) fn response<'e, 's, 'b, 'c, 'd, const ID: u8>(
-        &self,
         port: &crate::Port<'s, '_, 'b, 'c, 'd, ID>,
         step: Step,
         reply: frame::Stored<'s, 'd>,
         ctx: &mut turns::Context<'_, 'e, 'd, protocol::ConnState, Buffer, route::KeyTag<ID>>,
     ) {
         let mut turn = ctx.parts();
-        let mut reader = reply.reader();
-        let kind = match reader.next_event() {
-            Some(value::Event::Ok) => match reader.finish() {
-                Ok(()) => None,
-                Err(error) => {
-                    Self::fail(port, client::Failure::Protocol(error), &mut turn);
-                    return;
-                }
-            },
+        let kind = match reply.reader().next_event() {
+            Some(value::Event::Ok) => None,
             Some(value::Event::Error(_)) => Some(init::Kind::Rejected),
             Some(_) | None => Some(init::Kind::Unexpected),
         };
@@ -123,9 +116,29 @@ impl Plan {
             Self::fail(port, client::Failure::Handshake(cause), &mut turn);
             return;
         }
-        match self.next(step) {
-            Some(next) => self.begin(port, next, &mut turn),
-            None => Self::ready(port, &mut turn),
+        turn.state.advance_init(step);
+    }
+
+    pub(super) fn advance<'e, 's, 'b, 'c, 'd, const ID: u8>(
+        &self,
+        port: &crate::Port<'s, '_, 'b, 'c, 'd, ID>,
+        step: Step,
+        input: session::Input,
+        ctx: &mut turns::Context<'_, 'e, 'd, protocol::ConnState, Buffer, route::KeyTag<ID>>,
+    ) {
+        if !matches!(ctx.close_status(), conn::CloseStatus::Open) {
+            return;
+        }
+        let mut turn = ctx.parts();
+        match input {
+            session::Input::Empty => match self.next(step) {
+                Some(next) => Self::begin(port, next, &mut turn),
+                None => Self::ready(port, &mut turn),
+            },
+            session::Input::Partial => {
+                Self::fail(port, client::Failure::UnexpectedResponse, &mut turn);
+            }
+            session::Input::Yield | session::Input::Blocked => {}
         }
     }
 
@@ -143,7 +156,7 @@ impl Plan {
             close: ctx.close,
         };
         match self.first() {
-            Some(command) => self.begin(port, command, &mut turn),
+            Some(command) => Self::begin(port, command, &mut turn),
             None => Self::ready(port, &mut turn),
         }
     }

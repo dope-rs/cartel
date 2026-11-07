@@ -71,6 +71,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
     type Mode = mode::Plain;
     type Requests = request::Enabled;
     type Response = response::Resume<Pending<'d>, Pending<'d>>;
+    type Receipt = ();
     type Send = requests::Frame<'d>;
     fn codec<'a>(
         owner: &'a Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
@@ -92,7 +93,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         cause: scope::Error,
         ctx: &mut Context<'_, 'e, 'life, 'd, I, ID>,
     ) -> response::Delivery<Pending<'d>> {
-        failure::Failure::in_context(owner.root(), ctx).apply(crate::Error::Input(cause));
+        turn::Turn::new(owner.root(), ctx).fail(crate::Error::Input(cause));
         response::Delivery::Committed
     }
 
@@ -107,7 +108,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         match head {
             Head::Message(message) => turn::Turn::new(owner.root(), ctx).response(message),
             Head::Fatal(error) => {
-                failure::Failure::in_context(owner.root(), ctx).apply(error);
+                turn::Turn::new(owner.root(), ctx).fail(error);
                 response::Delivery::Committed
             }
         }
@@ -146,7 +147,7 @@ impl<
                 session::Input,
             )| {
                 if let Err(error) = turn::Turn::new(owner.root(), ctx).try_flush(input) {
-                    failure::Failure::in_context(owner.root(), ctx).apply(error);
+                    turn::Turn::new(owner.root(), ctx).fail(error);
                 }
             },
         )
@@ -264,7 +265,10 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         owner: &Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
         conn: conn::Id<'d, KeyTag<ID>>,
         failure: conn::Transmit,
-        _: &mut region::Token<region::Identity<'d>>,
+        _: &mut (
+            region::Token<region::Identity<'d>>,
+            region::Token<region::Identity<'d, 1>>,
+        ),
     ) -> Option<conn::Transmit> {
         let cause = replies::Failure::from_error(crate::Error::Transmit(failure));
         let mode = match cause.close_reason() {

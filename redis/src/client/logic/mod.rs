@@ -1,7 +1,7 @@
 use codec::storage;
 use core::convert::Infallible;
 
-use cartel_core::frame::Buffer;
+use cartel_core::{frame::Buffer, reply::order::Cutoff};
 use codec::mode;
 use codec::staging::Limit;
 use dope::{
@@ -27,9 +27,12 @@ use policy::{admit, output};
 
 use crate::{
     Owner, Port,
-    client::{self, CONNECTOR_CONNECTION_LIMIT, settings::init::Plan},
+    client::{
+        self, CONNECTOR_CONNECTION_LIMIT,
+        settings::init::{Plan, Step},
+    },
     port,
-    protocol::parser::Parser,
+    protocol::{Phase, parser::Parser},
 };
 mod pending;
 pub(super) use pending::Pending;
@@ -95,9 +98,43 @@ where
     type Mode = mode::Stored;
     type Requests = request::Enabled;
     type Response = response::Resume<Pending<'s, 'd>, Pending<'s, 'd>>;
+    type Receipt = (Option<Step>, Cutoff<'b>);
     type Send = Buffer;
     fn codec<'a>(owner: &'a Owner<'r, 's, 'd, P, ID>) -> &'a Self::Codec {
         &owner.logic().codec
+    }
+
+    fn receipt(
+        owner: &Owner<'r, 's, 'd, P, ID>,
+        conn: conn::Id<'d, route::KeyTag<ID>>,
+        state: &Self::ConnState,
+        region: &region::Token<region::Identity<'d>>,
+    ) -> Self::Receipt {
+        let step = match state.phase() {
+            Phase::Init(step) => Some(step),
+            _ => None,
+        };
+        let cutoff = owner
+            .root()
+            .port()
+            .schedule
+            .responses(conn)
+            .map_or(Cutoff::EMPTY, |lane| lane.cutoff(region));
+        (step, cutoff)
+    }
+
+    fn received<'e>(
+        owner: &mut Owner<'r, 's, 'd, P, ID>,
+        (step, cutoff): Self::Receipt,
+        has_prefix: bool,
+        ctx: &mut turns::Context<'_, 'e, 'd, Self::ConnState, Self::Send, route::KeyTag<ID>>,
+    ) {
+        ctx.state.received(step, has_prefix);
+        owner
+            .root()
+            .port()
+            .schedule
+            .received(ctx.conn_id, cutoff, has_prefix, ctx.region());
     }
 }
 impl<'r, 's: 'r, 'storage: 'r, 'b: 'r, 'c: 'r, 'd: 'r, P: 'r, const ID: u8>
@@ -132,7 +169,19 @@ where
                 session::Input,
             )| {
                 let port = owner.root().port();
-                match port.schedule.try_input(ctx.conn_id, input, ctx.region()) {
+                if let Phase::Advance(step) = ctx.state.phase() {
+                    owner.logic().init.advance(port, step, input, ctx);
+                    return;
+                }
+                if matches!(ctx.state.phase(), Phase::Unsolicited) {
+                    if matches!(input, session::Input::Partial)
+                        && matches!(ctx.close_status(), conn::CloseStatus::Open)
+                    {
+                        reply::fail(port, client::Failure::UnexpectedResponse, ctx);
+                    }
+                    return;
+                }
+                match port.schedule.try_input(ctx.conn_id, input) {
                     Ok(()) => port.activity.wake_send(),
                     Err(cause) => reply::fail(port, cause, ctx),
                 }
@@ -282,12 +331,15 @@ where
         owner: &Owner<'r, 's, 'd, P, ID>,
         conn: conn::Id<'d, route::KeyTag<ID>>,
         failure: conn::Transmit,
-        region: &mut region::Token<region::Identity<'d>>,
+        regions: &mut (
+            region::Token<region::Identity<'d>>,
+            region::Token<region::Identity<'d, 1>>,
+        ),
     ) -> Option<conn::Transmit> {
         owner
             .root()
             .port()
-            .fail(conn, client::Failure::Transmit(failure), region);
+            .fail(conn, client::Failure::Transmit(failure), &mut regions.0);
         None
     }
 
@@ -336,7 +388,8 @@ where
         conn: conn::Id<'d, route::KeyTag<ID>>,
         ctx: &mut turns::Retirement<'_, 'turn, 'd>,
     ) -> egress::Cleared {
-        owner.root().port().schedule.clear_send(conn, ctx)
+        let port = owner.root().port();
+        port.schedule.clear_send(conn, ctx, &port.activity)
     }
     fn clear_recv<'turn>(
         owner: &Owner<'r, 's, 'd, P, ID>,
@@ -424,11 +477,10 @@ where
         base: Positive,
         region: &mut region::Token<region::Identity<'d>>,
     ) -> app::Inbound {
-        use crate::protocol::Phase;
         use cartel_core::reply::order::Depth;
 
         match state.phase() {
-            Phase::Init(_) => app::Inbound::Awaiting(base),
+            Phase::Init(_) | Phase::Advance(_) | Phase::Unsolicited => app::Inbound::Awaiting(base),
             Phase::Offline | Phase::Ready => match owner.root().port().schedule.responses(conn) {
                 Some(reps) if reps.depth(region) != Depth::ZERO => app::Inbound::Awaiting(base),
                 Some(_) | None => app::Inbound::Quiescent,
@@ -480,9 +532,7 @@ where
         let codec = owner.logic().codec;
         codec::Stateful::decode(&codec, storage, state, budget, limit, |_| {
             codec::Admission::Ready(|decoded, _: &mut Parser<'s, 'd>| {
-                let store = owner.root().port();
-                let logic = owner.logic_mut();
-                reply::deliver(&logic.init, store, decoded, ctx)
+                reply::deliver(owner.root().port(), decoded, ctx)
             })
         })
     }
@@ -516,9 +566,7 @@ where
         let codec = owner.logic().codec;
         codec::Stateful::finish(&codec, input, budget, limit, |_| {
             codec::Admission::Ready(|decoded, _: &mut Parser<'s, 'd>| {
-                let store = owner.root().port();
-                let logic = owner.logic_mut();
-                reply::deliver(&logic.init, store, decoded, ctx)
+                reply::deliver(owner.root().port(), decoded, ctx)
             })
         })
     }

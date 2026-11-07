@@ -141,6 +141,9 @@ pub fn serve(
         })
         .collect();
     for (socket, (_, first, _)) in peers.iter_mut().zip(&messages) {
+        socket
+            .write_all(&Frame::new(b'N', b"SNOTICE\0C00000\0Mauth\0\0").encode())
+            .expect("authentication notice");
         try_auth(socket, 11, first.as_bytes()).expect("authentication message");
     }
     let mut peer_iter = peers.iter_mut();

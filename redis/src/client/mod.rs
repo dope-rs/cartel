@@ -191,6 +191,8 @@ impl<'d> Failure<'d> {
 }
 
 impl usage::Footprint for Failure<'_> {
+    type Amount = usage::Usage;
+
     fn footprint(&self) -> usage::Usage {
         match self {
             Self::Handshake(error) => match &error.frame {
@@ -254,12 +256,71 @@ impl<B: ?Sized, const ID: u8> Clone for Redis<'_, '_, '_, '_, '_, B, ID> {
     }
 }
 
+impl<B: ?Sized, const ID: u8> o3::mem::Return for Redis<'_, '_, '_, '_, '_, B, ID> {
+    type Item = o3::buffer::pool::Span;
+
+    fn return_item(self, frame: Self::Item) {
+        self.port.discard(frame);
+    }
+}
+
 impl<'app, 's, 'b, 'c: 'b, 'd: 'app + 'c, B: ?Sized, const ID: u8> api::Client<'d, ID>
     for Redis<'app, 's, 'b, 'c, 'd, B, ID>
 {
     type Call<D: Decode<Self>> =
         Command<'app, 's, 'b, 'c, 'd, Pooled<'app, 's, 'b, 'c, 'd, B, ID>, Adapter<Self, D>, ID>;
     type Connection = conn::Connection<'app, 's, 'b, 'c, 'd, B, ID>;
+    type Reserved = ops::scripts::Reservation<Self>;
+
+    fn try_reserve_bulk(
+        self,
+        required: std::num::NonZero<usize>,
+    ) -> Result<
+        impl abi::Fiber<'d, Output = Result<Self::Reserved, crate::Error<'d, ID>>>,
+        request::Error,
+    > {
+        use cartel_core::deadline;
+        use dope_fiber::task::done::Wait;
+        use std::{pin::Pin, task::Poll};
+
+        let pool = self.port.requests.bulk(required)?;
+        let mut guard = None;
+        Ok(Wait::new(move |mut cx, waiter| {
+            let retry = guard.is_some();
+            let guard = match &mut guard {
+                Some(guard) => guard,
+                slot @ None => {
+                    if let Some(frame) = pool.acquire() {
+                        return Poll::Ready(Ok(ops::scripts::Reservation::new(self, frame)));
+                    }
+                    slot.insert(match self.port.deadline.guard() {
+                        Ok(guard) => guard,
+                        Err(error) => return Poll::Ready(Err(crate::Error::Deadline(error))),
+                    })
+                }
+            };
+            let result = if let Poll::Ready(due) =
+                Pin::new(&mut *guard).poll_expired(cx.as_mut(), deadline::RequestPhase::Admission)
+            {
+                Poll::Ready(Err(due.into()))
+            } else if retry && let Some(frame) = pool.acquire() {
+                Poll::Ready(Ok(ops::scripts::Reservation::new(self, frame)))
+            } else if !self.port.is_active()
+                && let Some(cause) = self.port.activity.fatal_cause(cx.as_mut().region_token())
+            {
+                Poll::Ready(Err(cause))
+            } else {
+                match self.port.activity.try_dispatch(waiter, cx.as_ref()) {
+                    Ok(()) => Poll::Pending,
+                    Err(error) => Poll::Ready(Err(crate::Error::Wait(error))),
+                }
+            };
+            if result.is_ready() {
+                guard.complete();
+            }
+            result
+        }))
+    }
 
     fn connection(
         self,
@@ -304,7 +365,7 @@ impl<'app, 's, 'b, 'c: 'b, 'd: 'app + 'c, B: ?Sized, const ID: u8> api::Client<'
     fn encode_sized<D: Decode<Self>>(
         self,
         len: Result<encode::Length, request::Error>,
-        encode: impl FnOnce(encode::Writer) -> Result<encode::Complete, request::Error>,
+        encode: impl FnOnce(&mut encode::Writer) -> Result<(), request::Error>,
     ) -> Self::Call<D> {
         let frame = len.and_then(|len| self.port.encode_sized(len, encode));
         Command::new(Pooled::new(self), frame)

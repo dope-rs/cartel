@@ -2,7 +2,7 @@ use crate::{api, catalogs};
 use api::{exec, stmt};
 use dope_fiber::{abi, context};
 use exec::machine::{self, State};
-use std::{ops, task};
+use std::task;
 use stmt::{access::Access, target::Target};
 
 #[must_use = "a SQLite command does nothing unless it is driven"]
@@ -49,19 +49,22 @@ impl<'d, I: catalogs::Catalog, P: api::Bind, T: Target<I>> abi::Resume<'d>
     }
 
     fn finish<'slot, 'id>(
-        live: abi::Live<'slot, 'id, Self>,
+        mut live: abi::Live<'slot, 'id, Self>,
         ready: Self::Ready,
         mut admit: context::Admission<'_, '_, 'd>,
     ) -> abi::Transition<'id, Self::Output> {
         let mut context = admit.context();
+        let cleaned = match &mut live.get_mut().state {
+            State::Start(machine) => match machine.poll(context.as_mut()) {
+                task::Poll::Pending => return live.pending(),
+                task::Poll::Ready(result) => result,
+            },
+            State::Active(_) => Ok(()),
+        };
         let (vacant, mut this) = live.take();
         let mut active = match this.state {
-            State::Start(machine) => match machine.poll(context.as_mut()) {
-                Ok(ops::ControlFlow::Continue(machine)) => {
-                    this.state = State::Start(machine);
-                    return vacant.insert(this).pending();
-                }
-                Ok(ops::ControlFlow::Break(active)) => active,
+            State::Start(machine) => match machine.prepare(cleaned) {
+                Ok(active) => active,
                 Err(error) => return vacant.complete(Err(error)),
             },
             State::Active(active) => active.into_parts().0,

@@ -4,12 +4,9 @@ use api::results::copy;
 use api::traits::{copy::Transfer, sealed::Sealed};
 use api::{Response, ops, request, results, task, traits, tx};
 use cartel_core::reply::Batch;
-use cartel_core::reply::recv::{self, attach::Attach};
+use cartel_core::reply::recv;
 use dope::runtime::client;
 use dope::{core::driver::route::KeyTag, manifold::client::conn};
-use dope_fiber::{context, wait};
-use port::requests;
-use std::pin;
 use task::{
     group,
     lease::{self, Policy, Target},
@@ -127,93 +124,6 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
 
     fn status(self) -> impl traits::Status<'d, ID> {
         ops::Status(self)
-    }
-}
-
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
-{
-    pub(in crate::api) fn select(
-        self,
-        target: Option<api::Target<'d, ID>>,
-        boundary: requests::Boundary,
-    ) -> Result<Option<conn::Id<'d, KeyTag<ID>>>, crate::reply::Error<'d, ID>> {
-        api::check_open(self)?;
-        let shared = &self.port.shared;
-        if let Some(conn) = shared.pick_request(target, boundary) {
-            if target.is_some()
-                && shared
-                    .ready
-                    .connection(conn)
-                    .is_some_and(|slot| slot.is_receiving())
-            {
-                return Ok(None);
-            }
-            return Ok(Some(conn));
-        }
-        if let Some(target) = target {
-            return Err(crate::reply::Error::Pinned(target));
-        }
-        match shared.ready.blocking() {
-            Some(count) => Err(self.port.backpressure(count).into()),
-            None => Ok(None),
-        }
-    }
-
-    pub(in crate::api) fn retry_tx<'target>(
-        self,
-        mut ctx: pin::Pin<&mut context::Context<'_, 'd>>,
-        waiter: pin::Pin<&wait::Waiter<'target, 'd>>,
-        reply: &mut impl Attach<
-            'app,
-            'b,
-            'c,
-            'd,
-            replies::Row<'d>,
-            replies::ReplyFailure<'d>,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-        >,
-        req: api::Pending<'d>,
-    ) -> api::TxRetry<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
-    where
-        'app: 'target,
-        'd: 'target,
-    {
-        self.port
-            .maintain(ctx.as_ref().work(), ctx.as_mut().region_token());
-        let next = {
-            let region = ctx.as_mut().region_token();
-            req.attempt(self, reply, region)
-        };
-        waiter.unregister();
-        match next {
-            api::TxOutcome::NoConn { request: req } => {
-                let shared = &self.port.shared;
-                if let Some(error) = shared.failure() {
-                    return api::TxRetry::Failed(error);
-                }
-                match shared.ready.try_register(waiter, ctx.as_ref()) {
-                    Ok(()) => api::TxRetry::Waiting(req),
-                    Err(error) => api::TxRetry::Failed(crate::reply::Error::Wait(error)),
-                }
-            }
-            api::TxOutcome::Enqueued { lease } => api::TxRetry::Enqueued { lease },
-            api::TxOutcome::Throttled { throttle } => {
-                let shared = &self.port.shared;
-                if let Some(error) = shared.failure() {
-                    return api::TxRetry::Failed(error);
-                }
-                match shared
-                    .signals
-                    .egress
-                    .try_register(&throttle.cause, waiter, ctx.as_ref())
-                {
-                    Ok(()) => api::TxRetry::Waiting(throttle.request),
-                    Err(error) => api::TxRetry::Failed(throttle.fail(error)),
-                }
-            }
-            api::TxOutcome::Failed(error) => api::TxRetry::Failed(error),
-        }
     }
 }
 

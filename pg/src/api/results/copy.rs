@@ -55,7 +55,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         &'a mut self,
         chunk: &'a [u8],
     ) -> impl abi::Fiber<'d, Output = Result<(), Error<'d, ID>>> + 'a {
-        let timer = self.budget.guard();
+        let timer = self.budget.guard().map(Some);
         Write {
             guard: self,
             chunk,
@@ -69,7 +69,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 
     fn finish(self) -> impl abi::Fiber<'d, Output = Result<(), Error<'d, ID>>> {
-        let timer = self.budget.guard();
+        let timer = self.budget.guard().map(Some);
         Finish {
             guard: self,
             state: Finishing::Opening,
@@ -87,7 +87,7 @@ where
     guard: &'borrow mut Sink<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     chunk: &'borrow [u8],
     #[pin]
-    deadline: Result<timer::Alarm<'d>, timer::Exhausted>,
+    deadline: Result<Option<timer::Alarm<'d>>, timer::Exhausted>,
     #[pin]
     waiter: wait::Waiter<'borrow, 'd>,
 }
@@ -102,10 +102,11 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         let mut this = this.project();
         let guard = &mut **this.guard;
         let mut timer = match this.deadline.as_mut().get_mut() {
-            Ok(timer) => pin::Pin::new(timer),
+            Ok(Some(timer)) => pin::Pin::new(timer),
+            Ok(None) => unreachable!("complete"),
             Err(error) => {
                 this.waiter.as_ref().unregister();
-                return Poll::Ready(Err(guard.dispatched.no_timer(*error)));
+                return Poll::Ready(Err(guard.dispatched.abort(crate::Error::Deadline(*error))));
             }
         };
         let phase = guard.dispatched.phase();
@@ -114,25 +115,27 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             .poll_expired(timer.as_mut(), cx.as_mut(), phase)
         {
             this.waiter.as_ref().unregister();
-            let error = guard.dispatched.expire(cause);
+            let error = guard.dispatched.abort(crate::Error::RequestTimeout(cause));
+            this.deadline.set(Ok(None));
             return Poll::Ready(Err(error));
         }
-        let next = match guard
-            .dispatched
-            .poll(cx.as_mut(), this.waiter.as_ref(), Lease::admit)
-        {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(error)) => Err(error),
-            Poll::Ready(Ok(task::Progress::Admitted(lease))) => {
+        let next = match guard.dispatched.poll(
+            cx.as_mut(),
+            this.waiter.as_ref(),
+            Lease::admit,
+            task::Core::complete,
+        ) {
+            Poll::Pending => {
+                let Some(lease) = guard.dispatched.admitted() else {
+                    return Poll::Pending;
+                };
                 let client = lease.client();
                 let target = lease.target();
                 let region = cx.as_mut().region_token();
                 send(client, target, this.chunk, region)
             }
-            Poll::Ready(Ok(task::Progress::Complete {
-                outcome: next,
-                committed: commit,
-            })) => {
+            Poll::Ready(Err(error)) => Err(error),
+            Poll::Ready(Ok((next, commit))) => {
                 commit.quarantine();
                 match next {
                     Ok(()) => Err(crate::Error::Closed.into()),
@@ -140,7 +143,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                 }
             }
         };
-        timer.as_ref().clear();
+        this.deadline.set(Ok(None));
         Poll::Ready(next)
     }
 }
@@ -153,7 +156,7 @@ where
     guard: Sink<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     state: Finishing,
     #[pin]
-    deadline: Result<timer::Alarm<'d>, timer::Exhausted>,
+    deadline: Result<Option<timer::Alarm<'d>>, timer::Exhausted>,
     #[pin]
     waiter: wait::Waiter<'app, 'd>,
 }
@@ -167,10 +170,12 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         let (this, mut cx) = call.into_parts();
         let mut this = this.project();
         let mut timer = match this.deadline.as_mut().get_mut() {
-            Ok(timer) => pin::Pin::new(timer),
+            Ok(Some(timer)) => pin::Pin::new(timer),
+            Ok(None) => unreachable!("complete"),
             Err(error) => {
                 this.waiter.as_ref().unregister();
-                return Poll::Ready(Err(this.guard.dispatched.no_timer(*error)));
+                let error = this.guard.dispatched.abort(crate::Error::Deadline(*error));
+                return Poll::Ready(Err(error));
             }
         };
         let phase = this.guard.dispatched.phase();
@@ -180,20 +185,23 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                 .poll_expired(timer.as_mut(), cx.as_mut(), phase)
         {
             this.waiter.as_ref().unregister();
-            let error = this.guard.dispatched.expire(cause);
+            let error = this
+                .guard
+                .dispatched
+                .abort(crate::Error::RequestTimeout(cause));
+            this.deadline.set(Ok(None));
             return Poll::Ready(Err(error));
         }
-        match this
-            .guard
-            .dispatched
-            .poll(cx.as_mut(), this.waiter.as_ref(), Lease::admit)
-        {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(error)) => {
-                timer.as_ref().clear();
-                Poll::Ready(Err(error))
-            }
-            Poll::Ready(Ok(task::Progress::Admitted(lease))) => {
+        match this.guard.dispatched.poll(
+            cx.as_mut(),
+            this.waiter.as_ref(),
+            Lease::admit,
+            task::Core::complete,
+        ) {
+            Poll::Pending => {
+                let Some(lease) = this.guard.dispatched.admitted() else {
+                    return Poll::Pending;
+                };
                 if matches!(*this.state, Finishing::Opening) {
                     let client = lease.client();
                     let target = lease.target();
@@ -202,23 +210,24 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                         finish(client, target, region)
                     };
                     if let Err(error) = result {
-                        timer.as_ref().clear();
+                        this.deadline.set(Ok(None));
                         return Poll::Ready(Err(error));
                     }
                     *this.state = Finishing::Response;
                 }
                 Poll::Pending
             }
-            Poll::Ready(Ok(task::Progress::Complete {
-                outcome: next,
-                committed: commit,
-            })) => {
+            Poll::Ready(Err(error)) => {
+                this.deadline.set(Ok(None));
+                Poll::Ready(Err(error))
+            }
+            Poll::Ready(Ok((next, commit))) => {
                 if matches!(*this.state, Finishing::Opening) {
                     commit.quarantine();
                 } else {
                     commit.settle();
                 }
-                timer.as_ref().clear();
+                this.deadline.set(Ok(None));
                 Poll::Ready(next)
             }
         }

@@ -106,12 +106,10 @@ where
         'app: 'target,
         'd: 'target,
     {
-        match self.core.admission.poll_admit(
-            cx.as_mut(),
-            waiter,
-            &mut self.core.reply,
-            lease::Lease::admit,
-        ) {
+        match self
+            .core
+            .poll_admit(cx.as_mut(), waiter, lease::Lease::admit)
+        {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Ready(Ok(())) => {}
@@ -167,7 +165,10 @@ where
             Ok(None) => return Poll::Ready((this.map)(Ok(None))),
             Err(error) => {
                 waiter.unregister();
-                return Poll::Ready((this.map)(Err(this.stream.core.no_timer(*error))));
+                return Poll::Ready((this.map)(Err(this
+                    .stream
+                    .core
+                    .fail(crate::Error::Deadline(*error), cx.as_mut().region_token()))));
             }
         };
         let phase = this.stream.core.phase();
@@ -177,11 +178,16 @@ where
                 .poll_expired(guard.as_mut(), cx.as_mut(), phase)
         {
             waiter.unregister();
-            return Poll::Ready((this.map)(Err(this.stream.core.expire(time))));
+            let error = this.stream.core.fail(
+                crate::Error::RequestTimeout(time),
+                cx.as_mut().region_token(),
+            );
+            this.deadline.set(Ok(None));
+            return Poll::Ready((this.map)(Err(error)));
         }
         let next = this.stream.poll_stream(cx.as_mut(), waiter);
         if next.is_ready() {
-            guard.as_ref().clear();
+            this.deadline.set(Ok(None));
         }
         next.map(this.map)
     }

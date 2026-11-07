@@ -1,6 +1,6 @@
 use crate::protocol::frame;
+use cartel_core::memory;
 use o3::buffer;
-use o3::buffer::resident::staging;
 
 use crate::port::config;
 use crate::protocol;
@@ -35,9 +35,7 @@ impl codec::Codec for Codec {
     type Staging = Buffered;
 
     fn staging(&self) -> <Self::Staging as Policy>::Spec {
-        const WARM: usize = 16 * 1024;
-        let max = self.max_frame_bytes as usize;
-        staging::Plan::new(max.min(WARM), max)
+        memory::try_staging(self.max_frame_bytes as usize)
     }
 }
 
@@ -87,10 +85,13 @@ impl codec::Stateless for Codec {
                 None => codec::Parse::CapacityExhausted,
             });
         }
-        let data = frame::Payload::plan(&buffer, 5..wire + 1).map_err(scope::Error::Range)?;
-        let used = buffer.try_consumed(num::NonZero::<usize>::MIN.saturating_add(total - 1))?;
+        let (data, used) =
+            buffer.try_prefix(5, num::NonZero::<usize>::MIN.saturating_add(total - 1))?;
         Ok(codec::Parse::Item {
-            head: frame::Head::Message(frame::Message { typ, payload: data }),
+            head: frame::Head::Message(frame::Message {
+                typ,
+                payload: frame::Payload(data),
+            }),
             consumed: used,
         })
     }

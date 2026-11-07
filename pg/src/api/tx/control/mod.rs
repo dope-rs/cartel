@@ -1,5 +1,5 @@
 use crate::port;
-use crate::port::{Storage, replies};
+use crate::port::replies;
 use crate::reply::group::Ledger;
 use crate::{api, reply, schema};
 use api::task::{
@@ -13,10 +13,9 @@ use api::{
     traits::{self, copy::Transfer, sealed},
 };
 use dope::core::driver::{route::KeyTag, schedule::ready};
-use dope::manifold::client::{conn, side};
+use dope::manifold::client::conn;
 use dope_fiber::{abi, context};
 use port::pool::{access, backend};
-use side::registry;
 use std::task;
 
 pub mod error;
@@ -28,9 +27,8 @@ use error::Failure;
 /// The token cannot escape the guard that supplied its connection epoch:
 ///
 pub struct CancelToken<'tx, 'd: 'tx, const ID: u8 = 0> {
-    pub(super) port: &'tx registry::Registry<'d, port::Backend<'d, ID>, KeyTag<ID>>,
+    pub(super) lifecycle: &'tx port::Lifecycle<'d, ID>,
     pub(super) backend: backend::Bound<'tx, 'd, ID>,
-    pub(super) buffer: &'tx Storage,
     pub(super) pid: i32,
     pub(super) wake: ready::Target<'d>,
 }
@@ -48,9 +46,8 @@ impl<'tx, 'd: 'tx, const ID: u8> CancelToken<'tx, 'd, ID> {
     /// PostgreSQL sends no response; observe the query for server-side result.
     pub fn cancel(&self) -> Cancel<'tx, 'd, ID> {
         Cancel {
-            port: self.port,
+            lifecycle: self.lifecycle,
             backend: self.backend,
-            buffer: self.buffer,
             wake: self.wake,
             pending: false,
         }
@@ -59,9 +56,8 @@ impl<'tx, 'd: 'tx, const ID: u8> CancelToken<'tx, 'd, ID> {
 
 #[must_use = "a cancellation request does nothing unless it is driven"]
 pub struct Cancel<'tx, 'd: 'tx, const ID: u8 = 0> {
-    port: &'tx registry::Registry<'d, port::Backend<'d, ID>, KeyTag<ID>>,
+    lifecycle: &'tx port::Lifecycle<'d, ID>,
     backend: backend::Bound<'tx, 'd, ID>,
-    buffer: &'tx Storage,
     wake: ready::Target<'d>,
     pending: bool,
 }
@@ -76,7 +72,7 @@ impl<'tx, 'd: 'tx, const ID: u8> abi::Fiber<'d> for Cancel<'tx, 'd, ID> {
         let this = this.get_mut();
         let waiter = cx.as_ref().completion();
         if !this.pending {
-            let intent = match this.backend.try_current(this.buffer) {
+            let intent = match this.backend.try_current(&this.lifecycle.buffer) {
                 Ok(intent) => intent,
                 Err(error) => {
                     return task::Poll::Ready(Err(Error {
@@ -84,7 +80,7 @@ impl<'tx, 'd: 'tx, const ID: u8> abi::Fiber<'d> for Cancel<'tx, 'd, ID> {
                     }));
                 }
             };
-            if let Err(error) = this.port.try_reserve(intent, waiter) {
+            if let Err(error) = this.lifecycle.cancel.try_reserve(intent, waiter) {
                 return task::Poll::Ready(Err(Error {
                     failure: Failure::Reserve {
                         backend: this.backend,
@@ -96,7 +92,7 @@ impl<'tx, 'd: 'tx, const ID: u8> abi::Fiber<'d> for Cancel<'tx, 'd, ID> {
             this.wake.wake();
             return task::Poll::Pending;
         }
-        match this.port.poll(this.backend.target(), waiter) {
+        match this.lifecycle.cancel.poll(this.backend.target(), waiter) {
             task::Poll::Ready(result) => {
                 this.pending = false;
                 task::Poll::Ready(result.map_err(|cause| Error {
@@ -114,7 +110,7 @@ impl<'tx, 'd: 'tx, const ID: u8> abi::Fiber<'d> for Cancel<'tx, 'd, ID> {
 impl<const ID: u8> Drop for Cancel<'_, '_, ID> {
     fn drop(&mut self) {
         if self.pending {
-            self.port.abandon(self.backend.target());
+            self.lifecycle.cancel.abandon(self.backend.target());
             self.wake.wake();
         }
     }

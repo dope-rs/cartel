@@ -4,7 +4,7 @@ use crate::shape;
 use shape::mutation;
 
 use crate::plan::read::{agg, select, set};
-use crate::plan::write::{Each, From, Source, insert, update};
+use crate::plan::write::{insert, update};
 
 pub(crate) fn build(
     state: &mut plan::State<'_>,
@@ -38,18 +38,7 @@ pub(crate) fn build(
                 &delete.predicate,
                 query.returning,
             ),
-            Mutation::Each(each) => update::each(
-                state,
-                Each {
-                    source: &each.source,
-                    data: &each.data,
-                    row: &each.row,
-                    cols: &each.cols,
-                    predicate: &each.predicate,
-                    body: &each.body,
-                    returning: query.returning,
-                },
-            ),
+            Mutation::Each(each) => update::each(state, each, query.returning),
             Mutation::Insert(insert) => match &insert.input {
                 Input::One(values) => insert::build(
                     state,
@@ -67,22 +56,7 @@ pub(crate) fn build(
                     query.returning,
                     &insert.conflict,
                 ),
-                Input::From(from) => insert::from(
-                    state,
-                    From {
-                        table: &from.table,
-                        source: Source {
-                            query: &from.source,
-                            pred_idents: &from.pred_idents,
-                            predicate: &from.predicate,
-                            idents: &from.source_idents,
-                        },
-                        target: &from.target,
-                        body: &from.body,
-                        returning: query.returning,
-                        conflict: &insert.conflict,
-                    },
-                ),
+                Input::From(from) => insert::from(state, from, query.returning, &insert.conflict),
             },
         },
         shape::QueryShape::Aggregate(agg) => agg::build(state, agg),

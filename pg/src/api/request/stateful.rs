@@ -70,34 +70,30 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             Ok(guard) => pin::Pin::new(guard),
             Err(error) => {
                 this.waiter.as_ref().unregister();
-                return Poll::Ready(Err(this.command.no_timer(*error)));
+                return Poll::Ready(Err(this.command.abort(crate::Error::Deadline(*error))));
             }
         };
         let phase = this.command.phase();
         if let Poll::Ready(time) = guard.as_mut().poll_expired(ctx.as_mut(), phase) {
             this.waiter.as_ref().unregister();
-            return Poll::Ready(Err(this.command.expire(time)));
+            return Poll::Ready(Err(this.command.abort(crate::Error::RequestTimeout(time))));
         }
-        match this
-            .command
-            .poll_done(ctx.as_mut(), this.waiter.as_ref(), Lease::admit)
-        {
+        match this.command.poll(
+            ctx.as_mut(),
+            this.waiter.as_ref(),
+            Lease::admit,
+            task::Core::complete,
+        ) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(task::Done::AdmissionFailed(error)) => {
+            Poll::Ready(Err(error)) => {
                 guard.as_mut().complete();
                 Poll::Ready(Err(error))
             }
-            Poll::Ready(task::Done::Response {
-                outcome: Ok(()),
-                committed: lease,
-            }) => {
+            Poll::Ready(Ok((Ok(()), lease))) => {
                 guard.as_mut().complete();
                 Poll::Ready(Ok(lease))
             }
-            Poll::Ready(task::Done::Response {
-                outcome: Err(error),
-                committed: lease,
-            }) => {
+            Poll::Ready(Ok((Err(error), lease))) => {
                 lease.settle();
                 guard.as_mut().complete();
                 Poll::Ready(Err(error))

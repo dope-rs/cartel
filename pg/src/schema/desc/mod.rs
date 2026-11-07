@@ -14,7 +14,6 @@ pub(crate) const DYNAMIC_LTREE: u8 = 1;
 
 #[doc(hidden)]
 pub struct Input<'a> {
-    pub cursor: schema::QueryCursor,
     pub payload: &'a [u8],
     pub registry: Registry,
 }

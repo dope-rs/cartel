@@ -1,27 +1,21 @@
 use crate::api::{batches, exec, stmt, work};
-use crate::retry;
-use crate::runtime::slot::{Held, lease};
+use crate::runtime::slot::lease;
 use crate::{catalogs, sys};
-use dope_core::driver::schedule::clock;
 use dope_fiber::abi;
-use std::{mem, result, task};
+use std::{mem, result};
 use stmt::{access::Access, target::Target};
 use work::cleanup;
 
-#[repr(transparent)]
 pub(crate) struct Ready<'slot, 'd: 'slot, I: catalogs::Catalog = catalogs::Empty> {
-    pub(super) held: Held<Fields<'slot, I>, lease::Lease<'slot, 'd, I, lease::Ready>>,
+    pub(super) engine: stmt::Engine<'slot, I>,
+    pub(super) arena: batches::Arena<'slot>,
+    pub(super) lease: lease::Lease<'slot, 'd, I, lease::Ready>,
 }
 
 /// Consumes executable access while retaining statement and connection retirement.
-#[repr(transparent)]
 pub(crate) struct Retirement<'slot, 'd: 'slot, I: catalogs::Catalog> {
-    held: Held<stmt::Retirement<'slot>, lease::Lease<'slot, 'd, I, lease::Ready>>,
-}
-
-pub(super) struct Fields<'slot, I: catalogs::Catalog> {
-    pub(super) engine: stmt::Engine<'slot, I>,
-    pub(super) arena: batches::Arena<'slot>,
+    statements: stmt::Retirement<'slot>,
+    lease: lease::Lease<'slot, 'd, I, lease::Ready>,
 }
 
 impl<'slot, 'd: 'slot, I: catalogs::Catalog> Ready<'slot, 'd, I> {
@@ -46,34 +40,33 @@ impl<'slot, 'd: 'slot, I: catalogs::Catalog> Ready<'slot, 'd, I> {
         &'a mut self,
         txn: exec::Tx<'a>,
     ) -> (exec::Start<'a, 'slot, 'd, I>, &'a mut batches::Arena<'slot>) {
-        let Held { value, lease } = &mut self.held;
         (
-            exec::Start::new(&mut value.engine, lease.work(), lease.cleanup(), txn),
-            &mut value.arena,
+            exec::Start::new(&mut self.engine, self.lease.work(), self.lease.call(), txn),
+            &mut self.arena,
         )
     }
 
     pub(crate) fn work(&self) -> &'slot work::Work {
-        self.held.lease.work()
+        self.lease.work()
     }
 
     pub(crate) fn pending(&self) -> cleanup::Status {
         self.work().pending.status()
     }
 
-    pub(crate) const fn retry_ref(&self) -> &retry::Slot<'d> {
-        self.held.lease.cleanup_ref()
-    }
-
-    pub(crate) fn poll_cleanup(&mut self, now: clock::Moment<'d>) -> task::Poll<cleanup::Activity> {
-        let Held { value, lease } = &mut self.held;
-        cleanup::Run::new(&mut value.engine, lease.work(), lease.cleanup()).poll_park(now)
+    pub(crate) fn cleanup(&mut self) {
+        cleanup::Run::new(
+            &mut self.engine,
+            self.lease.work(),
+            self.lease.config().work.cleanup,
+        )
+        .park();
     }
 
     pub(crate) fn retire(self) -> Retirement<'slot, 'd, I> {
-        let Held { value, lease } = self.held;
         Retirement {
-            held: Held::new(value.engine.retire(), lease),
+            statements: self.engine.retire(),
+            lease: self.lease,
         }
     }
 
@@ -82,26 +75,26 @@ impl<'slot, 'd: 'slot, I: catalogs::Catalog> Ready<'slot, 'd, I> {
     }
 
     pub(crate) fn tx(&self) -> sys::Tx {
-        self.held.value.engine.transaction()
+        self.engine.transaction()
     }
 }
 
 impl<I: catalogs::Catalog> Retirement<'_, '_, I> {
     pub(crate) fn work(&self) -> &work::Work {
-        self.held.lease.work()
+        self.lease.work()
     }
 
     pub(crate) fn retire_one(&mut self) -> stmt::Inventory {
-        self.held.value.retire_one()
+        self.statements.retire_one()
     }
 
     pub(crate) fn inventory(&self) -> stmt::Inventory {
-        self.held.value.inventory()
+        self.statements.inventory()
     }
 
     pub(crate) fn force(&mut self) {
         self.work().reset();
-        self.held.value.retire_all();
+        self.statements.retire_all();
     }
 }
 

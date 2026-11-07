@@ -15,24 +15,19 @@ pub(super) enum Failure<'d, const ID: u8> {
 
 pub(crate) struct Signals<'d, const ID: u8> {
     pub(super) cause: cell::Cell<Option<Failure<'d, ID>>>,
-    pub(super) failed: cell::Cell<bool>,
     pub(crate) egress: waiters::Egress<'d>,
 }
 
 impl<'d, const ID: u8> Signals<'d, ID> {
     pub(crate) fn is_failed(&self) -> bool {
-        self.failed.get()
+        // SAFETY: this observation neither mutates the cell nor calls user code.
+        unsafe { &*self.cause.as_ptr() }.is_some()
     }
 
-    /// Taking the cause only copies a driver value or retains local diagnostic
-    /// storage. Neither operation calls application code, wakes a waiter, or
-    /// destroys the original diagnostic before it is restored.
     pub(crate) fn failure(&self) -> Option<reply::Error<'d, ID>> {
-        if !self.is_failed() {
-            return None;
-        }
-        let cause = self.cause.take();
-        let failure = match cause.as_ref() {
+        // SAFETY: copying errors and retaining the local diagnostic neither mutate
+        // this cell nor call user code. No borrowed cause escapes this match.
+        match unsafe { &*self.cause.as_ptr() } {
             Some(Failure::Driver(error)) => Some(reply::Error::Driver(*error)),
             Some(Failure::Open(cause)) => Some(reply::Error::Open(*cause)),
             Some(Failure::Server(error)) => Some(match error.try_clone() {
@@ -40,17 +35,15 @@ impl<'d, const ID: u8> Signals<'d, ID> {
                 Err(error) => reply::Error::Driver(crate::Error::ResponseRetain(error)),
             }),
             None => None,
-        };
-        self.cause.set(cause);
-        failure
+        }
     }
 
     pub(crate) fn clear_open(&self) {
-        let cause = self.cause.take();
-        if matches!(cause, Some(Failure::Open(_))) {
-            self.failed.set(false);
-        } else {
-            self.cause.set(cause);
+        // SAFETY: this observation ends before replacement and calls no user code.
+        let clear = matches!(unsafe { &*self.cause.as_ptr() }, Some(Failure::Open(_)));
+        if clear {
+            // Open is Copy, so the replaced value needs no destruction.
+            std::mem::forget(self.cause.replace(None));
         }
     }
 
@@ -62,15 +55,15 @@ impl<'d, const ID: u8> Signals<'d, ID> {
         self.record_cause(Failure::Server(error));
     }
 
-    /// Restore the retained cause before destroying a rejected failure, so a
-    /// diagnostic release cannot observe a transient empty cause.
     fn record_cause(&self, failure: Failure<'d, ID>) {
-        let cause = self.cause.take();
-        if cause.is_none() || matches!(cause.as_ref(), Some(Failure::Open(_))) {
-            self.failed.set(true);
-            self.cause.set(Some(failure));
-        } else {
-            self.cause.set(cause);
+        // SAFETY: this observation ends before replacement or diagnostic destruction.
+        let replace = matches!(
+            unsafe { &*self.cause.as_ptr() },
+            None | Some(Failure::Open(_))
+        );
+        if replace {
+            // Only None or the Copy Open value can be replaced here.
+            std::mem::forget(self.cause.replace(Some(failure)));
         }
     }
 

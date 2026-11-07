@@ -60,8 +60,8 @@ impl<'slot, 'd> Loan<'slot, 'd> {
         lease::Lease::new(self.reborrow())
     }
 
-    pub(crate) fn cleanup(&mut self) -> lease::Lease<'_, 'd, lease::Cleanup> {
-        lease::Lease::new(self.reborrow())
+    pub(crate) fn call(self) -> lease::Lease<'slot, 'd, lease::Call> {
+        lease::Lease::new(self)
     }
 
     pub(crate) fn finish(&mut self) {
@@ -78,7 +78,7 @@ impl<'slot, 'd> Loan<'slot, 'd> {
         unsafe { &mut *self.source.slot.get() }
     }
 
-    fn reborrow(&mut self) -> Loan<'_, 'd> {
+    pub(crate) fn reborrow(&mut self) -> Loan<'_, 'd> {
         Loan {
             source: self.source,
             unique: marker::PhantomData,

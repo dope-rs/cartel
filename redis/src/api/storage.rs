@@ -14,6 +14,7 @@ pub trait Storage: Sealed + Sized {
     type DriverError: source::Control;
     type Bytes: source::Bytes;
     type Error: source::Error<Bytes = Self::Bytes, DriverError = Self::DriverError>
+        + From<Self::DriverError>
         + From<reply::Decode<Self::Bytes>>;
     type Bulks: source::Bulks<Bytes = Self::Bytes>;
     type Optional: source::Optional<Bytes = Self::Bytes>;

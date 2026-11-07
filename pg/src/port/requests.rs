@@ -1,4 +1,4 @@
-use std::mem;
+use std::{mem, num::NonZero};
 
 use cartel_core::{frame, handoff, queue, reply};
 use dope::{
@@ -31,25 +31,7 @@ const _: () = {
     assert!(mem::align_of::<Boundary>() == mem::align_of::<bool>());
 };
 
-pub(crate) struct ReplyContext<'a, 'd, const ID: u8> {
-    token: conn::Id<'d, KeyTag<ID>>,
-    boundary: Boundary,
-    region: &'a mut region::Token<region::Identity<'d>>,
-}
-
-impl<'a, 'd, const ID: u8> ReplyContext<'a, 'd, ID> {
-    pub(crate) const fn new(
-        token: conn::Id<'d, KeyTag<ID>>,
-        boundary: Boundary,
-        region: &'a mut region::Token<region::Identity<'d>>,
-    ) -> Self {
-        Self {
-            token,
-            boundary,
-            region,
-        }
-    }
-}
+pub(crate) use crate::protocol::runtime::ready::ReplyContext;
 
 pub(crate) struct Access<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8> {
     port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
@@ -67,10 +49,12 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         kind: frame::Sensitivity,
         write: impl FnOnce(&mut encode::Writer) -> Result<T, encode::Error>,
     ) -> Result<(Complete<'d>, T), error::Error> {
-        let cursor = pool.cursor().ok_or(error::Error::RequestCapacity)?;
+        let span = pool.acquire().ok_or(error::Error::RequestCapacity)?;
         let (frame, value) =
-            encode::Writer::encode(cursor, kind, write).map_err(error::Error::Request)?;
-        Ok((Complete::try_new(frame)?, value))
+            encode::Writer::encode(span, kind, write).map_err(error::Error::Request)?;
+        let frame = egress::NonEmpty::try_new(Frame(Body::Owned(frame)))
+            .map_err(error::Error::RequestLoad)?;
+        Ok((frame, value))
     }
 
     pub(crate) fn encode(
@@ -105,8 +89,8 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
 
     pub(crate) fn try_with<J, K, R>(
         &self,
-        context: ReplyContext<'_, 'd, ID>,
-        weight: usize,
+        context: ReplyContext<'_, '_, 'd, ID>,
+        weight: NonZero<usize>,
         input: J,
         prepare: impl FnOnce(
             &mut region::Token<region::Identity<'d>>,
@@ -122,61 +106,57 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
             replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
             J,
         ) -> Result<(order::Depth, K), (attach::Error, J)>,
-        build: impl FnOnce(K) -> (Complete<'d>, R),
-    ) -> Result<R, (error::Error, J)> {
-        let ReplyContext {
-            token,
-            boundary,
-            region,
-        } = context;
-        let permit = match self
-            .port
-            .conn(token)
-            .ok_or(error::Error::Closed)
-            .and_then(|conn| conn.ready(token)?.try_reply(boundary))
-        {
+        build: impl FnOnce(K, conn::Id<'d, KeyTag<ID>>) -> (Complete<'d>, R),
+    ) -> Result<R, (error::Error, conn::Id<'d, KeyTag<ID>>, J)> {
+        let (ready, listed, boundary, region) = context.into_parts();
+        let token = ready.connection();
+        let permit = match ready.try_reply(boundary) {
             Ok(permit) => permit,
-            Err(error) => return Err((error, input)),
+            Err(error) => return Err((error, token, input)),
         };
         let replies = self.port.lane(token.lane());
-        let cause = match handoff::Lane::new(&self.port.request_queue, replies)
-            .try_prepare(region, weight)
-        {
-            Ok(lane) => {
-                let conn = permit.slot();
-                let (batch, boundary) = permit.parts();
-                let tag = replies::Tag::new(batch, boundary);
-                let result = lane.try_with(tag, input, prepare, |input, depth| {
-                    let (bytes, done) = build(input);
-                    if !permit.commit() {
-                        self.port.shared.wake_ready();
-                    }
-                    self.port.shared.reindex(token, depth);
-                    (bytes.into_frame(), done)
-                });
-                return match result {
-                    Ok(done) => {
-                        conn.wake();
-                        Ok(done)
-                    }
-                    Err((cause, input)) => Err((error::Error::Reply(cause), input)),
-                };
-            }
-            Err(cause) => cause,
-        };
-        Err((
-            error::Error::RequestQueue {
-                queued: self.port.request_queue.lane_for(replies).weight(region),
-                cause,
-            },
+        let conn = permit.slot();
+        let (batch, boundary) = permit.parts();
+        let result = handoff::Lane::new(&self.port.request_queue, replies).try_with(
+            region,
+            weight.get(),
+            replies::Tag::new(batch, boundary),
             input,
-        ))
+            prepare,
+            |input, depth| {
+                let (bytes, done) = build(input, token);
+                if !permit.commit() {
+                    self.port.shared.wake_ready();
+                }
+                if let Some(listed) = listed {
+                    listed.reprioritize(depth.get() + conn.barriers());
+                }
+                (bytes, done)
+            },
+        );
+        match result {
+            Ok(done) => {
+                conn.wake();
+                Ok(done)
+            }
+            Err((handoff::Failure::Reply(cause), input)) => {
+                Err((error::Error::Reply(cause), token, input))
+            }
+            Err((handoff::Failure::Queue(cause), input)) => Err((
+                error::Error::RequestQueue {
+                    queued: self.port.request_queue.lane_for(replies).weight(region),
+                    cause,
+                },
+                token,
+                input,
+            )),
+        }
     }
 
-    pub(crate) fn try_reply<S, R>(
+    pub(crate) fn try_reply<J, R>(
         &self,
-        bytes: Complete<'d>,
-        state: S,
+        weight: NonZero<usize>,
+        input: J,
         reply: &mut impl attach::Attach<
             'life,
             'b,
@@ -186,20 +166,19 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
             replies::ReplyFailure<'d>,
             replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
         >,
-        context: ReplyContext<'_, 'd, ID>,
-        seal: impl FnOnce(S) -> R,
-    ) -> Result<R, (error::Error, Complete<'d>, S)> {
+        context: ReplyContext<'_, '_, 'd, ID>,
+        build: impl FnOnce(J, conn::Id<'d, KeyTag<ID>>) -> (Complete<'d>, R),
+    ) -> Result<R, (error::Error, conn::Id<'d, KeyTag<ID>>, J)> {
         self.try_with(
             context,
-            bytes.as_ref().len(),
-            (bytes, state),
+            weight,
+            input,
             |token, lane, tag, input| match reply.try_ordered(token, lane, tag) {
                 Ok(depth) => Ok((depth, input)),
                 Err(cause) => Err((cause, input)),
             },
-            |(bytes, state)| (bytes, seal(state)),
+            build,
         )
-        .map_err(|(error, (bytes, state))| (error, bytes, state))
     }
 
     pub(crate) fn try_enqueue(
@@ -214,11 +193,13 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         let ready = conn.ready(token)?;
         let requests = self.request_lane(token);
         let queued = requests.weight(region);
-        let request = match requests.try_reserve(region, bytes.as_ref().len()) {
-            Ok(request) => request,
-            Err(cause) => return Err(error::Error::RequestQueue { queued, cause }),
-        };
-        request.publish(bytes.into_frame());
+        let weight = bytes.geometry().wire().widen().get();
+        requests
+            .try_push(region, bytes, weight)
+            .map_err(|queue::Rejected { cause, .. }| error::Error::RequestQueue {
+                queued,
+                cause,
+            })?;
         ready.wake();
         Ok(())
     }
@@ -264,12 +245,15 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         let sync = conn.ready(token)?.try_finish()?;
         let requests = self.request_lane(token);
         let queued = requests.weight(region);
-        let request = match requests.try_reserve(region, encode::COPY_DONE_SYNC.len()) {
-            Ok(request) => request,
-            Err(cause) => return Err(error::Error::RequestQueue { queued, cause }),
-        };
-        let unchanged = sync.commit();
-        request.publish(bytes);
+        let unchanged = requests
+            .try_with(
+                region,
+                encode::COPY_DONE_SYNC.len(),
+                bytes,
+                |_, bytes| Ok(((), bytes)),
+                |bytes, ()| (bytes, sync.commit()),
+            )
+            .map_err(|(cause, _)| error::Error::RequestQueue { queued, cause })?;
         if !unchanged {
             self.port.shared.wake_ready();
         }
@@ -321,43 +305,17 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
 enum Body<'d> {
     Owned(frame::Buffer),
     Borrowed(&'d [u8]),
-    Inline(data::Inline<16>),
 }
 
-pub(crate) struct Complete<'d>(egress::NonEmpty<Frame<'d>>);
+pub(crate) type Complete<'d> = egress::NonEmpty<Frame<'d>>;
 
 #[repr(transparent)]
 #[doc(hidden)]
 pub struct Frame<'d>(Body<'d>);
 
-impl<'d> Complete<'d> {
-    fn try_new(frame: frame::Buffer) -> Result<Self, error::Error> {
-        let frame = Frame(Body::Owned(frame));
-        Ok(Self(
-            egress::NonEmpty::try_new(frame).map_err(error::Error::RequestLoad)?,
-        ))
-    }
-
-    pub(crate) fn into_frame(self) -> egress::NonEmpty<Frame<'d>> {
-        self.0
-    }
-}
-
 impl<'d> From<&'d [u8]> for Frame<'d> {
     fn from(value: &'d [u8]) -> Self {
         Self(Body::Borrowed(value))
-    }
-}
-
-impl<'d> From<data::Inline<16>> for Frame<'d> {
-    fn from(value: data::Inline<16>) -> Self {
-        Self(Body::Inline(value))
-    }
-}
-
-impl AsRef<[u8]> for Complete<'_> {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_inner().as_ref()
     }
 }
 
@@ -366,7 +324,6 @@ impl AsRef<[u8]> for Frame<'_> {
         match &self.0 {
             Body::Owned(frame) => frame.as_ref(),
             Body::Borrowed(bytes) => bytes,
-            Body::Inline(bytes) => bytes.as_ref(),
         }
     }
 }
@@ -376,13 +333,12 @@ impl Residency for Frame<'_> {
         match &self.0 {
             Body::Owned(frame) => frame.resident(),
             Body::Borrowed(_) => 0,
-            Body::Inline(bytes) => bytes.resident(),
         }
     }
 }
 
 // SAFETY: each variant fixes a contiguous slice and its exact retained charge
-// while borrowed. Moving an inline body is allowed only after that borrow ends.
+// while borrowed.
 unsafe impl<'d> data::raw::Contiguous<'d> for Frame<'d> {}
 
 const _: () = {

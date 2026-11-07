@@ -1,7 +1,5 @@
 use std::{alloc, cell, num::NonZero, ptr};
 
-use o3::base::marker::ThreadBound;
-
 use crate::runtime::heap;
 use heap::scopes::Scope;
 
@@ -83,25 +81,11 @@ enum Block {
 }
 
 /// Native initialization and VFS allocations have lifetimes independent of connection arenas.
-pub(in crate::runtime) struct Foreign {
-    previous: Origin,
-    _thread: ThreadBound,
-}
-
-impl Foreign {
-    pub(in crate::runtime) fn enter() -> Self {
-        let previous = CURRENT.replace(Origin::Foreign);
-        Self {
-            previous,
-            _thread: ThreadBound::NEW,
-        }
-    }
-}
-
-impl Drop for Foreign {
-    fn drop(&mut self) {
-        CURRENT.set(self.previous);
-    }
+pub(in crate::runtime) fn foreign<T>(op: impl FnOnce() -> T) -> T {
+    let previous = CURRENT.replace(Origin::Foreign);
+    let result = op();
+    CURRENT.set(previous);
+    result
 }
 
 impl Origin {

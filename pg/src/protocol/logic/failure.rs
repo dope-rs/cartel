@@ -1,77 +1,18 @@
-use dope::{
-    core::driver::{result::SubmitCause, route::KeyTag},
-    manifold::client::{conn, session::turns},
-};
-use o3::base::cell::region;
+use dope::{core::driver::result::SubmitCause, manifold::client::conn};
 use o3::buffer::{hold, resident, storage::provided::account};
 use resident::copy;
 
 use crate::{
-    port::{self, Disposition, replies, requests::Frame},
-    protocol::logic::{State, state},
+    port::{Disposition, replies},
+    protocol::logic::{state, turn::Turn},
     reply::{self, server},
     schema, scram,
 };
 
-pub(super) struct Failure<
-    'turn,
-    'life,
-    'g,
-    'r,
-    's,
-    'b,
-    'c,
-    'd: 'life,
-    I: schema::QuerySet,
-    const ID: u8,
-> {
-    port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
-    conn: conn::Id<'d, KeyTag<ID>>,
-    state: &'turn mut State<'life, 'd, I, ID>,
-    region: &'turn mut region::Token<region::Identity<'d>>,
-}
-
-impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
-    Failure<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
+impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+    Turn<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
 {
-    pub(super) const fn new(
-        port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
-        conn: conn::Id<'d, KeyTag<ID>>,
-        state: &'turn mut State<'life, 'd, I, ID>,
-        region: &'turn mut region::Token<region::Identity<'d>>,
-    ) -> Self {
-        Self {
-            port,
-            conn,
-            state,
-            region,
-        }
-    }
-
-    pub(super) fn in_context<'ctx, 'e>(
-        port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
-        ctx: &'turn mut turns::Context<
-            'ctx,
-            'e,
-            'd,
-            State<'life, 'd, I, ID>,
-            Frame<'d>,
-            KeyTag<ID>,
-        >,
-    ) -> Self
-    where
-        'ctx: 'turn,
-    {
-        let parts = ctx.parts();
-        Self::new(
-            port,
-            parts.conn_id,
-            parts.state,
-            &mut parts.driver.into_regions().0,
-        )
-    }
-
-    pub(super) fn apply(self, error: crate::Error) {
+    pub(super) fn fail(&mut self, error: crate::Error) {
         let class = match &error {
             crate::Error::Transmit(conn::Transmit::Rejected(failure))
                 if failure.into_error().cause() == SubmitCause::IdentityExhausted =>
@@ -193,11 +134,11 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
             | crate::Error::Backpressure { .. } => reply::Class::Transient,
         };
         let cause = replies::Failure::from_error(error);
-        self.finish(class, cause, None);
+        self.finish_failure(class, cause, None);
     }
 
-    pub(super) fn apply_server(self, class: reply::Class, error: server::Diagnostic<'d>) {
-        self.finish(
+    pub(super) fn fail_server(&mut self, class: reply::Class, error: server::Diagnostic<'d>) {
+        self.finish_failure(
             class,
             replies::Failure::from_error(crate::Error::Closed),
             Some(error),
@@ -205,16 +146,16 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
     }
 
     /// The diagnostic is retained by a reply, group ledger, or pending delivery.
-    pub(super) fn apply_retained(self, class: reply::Class) {
-        self.finish(
+    pub(super) fn fail_retained(&mut self, class: reply::Class) {
+        self.finish_failure(
             class,
             replies::Failure::from_error(crate::Error::Closed),
             None,
         );
     }
 
-    fn finish(
-        self,
+    fn finish_failure(
+        &mut self,
         class: reply::Class,
         cause: replies::Failure,
         server: Option<server::Diagnostic<'d>>,
@@ -253,8 +194,7 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
             ) => Disposition::Reconnect,
         };
         self.state.phase = state::Phase::Failed;
-        self.state.skip = state::Skip::None;
-        self.state.completed = false;
+        self.state.progress = state::Progress::Running;
         let shared = &self.port.shared;
         match mode {
             Disposition::Permanent => {

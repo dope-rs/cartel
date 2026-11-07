@@ -17,8 +17,8 @@ pub struct Work {
     pub open: Budget,
     /// One bound for a query or transaction-control call, including busy retries.
     pub call: Budget,
-    /// One bound for deferred rollback and savepoint cleanup, including busy retries.
-    pub cleanup: Budget,
+    /// One bound for deferred rollback and savepoint cleanup.
+    pub cleanup: Progress,
 }
 
 impl Work {
@@ -26,7 +26,7 @@ impl Work {
         Self {
             open: budget,
             call: budget,
-            cleanup: budget,
+            cleanup: budget.progress,
         }
     }
 }

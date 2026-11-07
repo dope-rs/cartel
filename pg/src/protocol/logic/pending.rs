@@ -8,7 +8,8 @@ use crate::{
     port::{self, CONNECTOR_CONNECTION_LIMIT, replies, requests},
     protocol::{
         Reason,
-        logic::{Owner, Session, State, drain, failure, state},
+        logic::{Owner, Session, State, drain, turn::Turn},
+        runtime::tx::poll,
     },
     schema,
 };
@@ -19,7 +20,7 @@ pub struct Pending<'d>(Kind<'d>);
 
 enum Kind<'d> {
     Row(replies::Pending<'d>),
-    Ready(state::Drain),
+    Ready(poll::Status),
 }
 
 impl<'d> Pending<'d> {
@@ -27,7 +28,7 @@ impl<'d> Pending<'d> {
         Self(Kind::Row(pending))
     }
 
-    pub(super) const fn ready(pending: state::Drain) -> Self {
+    pub(super) const fn ready(pending: poll::Status) -> Self {
         Self(Kind::Ready(pending))
     }
 
@@ -44,8 +45,7 @@ impl<'d> Pending<'d> {
         >,
     ) -> response::Settlement<Self> {
         let Some(queue) = port.responses(ctx.conn_id) else {
-            failure::Failure::in_context(port, ctx)
-                .apply(crate::Error::Protocol(Reason::RowUnknown));
+            Turn::new(port, ctx).fail(crate::Error::Protocol(Reason::RowUnknown));
             return response::Settlement::Ready;
         };
         match pending {
@@ -55,8 +55,7 @@ impl<'d> Pending<'d> {
                     response::Settlement::Blocked(Self::row(replies::Pending::Row(value)))
                 }
                 Err(usage::InsertError::Capacity { cause, .. }) => {
-                    failure::Failure::in_context(port, ctx)
-                        .apply(crate::Error::ReplyCapacity(cause));
+                    Turn::new(port, ctx).fail(crate::Error::ReplyCapacity(cause));
                     response::Settlement::Ready
                 }
                 Err(usage::InsertError::Front {
@@ -64,7 +63,7 @@ impl<'d> Pending<'d> {
                     ..
                 }) => response::Settlement::Ready,
                 Err(usage::InsertError::Front { front, .. }) => {
-                    failure::Failure::in_context(port, ctx).apply(crate::Error::ReplyFront(front));
+                    Turn::new(port, ctx).fail(crate::Error::ReplyFront(front));
                     response::Settlement::Ready
                 }
             },
@@ -74,8 +73,7 @@ impl<'d> Pending<'d> {
                     response::Settlement::Blocked(Self::row(replies::Pending::Failure(value)))
                 }
                 Err(usage::InsertError::Capacity { cause, .. }) => {
-                    failure::Failure::in_context(port, ctx)
-                        .apply(crate::Error::ReplyCapacity(cause));
+                    Turn::new(port, ctx).fail(crate::Error::ReplyCapacity(cause));
                     response::Settlement::Ready
                 }
                 Err(usage::InsertError::Front {
@@ -86,7 +84,7 @@ impl<'d> Pending<'d> {
                     response::Settlement::Ready
                 }
                 Err(usage::InsertError::Front { front, .. }) => {
-                    failure::Failure::in_context(port, ctx).apply(crate::Error::ReplyFront(front));
+                    Turn::new(port, ctx).fail(crate::Error::ReplyFront(front));
                     response::Settlement::Ready
                 }
             },
@@ -127,9 +125,13 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
                     }
                 }
             }
-            Kind::Ready(pending) => match drain::Drain::new(port, ctx, pending).settle(work) {
-                drain::Progress::Complete => response::Settlement::Ready,
-                drain::Progress::Blocked => response::Settlement::Yield(Self::ready(pending)),
+            Kind::Ready(pending) => match Turn::new(port, ctx).try_settle(pending, work) {
+                Ok(drain::Progress::Complete) => response::Settlement::Ready,
+                Ok(drain::Progress::Blocked) => response::Settlement::Yield(Self::ready(pending)),
+                Err(error) => {
+                    Turn::new(port, ctx).fail(error);
+                    response::Settlement::Ready
+                }
             },
         }
     }

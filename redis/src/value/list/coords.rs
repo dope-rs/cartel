@@ -1,16 +1,18 @@
-use crate::value::list::Lease;
 use crate::value::source::Coordinates as _;
 use crate::{
     client::GeoCoord,
-    protocol::parser::{frame, storage},
+    protocol::parser::storage,
     value::{self, reply, scalar, source},
 };
-use std::{iter, marker};
+use cartel_core::reply::retain;
 
-/// Optional coordinates retaining one validated frame, parser tape, and credits.
-pub struct Coordinates<'s, 'arena, 'credits, 'region>(
-    Lease<'s, 'arena, 'credits, 'region, storage::Coordinate>,
-);
+pub use crate::protocol::parser::storage::CoordinateIter as Iter;
+
+/// Optional coordinates retaining a validated parser tape and its value credits.
+pub struct Coordinates<'s, 'arena, 'credits, 'region> {
+    coordinates: storage::Region<'s, storage::Coordinate>,
+    _values: Option<retain::Values<'arena, 'credits, 'region>>,
+}
 
 impl source::Sealed for Coordinates<'_, '_, '_, '_> {}
 
@@ -23,7 +25,7 @@ impl<'s, 'arena, 'credits, 'region> source::Coordinates
         Self: 'a;
 
     fn len(&self) -> usize {
-        self.0.len()
+        self.coordinates.len()
     }
 
     fn is_empty(&self) -> bool {
@@ -31,7 +33,7 @@ impl<'s, 'arena, 'credits, 'region> source::Coordinates
     }
 
     fn iter(&self) -> Self::Iter<'_> {
-        Iter(self.0.stored.iter(), marker::PhantomData)
+        Iter::new(&self.coordinates)
     }
 }
 
@@ -67,34 +69,14 @@ impl<'s, 'arena, 'credits, 'region, const ID: u8> value::Decode<'s, 'arena, 'cre
                     return Err(fault.into_reply(frame, keep));
                 }
             };
-            Ok(Self(Lease {
-                stored: frame.store(nodes),
-                keep,
-            }))
+            drop(frame);
+            Ok(Self {
+                coordinates: nodes,
+                _values: keep.into_parts().1,
+            })
         })
     }
 }
-
-pub struct Iter<'a, 's, 'arena, 'credits, 'region>(
-    frame::Iter<'a, 's, 'region, storage::Coordinate>,
-    marker::PhantomData<(&'arena (), &'credits ())>,
-);
-
-impl Iterator for Iter<'_, '_, '_, '_, '_> {
-    type Item = Option<GeoCoord>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        Some(self.0.next()?.map(|[lng, lat]| GeoCoord::new(lng, lat)))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.0.remaining() as usize;
-        (len, Some(len))
-    }
-}
-
-impl ExactSizeIterator for Iter<'_, '_, '_, '_, '_> {}
-impl iter::FusedIterator for Iter<'_, '_, '_, '_, '_> {}
 
 impl<'a, 's, 'arena, 'credits, 'region> IntoIterator
     for &'a Coordinates<'s, 'arena, 'credits, 'region>

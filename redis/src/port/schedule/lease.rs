@@ -34,4 +34,12 @@ impl<B: ?Sized, const ID: u8> Drop for Lease<'_, '_, '_, '_, '_, B, ID> {
     }
 }
 
+impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>
+    AsRef<crate::Port<'s, 'app, 'b, 'c, 'd, ID>> for Lease<'app, 's, 'b, 'c, 'd, B, ID>
+{
+    fn as_ref(&self) -> &crate::Port<'s, 'app, 'b, 'c, 'd, ID> {
+        &self.redis.port
+    }
+}
+
 const _: () = assert!(std::mem::size_of::<Lease<'_, '_, '_, '_, '_, (), 0>>() == 40);

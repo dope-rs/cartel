@@ -1,4 +1,10 @@
-use std::{array, mem::MaybeUninit, ops::ControlFlow, pin::Pin, task::Poll};
+use std::{
+    array,
+    mem::{self, MaybeUninit},
+    ops::ControlFlow,
+    pin::Pin,
+    task::Poll,
+};
 
 use cartel_core::{deadline, reply};
 use dope::{
@@ -8,7 +14,7 @@ use dope::{
 use dope_fiber::{abi, context, wait};
 use o3::{base::cell::region, depot::array::init};
 use reply::{
-    Slot, order,
+    Slot,
     recv::{
         self,
         attach::{self, Attach},
@@ -24,11 +30,7 @@ use crate::{
             group::{Outcome, Sync},
         },
     },
-    port::replies::{
-        self,
-        groups::{self, Owner},
-    },
-    port::requests,
+    port::replies::{self, groups},
     reply::{Error, group::Ledger},
     schema,
 };
@@ -45,15 +47,15 @@ impl<'app, 'b, 'c: 'b, 'd: 'c, const ID: u8>
 {
     type Output = Outcome<Option<replies::Payload<'b, 'c, 'd>>, Error<'d, ID>>;
     type Context = ();
-    const ACCEPTANCE: recv::Acceptance = recv::Acceptance::Collected;
+    const ACCEPTANCE: recv::Acceptance = recv::Acceptance::First;
 
     fn extract(
         _: &(),
         slot: &mut Slot<'_, 'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>,
     ) -> Option<Self::Output> {
         Some(match slot.terminal()? {
-            Terminal::Complete(mut done) => match done.try_lease() {
-                Ok(payload) => Outcome::Completed(payload.map(replies::Payload::from_lease)),
+            Terminal::Complete(mut done) => match done.try_node() {
+                Ok(payload) => Outcome::Completed(payload.map(replies::Payload::from_node)),
                 Err(error) => Outcome::Failed(crate::Error::ResponseRetain(error).into()),
             },
             Terminal::Failed(failure) => match failure.into_error() {
@@ -214,52 +216,6 @@ impl<'g, 'r, 's, 'b, 'c, 'd, const N: usize> Ready<'g, 'r, 's, 'b, 'c, 'd, N> {
     }
 }
 
-impl<'g, 'r, 's, 'b, 'c: 'b, 'd: 'c, const N: usize> Ready<'g, 'r, 's, 'b, 'c, 'd, N> {
-    fn try_attach<'app, const ID: u8>(
-        self,
-        replies: &mut Replies<'app, 'g, 'r, 's, 'b, 'c, 'd, ID, N>,
-        token: &mut region::Token<region::Identity<'d>>,
-        lane: reply::Lane<
-            'app,
-            'b,
-            'c,
-            'd,
-            replies::Row<'d>,
-            replies::ReplyFailure<'d>,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-        >,
-        tag: replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-    ) -> Result<(order::Depth, Owner<'g, 'r, 's, 'b, 'c, 'd>), (attach::Error, Self)> {
-        let reserved = match lane.try_reserve(self.collector.usage()) {
-            Ok(reserved) => reserved,
-            Err(error) => return Err((attach::Error::Payload(error), self)),
-        };
-        Response::try_group_by(
-            token,
-            lane,
-            &mut replies.commands,
-            &mut replies.sync,
-            (self, reserved),
-            |(ready, reserved)| {
-                let Self {
-                    collector: draft,
-                    commands,
-                    sync,
-                } = ready;
-                let owner = draft.admit(reserved);
-                let mut index = 0u32;
-                let commands = commands.map(|owner| {
-                    let position = index;
-                    index += 1;
-                    replies::Tag::command(tag.batch(), position, index as usize == N, owner)
-                });
-                (commands, replies::Tag::sync(tag.batch(), sync), owner)
-            },
-        )
-        .map_err(|(error, (ready, _))| (error, ready))
-    }
-}
-
 #[pin_project::pin_project]
 pub(in crate::api) struct Group<
     'app,
@@ -274,6 +230,7 @@ pub(in crate::api) struct Group<
     const ID: u8,
     const N: usize,
 > {
+    client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     admission: Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, N>,
     reply: Replies<'app, 'g, 'r, 's, 'b, 'c, 'd, ID, N>,
     #[pin]
@@ -301,9 +258,10 @@ impl<
         target: Option<api::Target<'d, ID>>,
         next: Result<api::Pending<'d, Ready<'g, 'r, 's, 'b, 'c, 'd, N>>, crate::Error>,
     ) -> Self {
-        let admit = State::new(client, target, next);
+        let admit = State::new(target, next);
         let deadline = client.port.lifecycle.deadline.guard();
         Self {
+            client,
             admission: admit,
             reply: Replies::new(),
             deadline,
@@ -343,43 +301,78 @@ impl<
             Some(stop) => stop,
             None => {
                 match this.admission.poll_with(
+                    this.client,
                     cx.as_mut(),
                     this.waiter.as_ref(),
-                    |admit, client, conn, request, region| {
-                        let api::Pending {
-                            frame,
-                            boundary,
-                            state: ready,
-                        } = request;
-                        let context = requests::ReplyContext::new(conn, boundary, region);
+                    |admit, client, weight, context| {
                         client
                             .port
                             .request()
                             .try_with(
                                 context,
-                                frame.as_ref().len(),
-                                (frame, ready),
-                                |token, lane, tag, (frame, ready)| match ready
-                                    .try_attach(this.reply, token, lane, tag)
-                                {
-                                    Ok((depth, owner)) => Ok((depth, (frame, owner))),
-                                    Err((error, ready)) => Err((error, (frame, ready))),
+                                weight,
+                                admit,
+                                |token, lane, tag, admit| {
+                                    let State::Connecting { request, .. } = &*admit else {
+                                        unreachable!("connecting");
+                                    };
+                                    let reserved =
+                                        match lane.try_reserve(request.state.collector.usage()) {
+                                            Ok(reserved) => reserved,
+                                            Err(error) => {
+                                                return Err((attach::Error::Payload(error), admit));
+                                            }
+                                        };
+                                    Response::try_group_by(
+                                        token,
+                                        lane,
+                                        &mut this.reply.commands,
+                                        &mut this.reply.sync,
+                                        (admit, reserved),
+                                        |(admit, reserved)| match mem::replace(admit, State::Done) {
+                                            State::Connecting { request, .. } => {
+                                                let api::Pending {
+                                                    frame,
+                                                    state:
+                                                        Ready {
+                                                            collector,
+                                                            commands,
+                                                            sync,
+                                                        },
+                                                    ..
+                                                } = request;
+                                                let owner = collector.admit(reserved);
+                                                let mut index = 0u32;
+                                                let commands = commands.map(|owner| {
+                                                    let position = index;
+                                                    index += 1;
+                                                    replies::Tag::command(
+                                                        tag.batch(),
+                                                        position,
+                                                        index as usize == N,
+                                                        owner,
+                                                    )
+                                                });
+                                                (
+                                                    commands,
+                                                    replies::Tag::sync(tag.batch(), sync),
+                                                    (admit, frame, owner),
+                                                )
+                                            }
+                                            _ => unreachable!("connecting"),
+                                        },
+                                    )
+                                    .map_err(|(error, (admit, _))| (error, admit))
                                 },
-                                |(frame, owner)| {
-                                    (frame, (lease::Lease::admit((), client, conn), owner))
+                                |(admit, frame, owner), conn| {
+                                    *admit = State::Admitted(
+                                        lease::Lease::admit((), client, conn),
+                                        owner,
+                                    );
+                                    (frame, ())
                                 },
                             )
-                            .map(|(lease, owner)| *admit = State::Admitted(lease, owner))
-                            .map_err(|(error, (frame, ready))| {
-                                (
-                                    error,
-                                    api::Pending {
-                                        frame,
-                                        boundary,
-                                        state: ready,
-                                    },
-                                )
-                            })
+                            .map_err(|(error, conn, _)| (error, conn))
                     },
                 ) {
                     Poll::Pending => return Poll::Pending,

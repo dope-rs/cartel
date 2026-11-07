@@ -7,36 +7,6 @@ use dope_fiber::{abi, context, wait};
 use reply::recv;
 use std::{pin, task::Poll};
 
-/// Projects a completed reply after its original call has released its resources.
-#[pin_project::pin_project]
-pub(in crate::api) struct Map<F, M> {
-    #[pin]
-    task: abi::Task<F>,
-    map: M,
-}
-
-impl<F, M> Map<F, M> {
-    pub(in crate::api) const fn new(fiber: F, map: M) -> Self {
-        Self {
-            task: abi::Task::new(fiber),
-            map,
-        }
-    }
-}
-
-impl<'d, F: abi::Fiber<'d>, M, T> abi::Fiber<'d> for Map<F, M>
-where
-    M: FnMut(F::Output) -> T,
-{
-    type Output = T;
-
-    fn poll(call: context::PollCall<'_, '_, 'd, Self>) -> Poll<T> {
-        let (this, admit) = call.into_admit();
-        let this = this.project();
-        admit.poll(this.task).0.map(this.map)
-    }
-}
-
 #[pin_project::pin_project]
 pub struct Call<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, X, const ID: u8>
 where
@@ -115,23 +85,23 @@ where
             Ok(guard) => pin::Pin::new(guard),
             Err(error) => {
                 this.waiter.as_ref().unregister();
-                return Poll::Ready(Err(this.core.no_timer(*error)));
+                return Poll::Ready(Err(this.core.abort(crate::Error::Deadline(*error))));
             }
         };
         let phase = this.core.phase();
         if let Poll::Ready(time) = guard.as_mut().poll_expired(cx.as_mut(), phase) {
             this.waiter.as_ref().unregister();
-            return Poll::Ready(Err(this.core.expire(time)));
+            return Poll::Ready(Err(this.core.fail(
+                crate::Error::RequestTimeout(time),
+                cx.as_mut().region_token(),
+            )));
         }
-        let next =
-            match this
-                .core
-                .poll_done(cx.as_mut(), this.waiter.as_ref(), task::lease::Lease::admit)
-            {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(task::Done::AdmissionFailed(error)) => Poll::Ready(Err(error)),
-                Poll::Ready(task::Done::Response { outcome, .. }) => Poll::Ready(outcome),
-            };
+        let next = this.core.poll(
+            cx.as_mut(),
+            this.waiter.as_ref(),
+            task::lease::Lease::admit,
+            |_, outcome| outcome,
+        );
         if next.is_ready() {
             guard.as_mut().complete();
         }

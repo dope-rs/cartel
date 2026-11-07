@@ -189,7 +189,7 @@ pub(crate) struct Runtime<'d, const ID: u8> {
 impl<'d, const ID: u8> Runtime<'d, ID> {
     pub(in crate::protocol) fn try_new(
         cap: Capacity,
-        proof: region::Proof<region::Identity<'d>>,
+        proof: region::Identity<'d>,
     ) -> Result<Self, alloc::Error> {
         Ok(Self {
             waiters: values::Values::try_fixed(cap.entries().get())?,

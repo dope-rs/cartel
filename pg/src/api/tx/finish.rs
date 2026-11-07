@@ -3,7 +3,7 @@ use crate::{port::pool::access, protocol::runtime::tx::poll};
 use api::{
     request,
     task::{
-        Core, Done,
+        Core,
         lease::{Lease, Recover},
         tx::Held,
     },
@@ -128,15 +128,20 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                 return Poll::Ready(Err(error));
             }
             if let State::Dispatching(call) = this.state {
-                match call.poll_done(cx.as_mut(), waiter, |held, _client, _conn| held.begin()) {
+                match call.poll(
+                    cx.as_mut(),
+                    waiter,
+                    |held, _client, _conn| held.begin(),
+                    Core::complete,
+                ) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Done::AdmissionFailed(error)) => {
+                    Poll::Ready(Err(error)) => {
                         *this.state = State::Done;
                         waiter.unregister();
                         timer.as_mut().complete();
                         return Poll::Ready(Err(error));
                     }
-                    Poll::Ready(Done::Response { outcome, committed }) => {
+                    Poll::Ready(Ok((outcome, committed))) => {
                         *this.state = State::Settling {
                             finalizing: committed,
                             outcome,

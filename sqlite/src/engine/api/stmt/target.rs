@@ -31,7 +31,7 @@ where
         _: &guard::Guard<'_, call::Call>,
     ) -> result::Result<(stmt::Bound<'query, 'connection, P>, Self::Access), crate::Error> {
         Ok((
-            stmt::Bound::new(engine.statements.lease(self), params, config, Q::PARAMETERS)?,
+            stmt::Bound::new(engine.lease(self), params, config, Q::PARAMETERS)?,
             access::Plain,
         ))
     }

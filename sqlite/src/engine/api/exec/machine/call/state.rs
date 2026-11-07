@@ -26,7 +26,7 @@ impl<'query, 'd> State<'query, 'd> {
         }
     }
 
-    pub(crate) const fn config(&self) -> &config::Config {
+    pub(crate) fn config(&self) -> &config::Config {
         self.retry.config()
     }
 
@@ -46,8 +46,11 @@ impl<'query, 'd> State<'query, 'd> {
                 },
             }
             match self.step(prepared, access) {
-                Err(crate::Error::Busy { action, code }) => {
+                Err(error @ crate::Error::Busy { action, code }) => {
                     self.transaction.check()?;
+                    if self.guard.check(Ok(())).is_err() {
+                        return task::Poll::Ready(Err(error));
+                    }
                     let fault = sys::Fault::new(action, code);
                     match self.wait(context.as_mut(), fault) {
                         task::Poll::Pending => return task::Poll::Pending,
@@ -95,8 +98,7 @@ impl<'query, 'd> State<'query, 'd> {
         fault: sys::Fault,
     ) -> task::Poll<result::Result<(), crate::Error>> {
         let (now, wake) = Self::sample(context);
-        self.retry.defer(now, fault)?;
-        self.retry.poll(now, wake)
+        self.retry.defer(now, fault, wake)
     }
 
     fn poll_retry(

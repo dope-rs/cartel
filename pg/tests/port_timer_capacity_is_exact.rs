@@ -178,10 +178,19 @@ fn typed_queries_free_timer() {
                                     drop(alarms.pop().expect("last available timer"));
 
                                     let mut stream = client.query().run_stream::<TextQuery>(());
-                                    assert!(matches!(
-                                        runtime.block_on(stream.next_row()),
-                                        Ok(Ok(Some(_)))
-                                    ));
+                                    {
+                                        let mut next = pin!(stream.next_row());
+                                        assert!(matches!(
+                                            runtime.block_on(poll_fn(|context| {
+                                                // SAFETY: the pinned operation remains owned here, and Ready
+                                                // ends this closure's polling authority.
+                                                unsafe { Live::new(next.as_mut()) }.poll(context)
+                                            })),
+                                            Ok(Ok(Some(_)))
+                                        ));
+                                        let _alarm =
+                                            timer.try_alarm().expect("completed next timer");
+                                    }
                                     assert!(matches!(
                                         runtime.block_on(stream.next_row()),
                                         Ok(Ok(None))
@@ -289,11 +298,22 @@ fn typed_queries_free_timer() {
                                         rows.as_ref().err().map(reply::Error::kind)
                                     );
                                     let rows = rows.ok().expect("collection query");
-                                    let _alarm =
-                                        timer.try_alarm().expect("completed run_all timer");
+                                    let alarm = timer.try_alarm().expect("completed run_all timer");
                                     let rows = rows.validate().expect("retained collection");
                                     let view = rows.iter().next().expect("collected row");
                                     assert_eq!((view.lease, view.name), (7, "retained"));
+                                    drop(rows);
+                                    drop(alarm);
+                                    let failure = runtime
+                                        .block_on(client.query().run_first::<TextQuery>(()))
+                                        .expect("late failure driver")
+                                        .err()
+                                        .expect("late Sync failure");
+                                    assert!(matches!(failure,
+                                        reply::Error::Server(error)
+                                            if error.fields().code().as_str() == "23505"
+                                                && error.fields().message() == "duplicate"
+                                    ));
                                 })
                             })
                         })

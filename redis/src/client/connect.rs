@@ -1,6 +1,6 @@
 //! One TCP attempt whose connection remains owned by the returned client.
 
-use std::{marker::PhantomData, pin::Pin, task::Poll};
+use std::{marker::PhantomData, ops::ControlFlow, pin::Pin};
 
 use dope::{
     core::driver::{
@@ -258,13 +258,13 @@ impl<'b, 'source, 'd, const ID: u8> Start<'b, 'source, 'd, ID> {
             let mut pending = machine::Machine::new(self.vacant.start((), target));
             let attempt = abi::poll_fn(move |cx| pending.step(|pending| {
                 match pending.poll(cx.as_ref().completion()) {
-                    mailbox::Poll::Pending(pending) => machine::Step::Suspend(pending, Poll::Pending),
+                    mailbox::Poll::Pending(pending) => ControlFlow::Continue(pending),
                     mailbox::Poll::Ready(result, attempt) => {
                         let result = match result {
                             Ok(()) => Ok(attempt),
                             Err(cause) => Err(Error::Attempt { key: attempt.id(), cause }),
                         };
-                        machine::Step::Complete(Poll::Ready(result))
+                        ControlFlow::Break(result)
                     }
                 }
             })).await?;

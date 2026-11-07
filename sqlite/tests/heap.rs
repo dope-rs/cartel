@@ -196,7 +196,7 @@ fn failed_query_keeps_reset(runtime: Runtime) -> Result<(), plan::Error> {
 
 fn reset_cleanup_receipts(runtime: Runtime) -> Result<(), plan::Error> {
     let (mut limits, memory) = try_settings()?;
-    limits.work.cleanup.progress = Progress::new(NonZero::<u64>::MIN);
+    limits.work.cleanup = Progress::new(NonZero::<u64>::MIN);
     let result = plan::Plan::<HeapDatabase>::try_new(open(runtime)?, limits, memory)?.try_app(
         |driver| {
             {

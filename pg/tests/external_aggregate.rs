@@ -74,12 +74,16 @@ fn aggregates() {
                             .try_own()?,
                         5
                     );
-                    assert_eq!(
-                        Aggregate::count_active(client.query(), true)
-                            .await
-                            .try_own()?,
-                        4
-                    );
+                    let mut pool = dope_fiber::task::batch::Pool::<4>::acquire().await
+                        .expect("aggregate task credits");
+                    let values = Aggregate::count_active_each(
+                        client.query(),
+                        &mut pool,
+                        [true, false, true, false],
+                    ).await.expect("aggregate tasks");
+                    for (value, expected) in values.zip([4, 1, 4, 1]) {
+                        assert_eq!(value.try_own()?, expected);
+                    }
                     assert_eq!(
                         Aggregate::sum_ages(client.query())
                             .await
@@ -92,8 +96,6 @@ fn aggregates() {
                         (0, 0, 0, None),
                         (0, 1, 1, None),
                     ];
-                    let mut pool = dope_fiber::task::batch::Pool::<4>::acquire().await
-                        .expect("aggregate task credits");
                     let values = Aggregate::sum_doubled_each(
                         client.query(),
                         &mut pool,

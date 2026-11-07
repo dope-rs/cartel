@@ -30,7 +30,7 @@ pub trait Batch: Sealed {
     }
     fn payload_len(&self) -> usage::Bytes;
     fn try_map<T>(
-        &self,
+        self,
         make: impl for<'slot> FnMut(
             &Self::Item,
             array::Slot<'slot, T>,
@@ -58,7 +58,7 @@ impl<'d> Batch for reply::Batch<'_, '_, '_, 'd, replies::Row<'d>> {
     }
 
     fn try_map<T>(
-        &self,
+        self,
         make: impl for<'slot> FnMut(
             &Self::Item,
             array::Slot<'slot, T>,

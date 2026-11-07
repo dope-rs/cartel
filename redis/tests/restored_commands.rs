@@ -47,6 +47,15 @@ fn preserves_wire_and_geo() {
                 socket.read_exact(received).expect("Redis request");
                 assert_eq!(received, request);
                 socket.write_all(reply).expect("Redis response");
+                if reply == b"*2\r\n*2\r\n$4\r\n1.25\r\n$4\r\n-2.5\r\n*-1\r\n" {
+                    let ping = &mut received[..common::session::held::PING.len()];
+                    socket.read_exact(ping).expect("held coordinate ping");
+                    assert_eq!(ping, common::session::held::PING);
+                    let mut pong = [b'x'; 128];
+                    pong[0] = b'+';
+                    pong[126..].copy_from_slice(b"\r\n");
+                    socket.write_all(&pong).expect("full byte allowance");
+                }
             }
         }, |server| {
         let prepared = topology::try_new::<Bundle<Tcp, Identity, Throughput>>(
@@ -109,6 +118,7 @@ fn preserves_wire_and_geo() {
                             }
                             let coords = runtime.block_on(redis.geo().positions(b"map", &values))
                                 .expect("coordinate operation").ok().expect("coordinate reply");
+                            assert!(matches!(runtime.block_on(redis.server().ping()), Ok(Ok(()))));
                             assert!(matches!(runtime.block_on(redis.geo().search(b"map", 1.25, -2.5, 3.5, Unit::Kilometers)),
                                 Ok(Ok(found)) if found.iter().eq(values)));
                             let usage = Tracker::begin();

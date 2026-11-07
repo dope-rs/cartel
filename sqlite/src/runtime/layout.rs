@@ -1,5 +1,5 @@
 use crate::{
-    catalogs, config, database,
+    catalogs, config, database, open,
     runtime::{self, heap, local},
 };
 use dope_core::driver::settings::{claim, errors};
@@ -7,6 +7,7 @@ use dope_core::driver::{
     settings::{self, demands, demands::slots::Slots},
     storage,
 };
+use dope_runtime::topology;
 use heap::layout;
 use std::marker;
 
@@ -20,38 +21,65 @@ pub struct Layout<'sql, I: catalogs::Catalog> {
     marker: marker::PhantomData<I>,
 }
 
-impl runtime::Runtime {
-    pub(crate) fn layout<'sql, I: catalogs::Catalog>(
-        &self,
-        config: config::Config,
+impl<'sql, I: catalogs::Catalog> Layout<'sql, I> {
+    pub(super) const fn dimensions(&self) -> (layout::Layout, usize, usize, usize) {
+        (
+            self.sqlite,
+            self.settings.config.result_bytes(),
+            self.statement_bytes,
+            self.lookaside.bytes(),
+        )
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        local::Settings,
+        database::Target<'sql>,
+        crate::memory::Lookaside,
+    ) {
+        (self.settings, self.database, self.lookaside)
+    }
+}
+
+impl<'sql> database::Target<'sql> {
+    pub fn plan<I: catalogs::Catalog>(
+        self,
+        limits: crate::Limits,
         memory: crate::Memory,
-        database: database::Target<'sql>,
-    ) -> Result<Layout<'sql, I>, runtime::Error> {
-        let (plan, sqlite) = memory.admit::<I>()?;
+    ) -> Result<topology::Plan<Layout<'sql, I>, open::Plan<I>>, database::Error> {
+        catalogs::validate::<I>().map_err(database::Error::Catalog)?;
+        let config = config::Config::from_parts(limits, memory)?;
+        let (plan, sqlite) = memory.admit::<I>().map_err(database::Error::Runtime)?;
         if plan.targets.retained > sqlite.capacity() {
-            return Err(runtime::Error::SqliteCapacity);
+            return Err(database::Error::Runtime(runtime::Error::SqliteCapacity));
         }
         let values = sqlite.capacity();
         if values > i32::MAX as usize {
-            return Err(runtime::Error::SqliteMemory { actual: values });
+            return Err(database::Error::Runtime(runtime::Error::SqliteMemory {
+                actual: values,
+            }));
         }
-        let actual = plan.statements.sql_bytes.max(database.sql_bytes());
+        let actual = plan.statements.sql_bytes.max(self.sql_bytes());
         if actual > i32::MAX as usize {
-            return Err(runtime::Error::StatementSqlBytes { actual });
+            return Err(database::Error::Runtime(
+                runtime::Error::StatementSqlBytes { actual },
+            ));
         }
         let sql = actual as i32;
-        Ok(Layout {
+        let layout = Layout {
             settings: local::Settings {
                 config,
                 value_bytes: values as i32,
                 statement_sql_bytes: sql,
             },
             sqlite,
-            database,
+            database: self,
             statement_bytes: plan.statements.slots_bytes,
             lookaside: memory.lookaside,
             marker: marker::PhantomData,
-        })
+        };
+        Ok(topology::Plan::new(layout, open::Plan::new()))
     }
 }
 
@@ -87,14 +115,6 @@ impl<I: catalogs::Catalog> storage::Create for Layout<'_, I> {
         Self: 'd,
         'd: 'p,
     {
-        let Self {
-            settings,
-            sqlite,
-            database,
-            statement_bytes: stmts,
-            lookaside: aside,
-            marker: marker::PhantomData,
-        } = self;
-        local::State::new(&mut context, settings, sqlite, database, stmts, aside)
+        local::State::new(&mut context, self)
     }
 }

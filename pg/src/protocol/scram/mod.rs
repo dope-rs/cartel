@@ -76,7 +76,6 @@ impl Mechanism {
     }
 }
 
-struct ClientNonce([u8; CLIENT_NONCE_BYTES]);
 pub(super) struct Signature(Secret32);
 
 pub(in crate::protocol) struct Keys {
@@ -103,13 +102,13 @@ impl Keys {
     }
 }
 
-struct Deriving {
+pub(super) struct Deriving {
     server_first: parser::Retained,
     key: kdf::KdfKey,
 }
 
 enum State {
-    AwaitServerFirst,
+    AwaitServerFirst([u8; CLIENT_NONCE_BYTES]),
     Deriving(Deriving),
     AwaitServerFinal(Signature),
     Complete,
@@ -117,107 +116,86 @@ enum State {
 
 pub(super) struct Scram<'a, 'd, const ID: u8> {
     pub(super) ticket: kdf::Ticket<'a, 'd, ID>,
-    nonce: ClientNonce,
     state: State,
-}
-
-pub(super) struct ClientFirst<'a>(&'a [u8; CLIENT_NONCE_BYTES]);
-
-pub(super) struct Derive<'a> {
-    nonce: &'a ClientNonce,
-    state: &'a Deriving,
-}
-
-impl ClientFirst<'_> {
-    pub(super) fn write_to(&self, out: &mut encode::Writer) -> Result<(), encode::Error> {
-        out.extend(b"n,,n=,r=")?;
-        out.extend(self.0)
-    }
 }
 
 impl<'a, 'd, const ID: u8> Scram<'a, 'd, ID> {
     pub(super) fn new(
         runtime: &'a Runtime<'d, ID>,
         owner: conn::Id<'d, route::KeyTag<ID>>,
+        send: impl FnOnce(&[u8; CLIENT_NONCE_BYTES]) -> Result<(), crate::Error>,
     ) -> Result<Self, crate::Error> {
         let ticket = runtime.try_entry(owner).map_err(crate::Error::ScramSlot)?;
         let mut bytes = mem::MaybeUninit::uninit();
         let raw = Backend::entropy::<18>(&mut bytes).map_err(crate::Error::Random)?;
+        let nonce = encode_nonce(raw);
+        send(&nonce)?;
         Ok(Self {
             ticket,
-            nonce: ClientNonce(encode_nonce(raw)),
-            state: State::AwaitServerFirst,
+            state: State::AwaitServerFirst(nonce),
         })
     }
 
-    pub(super) fn client_first(&self) -> ClientFirst<'_> {
-        ClientFirst(&self.nonce.0)
-    }
-
     pub(super) fn begin(&mut self, password: &[u8], bytes: Wire<'_>) -> Result<(), crate::Error> {
-        let State::AwaitServerFirst = &self.state else {
+        let State::AwaitServerFirst(expected) = &self.state else {
             return Err(crate::Error::Protocol(Reason::DuplicateServerFirst));
         };
         let parsed = parser::Parser::new(bytes)
             .server_first()
             .map_err(crate::Error::ServerFirst)?;
-        parsed.with_parts(|parsed, nonce, salt, count| {
-            if nonce.len() <= self.nonce.0.len() {
-                return Err(crate::Error::ServerFirst(Reason::NonceLength {
-                    actual: nonce.length(),
-                    minimum: Length::from_u32(CLIENT_NONCE_BYTES as u32 + 1),
-                }));
-            }
-            if let Some((offset, (actual, expected))) = (0u32..)
-                .zip(
-                    nonce
-                        .as_slice()
-                        .iter()
-                        .copied()
-                        .zip(self.nonce.0.iter().copied()),
-                )
-                .find(|item| item.1.0 != item.1.1)
-            {
-                return Err(crate::Error::ServerFirst(Reason::NonceByte {
-                    offset: Offset::from_u32(offset),
-                    actual,
-                    expected,
-                }));
-            }
+        let (parsed, nonce, salt, count) = parsed.into_parts();
+        if nonce.len() <= expected.len() {
+            return Err(crate::Error::ServerFirst(Reason::NonceLength {
+                actual: nonce.length(),
+                minimum: Length::from_u32(CLIENT_NONCE_BYTES as u32 + 1),
+            }));
+        }
+        if let Some((offset, (actual, expected))) = (0u32..)
+            .zip(
+                nonce
+                    .as_slice()
+                    .iter()
+                    .copied()
+                    .zip(expected.iter().copied()),
+            )
+            .find(|item| item.1.0 != item.1.1)
+        {
+            return Err(crate::Error::ServerFirst(Reason::NonceByte {
+                offset: Offset::from_u32(offset),
+                actual,
+                expected,
+            }));
+        }
 
-            let mut first = Sha256::new(64);
-            let mut outer = Zeroizing::new(IV);
-            hmac(password, &mut first.state, &mut outer);
-            decode_base64(salt, |decoded| first.update(decoded))?;
-            let iterations = kdf::try_iterations(count)?;
-            self.state = State::Deriving(Deriving {
-                server_first: parsed.try_retain()?,
-                key: kdf::KdfKey {
-                    first: Secret32::new([0; 32]),
-                    iterations,
-                },
-            });
-            let State::Deriving(state) = &mut self.state else {
-                unreachable!("scram")
-            };
-            first.update(&1u32.to_be_bytes());
-            first.hmac(&outer, &mut state.key.first);
-            Ok(())
-        })
+        let mut first = Sha256::new(64);
+        let mut outer = Zeroizing::new(IV);
+        hmac(password, &mut first.state, &mut outer);
+        decode_base64(salt, |decoded| first.update(decoded))?;
+        let iterations = kdf::try_iterations(count)?;
+        self.state = State::Deriving(Deriving {
+            server_first: parsed.try_retain()?,
+            key: kdf::KdfKey {
+                first: Secret32::new([0; 32]),
+                iterations,
+            },
+        });
+        let State::Deriving(state) = &mut self.state else {
+            unreachable!("scram")
+        };
+        first.update(&1u32.to_be_bytes());
+        first.hmac(&outer, &mut state.key.first);
+        Ok(())
     }
 
-    pub(super) fn deriving(&self) -> Option<Derive<'_>> {
+    pub(super) fn deriving(&self) -> Option<&Deriving> {
         match &self.state {
-            State::Deriving(state) => Some(Derive {
-                nonce: &self.nonce,
-                state,
-            }),
-            State::AwaitServerFirst | State::AwaitServerFinal(_) | State::Complete => None,
+            State::Deriving(state) => Some(state),
+            State::AwaitServerFirst(_) | State::AwaitServerFinal(_) | State::Complete => None,
         }
     }
 
-    pub(super) fn await_final(&mut self, sig: &Signature) {
-        self.state = State::AwaitServerFinal(Signature(sig.0.clone()));
+    pub(super) fn await_final(&mut self, sig: Signature) {
+        self.state = State::AwaitServerFinal(sig);
     }
 
     pub(super) fn verify_final(&mut self, bytes: Wire<'_>) -> Result<(), crate::Error> {
@@ -262,9 +240,9 @@ impl<'a, 'd, const ID: u8> Scram<'a, 'd, ID> {
     }
 }
 
-impl Derive<'_> {
+impl Deriving {
     pub(super) const fn key(&self) -> &kdf::KdfKey {
-        &self.state.key
+        &self.key
     }
 
     pub(super) fn write_final(
@@ -272,12 +250,15 @@ impl Derive<'_> {
         keys: &Keys,
         out: &mut encode::Writer,
     ) -> Result<Signature, encode::Error> {
-        let first = &self.state.server_first;
+        let first = &self.server_first;
         let nonce = first.nonce();
+        // SAFETY: Deriving is constructed only after validating this immutable
+        // retained nonce's length and equality with the client's fixed prefix.
+        let client = unsafe { &*nonce.as_ptr().cast::<[u8; CLIENT_NONCE_BYTES]>() };
         let mut proof = Secret32::new([0; 32]);
         hmac_auth_message(
             keys.stored.as_array(),
-            &self.nonce.0,
+            client,
             first.as_slice(),
             nonce,
             &mut proof,
@@ -291,7 +272,7 @@ impl Derive<'_> {
         let mut expected = Secret32::new([0; 32]);
         hmac_auth_message(
             keys.server.as_array(),
-            &self.nonce.0,
+            client,
             first.as_slice(),
             nonce,
             &mut expected,
@@ -301,7 +282,7 @@ impl Derive<'_> {
         out.extend(nonce)?;
         out.extend(b",p=")?;
         out.extend(encoded.as_slice())?;
-        Ok(Signature(expected.clone()))
+        Ok(Signature(expected))
     }
 }
 

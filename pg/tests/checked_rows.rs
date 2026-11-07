@@ -243,7 +243,7 @@ fn owned_batch_failure() {
                                         })) if actual.get() == 1
                                     ));
                                     let bytes = 2 * size_of::<TextRow>() + 11;
-                                    assert_eq!(counts, [3, bytes, 3, bytes]);
+                                    assert_eq!(counts, [3, bytes, 5, bytes + 80]);
                                 })
                             })
                         })

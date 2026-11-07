@@ -1,6 +1,6 @@
-use std::{mem, pin::Pin, task::Poll};
+use std::{mem, num::NonZero, pin::Pin, task::Poll};
 
-use cartel_core::{deadline, reply::recv::attach::Attach};
+use cartel_core::deadline;
 use dope::{
     core::driver::{
         route::KeyTag,
@@ -9,14 +9,9 @@ use dope::{
     manifold::client::conn,
 };
 use dope_fiber::{context, wait};
-use o3::base::{cell::region, time::Positive};
+use o3::base::time::Positive;
 
-use crate::{
-    api,
-    port::{replies, requests},
-    reply::Error,
-    schema,
-};
+use crate::{api, port::requests, reply::Error, schema};
 
 use crate::api::task::{State, lease};
 
@@ -38,17 +33,12 @@ impl<
 > State<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, S, A, P, H>
 {
     pub(super) fn new(
-        client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         target: Option<api::Target<'d, ID>>,
         next: Result<api::Pending<'d, S>, crate::Error>,
     ) -> Self {
         match next {
-            Ok(request) => State::Connecting {
-                client,
-                target,
-                request,
-            },
-            Err(error) => State::Failed(error.into()),
+            Ok(request) => State::Connecting { target, request },
+            Err(error) => State::Failed(error),
         }
     }
 
@@ -61,7 +51,7 @@ impl<
 
     pub(super) fn cancel(&mut self, error: crate::Error) -> Error<'d, ID> {
         match mem::replace(self, State::Done) {
-            State::Failed(error) => return error,
+            State::Failed(error) => return error.into(),
             State::Admitted(lease, _) => lease.abort(error),
             _ => {}
         }
@@ -70,66 +60,68 @@ impl<
 
     pub(super) fn poll_with<'target>(
         &mut self,
+        client: &api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         mut cx: Pin<&mut context::Context<'_, 'd>>,
         waiter: Pin<&wait::Waiter<'target, 'd>>,
         prepare: impl FnOnce(
             &mut Self,
             api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-            conn::Id<'d, KeyTag<ID>>,
-            api::Pending<'d, S>,
-            &mut region::Token<region::Identity<'d>>,
-        ) -> Result<(), (crate::Error, api::Pending<'d, S>)>,
+            NonZero<usize>,
+            requests::ReplyContext<'_, 'app, 'd, ID>,
+        ) -> Result<(), (crate::Error, conn::Id<'d, KeyTag<ID>>)>,
     ) -> Poll<Result<(), Error<'d, ID>>>
     where
         'app: 'target,
         'd: 'target,
     {
-        if matches!(self, State::Admitted(..)) {
-            return Poll::Ready(Ok(()));
-        }
-        let (client, target, request) = match mem::replace(self, State::Done) {
-            State::Connecting {
-                client,
-                target,
-                request,
-            } => (client, target, request),
-            State::Admitted(..) => unreachable!("admitted"),
-            State::Failed(error) => return Poll::Ready(Err(error)),
-            State::Done => return Poll::Ready(Err(crate::Error::Closed.into())),
+        let (client, target, request) = match &*self {
+            State::Connecting { target, request } => (*client, target, request),
+            State::Admitted(..) => return Poll::Ready(Ok(())),
+            State::Failed(_) | State::Done => {
+                return Poll::Ready(Err(self.cancel(crate::Error::Closed)));
+            }
         };
         client
             .port
             .maintain(cx.as_ref().work(), cx.as_mut().region_token());
-        let conn = match client.select(target, request.boundary) {
-            Ok(Some(conn)) => conn,
-            Ok(None) => {
-                if let Err(error) = client.port.shared.ready.try_register(waiter, cx.as_ref()) {
-                    waiter.unregister();
-                    return Poll::Ready(Err(Error::Wait(error)));
+        let context = 'selected: {
+            let error = 'failed: {
+                if let Err(error) = api::check_open(client) {
+                    break 'failed error;
                 }
-                *self = State::Connecting {
-                    client,
-                    target,
-                    request,
-                };
-                return Poll::Pending;
-            }
-            Err(error) => {
-                waiter.unregister();
-                return Poll::Ready(Err(error));
-            }
-        };
-        let (error, request) =
-            match prepare(self, client, conn, request, cx.as_mut().region_token()) {
-                Ok(()) => {
-                    waiter.unregister();
-                    return Poll::Ready(Ok(()));
+                let ready = &client.port.shared.ready;
+                match ready.select(target, request.boundary, cx.as_mut().region_token()) {
+                    Ok(Some(context)) => break 'selected context,
+                    Ok(None) => {}
+                    Err(target) => break 'failed Error::Pinned(target),
                 }
-                Err(failure) => failure,
+                if target.is_none()
+                    && let Some(count) = ready.blocking()
+                {
+                    break 'failed client.port.backpressure(count).into();
+                }
+                match ready.try_register(waiter, cx.as_ref()) {
+                    Ok(()) => return Poll::Pending,
+                    Err(error) => Error::Wait(error),
+                }
             };
-        let throttle = match api::Throttle::new(conn, error, request) {
+            let request = mem::replace(self, State::Done);
+            waiter.unregister();
+            drop(request);
+            return Poll::Ready(Err(error));
+        };
+        let weight = request.frame.geometry().wire().widen();
+        let (error, conn) = match prepare(self, client, weight, context) {
+            Ok(()) => {
+                waiter.unregister();
+                return Poll::Ready(Ok(()));
+            }
+            Err(failure) => failure,
+        };
+        let throttle = match api::Throttle::new(conn, error) {
             Ok(throttle) => throttle,
             Err(error) => {
+                drop(mem::replace(self, State::Done));
                 waiter.unregister();
                 return Poll::Ready(Err(error.into()));
             }
@@ -143,85 +135,13 @@ impl<
                 .try_register(&throttle.cause, waiter, cx.as_ref())
         {
             let error = throttle.fail(error);
+            drop(mem::replace(self, State::Done));
             waiter.unregister();
             return Poll::Ready(Err(error));
         }
         // No order was published: a later poll must revalidate the original
         // target before selecting a connection that may now belong to a transaction.
-        *self = State::Connecting {
-            client,
-            target,
-            request: throttle.request,
-        };
         Poll::Pending
-    }
-}
-
-impl<
-    'app,
-    'g,
-    'r,
-    's,
-    'b,
-    'c,
-    'd: 'app,
-    B: ?Sized,
-    I: schema::QuerySet + 'd,
-    const ID: u8,
-    S,
-    A: lease::Target<'d, ID>,
-    P: lease::Policy,
-> State<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, S, A, P>
-{
-    pub(super) fn poll_admit<'target>(
-        &mut self,
-        cx: Pin<&mut context::Context<'_, 'd>>,
-        waiter: Pin<&wait::Waiter<'target, 'd>>,
-        reply: &mut impl Attach<
-            'app,
-            'b,
-            'c,
-            'd,
-            replies::Row<'d>,
-            replies::ReplyFailure<'d>,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-        >,
-        seal: impl Copy
-        + Fn(
-            S,
-            api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-            conn::Id<'d, KeyTag<ID>>,
-        ) -> lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>,
-    ) -> Poll<Result<(), Error<'d, ID>>>
-    where
-        'app: 'target,
-        'd: 'target,
-    {
-        self.poll_with(cx, waiter, |this, client, conn, request, region| {
-            let api::Pending {
-                frame,
-                boundary,
-                state,
-            } = request;
-            let context = requests::ReplyContext::new(conn, boundary, region);
-            client
-                .port
-                .request()
-                .try_reply(frame, state, reply, context, |state| {
-                    seal(state, client, conn)
-                })
-                .map(|lease| *this = State::Admitted(lease, ()))
-                .map_err(|(error, frame, state)| {
-                    (
-                        error,
-                        api::Pending {
-                            frame,
-                            boundary,
-                            state,
-                        },
-                    )
-                })
-        })
     }
 }
 
@@ -267,7 +187,6 @@ impl<'d> Budget<'d> {
         };
         let alarm = guard.get_mut();
         if now >= due {
-            alarm.clear();
             self.state = BudgetState::Elapsed;
             return Poll::Ready(deadline::Elapsed::new(phase));
         }

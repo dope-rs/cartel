@@ -1,60 +1,22 @@
-use std::mem;
-
 use cartel_core::reply::{order::Front, usage};
-use dope::{core::driver::route::KeyTag, manifold::client::conn};
-use o3::{
-    base::cell::region,
-    buffer::{self, hold},
-};
+use o3::buffer::{self, hold};
 
 use crate::{
-    port::{self, pool::access, replies::Completion},
+    port::{pool::access, replies::Completion},
     protocol::{
         Reason, frame,
-        logic::{self, failure, payloads, state},
+        logic::{self, payloads, state, turn::Turn},
         messages,
         runtime::tx::poll,
     },
     reply, schema,
 };
 
-pub(super) struct Ready<
-    'turn,
-    'life,
-    'g,
-    'r,
-    's,
-    'b,
-    'c,
-    'd: 'life,
-    I: schema::QuerySet,
-    const ID: u8,
-> {
-    port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
-    conn: conn::Id<'d, KeyTag<ID>>,
-    state: &'turn mut logic::State<'life, 'd, I, ID>,
-    region: &'turn mut region::Token<region::Identity<'d>>,
-}
-
-impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
-    Ready<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
+impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+    Turn<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
 {
-    pub(super) const fn new(
-        port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
-        conn: conn::Id<'d, KeyTag<ID>>,
-        state: &'turn mut logic::State<'life, 'd, I, ID>,
-        region: &'turn mut region::Token<region::Identity<'d>>,
-    ) -> Self {
-        Self {
-            port,
-            conn,
-            state,
-            region,
-        }
-    }
-
     /// Command completion retains Ready replies until Sync resolves the transaction.
-    pub(super) fn handle<'input, R: buffer::Cursor + hold::raw::Retain<'d>>(
+    pub(super) fn ready<'input, R: buffer::Cursor + hold::raw::Retain<'d>>(
         &mut self,
         typ: u8,
         data: frame::Payload<'input, 'd, R>,
@@ -62,11 +24,10 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
     where
         'd: 'input,
     {
-        if (self.state.completed || !matches!(self.state.skip, state::Skip::None))
+        if !matches!(self.state.progress, state::Progress::Running)
             && !matches!(
                 typ,
-                messages::Be::NOTICE_RESPONSE
-                    | messages::Be::PARAMETER_STATUS
+                messages::Be::PARAMETER_STATUS
                     | messages::Be::NOTIFICATION_RESPONSE
                     | messages::Be::READY_FOR_QUERY
             )
@@ -84,7 +45,6 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                 }
                 Ok(None)
             }
-            messages::Be::NOTICE_RESPONSE => Ok(None),
             messages::Be::PARAMETER_STATUS => {
                 payloads::parameter(data.wire())?;
                 Ok(None)
@@ -104,6 +64,7 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                     return Err(crate::Error::UnexpectedReadyMessage(typ));
                 }
                 payloads::empty(typ, data.wire())?;
+                self.state.phase = state::Phase::Ready;
                 Ok(None)
             }
             messages::Be::COPY_IN_RESPONSE => {
@@ -140,11 +101,13 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                     Completion::Command | Completion::Group => queue.complete(self.region),
                     Completion::Last => {
                         queue.complete(self.region);
-                        self.state.completed = true;
+                        self.state.progress = state::Progress::Complete;
                     }
-                    Completion::Ready | Completion::Begin => self.state.completed = true,
+                    Completion::Ready | Completion::Begin => {
+                        self.state.progress = state::Progress::Complete;
+                    }
                     Completion::Commit => match data.wire().as_slice() {
-                        b"COMMIT\0" => self.state.completed = true,
+                        b"COMMIT\0" => self.state.progress = state::Progress::Complete,
                         b"ROLLBACK\0" => {
                             queue.fail_one(
                                 self.region,
@@ -152,7 +115,7 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                                     crate::Error::CommitRolledBack,
                                 ),
                             );
-                            self.state.skip = state::Skip::Pending;
+                            self.state.progress = state::Progress::Skipping;
                         }
                         _ => return Err(crate::Error::Protocol(Reason::CommitTag)),
                     },
@@ -223,13 +186,7 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                 if copy {
                     self.state.phase = state::Phase::Ready;
                 }
-                let next = state::Drain {
-                    skip: mem::take(&mut self.state.skip),
-                    completed: mem::take(&mut self.state.completed),
-                    status,
-                    batch: self.state.batch,
-                };
-                Ok(Some(logic::Pending::ready(next)))
+                Ok(Some(logic::Pending::ready(status)))
             }
             other => Err(crate::Error::UnexpectedReadyMessage(other)),
         }
@@ -300,7 +257,7 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
         }
     }
 
-    pub(super) fn error<'input, R: buffer::Cursor + hold::raw::Retain<'d>>(
+    pub(super) fn reply_error<'input, R: buffer::Cursor + hold::raw::Retain<'d>>(
         &mut self,
         plan: reply::Plan<'input, 'd, R>,
     ) -> Result<Option<logic::Pending<'d>>, crate::Error>
@@ -309,7 +266,6 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
     {
         use crate::port::replies;
 
-        self.state.completed = false;
         if matches!(
             self.state.phase,
             state::Phase::CopyInActive | state::Phase::CopyOutActive
@@ -324,7 +280,10 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
         let plan = match end {
             None => plan,
             Some(_) => {
-                let skipping = !matches!(self.state.skip, state::Skip::None);
+                let skipping = matches!(
+                    self.state.progress,
+                    state::Progress::Skipping | state::Progress::Unknown
+                );
                 match selected
                     .tag()
                     .ok_or(crate::Error::Protocol(Reason::ResponseUnknown))?
@@ -338,16 +297,10 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                     } => {
                         match scope {
                             reply::Scope::Connection => {
-                                failure::Failure::new(
-                                    self.port,
-                                    self.conn,
-                                    self.state,
-                                    self.region,
-                                )
-                                .apply_retained(class);
+                                self.fail_retained(class);
                             }
                             reply::Scope::Command | reply::Scope::Unknown if skipping => {}
-                            reply::Scope::Unknown => self.state.skip = state::Skip::Unknown,
+                            reply::Scope::Unknown => self.state.progress = state::Progress::Unknown,
                             reply::Scope::Command => {
                                 match end {
                                     Completion::Group | Completion::Last => {
@@ -366,7 +319,7 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
                                         return Err(crate::Error::Protocol(Reason::GroupReply));
                                     }
                                 }
-                                self.state.skip = state::Skip::Pending;
+                                self.state.progress = state::Progress::Skipping;
                             }
                         }
                         return Ok(None);
@@ -380,8 +333,7 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
             Err(error) => return Err(crate::Error::ResponseRetention(error)),
         };
         if end.is_none() {
-            failure::Failure::new(self.port, self.conn, self.state, self.region)
-                .apply_server(class, server);
+            self.fail_server(class, server);
             return Ok(None);
         }
         let pending = match selected.try_fail(replies::ReplyFailure::Server(server)) {
@@ -414,11 +366,10 @@ impl<'turn, 'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID:
         };
         match scope {
             reply::Scope::Connection => {
-                failure::Failure::new(self.port, self.conn, self.state, self.region)
-                    .apply_retained(class);
+                self.fail_retained(class);
             }
             reply::Scope::Command | reply::Scope::Unknown => {
-                self.state.skip = state::Skip::Pending;
+                self.state.progress = state::Progress::Skipping;
             }
         }
         Ok(pending)

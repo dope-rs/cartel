@@ -217,6 +217,79 @@ fn pool_timeout_reconnects() {
 }
 
 #[test]
+fn completed_pool_timeout_preserves_new_lease() {
+    let config = config(Positive::from_millis::<100>()).expect("valid redis configuration");
+    AcceptScript::with(
+        |peer| {
+            let socket = accept_within(peer)?;
+            socket.read_wait(Some(GUARD))?;
+            let mut request = [0; PING.len()];
+            socket.read_exact(&mut request)?;
+            assert_eq!(request, PING);
+            socket.write_all(b"-ERR completed\r\n")?;
+            common::session::held::pong_once(&socket)
+        },
+        |server| {
+            let prepared = topology::try_new::<Env>(config, server.addr(), Plan::new())
+                .expect("Redis topology");
+            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+            let mut report = Completion::new();
+            prepared.with_local(
+                |worker| {
+                    worker.lend(|node, stage| {
+                        node.install(stage, |host, stage| {
+                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+                                let redis = runtime.root_client();
+                                assert!(matches!(
+                                    runtime.block_on(redis.wait_active()),
+                                    Ok(Ok(()))
+                                ));
+                                let mut old = Box::pin(Task::new(redis.server().ping()));
+                                assert!(
+                                    runtime
+                                        .block_on(fibers::TEST.poll_once(old.as_mut()))
+                                        .expect("submit pooled command")
+                                        .is_none()
+                                );
+                                let mut lease = fibers::TEST
+                                    .try_run(&mut runtime, redis.connection())
+                                    .expect("drive replacement lease")
+                                    .ok()
+                                    .expect("completed reply releases connection order");
+                                fibers::TEST
+                                    .try_pause(&mut runtime, Duration::from_millis(200))
+                                    .expect("expire completed command");
+                                assert!(matches!(
+                                    fibers::TEST.try_run(&mut runtime, old.as_mut()),
+                                    Ok(Err(cartel_redis::value::reply::Failure::Control(
+                                        cartel_redis::Error::RequestTimeout(timeout)
+                                    ))) if timeout.phase() == cartel_redis::RequestPhase::Response
+                                ));
+                                assert!(
+                                    matches!(
+                                        fibers::TEST.try_run(&mut runtime, lease.ping()),
+                                        Ok(Ok(()))
+                                    ),
+                                    "completed pooled timeout preserves the new lease"
+                                );
+                            })
+                        })
+                    })
+                },
+                recovery::Policy::new(|event| reports.push(event), recover),
+                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
+            );
+            reports.events().expect("valid reclaim observations");
+            server
+                .finish()
+                .expect("Redis lifecycle")
+                .expect("Redis server");
+        },
+    )
+    .expect("start Redis server");
+}
+
+#[test]
 fn lease_timeout_reconnects() {
     let config = config(Positive::from_millis::<10>()).expect("valid redis configuration");
     AcceptScript::with(recovery_server, |server| {

@@ -1,6 +1,9 @@
 use std::{marker, mem, pin, task::Poll};
 
-use cartel_core::deadline;
+use cartel_core::{
+    deadline,
+    reply::{order, recv::attach::Attach},
+};
 use dope::{core::driver::route, manifold::client::conn};
 use dope_fiber::{abi, context, wait};
 use o3::base::cell::region;
@@ -38,8 +41,16 @@ impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Pooled<'app, 's, 'b, '
     }
 }
 
-pub(in crate::client) trait Target<'app, 's, 'b, 'c, 'd: 'app, const ID: u8>:
-    Sized
+impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>
+    AsRef<crate::Port<'s, 'app, 'b, 'c, 'd, ID>> for Pooled<'app, 's, 'b, 'c, 'd, B, ID>
+{
+    fn as_ref(&self) -> &crate::Port<'s, 'app, 'b, 'c, 'd, ID> {
+        &self.0.port
+    }
+}
+
+pub(in crate::client) trait Target<'app, 's: 'b, 'b: 'app, 'c: 'b, 'd: 's + 'c, const ID: u8>:
+    Sized + AsRef<crate::Port<'s, 'app, 'b, 'c, 'd, ID>>
 {
     type Provider: ?Sized;
 
@@ -120,14 +131,33 @@ enum State<'app, 's, 'b, 'c, 'd, const ID: u8> {
     Done,
 }
 
-#[pin_project::pin_project]
-struct Core<'app, 's, 'b, 'c, 'd: 'app + 's, T, const ID: u8> {
+#[pin_project::pin_project(PinnedDrop)]
+struct Core<'app, 's: 'b, 'b: 'app, 'c: 'b, 'd: 's + 'c, T, const ID: u8>
+where
+    T: AsRef<crate::Port<'s, 'app, 'b, 'c, 'd, ID>>,
+{
     target: T,
     state: State<'app, 's, 'b, 'c, 'd, ID>,
     #[pin]
     deadline: Option<deadline::Guard<'d>>,
     #[pin]
     waiter: wait::Waiter<'app, 'd>,
+}
+
+#[pin_project::pinned_drop]
+impl<'app, 's: 'b, 'b: 'app, 'c: 'b, 'd: 's + 'c, T, const ID: u8> PinnedDrop
+    for Core<'app, 's, 'b, 'c, 'd, T, ID>
+where
+    T: AsRef<crate::Port<'s, 'app, 'b, 'c, 'd, ID>>,
+{
+    fn drop(self: pin::Pin<&mut Self>) {
+        let this = self.project();
+        if matches!(this.state, State::Admission(_)) {
+            this.target
+                .as_ref()
+                .discard(mem::replace(this.state, State::Done));
+        }
+    }
 }
 
 impl<'app, 's, 'b, 'c, 'd: 'app + 's, T, const ID: u8> Core<'app, 's, 'b, 'c, 'd, T, ID>
@@ -150,14 +180,18 @@ where
                         .as_mut()
                         .poll_expired(cx.as_mut(), deadline::RequestPhase::Response)
                     {
-                        this.waiter.as_ref().unregister();
                         let redis = this.target.redis();
-                        redis.port.schedule.reconnect(
-                            *token,
-                            client::Failure::RequestTimeout(due),
-                            cx.as_mut().region_token(),
-                            &redis.port.activity,
-                        );
+                        if matches!(
+                            reply.detach_order(cx.as_mut().region_token()),
+                            order::State::Linked
+                        ) {
+                            redis.port.schedule.reconnect(
+                                *token,
+                                client::Failure::RequestTimeout(due),
+                                cx.as_mut().region_token(),
+                                &redis.port.activity,
+                            );
+                        }
                         *this.state = State::Done;
                         return Poll::Ready(Err(crate::Error::from(due).into()));
                     }
@@ -181,6 +215,7 @@ where
                         .poll_expired(cx.as_mut(), deadline::RequestPhase::Admission)
                     {
                         this.waiter.as_ref().unregister();
+                        this.target.as_ref().discard(frame);
                         return Poll::Ready(Err(crate::Error::from(due).into()));
                     }
                     let redis = this.target.redis();
@@ -199,7 +234,9 @@ where
                                     .try_dispatch(this.waiter.as_ref(), cx.as_ref())
                                 {
                                     this.waiter.as_ref().unregister();
-                                    *this.state = State::Done;
+                                    this.target
+                                        .as_ref()
+                                        .discard(mem::replace(this.state, State::Done));
                                     return Poll::Ready(Err(crate::Error::Dispatch {
                                         blocked: cause,
                                         wait: error,
@@ -210,6 +247,7 @@ where
                             }
                             Err(schedule::Reject::Failed(error)) => {
                                 this.waiter.as_ref().unregister();
+                                this.target.as_ref().activity.wake_send();
                                 return Poll::Ready(Err(error.into()));
                             }
                         };
@@ -230,13 +268,19 @@ where
 /// Projects one completed retained reply without duplicating protocol state.
 #[pin_project::pin_project]
 #[doc(hidden)]
-pub struct Command<'app, 's, 'b, 'c, 'd: 'app + 's, T, D, const ID: u8> {
+pub struct Command<'app, 's, 'b, 'c, 'd: 'app + 's, T, D, const ID: u8>
+where
+    T: AsRef<crate::Port<'s, 'app, 'b, 'c, 'd, ID>>,
+{
     #[pin]
     core: Core<'app, 's, 'b, 'c, 'd, T, ID>,
     decoder: marker::PhantomData<fn(D) -> D>,
 }
 
-impl<'app, 's, 'b, 'c, 'd: 'app + 's, T, D, const ID: u8> Command<'app, 's, 'b, 'c, 'd, T, D, ID> {
+impl<'app, 's, 'b, 'c, 'd: 'app + 's, T, D, const ID: u8> Command<'app, 's, 'b, 'c, 'd, T, D, ID>
+where
+    T: AsRef<crate::Port<'s, 'app, 'b, 'c, 'd, ID>>,
+{
     pub(in crate::client) fn new(target: T, frame: Result<encode::Complete, request::Error>) -> Self
     where
         T: Target<'app, 's, 'b, 'c, 'd, ID>,
@@ -245,7 +289,10 @@ impl<'app, 's, 'b, 'c, 'd: 'app + 's, T, D, const ID: u8> Command<'app, 's, 'b, 
             Err(error) => (State::Request(error), None),
             Ok(frame) => match target.redis().port.deadline.guard() {
                 Ok(deadline) => (State::Admission(frame), Some(deadline)),
-                Err(error) => (State::Deadline(error), None),
+                Err(error) => {
+                    target.as_ref().discard(frame);
+                    (State::Deadline(error), None)
+                }
             },
         };
         Self {

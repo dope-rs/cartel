@@ -197,3 +197,55 @@ pub fn try_bulk_config(bytes: usize) -> Result<settings::Config, settings::Error
     .window(Positive::from_secs::<1>())
     .build()
 }
+
+pub fn try_retained_bulk_config(bytes: usize) -> Result<settings::Config, settings::Error> {
+    Builder::new(settings::Capacities {
+        connections: 1,
+        admission_waiters: 2,
+        inflight: 3,
+        request_frame_bytes: 256 * 1024,
+        response_bytes: 64,
+        response_values: 3,
+        response_frame_bytes: 48,
+        response_frame_values: 1,
+    })
+    .bulk(Bulk::new(1, bytes))
+    .window(Positive::from_secs::<5>())
+    .build()
+}
+
+pub fn retained_bulk(
+    socket: &dope_test::harness::peer::Stream<'_>,
+    need: std::num::NonZero<usize>,
+    complete: bool,
+) -> Result<(), dope_test::harness::peer::Error> {
+    use crate::common::session::deadline::wait_closed;
+
+    const GET: &[u8] = b"*2\r\n$3\r\nGET\r\n$4\r\n";
+    socket.read_wait(Some(dope_test::harness::GUARD))?;
+    let mut request = [0; GET.len() + 6];
+    socket.read_exact(&mut request)?;
+    assert_eq!(&request[..GET.len()], GET);
+    assert_eq!(&request[GET.len()..], b"held\r\n");
+    socket.write_all(b"$41\r\n")?;
+    socket.write_all(&[b'x'; 41])?;
+    socket.write_all(b"\r\n")?;
+    socket.read_exact(&mut request)?;
+    assert_eq!(&request[GET.len()..], b"next\r\n");
+    const REPLY: &[u8] = b"$25\r\nyyyyyyyyyyyyyyyyyyyyyyyyy\r\n:7\r\n";
+    let end = if complete {
+        REPLY.len()
+    } else {
+        REPLY.len() - 2
+    };
+    socket.write_all(&REPLY[..end])?;
+    socket.read_exact(&mut [0; 1])?;
+    let mut remaining = need.get() - 1;
+    let mut bytes = [0; 8192];
+    while remaining != 0 {
+        let count = remaining.min(bytes.len());
+        socket.read_exact(&mut bytes[..count])?;
+        remaining -= count;
+    }
+    wait_closed(socket)
+}

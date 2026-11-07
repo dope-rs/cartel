@@ -216,13 +216,10 @@ impl<'id, 's> Nodes<'id, 's> {
     pub(crate) fn coordinates<E>(
         self,
         mut number: impl FnMut(parser::Value<Selection<'id>>) -> Result<f64, E>,
-    ) -> Result<
-        Nodes<'id, 's, storage::Region<'s, storage::Coordinate>>,
-        storage::CoordError<E, Selection<'id>>,
-    > {
+    ) -> Result<storage::Region<'s, storage::Coordinate>, storage::CoordError<E, Selection<'id>>>
+    {
         self.nodes
             .coordinates(|value| number(value.map(Selection::new)))
-            .map(Nodes::new)
             .map_err(|error| match error {
                 storage::CoordError::Array(error) => storage::CoordError::Array(mismatch(error)),
                 storage::CoordError::Member(error) => storage::CoordError::Member(mismatch(error)),

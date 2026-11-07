@@ -10,7 +10,7 @@ pub(crate) mod work;
 use crate::catalogs;
 pub(crate) use bind::Bind;
 pub use bind::{Bound, Limit, Offset};
-pub(crate) use state::{Open, Plan, State};
+pub(crate) use state::{Open, State};
 
 #[doc(hidden)]
 pub trait IntoQuery<'query, 'connection: 'query, 'd: 'connection, I: catalogs::Catalog> {

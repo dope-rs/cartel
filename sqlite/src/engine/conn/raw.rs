@@ -6,7 +6,7 @@ use crate::{
     },
     runtime,
 };
-use api::stmt;
+use api::{stmt, work::cleanup::Status};
 use dope_core::driver::{schedule, settings};
 use dope_runtime::{executor, topology::lending};
 use std::{alloc::Layout, marker, pin, ptr};
@@ -48,8 +48,7 @@ impl<I: catalogs::Catalog> Drop for Installed<'_, '_, I> {
 }
 
 // SAFETY: SQLite owns no driver routes or asynchronous native requests. Its SQL
-// and VFS calls finish synchronously. Retry alarms retain resident timer leases;
-// cleanup checks their absolute deadlines and clears them without native dispatch.
+// and VFS calls finish synchronously. Retry alarms retain resident timer leases.
 // The pinned connection and allocator remain owned through release and finish.
 unsafe impl<'local, 'd: 'local, I: catalogs::Catalog> lending::raw::Resume<'d>
     for Installed<'local, 'd, I>
@@ -141,20 +140,20 @@ unsafe impl<'local, 'd: 'local, I: catalogs::Catalog> executor::raw::App<'d>
         // SAFETY: phase admission excludes client borrows, and park excludes reentry.
         let phase = unsafe { &mut *conn.phase.as_ptr() };
         loop {
-            let (state, plan) = match phase {
+            let (state, pending) = match phase {
                 Phase::Live(live) => {
                     // SAFETY: the vacant live phase excludes all mutable client state borrows.
                     let state = unsafe { &mut *live.state.get() };
-                    let plan = state.maintenance(park.now());
-                    (state, plan)
+                    let pending = state.pending();
+                    (state, pending)
                 }
                 Phase::Closing(state) => {
-                    let plan = state.maintenance(park.now());
-                    if matches!(plan, api::Plan::Idle) {
+                    let pending = state.pending();
+                    if matches!(pending, Status::Idle) {
                         phase.retire();
                         continue;
                     }
-                    (state, plan)
+                    (state, pending)
                 }
                 Phase::Retiring(retiring) => {
                     if matches!(retiring.inventory(), stmt::Inventory::Empty) {
@@ -168,16 +167,14 @@ unsafe impl<'local, 'd: 'local, I: catalogs::Catalog> executor::raw::App<'d>
                 }
                 Phase::Empty => break,
             };
-            match plan {
-                api::Plan::Idle | api::Plan::Delayed => break,
-                api::Plan::Ready => {}
+            match pending {
+                Status::Idle => break,
+                Status::Pending => {}
             }
-            let Some(step) = park.next_step() else {
-                break;
-            };
-            if state.maintain(step.now()).is_pending() {
+            if park.next_step().is_none() {
                 break;
             }
+            state.cleanup();
         }
     }
 }
