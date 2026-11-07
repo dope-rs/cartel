@@ -1,4 +1,4 @@
-use crate::protocol;
+use crate::{protocol, reply::server::Field};
 use std::{mem, num};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -32,15 +32,7 @@ const _: () = {
     assert!(mem::size_of::<Context<'_>>() == fields.next_multiple_of(align));
 };
 
-pub(super) struct Write<'a, 'value> {
-    context: &'a mut Context<'value>,
-}
-
 impl<'a> Context<'a> {
-    pub(super) fn write<'b>(&'b mut self) -> Write<'b, 'a> {
-        Write { context: self }
-    }
-
     pub const fn detail(self) -> Option<&'a str> {
         self.detail
     }
@@ -96,108 +88,90 @@ impl<'a> Context<'a> {
     pub const fn routine(self) -> Option<&'a str> {
         self.origin.routine
     }
-}
 
-impl<'context, 'value> Write<'context, 'value> {
     pub(super) fn field(
-        self,
-        kind: u8,
-        value: &'value str,
-    ) -> Option<&'context mut Option<num::NonZero<u32>>> {
-        if kind == b'D' {
-            self.context.detail = Some(value);
-        } else if kind == b'H' {
-            self.context.hint = Some(value);
-        } else if kind == b'P' {
-            return Some(&mut self.context.position);
-        } else if kind == b'p' {
-            return Some(&mut self.context.inner_position);
-        } else if kind == b'q' {
-            self.context.inner_query = Some(value);
-        } else if kind == b'W' {
-            self.context.location = Some(value);
-        } else if kind == b's' {
-            self.context.origin.schema = Some(value);
-        } else if kind == b't' {
-            self.context.origin.table = Some(value);
-        } else if kind == b'c' {
-            self.context.origin.column = Some(value);
-        } else if kind == b'd' {
-            self.context.origin.data_type = Some(value);
-        } else if kind == b'n' {
-            self.context.origin.constraint = Some(value);
-        } else if kind == b'F' {
-            self.context.origin.file = Some(value);
-        } else if kind == b'L' {
-            return Some(&mut self.context.origin.line);
-        } else if kind == b'R' {
-            self.context.origin.routine = Some(value);
+        &mut self,
+        field: Field,
+        value: &'a str,
+    ) -> Option<&mut Option<num::NonZero<u32>>> {
+        if field == Field::Detail {
+            self.detail = Some(value);
+        } else if field == Field::Hint {
+            self.hint = Some(value);
+        } else if field == Field::Position {
+            return Some(&mut self.position);
+        } else if field == Field::InnerPosition {
+            return Some(&mut self.inner_position);
+        } else if field == Field::InnerQuery {
+            self.inner_query = Some(value);
+        } else if field == Field::Location {
+            self.location = Some(value);
+        } else if field == Field::Schema {
+            self.origin.schema = Some(value);
+        } else if field == Field::Table {
+            self.origin.table = Some(value);
+        } else if field == Field::Column {
+            self.origin.column = Some(value);
+        } else if field == Field::DataType {
+            self.origin.data_type = Some(value);
+        } else if field == Field::Constraint {
+            self.origin.constraint = Some(value);
+        } else if field == Field::File {
+            self.origin.file = Some(value);
+        } else if field == Field::Line {
+            return Some(&mut self.origin.line);
+        } else if field == Field::Routine {
+            self.origin.routine = Some(value);
         }
         None
     }
+}
 
-    pub(super) fn try_set(
-        self,
-        kind: u8,
-        value: protocol::Text<'value>,
-    ) -> Result<(), crate::Error> {
-        if let Some(number) = self.field(kind, value.as_str()) {
-            *number = Some(Self::try_number(kind, value)?);
-        }
-        Ok(())
+pub(super) fn try_number(
+    kind: u8,
+    value: protocol::Text<'_>,
+) -> Result<num::NonZero<u32>, protocol::Reason> {
+    use protocol::Offset;
+
+    let mut bytes = value.bytes();
+    let length = bytes.length().get();
+    if bytes.is_empty() {
+        return Err(protocol::Reason::DiagnosticPosition {
+            kind,
+            error: protocol::Number::Empty,
+        });
     }
-
-    fn try_number(kind: u8, value: protocol::Text<'_>) -> Result<num::NonZero<u32>, crate::Error> {
-        use protocol::Offset;
-
-        let mut bytes = value.bytes();
-        let length = bytes.length().get();
-        if bytes.is_empty() {
-            return Err(crate::Error::Protocol(
-                protocol::Reason::DiagnosticPosition {
-                    kind,
-                    error: protocol::Number::Empty,
+    let mut number = 0u32;
+    while let Some((byte, tail)) = bytes.split_first() {
+        if !byte.is_ascii_digit() {
+            return Err(protocol::Reason::DiagnosticPosition {
+                kind,
+                error: protocol::Number::Invalid {
+                    offset: Offset::from_u32(length - bytes.length().get()),
+                    byte,
                 },
-            ));
+            });
         }
-        let mut number = 0u32;
-        while let Some((byte, tail)) = bytes.split_first() {
-            if !byte.is_ascii_digit() {
-                return Err(crate::Error::Protocol(
-                    protocol::Reason::DiagnosticPosition {
-                        kind,
-                        error: protocol::Number::Invalid {
-                            offset: Offset::from_u32(length - bytes.length().get()),
-                            byte,
-                        },
-                    },
-                ));
-            }
-            let Some(next) = number
-                .checked_mul(10)
-                .and_then(|number| number.checked_add(u32::from(byte - b'0')))
-            else {
-                return Err(crate::Error::Protocol(
-                    protocol::Reason::DiagnosticPosition {
-                        kind,
-                        error: protocol::Number::Overflow {
-                            offset: Offset::from_u32(length - bytes.length().get()),
-                            byte,
-                        },
-                    },
-                ));
-            };
-            number = next;
-            bytes = tail;
-        }
-        match num::NonZero::<u32>::new(number) {
-            Some(number) => Ok(number),
-            None => Err(crate::Error::Protocol(
-                protocol::Reason::DiagnosticPosition {
-                    kind,
-                    error: protocol::Number::Zero,
+        let Some(next) = number
+            .checked_mul(10)
+            .and_then(|number| number.checked_add(u32::from(byte - b'0')))
+        else {
+            return Err(protocol::Reason::DiagnosticPosition {
+                kind,
+                error: protocol::Number::Overflow {
+                    offset: Offset::from_u32(length - bytes.length().get()),
+                    byte,
                 },
-            )),
-        }
+            });
+        };
+        number = next;
+        bytes = tail;
+    }
+    match num::NonZero::<u32>::new(number) {
+        Some(number) => Ok(number),
+        None => Err(protocol::Reason::DiagnosticPosition {
+            kind,
+            error: protocol::Number::Zero,
+        }),
     }
 }

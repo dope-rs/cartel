@@ -34,15 +34,12 @@ impl<'input, 'd, R: buffer::Cursor> Plan<'input, 'd, R> {
     where
         R: hold::raw::Retain<'d>,
     {
-        let fields = server::Fields::try_parse(payload.wire())?;
+        let (scope, class) =
+            server::Fields::try_classify(payload.wire()).map_err(crate::Error::Protocol)?;
         Ok(Self {
             payload,
-            class: fields.code().class(),
-            scope: match fields.severity() {
-                "ERROR" => Scope::Command,
-                "FATAL" | "PANIC" => Scope::Connection,
-                _ => Scope::Unknown,
-            },
+            class,
+            scope,
         })
     }
 

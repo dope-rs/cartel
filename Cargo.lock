@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "cartel-core"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "dope",
  "dope-fiber",
@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "cartel-gen"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "cartel-pg"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "base64",
  "cartel-core",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "cartel-redis"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "cartel-core",
  "dope",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "cartel-sqlite"
-version = "0.27.1"
+version = "0.27.2"
 dependencies = [
  "cartel-core",
  "cartel-gen",

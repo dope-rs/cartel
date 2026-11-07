@@ -170,8 +170,8 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             };
         }
         if typ == messages::Be::NOTICE_RESPONSE {
-            if let Err(error) = server::Fields::try_parse(data.wire()) {
-                self.fail(error);
+            if let Err(error) = server::Fields::try_classify(data.wire()) {
+                self.fail(crate::Error::Protocol(error));
             }
             return Delivery::Committed;
         }
