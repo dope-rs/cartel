@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "cartel-redis"
-version = "0.25.0"
+version = "0.25.1"
 dependencies = [
  "cartel-core",
  "dope",

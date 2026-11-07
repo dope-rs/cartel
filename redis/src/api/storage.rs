@@ -11,7 +11,7 @@ use crate::{
 
 /// Reply owners retaining their original storage, credits, and route.
 pub trait Storage: Sealed + Sized {
-    type DriverError: source::Control;
+    type DriverError: source::Control + From<crate::request::Error>;
     type Bytes: source::Bytes;
     type Error: source::Error<Bytes = Self::Bytes, DriverError = Self::DriverError>
         + From<Self::DriverError>
