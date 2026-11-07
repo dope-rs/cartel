@@ -58,7 +58,7 @@ pub const NEXT_ROW: &[u8] = b"2\0\0\0\x04\
     C\0\0\0\x0dSELECT 1\0Z\0\0\0\x05I";
 
 pub fn transaction(socket: &mut &peer::Stream<'_>) -> Result<(), Error> {
-    Database::start(&mut *socket)?;
+    Database::start(socket)?;
     read_empty(socket, b'S')?;
     socket.write_all(&Frame::new(b'C', b"BEGIN\0").encode())?;
     socket.write_all(&Frame::new(b'Z', b"T").encode())?;
@@ -74,7 +74,7 @@ pub fn transaction(socket: &mut &peer::Stream<'_>) -> Result<(), Error> {
 }
 
 pub fn late_error(socket: &mut &peer::Stream<'_>) -> Result<(), Error> {
-    Database::start(&mut *socket)?;
+    Database::start(socket)?;
     read_empty(socket, b'S')?;
     for (id, name) in [(3, b"first".as_slice()), (7, b"second".as_slice())] {
         socket.write_all(&Frame::new(b'2', &[]).encode())?;
@@ -91,7 +91,7 @@ pub fn late_error(socket: &mut &peer::Stream<'_>) -> Result<(), Error> {
 }
 
 pub fn classified(socket: &mut &peer::Stream<'_>, detail: &[u8], ready: bool) -> Result<(), Error> {
-    Database::start(&mut *socket)?;
+    Database::start(socket)?;
     read_empty(socket, b'S')?;
     socket.write_all(&Frame::new(b'E', detail).encode())?;
     if ready {
@@ -103,7 +103,7 @@ pub fn classified(socket: &mut &peer::Stream<'_>, detail: &[u8], ready: bool) ->
 }
 
 pub fn overflow(socket: &mut &peer::Stream<'_>) -> Result<(), Error> {
-    Database::start(&mut *socket)?;
+    Database::start(socket)?;
     read_empty(socket, b'S')?;
     socket.write_all(&Frame::new(b'E', COMMAND_ERROR).encode())?;
     socket.write_all(&Frame::new(b'E', RECOVERY_ERROR).encode())?;
@@ -111,7 +111,7 @@ pub fn overflow(socket: &mut &peer::Stream<'_>) -> Result<(), Error> {
 }
 
 pub fn settled(socket: &mut &peer::Stream<'_>) -> Result<(), Error> {
-    Database::start(&mut *socket)?;
+    Database::start(socket)?;
     read_empty(socket, b'S')?;
     complete(socket, 3, b"retained")?;
     socket.write_all(&Frame::new(b'E', COMMAND_ERROR).encode())?;
@@ -121,7 +121,7 @@ pub fn settled(socket: &mut &peer::Stream<'_>) -> Result<(), Error> {
 }
 
 pub fn missing(socket: &mut &peer::Stream<'_>) -> Result<(), Error> {
-    Database::start(&mut *socket)?;
+    Database::start(socket)?;
     read_empty(socket, b'S')?;
     complete(socket, 3, b"first")?;
     socket.write_all(&Frame::new(b'2', &[]).encode())?;

@@ -163,10 +163,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        abi::Map::new(
-            self.client.group::<Q, N>(self.target, params),
-            results::GroupFailure::required::<Q>,
-        )
+        self.client.group::<Q, N>(self.target, params)
     }
 
     fn run_first<Q>(

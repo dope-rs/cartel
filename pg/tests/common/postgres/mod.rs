@@ -56,6 +56,7 @@ impl<'d, F: Fiber<'d>, C: FnOnce() + Unpin> root::Root<'d> for Quarantine<F, C> 
             wake.wake();
             return Poll::Pending;
         }
+        let _permit = work.permit();
         if work.remaining() != 0 {
             wake.wake();
             return Poll::Pending;

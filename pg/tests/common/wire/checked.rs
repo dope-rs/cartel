@@ -444,7 +444,7 @@ impl Bind {
         \0\0\0\x01\0\0\0\x01\0\0\0\x01x\0\x01\0\x01";
 
     pub fn serve(socket: &mut &peer::Stream<'_>) -> Result<Vec<Vec<u8>>, Error> {
-        Database::start(&mut *socket)?;
+        Database::start(socket)?;
         let mut received = Vec::new();
         loop {
             let mut tag = [0];

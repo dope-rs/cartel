@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, ptr::NonNull};
 
 use cartel_core::reply::{self, order, retain, usage};
 use dope::{
@@ -28,35 +28,34 @@ pub(crate) mod groups;
 
 pub(crate) use batch::Batch;
 
+pub(crate) type Response<'app, 'g, 'r, 's, 'b, 'c, 'd, X> = reply::recv::Response<
+    'app,
+    'b,
+    'c,
+    'd,
+    Row<'d>,
+    X,
+    ReplyFailure<'d>,
+    Tag<'g, 'r, 's, 'b, 'c, 'd>,
+>;
+
 pub(crate) struct Tag<'g, 'r, 's, 'b, 'c, 'd> {
     batch: Batch,
     /// Admission proves a Ready-completed order closes this exact batch.
-    kind: Kind<groups::Owner<'g, 'r, 's, 'b, 'c, 'd>>,
+    kind: Kind<NonNull<groups::State<'r, 's, 'b, 'c, 'd>>, groups::Owner<'g, 'r, 's, 'b, 'c, 'd>>,
 }
 
-pub(crate) enum Kind<G> {
+pub(crate) enum Kind<G, S = G> {
     Command,
     Ready,
     Begin,
     Commit,
     Group(u32, G),
     Last(u32, G),
-    Sync(G),
+    Sync(S),
 }
 
-impl<G> Kind<G> {
-    fn as_ref(&self) -> Kind<&G> {
-        match self {
-            Self::Command => Kind::Command,
-            Self::Ready => Kind::Ready,
-            Self::Begin => Kind::Begin,
-            Self::Commit => Kind::Commit,
-            Self::Group(index, group) => Kind::Group(*index, group),
-            Self::Last(index, group) => Kind::Last(*index, group),
-            Self::Sync(group) => Kind::Sync(group),
-        }
-    }
-
+impl<G, S> Kind<G, S> {
     fn completion(&self) -> Completion {
         match self {
             Self::Command => Completion::Command,
@@ -97,29 +96,6 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Tag<'g, 'r, 's, 'b, 'c, 'd> {
         }
     }
 
-    pub(crate) const fn command(
-        batch: Batch,
-        index: u32,
-        last: bool,
-        group: groups::Owner<'g, 'r, 's, 'b, 'c, 'd>,
-    ) -> Self {
-        Self {
-            batch,
-            kind: if last {
-                Kind::Last(index, group)
-            } else {
-                Kind::Group(index, group)
-            },
-        }
-    }
-
-    pub(crate) const fn sync(batch: Batch, group: groups::Owner<'g, 'r, 's, 'b, 'c, 'd>) -> Self {
-        Self {
-            batch,
-            kind: Kind::Sync(group),
-        }
-    }
-
     pub(crate) const fn batch(&self) -> Batch {
         self.batch
     }
@@ -129,14 +105,14 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Tag<'g, 'r, 's, 'b, 'c, 'd> {
         skipping: bool,
         plan: crate::reply::Plan<'input, 'd, R>,
     ) -> Result<ErrorRoute<'input, 'd, R>, crate::Error> {
-        let end = &self.kind;
+        let end = self.as_ref();
         let complete = end.completion();
         let (group, command) = match end {
             Kind::Command | Kind::Ready | Kind::Begin | Kind::Commit => {
                 return Ok(ErrorRoute::Single(plan));
             }
             Kind::Group(index, owner) | Kind::Last(index, owner) => {
-                (owner, Position::Command(*index as usize))
+                (owner, Position::Command(index as usize))
             }
             Kind::Sync(owner) => (owner, Position::Sync),
         };
@@ -156,6 +132,64 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Tag<'g, 'r, 's, 'b, 'c, 'd> {
             class,
             completion: complete,
         })
+    }
+}
+
+pub(crate) fn try_group_by<'app, 'g, 'r, 's, 'b, 'c: 'b, 'd: 'c, X, Y, I, R, const N: usize>(
+    token: &mut region::Token<region::Identity<'d>>,
+    lane: reply::Lane<'app, 'b, 'c, 'd, Row<'d>, ReplyFailure<'d>, Tag<'g, 'r, 's, 'b, 'c, 'd>>,
+    commands: &mut [Response<'app, 'g, 'r, 's, 'b, 'c, 'd, X>; N],
+    terminal: &mut Response<'app, 'g, 'r, 's, 'b, 'c, 'd, Y>,
+    batch: Batch,
+    input: I,
+    make: impl FnOnce(I) -> (groups::Owner<'g, 'r, 's, 'b, 'c, 'd>, R),
+) -> Result<(order::Depth, R), (reply::recv::attach::Error, I)>
+where
+    X: reply::recv::Extract<'app, 'b, 'c, 'd, Row<'d>, ReplyFailure<'d>>,
+    Y: reply::recv::Extract<'app, 'b, 'c, 'd, Row<'d>, ReplyFailure<'d>>,
+{
+    Response::try_group_by(token, lane, commands, terminal, input, |input| {
+        let (owner, output) = make(input);
+        let group = NonNull::from(&*owner);
+        let commands = std::array::from_fn(|index| Tag {
+            batch,
+            kind: if index + 1 == N {
+                Kind::Last(index as u32, group)
+            } else {
+                Kind::Group(index as u32, group)
+            },
+        });
+        // The admitted FIFO publishes its owning Sync last. Only front access
+        // can inspect a command; detachment never removes its ordered anchor.
+        (
+            commands,
+            Tag {
+                batch,
+                kind: Kind::Sync(owner),
+            },
+            output,
+        )
+    })
+}
+
+mod raw {
+    use super::{Kind, Tag, groups};
+
+    impl<'g, 'r, 's, 'b, 'c, 'd> Tag<'g, 'r, 's, 'b, 'c, 'd> {
+        pub(super) fn as_ref(&self) -> Kind<&groups::State<'r, 's, 'b, 'c, 'd>> {
+            match &self.kind {
+                Kind::Command => Kind::Command,
+                Kind::Ready => Kind::Ready,
+                Kind::Begin => Kind::Begin,
+                Kind::Commit => Kind::Commit,
+                // SAFETY: only try_group_by constructs these command tags. Its
+                // later Sync retains the stable state through this front borrow.
+                Kind::Group(index, group) => Kind::Group(*index, unsafe { group.as_ref() }),
+                // SAFETY: the same ordered Sync also outlives the final command.
+                Kind::Last(index, group) => Kind::Last(*index, unsafe { group.as_ref() }),
+                Kind::Sync(group) => Kind::Sync(group),
+            }
+        }
     }
 }
 
@@ -490,7 +524,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         expected: Batch,
         token: &mut region::Token<region::Identity<'d>>,
         inspect: impl for<'tag> FnOnce(
-            Option<Kind<&'tag groups::Owner<'g, 'r, 's, 'b, 'c, 'd>>>,
+            Option<Kind<&'tag groups::State<'r, 's, 'b, 'c, 'd>>>,
             order::Front,
         ) -> R,
     ) -> Result<R, crate::Error> {
@@ -502,7 +536,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         let end = match tag.batch.relative_to(expected) {
             Ordering::Greater => None,
             Ordering::Less => return Err(crate::Error::Protocol(Reason::ReadyUnknown)),
-            Ordering::Equal => Some(tag.kind.as_ref()),
+            Ordering::Equal => Some(tag.as_ref()),
         };
         Ok(inspect(end, front))
     }

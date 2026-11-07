@@ -26,6 +26,8 @@ pub(in crate::api) use dispatch::Budget;
 
 pub use call::Call;
 
+type Completed<'d, T, L, const ID: u8> = Result<(T, L), Error<'d, ID>>;
+
 enum State<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8, S, A, P, H = ()>
 where
     I: schema::QuerySet + 'd,
@@ -235,13 +237,8 @@ where
     pub(super) fn complete(
         &mut self,
         outcome: Result<T, Error<'d, ID>>,
-    ) -> Result<
-        (
-            Result<T, Error<'d, ID>>,
-            lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>,
-        ),
-        Error<'d, ID>,
-    > {
+    ) -> Completed<'d, X::Output, lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>, ID>
+    {
         match self.admission.take() {
             Some(lease) => Ok((outcome, lease)),
             None => Err(crate::Error::Closed.into()),

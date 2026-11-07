@@ -6,8 +6,7 @@ use cartel_core::reply;
 use dope_fiber::abi;
 use dope_fiber::context;
 use dope_fiber::wait;
-use o3::depot::array::init;
-use std::{marker, mem, ops::ControlFlow, task::Poll};
+use std::{marker, task::Poll};
 
 use crate::api::{
     task,
@@ -350,69 +349,5 @@ impl<T, E, D: Diagnostics, const N: usize> GroupFailure<T, E, D, N> {
             .iter()
             .find(|entry| entry.position == Position::Command(index))
             .map(|entry| entry.fields)
-    }
-}
-
-impl<P: source::Payload, E: From<crate::Error>, D: Diagnostics, const N: usize>
-    GroupFailure<Option<P>, E, D, N>
-{
-    /// Each insertion takes the matching payload; Full leaves only `Completed(None)`.
-    /// Vacant owns fewer than N rows. Restoration over N outcome slots stops only
-    /// on prefix exhaustion, leaving no unread owner to release.
-    pub(in crate::api) fn required<Q>(mut self) -> GroupResult<Row<P, Q>, E, D, N>
-    where
-        Q: schema::TypedQuery<Result = schema::result::Rows>,
-    {
-        if self.sync == Sync::Complete
-            && self.sync_error.is_none()
-            && self.cause.is_none()
-            && self.diagnostics.is_empty()
-        {
-            let mut storage = mem::MaybeUninit::uninit();
-            let mut rows = init::Guard::<Row<P, Q>, N>::new(&mut storage);
-            loop {
-                let vacant = match rows.next() {
-                    ControlFlow::Break(full) => {
-                        mem::forget(self.outcomes);
-                        return Ok(full.into_array());
-                    }
-                    ControlFlow::Continue(vacant) => vacant,
-                };
-                let payload = match vacant.get_mut(&mut self.outcomes) {
-                    Outcome::Completed(payload) => payload.take(),
-                    _ => None,
-                };
-                match payload {
-                    Some(payload) => rows = vacant.insert(Row::new(payload)),
-                    None => {
-                        let mut prefix = vacant.into_iter();
-                        for outcome in &mut self.outcomes {
-                            let Some(row) = prefix.next() else {
-                                break;
-                            };
-                            *outcome = Outcome::Completed(Some(row.payload));
-                        }
-                        mem::forget(prefix);
-                        break;
-                    }
-                }
-            }
-        }
-        let outcomes = self.outcomes.map(|outcome| match outcome {
-            Outcome::Completed(Some(payload)) => Outcome::Completed(Row::new(payload)),
-            Outcome::Completed(None) => Outcome::Failed(crate::Error::NotFound.into()),
-            Outcome::Failed(error) => Outcome::Failed(error),
-            Outcome::Interrupted(error) => Outcome::Interrupted(error),
-            Outcome::Server => Outcome::Server,
-            Outcome::Skipped => Outcome::Skipped,
-            Outcome::Unobserved => Outcome::Unobserved,
-        });
-        Err(GroupFailure {
-            outcomes,
-            diagnostics: self.diagnostics,
-            sync: self.sync,
-            sync_error: self.sync_error,
-            cause: self.cause,
-        })
     }
 }

@@ -506,7 +506,7 @@ fn retains_next_owner() {
         |listener| {
             let mut socket = listener.accept_within(Duration::from_secs(1))?;
             socket.try_start(None)?;
-            retire::finalize(&mut socket)
+            retire::finalize(&socket)
         },
         |server| {
             let prepared = topology::try_new::<_, Env>(

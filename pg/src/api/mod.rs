@@ -6,7 +6,7 @@
 use dope::core::driver::route::KeyTag;
 use dope_fiber::reply::{Batch, Batches};
 
-use crate::port::{pool::access, replies};
+use crate::port::{pool::access, replies, replies::Response};
 use crate::protocol::{self, runtime::tx::Access};
 use crate::reply;
 use crate::schema;
@@ -79,17 +79,6 @@ pub mod traits;
 pub mod tx;
 
 pub use client::Client;
-
-type Response<'app, 'g, 'r, 's, 'b, 'c, 'd, X> = recv::Response<
-    'app,
-    'b,
-    'c,
-    'd,
-    replies::Row<'d>,
-    X,
-    replies::ReplyFailure<'d>,
-    replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
->;
 
 fn check_open<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet, const ID: u8>(
     client: Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,

@@ -136,12 +136,9 @@ impl Coordinator {
         }
         let index = match empty {
             Some(index) => index,
-            None => {
-                let index = self.cached[usize::from(self.second)]
-                    .take()
-                    .or_else(|| self.cached[usize::from(!self.second)].take())?;
-                index
-            }
+            None => self.cached[usize::from(self.second)]
+                .take()
+                .or_else(|| self.cached[usize::from(!self.second)].take())?,
         };
         let Entry { key: owned, state } = index.get_mut(&mut self.entries).insert(Entry {
             key: KdfKey {
