@@ -9,7 +9,6 @@ use crate::{
         logic::{state, turn::Turn},
         runtime::tx::poll,
     },
-    reply::group::Resolution,
     schema,
 };
 
@@ -82,9 +81,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                     }
                 };
                 Ok(work.admit(|| {
-                    let server = command.is_some_and(|(group, position)| {
-                        matches!(group.resolve(position), Resolution::Resolved)
-                    });
+                    let server = command.is_some_and(|(group, position)| group.resolve(position));
                     if matches!(front, Front::Detached) {
                         Action::Retire
                     } else if server {

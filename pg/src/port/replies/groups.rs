@@ -18,8 +18,6 @@ use crate::{
     reply::{self, group},
 };
 
-use crate::reply::group::Resolution;
-
 pub(crate) struct Active<'r, 's> {
     records: Unique<'r, group::Records<'s>>,
     bytes: pool::Span,
@@ -138,13 +136,13 @@ impl<'r, 's, 'b, 'c, 'd> State<'r, 's, 'b, 'c, 'd> {
         }
     }
 
-    pub(crate) fn resolve(&self, position: Position) -> Resolution {
-        let Some(mut active) = self.active.take() else {
-            return Resolution::Unchanged;
-        };
-        let resolved = active.records.get_mut().get_mut().resolve(position);
-        self.active.set(Some(active));
-        resolved
+    pub(crate) fn resolve(&self, position: Position) -> bool {
+        // SAFETY: no active borrow escapes this thread-bound owner. Resolution
+        // only mutates its records and invokes no user code or drop.
+        let active = unsafe { &mut *self.active.as_ptr() };
+        active
+            .as_mut()
+            .is_some_and(|active| active.records.get_mut().get_mut().resolve(position))
     }
 }
 
