@@ -200,12 +200,12 @@ impl ExprExt for syn::Expr {
 }
 
 pub(super) trait FnParamsExt {
-    fn resolve(&self, expr: &syn::Expr) -> syn::Result<syn::Ident>;
-    fn resolve_ref(&self, expr: &syn::Expr) -> syn::Result<syn::Ident>;
+    fn resolve(&self, expr: &syn::Expr) -> syn::Result<crate::backend::Capture>;
+    fn resolve_ref(&self, expr: &syn::Expr) -> syn::Result<crate::backend::Capture>;
 }
 
 impl FnParamsExt for [crate::backend::Param] {
-    fn resolve(&self, expr: &syn::Expr) -> syn::Result<syn::Ident> {
+    fn resolve(&self, expr: &syn::Expr) -> syn::Result<crate::backend::Capture> {
         let syn::Expr::Path(path) = expr else {
             return Err(syn::Error::new(
                 expr.span(),
@@ -230,18 +230,18 @@ impl FnParamsExt for [crate::backend::Param] {
                 "captured value must be a single ident",
             ));
         };
-        if !self.iter().any(|(p, _)| p.unraw() == id.unraw()) {
+        let Some(index) = self.iter().position(|(p, _)| p.unraw() == id.unraw()) else {
             return Err(syn::Error::new(
                 id.span(),
                 format!(
                     "`{id}` is not a function parameter — only fn params can be captured in v0"
                 ),
             ));
-        }
-        Ok(id.clone())
+        };
+        Ok((index, id.span()))
     }
 
-    fn resolve_ref(&self, expr: &syn::Expr) -> syn::Result<syn::Ident> {
+    fn resolve_ref(&self, expr: &syn::Expr) -> syn::Result<crate::backend::Capture> {
         let inner = match expr {
             syn::Expr::Reference(r) => r.expr.as_ref(),
             other => other,

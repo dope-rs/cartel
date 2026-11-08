@@ -61,7 +61,7 @@ impl Query {
             }
         };
         param::Param::<true>::apply(params.iter_mut().map(|(_, ty)| ty), &region);
-        let bound = params::Params::new(&params, &captures, &nonneg)?;
+        let bound = params::Params::new(&params, &captures, &nonneg);
         let ids = params.iter().map(|(id, _)| id);
         let run_tys = params.iter().map(|(_, ty)| ty);
         let n_params = captures.len();

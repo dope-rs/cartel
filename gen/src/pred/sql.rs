@@ -1,22 +1,18 @@
 use crate::backend;
-use syn::ext::IdentExt as _;
 
 enum Part {
     Token(proc_macro2::TokenStream),
-    Capture(syn::Ident),
+    Capture(backend::Capture),
 }
 
 pub(crate) struct Sql(Vec<Part>);
 
-pub(crate) fn intern(captures: &mut Vec<syn::Ident>, ident: syn::Ident) -> usize {
-    if let Some(index) = captures
-        .iter()
-        .position(|current| current.unraw() == ident.unraw())
-    {
+pub(crate) fn intern(captures: &mut Vec<backend::Capture>, capture: backend::Capture) -> usize {
+    if let Some(index) = captures.iter().position(|current| current.0 == capture.0) {
         return index;
     }
     let index = captures.len();
-    captures.push(ident);
+    captures.push(capture);
     index
 }
 
@@ -33,8 +29,8 @@ impl Sql {
         self.0.truncate(len);
     }
 
-    pub(super) fn capture(&mut self, ident: syn::Ident) {
-        self.0.push(Part::Capture(ident));
+    pub(super) fn capture(&mut self, capture: backend::Capture) {
+        self.0.push(Part::Capture(capture));
     }
 
     pub(super) fn push(&mut self, token: proc_macro2::TokenStream) {
@@ -47,7 +43,7 @@ impl Sql {
 
     pub(crate) fn render(
         self,
-        captures: &mut Vec<syn::Ident>,
+        captures: &mut Vec<backend::Capture>,
         params: &[backend::Param],
         dialect: &backend::Dialect,
     ) -> Vec<proc_macro2::TokenStream> {
@@ -55,10 +51,9 @@ impl Sql {
         for part in self.0 {
             match part {
                 Part::Token(token) => tokens.push(token),
-                Part::Capture(ident) => {
-                    let index = intern(captures, ident);
-                    let context = backend::ParamCtx { captures, params };
-                    tokens.push(dialect.placeholder(index, &context));
+                Part::Capture(capture) => {
+                    let index = intern(captures, capture);
+                    tokens.push(dialect.placeholder(index, &params[capture.0].1));
                 }
             }
         }
@@ -70,9 +65,9 @@ impl Sql {
         for part in self.0 {
             match part {
                 Part::Token(token) => tokens.push(token),
-                Part::Capture(ident) => {
+                Part::Capture((_, span)) => {
                     return Err(syn::Error::new(
-                        ident.span(),
+                        span,
                         "JOIN ON clause must compare columns only; bound parameters belong in `.filter(...)`",
                     ));
                 }

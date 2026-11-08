@@ -4,7 +4,7 @@ use crate::plan;
 use crate::shape;
 use std::collections;
 
-use syn::{ext::IdentExt as _, spanned::Spanned as _};
+use syn::spanned::Spanned as _;
 
 mod names;
 pub(super) use names::Names;
@@ -31,11 +31,12 @@ pub(super) trait TableBackend: Backend {
 }
 
 pub(super) type Param = (syn::Ident, syn::Type);
+pub(super) type Capture = (usize, proc_macro2::Span);
 
 pub(super) struct Compiled {
     pub(super) params: Vec<Param>,
-    pub(super) captures: Vec<syn::Ident>,
-    pub(super) nonnegative: Vec<(syn::Ident, plan::Bound)>,
+    pub(super) captures: Vec<Capture>,
+    pub(super) nonnegative: Vec<(usize, plan::Bound)>,
     pub(super) plan: emit::Plan,
     pub(super) block: syn::Block,
 }
@@ -272,11 +273,6 @@ pub(super) struct Dialect {
     pub(super) kind: Kind,
 }
 
-pub(super) struct ParamCtx<'a> {
-    pub(super) captures: &'a [syn::Ident],
-    pub(super) params: &'a [Param],
-}
-
 impl Dialect {
     pub(super) fn text(&self, parts: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
         let rt = &self.rt_crate;
@@ -313,23 +309,18 @@ impl Dialect {
         quote::quote! { #rt::dsl::sql::#id }
     }
 
-    pub(super) fn placeholder(&self, idx0: usize, ctx: &ParamCtx<'_>) -> proc_macro2::TokenStream {
+    pub(super) fn placeholder(&self, idx0: usize, ty: &syn::Type) -> proc_macro2::TokenStream {
         let index = idx0 + 1;
         let s = match self.kind {
-            Kind::Pg if Self::is_ltree_param(idx0, ctx) => format!("${index}::ltree"),
+            Kind::Pg if Self::is_ltree_param(ty) => format!("${index}::ltree"),
             Kind::Pg => format!("${index}"),
             Kind::Sqlite => format!("?{index}"),
         };
         quote::quote! { #s }
     }
 
-    fn is_ltree_param(idx0: usize, ctx: &ParamCtx<'_>) -> bool {
-        let Some(cap) = ctx.captures.get(idx0) else {
-            return false;
-        };
-        let Some((_, syn::Type::Path(path))) =
-            ctx.params.iter().find(|(id, _)| id.unraw() == cap.unraw())
-        else {
+    fn is_ltree_param(ty: &syn::Type) -> bool {
+        let syn::Type::Path(path) = ty else {
             return false;
         };
         path.qself.is_none()

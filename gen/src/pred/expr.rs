@@ -292,11 +292,11 @@ impl pred::RowScope<'_> {
         }
         if let Some(params) = params
             && let Some(ident) = Path::new(expr).and_then(|path| path.single())
-            && params
+            && let Some(index) = params
                 .iter()
-                .any(|(param, _)| param.unraw() == ident.unraw())
+                .position(|(param, _)| param.unraw() == ident.unraw())
         {
-            sql.capture(ident.clone());
+            sql.capture((index, ident.span()));
             return Ok(true);
         }
         if let Some(binary) = Binary::new(expr) {

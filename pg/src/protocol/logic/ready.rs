@@ -293,7 +293,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                     replies::ErrorRoute::Group {
                         scope,
                         class,
-                        completion: end,
+                        command,
                     } => {
                         match scope {
                             reply::Scope::Connection => {
@@ -302,21 +302,12 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                             reply::Scope::Command | reply::Scope::Unknown if skipping => {}
                             reply::Scope::Unknown => self.state.progress = state::Progress::Unknown,
                             reply::Scope::Command => {
-                                match end {
-                                    Completion::Group | Completion::Last => {
-                                        let detached = matches!(selected.front(), Front::Detached);
-                                        if detached {
-                                            queue.complete(self.region);
-                                        } else {
-                                            queue.fail_group(self.region);
-                                        }
-                                    }
-                                    Completion::Sync => {}
-                                    Completion::Command
-                                    | Completion::Ready
-                                    | Completion::Begin
-                                    | Completion::Commit => {
-                                        return Err(crate::Error::Protocol(Reason::GroupReply));
+                                if command {
+                                    let detached = matches!(selected.front(), Front::Detached);
+                                    if detached {
+                                        queue.complete(self.region);
+                                    } else {
+                                        queue.fail_group(self.region);
                                     }
                                 }
                                 self.state.progress = state::Progress::Skipping;

@@ -177,11 +177,7 @@ pub(in crate::plan) fn each(
     for ds in data {
         let captured = state.params.resolve_ref(ds)?;
         let idx = pred::sql::intern(&mut state.captures, captured);
-        let ctx = backend::ParamCtx {
-            captures: &state.captures,
-            params: state.params,
-        };
-        params.push(state.dialect.placeholder(idx, &ctx));
+        params.push(state.dialect.placeholder(idx, &state.params[captured.0].1));
     }
 
     let scope = pred::RowScope::for_source(source, slice::from_ref(row_var))?.with_unnest(col_vars);

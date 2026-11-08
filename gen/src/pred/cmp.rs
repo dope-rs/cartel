@@ -50,11 +50,11 @@ impl Cmp {
 
     pub(super) fn capture(
         self,
-        ident: syn::Ident,
+        capture: backend::Capture,
         sql: &mut crate::pred::sql::Sql,
         dialect: &backend::Dialect,
     ) {
-        sql.capture(ident);
+        sql.capture(capture);
         match self {
             Self::LtreeDescOf | Self::LtreeAncOf => sql.push(dialect.kw("CAST_LTREE_SUFFIX")),
             Self::Eq

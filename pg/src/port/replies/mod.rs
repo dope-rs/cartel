@@ -106,7 +106,6 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Tag<'g, 'r, 's, 'b, 'c, 'd> {
         plan: crate::reply::Plan<'input, 'd, R>,
     ) -> Result<ErrorRoute<'input, 'd, R>, crate::Error> {
         let end = self.as_ref();
-        let complete = end.completion();
         let (group, command) = match end {
             Kind::Command | Kind::Ready | Kind::Begin | Kind::Commit => {
                 return Ok(ErrorRoute::Single(plan));
@@ -130,7 +129,7 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Tag<'g, 'r, 's, 'b, 'c, 'd> {
         Ok(ErrorRoute::Group {
             scope,
             class,
-            completion: complete,
+            command: matches!(command, Position::Command(_)),
         })
     }
 }
@@ -285,7 +284,7 @@ pub(crate) enum ErrorRoute<'input, 'd, R: buffer::Cursor> {
     Group {
         scope: crate::reply::Scope,
         class: crate::reply::Class,
-        completion: Completion,
+        command: bool,
     },
 }
 

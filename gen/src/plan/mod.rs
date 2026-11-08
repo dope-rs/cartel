@@ -1,7 +1,6 @@
 use crate::backend;
 use crate::pred;
 use std::collections;
-use syn::ext::IdentExt as _;
 
 use pred::sql::Sql;
 
@@ -19,8 +18,8 @@ pub(super) enum Bound {
 
 pub(super) struct State<'a> {
     pub(super) params: &'a [backend::Param],
-    pub(super) captures: Vec<syn::Ident>,
-    pub(super) nonnegative: Vec<(syn::Ident, Bound)>,
+    pub(super) captures: Vec<backend::Capture>,
+    pub(super) nonnegative: Vec<(usize, Bound)>,
     pub(super) return_type: &'a syn::ReturnType,
     pub(super) dialect: &'a backend::Dialect,
     pub(super) cte_map: collections::BTreeMap<String, syn::Path>,
@@ -35,13 +34,9 @@ impl State<'_> {
         }
     }
 
-    pub(super) fn mark_nonneg(&mut self, ident: syn::Ident, bound: Bound) {
-        if self
-            .nonnegative
-            .iter()
-            .all(|current| current.0.unraw() != ident.unraw())
-        {
-            self.nonnegative.push((ident, bound));
+    pub(super) fn mark_nonneg(&mut self, index: usize, bound: Bound) {
+        if self.nonnegative.iter().all(|current| current.0 != index) {
+            self.nonnegative.push((index, bound));
         }
     }
 

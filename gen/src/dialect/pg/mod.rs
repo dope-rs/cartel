@@ -3,7 +3,6 @@ use crate::backend::Backend as _;
 use crate::dialect::param;
 use crate::dialect::pg::types::TypeExt as _;
 use crate::emit;
-use syn::ext::IdentExt as _;
 use syn::visit::Visit as _;
 
 pub(crate) mod group;
@@ -90,12 +89,8 @@ impl PgBackend {
         let mut calls = Vec::new();
         let mut fmts = Vec::new();
         let mut text = false;
-        for cap in caps {
-            let (fn_idx, (_, ty)) = params
-                .iter()
-                .enumerate()
-                .find(|(_, (id, _))| id.unraw() == cap.unraw())
-                .ok_or_else(|| syn::Error::new(cap.span(), "captured ident not in fn params"))?;
+        for &(fn_idx, _) in caps {
+            let (_, ty) = &params[fn_idx];
             let bind = ty.bind()?;
             let oid = bind.oid;
             oids.push(quote::quote! { #oid });

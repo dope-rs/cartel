@@ -1,4 +1,4 @@
-use crate::{ext, plan};
+use crate::{backend, plan};
 
 pub(super) struct Params {
     pub(super) ty: proc_macro2::TokenStream,
@@ -7,28 +7,17 @@ pub(super) struct Params {
 
 impl Params {
     pub(super) fn new(
-        params: &[crate::backend::Param],
-        captures: &[syn::Ident],
-        checks: &[(syn::Ident, plan::Bound)],
-    ) -> syn::Result<Self> {
+        params: &[backend::Param],
+        captures: &[backend::Capture],
+        checks: &[(usize, plan::Bound)],
+    ) -> Self {
         let mut ty = quote::quote! { () };
         let mut value = quote::quote! { () };
-        for capture in captures.iter().rev() {
-            let display = capture.to_string();
-            let name = ext::unraw(&display);
-            let Some((_, plain)) = params
-                .iter()
-                .find(|(id, _)| ext::unraw(&id.to_string()) == name)
-            else {
-                return Err(syn::Error::new(
-                    capture.span(),
-                    "unknown captured parameter",
-                ));
-            };
-            let role = checks
-                .iter()
-                .find(|entry| ext::unraw(&entry.0.to_string()) == name);
-            drop(display);
+        for &(index, span) in captures.iter().rev() {
+            let (ident, plain) = &params[index];
+            let mut capture = ident.clone();
+            capture.set_span(span);
+            let role = checks.iter().find(|entry| entry.0 == index);
             let role = role.map(|entry| match entry.1 {
                 plan::Bound::Limit => quote::quote! { ::cartel_sqlite::Limit },
                 plan::Bound::Offset => quote::quote! { ::cartel_sqlite::Offset },
@@ -43,6 +32,6 @@ impl Params {
             ty = quote::quote! { (#item, #ty) };
             value = quote::quote! { (#bound, #value) };
         }
-        Ok(Self { ty, value })
+        Self { ty, value }
     }
 }

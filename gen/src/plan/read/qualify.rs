@@ -14,7 +14,7 @@ pub(in crate::plan) struct Qualify {
 
 pub(in crate::plan) enum Integer {
     Literal(proc_macro2::TokenStream),
-    Param(syn::Ident),
+    Param(backend::Capture),
 }
 
 struct Clause {
@@ -155,13 +155,16 @@ impl Integer {
                 }
             }
             let id = &segment.ident;
-            if !params.iter().any(|(param, _)| param.unraw() == id.unraw()) {
+            let Some(index) = params
+                .iter()
+                .position(|(param, _)| param.unraw() == id.unraw())
+            else {
                 return Err(syn::Error::new(
                     id.span(),
                     format!("`{id}` is not a fn parameter"),
                 ));
-            }
-            return Ok(Self::Param(id.clone()));
+            };
+            return Ok(Self::Param((index, id.span())));
         }
         Err(Self::invalid(expr.span()))
     }
@@ -173,14 +176,10 @@ impl Integer {
     ) -> proc_macro2::TokenStream {
         match self {
             Self::Literal(value) => value,
-            Self::Param(id) => {
-                let idx = pred::sql::intern(&mut state.captures, id.clone());
-                state.mark_nonneg(id, bound);
-                let ctx = backend::ParamCtx {
-                    captures: &state.captures,
-                    params: state.params,
-                };
-                state.dialect.placeholder(idx, &ctx)
+            Self::Param(capture) => {
+                let idx = pred::sql::intern(&mut state.captures, capture);
+                state.mark_nonneg(capture.0, bound);
+                state.dialect.placeholder(idx, &state.params[capture.0].1)
             }
         }
     }
