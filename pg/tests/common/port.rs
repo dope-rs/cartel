@@ -5,7 +5,7 @@ use std::num::NonZero;
 #[derive(Debug)]
 pub struct Reply<'a, 'd> {
     pub kind: reply::Kind<'a, 'd>,
-    pub wake: Option<(NonZero<u16>, u32)>,
+    pub wake: Option<(NonZero<u32>, u32)>,
 }
 
 impl<'a, 'd> From<&'a reply::Error<'d>> for Reply<'a, 'd> {

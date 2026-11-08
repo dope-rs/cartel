@@ -37,8 +37,8 @@ pub(in crate::api) type StoredCollection<S, Q> = Collection<<S as Storage>::Batc
 pub(in crate::api) type FirstResult<'d, S, Q, const ID: u8, const SCALAR: bool = false> =
     Result<Option<StoredRow<S, Q, SCALAR>>, Error<'d, ID>>;
 
-pub(in crate::api) type GroupResult<T, E, D, const N: usize> =
-    Result<[T; N], GroupFailure<T, E, D, N>>;
+pub(in crate::api) type GroupResult<'d, T, D, const N: usize, const ID: u8> =
+    Result<[T; N], GroupFailure<'d, T, D, N, ID>>;
 
 /// One row retaining its original immutable payload and reply credits.
 pub struct Row<P, Q, const SCALAR: bool = false>
@@ -307,17 +307,15 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
 ///
 /// `cause` retains admission, capacity, timeout or transport failures alongside
 /// command and server failures, even when all commands completed before timeout.
-#[derive(Debug)]
-pub struct GroupFailure<T, E, D, const N: usize> {
-    pub(crate) outcomes: [Outcome<T, E>; N],
+pub struct GroupFailure<'d, T, D, const N: usize, const ID: u8 = 0> {
+    pub(crate) outcomes: [Outcome<T, replies::ReplyFailure<'d>>; N],
     pub(crate) diagnostics: D,
-    pub(crate) sync: Sync,
-    pub(crate) sync_error: Option<E>,
-    pub(crate) cause: Option<E>,
+    pub(crate) sync: Option<Result<(), Error<'d, ID>>>,
+    pub(crate) cause: Option<Error<'d, ID>>,
 }
 
-impl<T, E, D, const N: usize> GroupFailure<T, E, D, N> {
-    pub fn outcomes(&self) -> &[Outcome<T, E>; N] {
+impl<'d, T, D, const N: usize, const ID: u8> GroupFailure<'d, T, D, N, ID> {
+    pub fn outcomes(&self) -> &[Outcome<T, replies::ReplyFailure<'d>>; N] {
         &self.outcomes
     }
 
@@ -326,23 +324,26 @@ impl<T, E, D, const N: usize> GroupFailure<T, E, D, N> {
     }
 
     pub fn sync(&self) -> Sync {
-        self.sync
+        match self.sync {
+            Some(Ok(())) => Sync::Complete,
+            _ => Sync::Unobserved,
+        }
     }
 
     /// A failure that ended admission or the caller's wait, including timeout.
     /// Any failure already posted to the Sync response remains separately available.
-    pub fn cause(&self) -> Option<&E> {
+    pub fn cause(&self) -> Option<&Error<'d, ID>> {
         self.cause.as_ref()
     }
 
     /// The exact failure posted to the terminal Sync response, if observed.
     /// This is preserved even when the caller's deadline also expired.
-    pub fn sync_error(&self) -> Option<&E> {
-        self.sync_error.as_ref()
+    pub fn sync_error(&self) -> Option<&Error<'d, ID>> {
+        self.sync.as_ref()?.as_ref().err()
     }
 }
 
-impl<T, E, D: Diagnostics, const N: usize> GroupFailure<T, E, D, N> {
+impl<T, D: Diagnostics, const N: usize, const ID: u8> GroupFailure<'_, T, D, N, ID> {
     /// Borrows the first exact server diagnostic associated with this command.
     pub fn diagnostic(&self, index: usize) -> Option<server::Fields<'_>> {
         self.diagnostics

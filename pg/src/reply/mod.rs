@@ -1,11 +1,12 @@
 use crate::api;
-use cartel_core::reply::recv::attach;
+use cartel_core::reply::{LaneIndex, layout, recv::attach};
 use dope::{
     core::driver::route::KeyTag,
     manifold::client::{attempt, conn},
     net::link::pool::change::opening,
 };
 use dope_fiber::wait;
+use o3::{depot::capacity, mem::credit::fair};
 
 pub(crate) use code::Class;
 pub use code::Code;
@@ -22,12 +23,32 @@ mod plan;
 pub(crate) mod raw;
 pub mod server;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Pressure {
+    Full {
+        len: capacity::Count,
+        capacity: layout::Entries,
+    },
+    Capacity {
+        lane: LaneIndex,
+        axis: fair::Axis<2>,
+        required: usize,
+        available: usize,
+    },
+}
+
+const _: () = {
+    assert!(size_of::<Pressure>() == 4 * size_of::<usize>());
+    assert!(align_of::<Pressure>() == align_of::<usize>());
+    assert!(size_of::<Pressure>() + size_of::<usize>() == size_of::<attach::Error>());
+};
+
 pub enum Error<'d, const ID: u8 = 0> {
     Driver(crate::Error),
     Wait(wait::Error<'d>),
     Admission {
         conn: conn::Id<'d, KeyTag<ID>>,
-        cause: attach::Error,
+        cause: Pressure,
         error: wait::Error<'d>,
     },
     Open(Open<'d, ID>),
@@ -42,7 +63,7 @@ pub enum Kind<'a, 'd, const ID: u8 = 0> {
     Wait(wait::Cause),
     Admission {
         conn: &'a conn::Id<'d, KeyTag<ID>>,
-        cause: &'a attach::Error,
+        cause: &'a Pressure,
         error: wait::Cause,
     },
     Open(&'a Open<'d, ID>),

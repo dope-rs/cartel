@@ -71,10 +71,11 @@ pub trait Query<'d, const ID: u8 = 0>: Sealed + Copy {
     ) -> impl Fiber<
         'd,
         Output = results::GroupResult<
+            'd,
             results::StoredRow<Self::Results, Q>,
-            Error<'d, ID>,
             <Self::Results as Storage>::Diagnostics,
             N,
+            ID,
         >,
     > + use<'d, Self, Q, ID, N>
     where

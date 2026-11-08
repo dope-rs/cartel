@@ -202,16 +202,9 @@ impl ExprExt for syn::Expr {
 pub(super) trait FnParamsExt {
     fn resolve(&self, expr: &syn::Expr) -> syn::Result<syn::Ident>;
     fn resolve_ref(&self, expr: &syn::Expr) -> syn::Result<syn::Ident>;
-    fn index_of(&self, target: &syn::Ident) -> syn::Result<usize>;
 }
 
-impl FnParamsExt for [syn::Ident] {
-    fn index_of(&self, target: &syn::Ident) -> syn::Result<usize> {
-        self.iter()
-            .position(|p| p.unraw() == target.unraw())
-            .ok_or_else(|| syn::Error::new(target.span(), "captured ident not in fn params"))
-    }
-
+impl FnParamsExt for [crate::backend::Param] {
     fn resolve(&self, expr: &syn::Expr) -> syn::Result<syn::Ident> {
         let syn::Expr::Path(path) = expr else {
             return Err(syn::Error::new(
@@ -237,7 +230,7 @@ impl FnParamsExt for [syn::Ident] {
                 "captured value must be a single ident",
             ));
         };
-        if !self.iter().any(|p| p.unraw() == id.unraw()) {
+        if !self.iter().any(|(p, _)| p.unraw() == id.unraw()) {
             return Err(syn::Error::new(
                 id.span(),
                 format!(

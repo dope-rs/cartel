@@ -11,7 +11,7 @@ pub(crate) struct Group;
 
 impl Group {
     fn queries(
-        items: &[syn::ImplItem],
+        items: Vec<syn::ImplItem>,
         group: &syn::Type,
         owner: &syn::Ident,
     ) -> syn::Result<Vec<(syn::Ident, proc_macro2::TokenStream)>> {
@@ -27,7 +27,7 @@ impl Group {
             };
             fun.modifiers.require_empty()?;
             backend::Compiled::validate(&fun.sig, &fun.attrs, "#[query_group] methods")?;
-            let name = fun.sig.ident.clone();
+            let name = fun.sig.ident;
             let text = name.to_string();
             let text = text.trim_start_matches("r#");
             if Group::DSL_BUILDER_METHODS.contains(&text) {
@@ -40,8 +40,8 @@ impl Group {
             }
             let code = backend::Compiled::build::<pg::PgBackend>(
                 &fun.sig.generics,
-                fun.sig.inputs.iter().map(backend::Compiled::fn_arg),
-                &fun.block,
+                fun.sig.inputs.into_iter().map(backend::Compiled::fn_arg),
+                fun.block,
                 &fun.sig.output,
             )?;
             let each = (!matches!(code.plan.dispatch, crate::emit::Kind::Stream(_)))
@@ -73,7 +73,7 @@ impl Group {
                 group_ident: owner.clone(),
                 marker: marker.clone(),
                 method: name,
-                vis: fun.vis.clone(),
+                vis: fun.vis,
             };
             queries.push((marker, pg::PgBackend::emit_query(q, &fun.attrs)?));
         }
@@ -158,7 +158,7 @@ impl Group {
             }
         };
 
-        let queries = Self::queries(&block.items, &group, &owner)?;
+        let queries = Self::queries(block.items, &group, &owner)?;
 
         let metas: proc_macro2::TokenStream = queries
             .iter()

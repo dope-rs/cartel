@@ -3,7 +3,7 @@ use crate::backend::Backend as _;
 use crate::dialect::param;
 use crate::dialect::pg::types::TypeExt as _;
 use crate::emit;
-use crate::ext::FnParamsExt as _;
+use syn::ext::IdentExt as _;
 use syn::visit::Visit as _;
 
 pub(crate) mod group;
@@ -49,8 +49,7 @@ impl PgBackend {
             method,
             vis,
         } = q;
-        let ids = &code.param_ids;
-        let tys = &code.param_tys;
+        let mut params = code.params;
         let caps = &code.captures;
         let plan = code.plan;
         let stmt = format!("{ident}.{method}");
@@ -60,7 +59,7 @@ impl PgBackend {
         names.visit_ident(query);
         names.visit_return_type(&plan.output);
         names.visit_block(&code.block);
-        for (id, ty) in ids.iter().zip(tys) {
+        for (id, ty) in &params {
             names.visit_ident(id);
             names.visit_type(ty);
         }
@@ -92,8 +91,11 @@ impl PgBackend {
         let mut fmts = Vec::new();
         let mut text = false;
         for cap in caps {
-            let fn_idx = ids.index_of(cap)?;
-            let ty = &tys[fn_idx];
+            let (fn_idx, (_, ty)) = params
+                .iter()
+                .enumerate()
+                .find(|(_, (id, _))| id.unraw() == cap.unraw())
+                .ok_or_else(|| syn::Error::new(cap.span(), "captured ident not in fn params"))?;
             let bind = ty.bind()?;
             let oid = bind.oid;
             oids.push(quote::quote! { #oid });
@@ -124,6 +126,7 @@ impl PgBackend {
             quote::quote! {}
         };
 
+        let ids = params.iter().map(|(id, _)| id);
         let values = quote::quote! { ( #( #ids, )* ) };
 
         let parts = &plan.sql_parts;
@@ -205,9 +208,8 @@ impl PgBackend {
             const SQL: &str = #text;
         };
 
-        let decls: Vec<proc_macro2::TokenStream> = ids
+        let decls: Vec<proc_macro2::TokenStream> = params
             .iter()
-            .zip(tys.iter())
             .map(|(id, ty)| quote::quote! { #id: #ty })
             .collect();
 
@@ -218,6 +220,7 @@ impl PgBackend {
             };
             let output = &plan.output;
             let scope = backend::scope();
+            let tys = params.iter().map(|(_, ty)| ty);
             quote::quote! {
                 const _: fn(
                     &::cartel_pg::dsl::Scope,
@@ -232,8 +235,9 @@ impl PgBackend {
         };
         let batch = if !matches!(plan.dispatch, emit::Kind::Stream(_)) {
             let count = names.fresh("__CARTEL_GROUP_LEN_");
-            let (params, values, item) = match tys.as_slice() {
-                [ty] => (
+            let tys = params.iter().map(|(_, ty)| ty);
+            let (params, values, item) = match params.as_slice() {
+                [(_, ty)] => (
                     quote::quote! { [#ty; #count] },
                     quote::quote! { #args.map(|#argument| (#argument,)) },
                     quote::quote! { (#argument,) },
@@ -255,10 +259,11 @@ impl PgBackend {
                         Output = ::core::result::Result<
                             [#value; #count],
                             ::cartel_pg::api::results::GroupFailure<
+                                #driver,
                                 #value,
-                                ::cartel_pg::reply::Error<#driver, #route_id>,
                                 <#caller::Results as ::cartel_pg::api::results::Storage>::Diagnostics,
                                 #count,
+                                #route_id,
                             >,
                         >,
                     > + use<#driver, #caller, #route_id, #count>
@@ -304,7 +309,8 @@ impl PgBackend {
         } else {
             quote::quote! {}
         };
-        let bound = param::Param::<false>::apply(code.param_tys, &input);
+        param::Param::<false>::apply(params.iter_mut().map(|(_, ty)| ty), &input);
+        let bound = params.iter().map(|(_, ty)| ty);
         let params = quote::quote! { ( #( #bound, )* ) };
 
         Ok(quote::quote! {

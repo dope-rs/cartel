@@ -21,12 +21,12 @@ fn retains_fields_and_pid() {
         |peer| {
             let mut socket = peer.accept().expect("notification peer connection");
             Stream::try_start(&mut socket, None).expect("peer handshake");
-            notice::try_write(&mut socket, &notice::SEED).expect("notification frames");
+            notice::try_write(&socket, &notice::SEED).expect("notification frames");
             for (cases, ..) in notice::BATCHES {
-                notice::try_batch(&mut socket, cases).expect("notification fence");
+                notice::try_batch(&socket, cases).expect("notification fence");
             }
             while socket.peek(&mut [0]).expect("notification round") != 0 {
-                notice::try_batch(&mut socket, &notice::BUDGET).expect("budget fence");
+                notice::try_batch(&socket, &notice::BUDGET).expect("budget fence");
             }
         },
         |server| {

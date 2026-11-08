@@ -88,6 +88,8 @@ fn throttled_query_cannot_enter_later_transaction() {
         |server| {
             let mut capacity = Queries::try_cancel().expect("PG capacity").capacities();
             capacity.inflight = 1;
+            capacity.requests.frames = 3;
+            capacity.admission_waiters = 1;
             let prepared = topology::try_new::<_, Env>(
                 port::Port::<Queries>::plan(
                     Queries::try_config().expect("database config"),
@@ -118,6 +120,14 @@ fn throttled_query_cannot_enter_later_transaction() {
                                     .block_on(dope_fiber::fiber!('_ => async move {
                                         ::core::assert!(fibers::TEST.poll_once(first.as_mut()).await.is_none());
                                         ::core::assert!(fibers::TEST.poll_once(waiting.as_mut()).await.is_none());
+                                        ::core::assert!(matches!(
+                                            client.unchecked().command("SELECT 3").await,
+                                            Err(reply::Error::Admission {
+                                                cause: reply::Pressure::Full { len, capacity },
+                                                error: dope_fiber::wait::Error::QueueFull { capacity: waiters, .. },
+                                                ..
+                                            }) if len.get() == 1 && capacity.get() == 1 && waiters.get() == 1
+                                        ));
                                         ::core::assert!(matches!(first.as_mut().await, Ok(())));
                                         let tx = client.transaction().begin().await
                                             .ok().expect("exclusive transaction");

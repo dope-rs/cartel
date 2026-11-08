@@ -16,24 +16,23 @@ impl Query {
         quote::format_ident!("__CartelSqliteQuery{suffix}")
     }
 
-    pub(crate) fn expand(f: &syn::ItemFn) -> syn::Result<(syn::Ident, proc_macro2::TokenStream)> {
+    pub(crate) fn expand(f: syn::ItemFn) -> syn::Result<(syn::Ident, proc_macro2::TokenStream)> {
         f.modifiers.require_empty()?;
         backend::Compiled::validate(&f.sig, &f.attrs, "#[query] functions")?;
+        let mut names = backend::Names::default();
+        names.visit_item_fn(&f);
         let backend::Compiled {
-            param_ids: ids,
-            param_tys: tys,
+            mut params,
             captures,
             nonnegative: nonneg,
             plan,
             block,
         } = backend::Compiled::build::<Backend>(
             &f.sig.generics,
-            f.sig.inputs.iter().map(backend::Compiled::fn_arg),
-            &f.block,
+            f.sig.inputs.into_iter().map(backend::Compiled::fn_arg),
+            *f.block,
             &f.sig.output,
         )?;
-        let mut names = backend::Names::default();
-        names.visit_item_fn(f);
         let source = names.fresh("source");
         let query = names.fresh("query");
         let catalog = names.fresh("I");
@@ -46,20 +45,25 @@ impl Query {
             let p_body = ScopeCalls::sqlite(block);
             let output = &plan.output;
             let scope = crate::backend::scope();
+            let ids = params.iter().map(|(id, _)| id);
+            let tys = params.iter().map(|(_, ty)| ty);
+            let decl_tys = params.iter().map(|(_, ty)| ty);
             quote::quote! {
                 const _: fn(
                     &::cartel_sqlite::dsl::Scope,
                     #( #tys, )*
                 ) #output = |
                     #scope: &::cartel_sqlite::dsl::Scope,
-                    #( #ids: #tys, )*
+                    #( #ids: #decl_tys, )*
                 | {
                     #p_body
                 };
             }
         };
-        let run_tys = param::Param::<true>::apply(tys, &region);
-        let params = params::Params::new(&ids, &run_tys, &captures, &nonneg)?;
+        param::Param::<true>::apply(params.iter_mut().map(|(_, ty)| ty), &region);
+        let bound = params::Params::new(&params, &captures, &nonneg)?;
+        let ids = params.iter().map(|(id, _)| id);
+        let run_tys = params.iter().map(|(_, ty)| ty);
         let n_params = captures.len();
         let n_cols = match &plan.dispatch {
             emit::Kind::NoRows => quote::quote! { 0usize },
@@ -75,8 +79,8 @@ impl Query {
         let fn_name = &f.sig.ident;
         let attrs = &f.attrs;
         let marker = Self::marker(fn_name);
-        let p_ty = params.ty;
-        let p_val = params.value;
+        let p_ty = bound.ty;
+        let p_val = bound.value;
 
         let parts = &plan.sql_parts;
         let sql = Backend::dialect().text(quote::quote! { &[#(#parts),*] });

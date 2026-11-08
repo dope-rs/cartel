@@ -18,8 +18,7 @@ pub(super) enum Bound {
 }
 
 pub(super) struct State<'a> {
-    pub(super) fn_params: &'a [syn::Ident],
-    pub(super) param_tys: &'a [syn::Type],
+    pub(super) params: &'a [backend::Param],
     pub(super) captures: Vec<syn::Ident>,
     pub(super) nonnegative: Vec<(syn::Ident, Bound)>,
     pub(super) return_type: &'a syn::ReturnType,
@@ -30,8 +29,7 @@ pub(super) struct State<'a> {
 impl State<'_> {
     pub(super) fn context(&self) -> pred::WhereContext<'_> {
         pred::WhereContext {
-            fn_params: self.fn_params,
-            param_tys: self.param_tys,
+            params: self.params,
             dialect: self.dialect,
             cte_map: &self.cte_map,
         }
@@ -53,22 +51,11 @@ impl State<'_> {
         expr: &syn::Expr,
         error: syn::Error,
     ) -> syn::Result<Sql> {
-        let sql = scope.parse(
-            expr,
-            Some(self.fn_params),
-            self.param_tys,
-            self.dialect,
-            &self.cte_map,
-        )?;
+        let sql = scope.parse(expr, Some(self.params), self.dialect, &self.cte_map)?;
         sql.required(error)
     }
 
     pub(super) fn render(&mut self, sql: Sql) -> Vec<proc_macro2::TokenStream> {
-        sql.render(
-            &mut self.captures,
-            self.fn_params,
-            self.param_tys,
-            self.dialect,
-        )
+        sql.render(&mut self.captures, self.params, self.dialect)
     }
 }

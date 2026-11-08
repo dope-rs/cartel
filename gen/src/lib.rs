@@ -82,7 +82,7 @@ pub fn query(
         .into();
     }
     let f = syn::parse_macro_input!(item as syn::ItemFn);
-    match sqlite::Query::expand(&f) {
+    match sqlite::Query::expand(f) {
         Ok((_, ts)) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }

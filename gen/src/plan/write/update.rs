@@ -73,8 +73,7 @@ pub(in crate::plan) fn build(
         body,
         set_id,
         &scope,
-        state.fn_params,
-        state.param_tys,
+        state.params,
         state.dialect,
         &state.cte_map,
     )?;
@@ -176,12 +175,11 @@ pub(in crate::plan) fn each(
 
     let mut params: Vec<proc_macro2::TokenStream> = Vec::with_capacity(data.len());
     for ds in data {
-        let captured = state.fn_params.resolve_ref(ds)?;
+        let captured = state.params.resolve_ref(ds)?;
         let idx = pred::sql::intern(&mut state.captures, captured);
         let ctx = backend::ParamCtx {
             captures: &state.captures,
-            param_ids: state.fn_params,
-            param_tys: state.param_tys,
+            params: state.params,
         };
         params.push(state.dialect.placeholder(idx, &ctx));
     }
@@ -192,8 +190,7 @@ pub(in crate::plan) fn each(
         set_body,
         row_var,
         &scope,
-        state.fn_params,
-        state.param_tys,
+        state.params,
         state.dialect,
         &state.cte_map,
     )?;
@@ -247,8 +244,9 @@ pub(in crate::plan) fn each(
         let rt = &state.dialect.rt_crate;
         let mut names = backend::Names::default();
         for name in state
-            .fn_params
+            .params
             .iter()
+            .map(|(id, _)| id)
             .chain(col_vars)
             .chain(slice::from_ref(row_var))
         {

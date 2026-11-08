@@ -4,11 +4,13 @@ use syn::visit_mut::VisitMut as _;
 pub(super) struct Param<'a, const BORROW_OWNED: bool>(&'a syn::Lifetime);
 
 impl<'a, const BORROW_OWNED: bool> Param<'a, BORROW_OWNED> {
-    pub(super) fn apply(mut types: Vec<syn::Type>, lifetime: &'a syn::Lifetime) -> Vec<syn::Type> {
-        for ty in &mut types {
+    pub(super) fn apply<'t>(
+        types: impl IntoIterator<Item = &'t mut syn::Type>,
+        lifetime: &'a syn::Lifetime,
+    ) {
+        for ty in types {
             Self(lifetime).visit_type_mut(ty);
         }
-        types
     }
 
     fn is_string(ty: &syn::Type) -> bool {

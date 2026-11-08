@@ -3,7 +3,7 @@ use api::{exec, stmt};
 use dope_fiber::{abi, context};
 use exec::Policy as _;
 use exec::machine::{self, State};
-use std::{marker, num, ops, result, task};
+use std::{num, ops, result, task};
 use stmt::access;
 
 type Machine<'query, 'connection, 'd, I, Q, P> =
@@ -14,6 +14,8 @@ type RowState<'query, 'connection, 'd, I, Q, R, P, C> = State<
     (
         machine::Lease<'query, 'connection, 'd, P, access::Plain>,
         <C as exec::Create<R>>::Policy,
+        usize,
+        Option<num::NonZero<i32>>,
     ),
 >;
 
@@ -29,10 +31,6 @@ pub(crate) struct Rows<
     C: exec::Create<R>,
 > {
     state: RowState<'query, 'connection, 'd, I, Q, R, P, C>,
-    remaining: usize,
-    /// A present capacity proves the live row shape until a busy reset yields.
-    byte_capacity: Option<num::NonZero<i32>>,
-    row: marker::PhantomData<R>,
 }
 
 impl<
@@ -52,9 +50,6 @@ impl<
     ) -> abi::Owned<Self> {
         abi::Owned::new(Self {
             state: State::Start((machine, create)),
-            remaining: 0,
-            byte_capacity: None,
-            row: marker::PhantomData,
         })
     }
 }
@@ -80,39 +75,38 @@ impl<
     ) -> task::Poll<Self::Ready> {
         let mut context = admit.context();
         let this = live.get_mut();
-        let (active, policy) = match &mut this.state {
+        let (active, policy, remaining, byte_capacity) = match &mut this.state {
             State::Start(_) => return task::Poll::Ready(None),
-            State::Active((active, policy)) => (active.parts_mut().0, policy),
+            State::Active((active, policy, remaining, bytes)) => {
+                (active.parts_mut().0, policy, remaining, bytes)
+            }
         };
-        let mut polled = active.poll(context.as_mut());
+        let mut polled = active.poll(byte_capacity.is_none(), context.as_mut());
         let result = loop {
             let step = match polled {
-                task::Poll::Pending => {
-                    this.byte_capacity = None;
-                    return task::Poll::Pending;
-                }
+                task::Poll::Pending => return task::Poll::Pending,
                 task::Poll::Ready(Ok(step)) => step,
                 task::Poll::Ready(Err(error)) => break Err(error),
             };
-            let bytes = match this.byte_capacity {
+            let bytes = match *byte_capacity {
                 Some(bytes) => bytes,
                 None => {
                     if let Err(error) = active.columns::<true>(R::N_COLS) {
                         break Err(error);
                     }
                     let bytes = active.config().row_bytes();
-                    this.byte_capacity = Some(bytes);
+                    *byte_capacity = Some(bytes);
                     bytes
                 }
             };
             if matches!(step, stmt::Step::Done) {
                 break Ok(None);
             }
-            let Some(left) = this.remaining.checked_sub(1) else {
+            let Some(left) = remaining.checked_sub(1) else {
                 let capacity = active.config().scan_rows();
                 break Err(crate::Error::ScanRows { capacity });
             };
-            this.remaining = left;
+            *remaining = left;
             let flow = match active.read::<R, _>(bytes.cast_unsigned(), policy) {
                 Ok(flow) => flow,
                 Err(error) => break Err(error),
@@ -122,7 +116,7 @@ impl<
             }
             match context.as_ref().try_continue() {
                 context::Continue::Permit(permit) => {
-                    polled = permit.run(|| active.poll(context.as_mut()));
+                    polled = permit.run(|| active.poll(false, context.as_mut()));
                 }
                 context::Continue::Exhausted => return task::Poll::Pending,
             }
@@ -144,7 +138,7 @@ impl<
             State::Active(_) => Ok(()),
         };
         let (vacant, mut this) = live.take();
-        let (active, policy) = match this.state {
+        let (active, policy, remaining) = match this.state {
             State::Start((machine, create)) => {
                 let active = match machine.prepare(cleaned) {
                     Ok(active) => active,
@@ -154,19 +148,22 @@ impl<
                     return vacant.complete(active.finish(Err(error)));
                 }
                 let config = active.config();
-                this.remaining = config.scan_rows();
+                let remaining = config.scan_rows();
                 let policy = match create.create(config) {
                     Ok(policy) => policy,
                     Err(error) => return vacant.complete(active.finish(Err(error))),
                 };
-                (active, policy)
+                (active, policy, remaining)
             }
-            State::Active((active, policy)) => (active.into_parts().0, policy),
+            State::Active((active, policy, remaining, _)) => {
+                (active.into_parts().0, policy, remaining)
+            }
         };
         let result = match ready {
             Some(result) => result,
             None => {
-                this.state = State::Active((machine::Lease::open(active, ()), policy));
+                this.state =
+                    State::Active((machine::Lease::open(active, ()), policy, remaining, None));
                 let mut live = vacant.insert(this);
                 return match Self::poll(&mut live, &mut admit) {
                     task::Poll::Pending => live.pending(),

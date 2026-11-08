@@ -62,19 +62,21 @@ fn busy_failure_is_causal(runtime: Runtime) -> Result<(), plan::Error> {
             .try_run(
                 |driver, mut db| {
                     let mut blocker = Blocker::try_new(&db, &path).map_err(plan::Error::Client)?;
-                    let mut query = abi::Task::new(
-                        db.query()
-                            .run_no_rows(ContentionDatabase::INSERT_ITEM, (2_i64, ())),
-                    );
-                    assert!(
-                        fibers::TEST
-                            .try_run(driver, fibers::TEST.poll_once(Pin::new(&mut query)))
-                            .map_err(plan::Error::Run)?
-                            .is_none()
-                    );
+                    blocker.commit().map_err(plan::Error::Call)?;
+                    blocker.read().map_err(plan::Error::Call)?;
+                    let mut rows = 0;
+                    let query = db.query().stream::<i64, _, _>(
+                        ContentionDatabase::INSERT_RETURNING, (2_i64, ()),
+                    ).visit(|_| {
+                        rows += 1;
+                        std::ops::ControlFlow::Continue(())
+                    });
+                    let result = fibers::TEST.try_run(driver, query);
+                    assert_eq!(rows, 1);
+                    assert!(matches!(result, Ok(Err(Error::Busy { action: Action::Step, code })) if code.primary() == 5));
                     blocker.commit().map_err(plan::Error::Call)?;
                     fibers::TEST
-                        .try_run(driver, query)
+                        .try_run(driver, db.query().run_no_rows(ContentionDatabase::INSERT_ITEM, (2_i64, ())))
                         .map_err(plan::Error::Run)?
                         .map_err(plan::Error::Call)?;
 

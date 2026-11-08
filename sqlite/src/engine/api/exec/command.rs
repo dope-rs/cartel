@@ -44,7 +44,7 @@ impl<'d, I: catalogs::Catalog, P: api::Bind, T: Target<I>> abi::Resume<'d>
     ) -> task::Poll<Self::Ready> {
         match &mut live.get_mut().state {
             State::Start(_) => task::Poll::Ready(None),
-            State::Active(active) => active.parts_mut().0.poll(admit.context()).map(Some),
+            State::Active(active) => active.parts_mut().0.poll(true, admit.context()).map(Some),
         }
     }
 
@@ -71,7 +71,7 @@ impl<'d, I: catalogs::Catalog, P: api::Bind, T: Target<I>> abi::Resume<'d>
         };
         let result = match ready {
             Some(result) => result,
-            None => match active.poll(context.as_mut()) {
+            None => match active.poll(true, context.as_mut()) {
                 task::Poll::Pending => {
                     this.state = State::Active(machine::Lease::open(active, ()));
                     return vacant.insert(this).pending();

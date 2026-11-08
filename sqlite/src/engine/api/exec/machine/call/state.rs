@@ -34,6 +34,7 @@ impl<'query, 'd> State<'query, 'd> {
         &mut self,
         prepared: &mut stmt::Prepared<'_>,
         access: &A,
+        retry: bool,
         mut context: pin::Pin<&mut context::Context<'_, 'd>>,
     ) -> task::Poll<result::Result<stmt::Step, crate::Error>> {
         loop {
@@ -48,7 +49,7 @@ impl<'query, 'd> State<'query, 'd> {
             match self.step(prepared, access) {
                 Err(error @ crate::Error::Busy { action, code }) => {
                     self.transaction.check()?;
-                    if self.guard.check(Ok(())).is_err() {
+                    if !retry || self.guard.check(Ok(())).is_err() {
                         return task::Poll::Ready(Err(error));
                     }
                     let fault = sys::Fault::new(action, code);

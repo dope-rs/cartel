@@ -30,9 +30,10 @@ pub(super) trait TableBackend: Backend {
     }
 }
 
+pub(super) type Param = (syn::Ident, syn::Type);
+
 pub(super) struct Compiled {
-    pub(super) param_ids: Vec<syn::Ident>,
-    pub(super) param_tys: Vec<syn::Type>,
+    pub(super) params: Vec<Param>,
     pub(super) captures: Vec<syn::Ident>,
     pub(super) nonnegative: Vec<(syn::Ident, plan::Bound)>,
     pub(super) plan: emit::Plan,
@@ -88,8 +89,8 @@ impl Compiled {
 
     pub(super) fn build<B: Backend>(
         generics: &syn::Generics,
-        inputs: impl Iterator<Item = syn::Result<(syn::Ident, syn::Type)>>,
-        block: &syn::Block,
+        inputs: impl ExactSizeIterator<Item = syn::Result<Param>>,
+        block: syn::Block,
         output: &syn::ReturnType,
     ) -> syn::Result<Self> {
         if !generics.params.is_empty() || generics.where_clause.is_some() {
@@ -99,22 +100,18 @@ impl Compiled {
             ));
         }
 
-        let mut ids: Vec<syn::Ident> = Vec::new();
-        let mut tys: Vec<syn::Type> = Vec::new();
+        let mut params = Vec::with_capacity(inputs.len());
         for input in inputs {
-            let (id, ty) = input?;
-            ids.push(id);
-            tys.push(ty);
+            params.push(input?);
         }
 
-        let block = names::lower(block, &ids)?;
+        let block = names::lower(block, &params)?;
 
         let (ctes, body) = shape::CteBinding::extract_from(&block)?;
 
         let dialect = B::dialect();
         let mut state = plan::State {
-            fn_params: &ids,
-            param_tys: &tys,
+            params: &params,
             captures: Vec::new(),
             nonnegative: Vec::new(),
             return_type: output,
@@ -154,8 +151,7 @@ impl Compiled {
         let captures = state.captures;
         let nonneg = state.nonnegative;
         Ok(Self {
-            param_ids: ids,
-            param_tys: tys,
+            params,
             captures,
             nonnegative: nonneg,
             plan,
@@ -163,7 +159,7 @@ impl Compiled {
         })
     }
 
-    pub(super) fn fn_arg(arg: &syn::FnArg) -> syn::Result<(syn::Ident, syn::Type)> {
+    pub(super) fn fn_arg(arg: syn::FnArg) -> syn::Result<Param> {
         let syn::FnArg::Typed(param) = arg else {
             return Err(syn::Error::new(
                 arg.span(),
@@ -176,7 +172,7 @@ impl Compiled {
                 "query method parameter attributes are not supported",
             ));
         }
-        let syn::Pat::Ident(ident) = param.pat.as_ref() else {
+        let syn::Pat::Ident(ident) = *param.pat else {
             return Err(syn::Error::new(
                 param.pat.span(),
                 "query method params must be plain identifiers",
@@ -192,7 +188,7 @@ impl Compiled {
                 "query method params must be plain identifiers",
             ));
         }
-        Ok((ident.ident.clone(), (*param.ty).clone()))
+        Ok((ident.ident, *param.ty))
     }
 }
 
@@ -278,8 +274,7 @@ pub(super) struct Dialect {
 
 pub(super) struct ParamCtx<'a> {
     pub(super) captures: &'a [syn::Ident],
-    pub(super) param_ids: &'a [syn::Ident],
-    pub(super) param_tys: &'a [syn::Type],
+    pub(super) params: &'a [Param],
 }
 
 impl Dialect {
@@ -332,10 +327,9 @@ impl Dialect {
         let Some(cap) = ctx.captures.get(idx0) else {
             return false;
         };
-        let Some(pos) = ctx.param_ids.iter().position(|p| p.unraw() == cap.unraw()) else {
-            return false;
-        };
-        let Some(syn::Type::Path(path)) = ctx.param_tys.get(pos) else {
+        let Some((_, syn::Type::Path(path))) =
+            ctx.params.iter().find(|(id, _)| id.unraw() == cap.unraw())
+        else {
             return false;
         };
         path.qself.is_none()

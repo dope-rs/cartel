@@ -225,7 +225,7 @@ impl Head {
                         format!("`{name}(...)` first arg must be a column / expression"),
                     ),
                 )?;
-                let offset = Integer::parse(&call.args[1], state.fn_params)?;
+                let offset = Integer::parse(&call.args[1], state.params)?;
                 Ok(Self::Offset(open, sql, offset))
             }
         }

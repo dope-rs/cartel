@@ -48,8 +48,7 @@ impl Sql {
     pub(crate) fn render(
         self,
         captures: &mut Vec<syn::Ident>,
-        ids: &[syn::Ident],
-        tys: &[syn::Type],
+        params: &[backend::Param],
         dialect: &backend::Dialect,
     ) -> Vec<proc_macro2::TokenStream> {
         let mut tokens = Vec::with_capacity(self.0.len());
@@ -58,11 +57,7 @@ impl Sql {
                 Part::Token(token) => tokens.push(token),
                 Part::Capture(ident) => {
                     let index = intern(captures, ident);
-                    let context = backend::ParamCtx {
-                        captures,
-                        param_ids: ids,
-                        param_tys: tys,
-                    };
+                    let context = backend::ParamCtx { captures, params };
                     tokens.push(dialect.placeholder(index, &context));
                 }
             }

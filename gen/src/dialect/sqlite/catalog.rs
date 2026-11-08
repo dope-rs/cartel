@@ -100,7 +100,7 @@ impl Catalog {
                         Some(index) => {
                             let attr = function.attrs.remove(index);
                             let meta = attr.meta.require_path_only()?;
-                            let (mut marker, tokens) = Query::expand(&function)?;
+                            let (mut marker, tokens) = Query::expand(function)?;
                             marker.set_span(meta.span());
                             queries.push(syn::Path::from(marker));
                             emitted.push(tokens);

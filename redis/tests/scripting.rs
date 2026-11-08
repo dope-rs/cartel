@@ -165,13 +165,13 @@ fn request_failure_recycles() {
     let unread = iter::repeat_with(|| panic!("length iterator advanced"));
     for (keys, arguments, expected) in PREFIX_ERRORS {
         assert_eq!(
-            scripts::wire_len(b"", keys, unread.clone(), arguments, unread.clone()),
+            scripts::wire_len(b"", keys, unread, arguments, unread),
             Err(expected)
         );
     }
     for (count, lengths, expected) in KEY_LENGTH_ERRORS {
         assert_eq!(
-            scripts::wire_len(b"", count, lengths.iter().copied(), 1, unread.clone()),
+            scripts::wire_len(b"", count, lengths.iter().copied(), 1, unread),
             Err(expected)
         );
     }
@@ -576,7 +576,7 @@ fn bulk_reservation_retains_reply() {
                                     drop(reserved);
                                     drop(held);
                                     let error = runtime.block_on(send.as_mut())
-                                        .expect("queued EVAL drive").err().expect("old suffix rejected");
+                                        .expect("queued EVAL drive").expect_err("old suffix rejected");
                                     assert!(
                                         matches!(&error, value::reply::Failure::Control(cartel_redis::Error::ResponseFront(cartel_core::reply::order::Front::Empty)) if complete)
                                         || matches!(&error, value::reply::Failure::Control(cartel_redis::Error::UnexpectedResponse) if !complete),
@@ -710,7 +710,7 @@ fn split_is_one_bulk() {
                 let (actual, rest) = got.split_at(header.len());
                 assert_eq!(actual, header);
                 let (keys, argument) = rest.split_at(count * KEY_BULK.len());
-                assert!(keys.chunks_exact(KEY_BULK.len()).all(|key| key == KEY_BULK));
+                assert!(keys.as_chunks::<{ KEY_BULK.len() }>().0.iter().all(|key| key == KEY_BULK));
                 assert_eq!(argument, SPLIT_BULK);
                 socket.write_all(b":17\r\n").expect("integer response");
             }

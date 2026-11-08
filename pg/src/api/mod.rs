@@ -8,16 +8,16 @@ use dope_fiber::reply::{Batch, Batches};
 
 use crate::port::{pool::access, replies, replies::Response};
 use crate::protocol::{self, runtime::tx::Access};
-use crate::reply;
+use crate::reply::{self, Pressure};
 use crate::schema;
 use cartel_core::reply::recv::outcome::Terminal;
 use cartel_core::reply::{
-    LaneIndex, Slot, layout,
+    Slot,
     recv::{self, attach},
 };
 use dope::manifold::client::conn;
 use dope_fiber::wait;
-use o3::{depot::capacity, mem::credit::fair};
+use o3::mem::credit::fair;
 use std::{marker, mem};
 
 use request::Pending;
@@ -216,19 +216,6 @@ pub(super) struct Throttle<'d, const ID: u8> {
     cause: Pressure,
 }
 
-pub(super) enum Pressure {
-    Full {
-        len: capacity::Count,
-        capacity: layout::Entries,
-    },
-    Capacity {
-        lane: LaneIndex,
-        axis: fair::Axis<2>,
-        required: usize,
-        available: usize,
-    },
-}
-
 impl<'d, const ID: u8> Throttle<'d, ID> {
     pub(in crate::api) fn new(
         conn: conn::Id<'d, KeyTag<ID>>,
@@ -260,40 +247,11 @@ impl<'d, const ID: u8> Throttle<'d, ID> {
     fn fail(self, error: wait::Error<'d>) -> reply::Error<'d, ID> {
         reply::Error::Admission {
             conn: self.conn,
-            cause: self.cause.attach(),
+            cause: self.cause,
             error,
         }
     }
 }
-
-impl Pressure {
-    fn attach(self) -> attach::Error {
-        match self {
-            Self::Full { len, capacity } => attach::Error::Full { len, capacity },
-            Self::Capacity {
-                lane,
-                axis,
-                required,
-                available: avail,
-            } => attach::Error::Capacity {
-                lane,
-                cause: fair::Cause::Exhausted {
-                    axis,
-                    required,
-                    available: avail,
-                },
-            },
-        }
-    }
-}
-
-const _: () = {
-    assert!(mem::size_of::<Pressure>() == 4 * mem::size_of::<usize>());
-    assert!(mem::align_of::<Pressure>() == mem::align_of::<usize>());
-    assert!(
-        mem::size_of::<Pressure>() + mem::size_of::<usize>() == mem::size_of::<attach::Error>()
-    );
-};
 
 const _: () = assert!(
     mem::size_of::<Target<'static, 0>>() == mem::size_of::<access::Transaction<'static, 0>>()

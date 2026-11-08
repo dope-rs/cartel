@@ -46,8 +46,8 @@ impl Qualify {
                 .reject("row locking is not supported with DISTINCT")?;
         }
         let lock = quals.lock.try_render(state.dialect)?;
-        let limit = Limit::new(&quals.limit, end, state.fn_params)?;
-        let offset = Offset::new(&quals.offset, state.fn_params)?;
+        let limit = Limit::new(&quals.limit, end, state.params)?;
+        let offset = Offset::new(&quals.offset, state.params)?;
         let mut clauses = Vec::with_capacity(quals.order_by.len());
         for clause in &quals.order_by {
             clauses.push(Clause::new(state, clause, parent)?);
@@ -74,8 +74,8 @@ impl Qualify {
                 "DISTINCT qualifiers are not supported on set-operation queries",
             ));
         }
-        let limit = Limit::new(&quals.limit, Some(end), state.fn_params)?;
-        let offset = Offset::new(&quals.offset, state.fn_params)?;
+        let limit = Limit::new(&quals.limit, Some(end), state.params)?;
+        let offset = Offset::new(&quals.offset, state.params)?;
         Ok(Self {
             clauses: Vec::new(),
             limit,
@@ -117,7 +117,7 @@ impl Integer {
         )
     }
 
-    pub(in crate::plan) fn parse(expr: &syn::Expr, params: &[syn::Ident]) -> syn::Result<Self> {
+    pub(in crate::plan) fn parse(expr: &syn::Expr, params: &[backend::Param]) -> syn::Result<Self> {
         if let syn::Expr::Lit(literal) = expr {
             let syn::ExprLit { attrs, lit } = literal;
             if let Some(attr) = attrs.first() {
@@ -155,7 +155,7 @@ impl Integer {
                 }
             }
             let id = &segment.ident;
-            if !params.iter().any(|param| param.unraw() == id.unraw()) {
+            if !params.iter().any(|(param, _)| param.unraw() == id.unraw()) {
                 return Err(syn::Error::new(
                     id.span(),
                     format!("`{id}` is not a fn parameter"),
@@ -178,8 +178,7 @@ impl Integer {
                 state.mark_nonneg(id, bound);
                 let ctx = backend::ParamCtx {
                     captures: &state.captures,
-                    param_ids: state.fn_params,
-                    param_tys: state.param_tys,
+                    params: state.params,
                 };
                 state.dialect.placeholder(idx, &ctx)
             }
@@ -191,7 +190,7 @@ impl Limit {
     fn new(
         bound: &bound::Bound,
         end: Option<shape::Terminator>,
-        params: &[syn::Ident],
+        params: &[backend::Param],
     ) -> syn::Result<Self> {
         match bound {
             bound::Bound::Expr(expr) => Ok(Self::Value(Integer::parse(expr, params)?)),
@@ -221,7 +220,7 @@ impl Limit {
 }
 
 impl Offset {
-    fn new(bound: &bound::Bound, params: &[syn::Ident]) -> syn::Result<Self> {
+    fn new(bound: &bound::Bound, params: &[backend::Param]) -> syn::Result<Self> {
         match bound {
             bound::Bound::None => Ok(Self::None),
             bound::Bound::Expr(expr) => Ok(Self::Value(Integer::parse(expr, params)?)),

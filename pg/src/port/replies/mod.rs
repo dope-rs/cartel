@@ -151,18 +151,18 @@ where
     Response::try_group_by(token, lane, commands, terminal, input, |input| {
         let (owner, output) = make(input);
         let group = NonNull::from(&*owner);
-        let commands = std::array::from_fn(|index| Tag {
-            batch,
-            kind: if index + 1 == N {
-                Kind::Last(index as u32, group)
-            } else {
-                Kind::Group(index as u32, group)
-            },
-        });
         // The admitted FIFO publishes its owning Sync last. Only front access
         // can inspect a command; detachment never removes its ordered anchor.
         (
-            commands,
+            [(); N],
+            move |index, ()| Tag {
+                batch,
+                kind: if index + 1 == N {
+                    Kind::Last(index as u32, group)
+                } else {
+                    Kind::Group(index as u32, group)
+                },
+            },
             Tag {
                 batch,
                 kind: Kind::Sync(owner),
@@ -345,6 +345,16 @@ impl source::Payload for Payload<'_, '_, '_> {
 }
 
 impl<'d> ReplyFailure<'d> {
+    pub fn kind(&self) -> crate::reply::Kind<'_, 'd> {
+        match self {
+            Self::Server(error) => crate::reply::Kind::Server(error.fields()),
+            Self::GroupServer => {
+                crate::reply::Kind::Driver(&crate::Error::Protocol(Reason::GroupReply))
+            }
+            Self::Failed(error) => crate::reply::Kind::Driver(error),
+        }
+    }
+
     pub(crate) fn into_error<const ID: u8>(self) -> Error<'d, ID> {
         match self {
             Self::Server(error) => Error::Server(error),

@@ -21,7 +21,7 @@ use crate::{
         self, Response,
         results::{
             GroupFailure, GroupResult, Row,
-            group::{Diagnostics, Outcome, Sync},
+            group::{Diagnostics, Outcome},
         },
     },
     port::replies::{self, groups},
@@ -32,16 +32,16 @@ use crate::{
 use crate::api::task::{State, lease};
 
 type Output<'r, 's, 'b, 'c, 'd, Q, const ID: u8, const N: usize> =
-    GroupResult<Row<replies::Payload<'b, 'c, 'd>, Q>, Error<'d, ID>, Ledger<'r, 's>, N>;
+    GroupResult<'d, Row<replies::Payload<'b, 'c, 'd>, Q>, Ledger<'r, 's>, N, ID>;
 
-struct First<Q, const ID: u8>(PhantomData<Q>);
+struct First<Q>(PhantomData<Q>);
 
-impl<'app, 'b, 'c: 'b, 'd: 'c, Q, const ID: u8>
-    recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>> for First<Q, ID>
+impl<'app, 'b, 'c: 'b, 'd: 'c, Q>
+    recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>> for First<Q>
 where
     Q: schema::TypedQuery<Result = schema::result::Rows>,
 {
-    type Output = Outcome<Row<replies::Payload<'b, 'c, 'd>, Q>, Error<'d, ID>>;
+    type Output = Outcome<Row<replies::Payload<'b, 'c, 'd>, Q>, replies::ReplyFailure<'d>>;
     type Context = ();
     const ACCEPTANCE: recv::Acceptance = recv::Acceptance::First;
 
@@ -54,17 +54,17 @@ where
                 match Row::required(
                     done.try_node()
                         .map(|payload| payload.map(replies::Payload::from_node))
-                        .map_err(|error| crate::Error::ResponseRetain(error).into()),
+                        .map_err(crate::Error::ResponseRetain),
                 ) {
                     Ok(row) => Outcome::Completed(row),
-                    Err(error) => Outcome::Failed(error),
+                    Err(error) => Outcome::Failed(replies::ReplyFailure::Failed(error)),
                 }
             }
             Terminal::Failed(failure) => match failure.into_error() {
-                replies::ReplyFailure::Server(error) => Outcome::Failed(Error::Server(error)),
+                error @ replies::ReplyFailure::Server(_) => Outcome::Failed(error),
                 replies::ReplyFailure::GroupServer => Outcome::Server,
                 replies::ReplyFailure::Failed(crate::Error::Skipped) => Outcome::Skipped,
-                replies::ReplyFailure::Failed(error) => Outcome::Interrupted(error.into()),
+                error @ replies::ReplyFailure::Failed(_) => Outcome::Interrupted(error),
             },
         })
     }
@@ -93,10 +93,10 @@ enum Stop<'d, const ID: u8> {
     Sync,
 }
 
-fn take<'app, 'g, 'r, 's, 'b, 'c: 'b, 'd: 'c, Q, const ID: u8>(
-    command: &mut Response<'app, 'g, 'r, 's, 'b, 'c, 'd, First<Q, ID>>,
+fn take<'app, 'g, 'r, 's, 'b, 'c: 'b, 'd: 'c, Q>(
+    command: &mut Response<'app, 'g, 'r, 's, 'b, 'c, 'd, First<Q>>,
     token: &mut region::Token<region::Identity<'d>>,
-) -> Outcome<Row<replies::Payload<'b, 'c, 'd>, Q>, Error<'d, ID>>
+) -> Outcome<Row<replies::Payload<'b, 'c, 'd>, Q>, replies::ReplyFailure<'d>>
 where
     Q: schema::TypedQuery<Result = schema::result::Rows>,
 {
@@ -126,7 +126,7 @@ pub(in crate::api) struct Group<
 > {
     client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     admission: Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-    commands: [Response<'app, 'g, 'r, 's, 'b, 'c, 'd, First<Q, ID>>; N],
+    commands: [Response<'app, 'g, 'r, 's, 'b, 'c, 'd, First<Q>>; N],
     sync: Response<'app, 'g, 'r, 's, 'b, 'c, 'd, api::ExtractUnit<ID>>,
     #[pin]
     deadline: Result<deadline::Guard<'d>, timer::Exhausted>,
@@ -227,8 +227,8 @@ impl<
                                         this.commands,
                                         this.sync,
                                         tag.batch(),
-                                        (admit, reserved),
-                                        |(admit, reserved)| match mem::replace(admit, State::Done) {
+                                        admit,
+                                        move |admit| match mem::replace(admit, State::Done) {
                                             State::Connecting { request, .. } => {
                                                 let api::Pending { frame, state, .. } = request;
                                                 let (owner, sync) = state.admit(reserved);
@@ -237,7 +237,6 @@ impl<
                                             _ => unreachable!("connecting"),
                                         },
                                     )
-                                    .map_err(|(error, (admit, _))| (error, admit))
                                 },
                                 |(admit, frame, owner), conn| {
                                     *admit = State::Admitted(
@@ -300,11 +299,6 @@ impl<
             }
         };
         this.waiter.as_ref().unregister();
-        let (sync, sync_error) = match sync {
-            Some(Ok(())) => (Sync::Complete, None),
-            Some(Err(error)) => (Sync::Unobserved, Some(error)),
-            None => (Sync::Unobserved, None),
-        };
         // Snapshot before detachment and cancellation can retire another order.
         let diagnostics = match &*this.admission {
             State::Admitted(_, owner) => owner.snapshot(),
@@ -327,10 +321,7 @@ impl<
         };
         let outcomes = match collected {
             Ok(rows)
-                if sync == Sync::Complete
-                    && sync_error.is_none()
-                    && cause.is_none()
-                    && diagnostics.is_empty() =>
+                if matches!(sync, Some(Ok(()))) && cause.is_none() && diagnostics.is_empty() =>
             {
                 return Poll::Ready(Ok(rows.into_array()));
             }
@@ -341,7 +332,6 @@ impl<
             outcomes,
             diagnostics,
             sync,
-            sync_error,
             cause,
         }))
     }
