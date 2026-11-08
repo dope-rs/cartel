@@ -8,7 +8,7 @@ use dope::{
 use o3::{
     base::cell::region,
     buffer,
-    buffer::{Residency as _, hold},
+    buffer::{Residency as _, bytes::bounded, hold},
 };
 use usage::Build as _;
 
@@ -260,15 +260,18 @@ impl Failure {
 }
 
 #[doc(hidden)]
-pub struct Row<'d>(frame::Retained<'d>);
+pub struct Row<'d>(hold::Retained<'d>);
 
 impl Sealed for Row<'_> {}
 
 impl source::Payload for Row<'_> {
     fn wire(&self) -> protocol::Wire<'_> {
-        self.0.wire()
+        // SAFETY: RowPlan retains the admitted frame's unchanged bytes and u32 extent.
+        protocol::Wire::from_raw(unsafe { bounded::raw::Input::new(self.0.as_slice()) })
     }
 }
+
+const _: () = assert!(size_of::<Row<'static>>() == size_of::<buffer::resident::Shared<'static>>());
 
 #[doc(hidden)]
 pub enum ReplyFailure<'d> {
@@ -289,7 +292,7 @@ pub(crate) enum ErrorRoute<'input, 'd, R: buffer::Cursor> {
 }
 
 pub(crate) struct RowPlan<'input, 'd, R: buffer::Cursor> {
-    payload: frame::Payload<'input, 'd, R>,
+    payload: hold::scope::Deferred<'input, 'd, R>,
 }
 
 pub(crate) enum Pending<'d> {
@@ -298,8 +301,10 @@ pub(crate) enum Pending<'d> {
 }
 
 impl<'input, 'd, R: buffer::Cursor> RowPlan<'input, 'd, R> {
-    pub(crate) const fn row(payload: frame::Payload<'input, 'd, R>) -> Self {
-        Self { payload }
+    pub(crate) fn row(payload: frame::Payload<'input, 'd, R>) -> Self {
+        Self {
+            payload: payload.into_inner(),
+        }
     }
 
     pub(crate) fn into_pending(self) -> Result<Pending<'d>, (Self, hold::Error)>
@@ -318,10 +323,15 @@ impl<'d, R: buffer::Cursor + hold::raw::Retain<'d>> usage::Build<Row<'d>> for Ro
     }
 
     fn try_build(self) -> Result<Row<'d>, (Self, Self::Error)> {
-        let Self { payload } = self;
-        match payload.try_retain(cartel_core::memory::RETENTION) {
+        let payload = self.payload.bind(cartel_core::memory::RETENTION);
+        match payload.try_retain() {
             Ok(owner) => Ok(Row(owner)),
-            Err((payload, error)) => Err((Self { payload }, error)),
+            Err(error) => Err((
+                Self {
+                    payload: payload.defer(),
+                },
+                error,
+            )),
         }
     }
 }
@@ -339,7 +349,7 @@ impl Sealed for Payload<'_, '_, '_> {}
 
 impl source::Payload for Payload<'_, '_, '_> {
     fn wire(&self) -> protocol::Wire<'_> {
-        self.0.get().0.wire()
+        self.0.get().wire()
     }
 }
 
@@ -367,7 +377,7 @@ impl usage::Footprint for Row<'_> {
     type Amount = usage::Bytes;
 
     fn footprint(&self) -> usage::Bytes {
-        usage::Bytes::new(self.0.len())
+        usage::Bytes::new(self.0.as_slice().len())
     }
 }
 

@@ -60,31 +60,27 @@ pub(in crate::plan) fn build(
     let group = match &agg.group_by {
         Some(group) => {
             let scope = pred::RowScope::for_source(source, &group.args)?;
-            Some(state.parse(
-                &scope,
-                &group.body,
+            Some(state.parse(&scope, &group.body, || {
                 syn::Error::new(
                     group.body.span(),
                     "`.group_by(...)` body must be a column / arithmetic / function expression",
-                ),
-            )?)
+                )
+            })?)
         }
         None => None,
     };
     let value = match agg.kind.function() {
         Some((name, column)) => {
             let scope = pred::RowScope::for_source(source, &column.args)?;
-            let sql = state.parse(
-                &scope,
-                &column.body,
+            let sql = state.parse(&scope, &column.body, || {
                 syn::Error::new(
                     column.body.span(),
                     format!(
                         "`.{}(...)` body must be a column / arithmetic / function expression",
                         name.lower(),
                     ),
-                ),
-            )?;
+                )
+            })?;
             Some((name, sql))
         }
         None => None,

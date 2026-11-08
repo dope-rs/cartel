@@ -250,14 +250,12 @@ impl Clause {
             ));
         };
         let scope = pred::RowScope::for_order(parent, &closure.inputs)?;
-        let sql = state.parse(
-            &scope,
-            &closure.body,
+        let sql = state.parse(&scope, &closure.body, || {
             syn::Error::new(
                 closure.body.span(),
                 "`.order_by(...)` body must be a column / arithmetic / function expression",
-            ),
-        )?;
+            )
+        })?;
         Ok(Self {
             sql,
             dir: clause.dir,

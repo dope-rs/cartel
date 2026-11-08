@@ -90,7 +90,7 @@ impl Assign {
         })?;
         let value = scope
             .parse(right, Some(params), dialect, cte_map)?
-            .required(syn::Error::new(
+            .ok_or_else(|| syn::Error::new(
                 right.span(),
                 "right side of assignment must be a fn-parameter, literal, or arithmetic/function expression",
             ))?;

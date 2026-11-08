@@ -24,7 +24,7 @@ pub(in crate::plan) fn element(
         .parse(
             scope,
             elem,
-            syn::Error::new(
+            || syn::Error::new(
                 elem.span(),
                 "`.select(...)` element must be a column / arithmetic / function expression or a window expression `<fn>().over(|w| ...)`",
             ),
@@ -98,14 +98,12 @@ pub(in crate::plan) fn distinct(
                 alias_depth: scope.alias_depth,
                 unnest_cols: &[],
             };
-            let parsed = state.parse(
-                &local,
-                expr,
+            let parsed = state.parse(&local, expr, || {
                 syn::Error::new(
                     expr.span(),
                     "`.distinct_on(...)` body must be a column / arithmetic / function expression",
-                ),
-            )?;
+                )
+            })?;
             let inner = state.render(parsed);
             let mut parts = vec![state.dialect.kw("DISTINCT_ON_OPEN")];
             parts.extend(inner);

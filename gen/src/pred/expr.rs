@@ -206,20 +206,6 @@ impl<'a> Method<'a> {
     }
 }
 
-pub(crate) enum Parsed {
-    Sql(sql::Sql),
-    Unsupported,
-}
-
-impl Parsed {
-    pub(crate) fn required(self, error: syn::Error) -> syn::Result<sql::Sql> {
-        match self {
-            Self::Sql(sql) => Ok(sql),
-            Self::Unsupported => Err(error),
-        }
-    }
-}
-
 impl pred::RowScope<'_> {
     pub(super) fn has_column(&self, expr: &syn::Expr) -> bool {
         if self.column_ref(expr).is_some() || self.unnest_ref(expr).is_some() {
@@ -249,13 +235,10 @@ impl pred::RowScope<'_> {
         params: Option<&[backend::Param]>,
         dialect: &backend::Dialect,
         cte_map: &collections::BTreeMap<String, syn::Path>,
-    ) -> syn::Result<Parsed> {
+    ) -> syn::Result<Option<sql::Sql>> {
         let mut sql = sql::Sql::new();
-        if self.parse_into(expr, params, dialect, cte_map, &mut sql)? {
-            Ok(Parsed::Sql(sql))
-        } else {
-            Ok(Parsed::Unsupported)
-        }
+        let parsed = self.parse_into(expr, params, dialect, cte_map, &mut sql)?;
+        Ok(parsed.then_some(sql))
     }
 
     pub(super) fn parse_into(

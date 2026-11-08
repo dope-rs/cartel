@@ -44,10 +44,10 @@ impl State<'_> {
         &self,
         scope: &pred::RowScope<'_>,
         expr: &syn::Expr,
-        error: syn::Error,
+        error: impl FnOnce() -> syn::Error,
     ) -> syn::Result<Sql> {
         let sql = scope.parse(expr, Some(self.params), self.dialect, &self.cte_map)?;
-        sql.required(error)
+        sql.ok_or_else(error)
     }
 
     pub(super) fn render(&mut self, sql: Sql) -> Vec<proc_macro2::TokenStream> {
