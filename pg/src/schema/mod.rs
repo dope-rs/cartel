@@ -49,7 +49,7 @@ impl QueryMeta<'_> {
 
     #[doc(hidden)]
     pub const fn try_new<Q: TypedQuery>() -> Result<Self, Error> {
-        match Self::check::<Q>() {
+        match const { Self::check::<Q>() } {
             Ok(()) => {}
             Err(error) => return Err(error),
         }
@@ -65,7 +65,7 @@ impl QueryMeta<'_> {
     }
 
     pub(crate) fn validate<Q: TypedQuery>() -> Result<Admission<Q>, Error> {
-        Self::check::<Q>()?;
+        const { Self::check::<Q>() }?;
         let mut formats = desc::Formats::new(Q::RESULT_FORMAT_CODES, Q::N_RESULT_COLS);
         <Q::Row as desc::Validate>::formats(&mut formats)?;
         formats.finish()?;

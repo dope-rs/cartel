@@ -209,10 +209,11 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             | state::Phase::AwaitingReady
             | state::Phase::Sasl { .. }
             | state::Phase::Preparing { .. } => {
-                let (server, class) = match plan.try_build() {
+                let class = plan.class();
+                let server = match plan.try_build() {
                     Ok(built) => built,
                     Err(error) => {
-                        self.fail(crate::Error::ResponseRetention(error));
+                        self.fail(error);
                         return None;
                     }
                 };

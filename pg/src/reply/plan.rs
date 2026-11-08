@@ -43,19 +43,16 @@ impl<'input, 'd, R: buffer::Cursor> Plan<'input, 'd, R> {
         })
     }
 
-    pub(crate) fn try_build(self) -> Result<(server::Diagnostic<'d>, reply::Class), hold::Error>
+    pub(crate) fn try_build(self) -> Result<server::Diagnostic<'d>, crate::Error>
     where
         R: hold::raw::Retain<'d>,
     {
-        let Self {
-            payload,
-            class,
-            scope: _,
-        } = self;
-        let payload = payload
+        let payload = self
+            .payload
             .into_inner()
             .bind(cartel_core::memory::RETENTION)
-            .try_into()?;
-        Ok((server::Diagnostic { payload }, class))
+            .try_into()
+            .map_err(crate::Error::ResponseRetention)?;
+        Ok(server::Diagnostic { payload })
     }
 }

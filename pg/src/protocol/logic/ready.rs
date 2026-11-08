@@ -297,7 +297,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                     } => {
                         match scope {
                             reply::Scope::Connection => {
-                                self.fail_retained(class);
+                                self.fail_classified(class);
                             }
                             reply::Scope::Command | reply::Scope::Unknown if skipping => {}
                             reply::Scope::Unknown => self.state.progress = state::Progress::Unknown,
@@ -319,45 +319,39 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             }
         };
         let scope = plan.scope();
-        let (server, class) = match plan.try_build() {
-            Ok(built) => built,
-            Err(error) => return Err(crate::Error::ResponseRetention(error)),
-        };
+        let class = plan.class();
         if end.is_none() {
-            self.fail_server(class, server);
+            self.fail_server(class, plan.try_build()?);
             return Ok(None);
         }
-        let pending = match selected.try_fail(replies::ReplyFailure::Server(server)) {
-            Ok(depth) => {
-                self.port.shared.reindex(self.conn, depth);
-                None
-            }
-            Err(usage::InsertError::Backpressure { value, .. }) => {
-                Some(logic::Pending::row(replies::Pending::Failure(value)))
-            }
-            Err(usage::InsertError::Capacity { cause, .. }) => {
-                return Err(crate::Error::ReplyCapacity(cause));
-            }
-            Err(usage::InsertError::Front {
-                front: Front::Detached,
-                ..
-            }) => {
+        let pending = match selected.try_failure() {
+            Ok(failure) => match failure.try_fail(replies::ReplyFailure::Server(plan.try_build()?))
+            {
+                Ok(depth) => {
+                    self.port.shared.reindex(self.conn, depth);
+                    None
+                }
+                Err((value, usage::Acquire::Backpressure(_))) => {
+                    Some(logic::Pending::row(replies::Pending::Failure(value)))
+                }
+                Err((_, usage::Acquire::Capacity(cause))) => {
+                    return Err(crate::Error::ReplyCapacity(cause));
+                }
+            },
+            Err(Front::Detached) => {
                 queue.complete(self.region);
                 None
             }
-            Err(usage::InsertError::Front {
-                front: Front::Empty,
-                ..
-            }) => {
+            Err(Front::Empty) => {
                 return Err(crate::Error::Protocol(Reason::ReadyUnknown));
             }
-            Err(usage::InsertError::Front { front, .. }) => {
+            Err(front) => {
                 return Err(crate::Error::ReplyFront(front));
             }
         };
         match scope {
             reply::Scope::Connection => {
-                self.fail_retained(class);
+                self.fail_classified(class);
             }
             reply::Scope::Command | reply::Scope::Unknown => {
                 self.state.progress = state::Progress::Skipping;

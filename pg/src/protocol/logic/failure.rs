@@ -145,8 +145,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         );
     }
 
-    /// The diagnostic is retained by a reply, group ledger, or pending delivery.
-    pub(super) fn fail_retained(&mut self, class: reply::Class) {
+    pub(super) fn fail_classified(&mut self, class: reply::Class) {
         self.finish_failure(
             class,
             replies::Failure::from_error(crate::Error::Closed),
