@@ -407,8 +407,8 @@ impl From<&GroupServer> for ReplyFailure<'_> {
     }
 }
 
-type Front<'turn, 'g, 'r, 's, 'b, 'c, 'd> = (
-    Option<Completion>,
+type Front<'turn, 'g, 'r, 's, 'b, 'c, 'd, R = Option<Completion>> = (
+    R,
     reply::Push<'turn, 'b, 'c, 'd, Row<'d>, ReplyFailure<'d>, Tag<'g, 'r, 's, 'b, 'c, 'd>>,
 );
 
@@ -472,16 +472,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         self.port.shared.reindex(self.conn, depth);
     }
 
-    pub(crate) fn settle(
-        self,
-        complete: bool,
-        token: &mut region::Token<region::Identity<'d>>,
-    ) -> Result<Option<usize>, crate::Error> {
-        let depth = if complete {
-            self.lane.complete(token)
-        } else {
-            self.lane.depth(token)
-        };
+    pub(crate) fn settle(self, depth: order::Depth) -> Result<Option<usize>, crate::Error> {
         let slot = self
             .port
             .conn(self.conn)
@@ -524,40 +515,32 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
     where
         'life: 'turn,
     {
-        let mut selected = self.lane.select(token);
-        let Some(tag) = selected.tag() else {
-            return Ok((None, selected));
-        };
-        let complete = match tag.batch.relative_to(expected) {
-            Ordering::Greater => None,
-            Ordering::Less => {
-                return Err(crate::Error::Protocol(Reason::ReadyUnknown));
-            }
-            Ordering::Equal => Some(tag.kind.completion()),
-        };
-        Ok((complete, selected))
+        self.inspect(expected, token, |end, _| end.map(|kind| kind.completion()))
     }
 
-    pub(crate) fn inspect<R>(
+    pub(crate) fn inspect<'turn, R>(
         self,
         expected: Batch,
-        token: &mut region::Token<region::Identity<'d>>,
+        token: &'turn mut region::Token<region::Identity<'d>>,
         inspect: impl for<'tag> FnOnce(
             Option<Kind<&'tag groups::State<'r, 's, 'b, 'c, 'd>>>,
             order::Front,
         ) -> R,
-    ) -> Result<R, crate::Error> {
+    ) -> Result<Front<'turn, 'g, 'r, 's, 'b, 'c, 'd, R>, crate::Error>
+    where
+        'life: 'turn,
+    {
         let mut selected = self.lane.select(token);
         let front = selected.front();
         let Some(tag) = selected.tag() else {
-            return Ok(inspect(None, front));
+            return Ok((inspect(None, front), selected));
         };
         let end = match tag.batch.relative_to(expected) {
             Ordering::Greater => None,
             Ordering::Less => return Err(crate::Error::Protocol(Reason::ReadyUnknown)),
             Ordering::Equal => Some(tag.as_ref()),
         };
-        Ok(inspect(end, front))
+        Ok((inspect(end, front), selected))
     }
 }
 
