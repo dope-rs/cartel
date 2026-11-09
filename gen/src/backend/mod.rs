@@ -33,15 +33,15 @@ pub(super) trait TableBackend: Backend {
 pub(super) type Param = (syn::Ident, syn::Type);
 pub(super) type Capture = (usize, proc_macro2::Span);
 
-pub(super) struct Compiled {
+pub(super) struct Compiled<'a> {
     pub(super) params: Vec<Param>,
     pub(super) captures: Vec<Capture>,
     pub(super) nonnegative: Vec<(usize, plan::Bound)>,
-    pub(super) plan: emit::Plan,
+    pub(super) plan: emit::Plan<'a>,
     pub(super) block: syn::Block,
 }
 
-impl Compiled {
+impl<'a> Compiled<'a> {
     pub(super) fn validate(
         sig: &syn::Signature,
         attrs: &[syn::Attribute],
@@ -92,7 +92,7 @@ impl Compiled {
         generics: &syn::Generics,
         inputs: impl ExactSizeIterator<Item = syn::Result<Param>>,
         block: syn::Block,
-        output: &syn::ReturnType,
+        output: &'a syn::ReturnType,
     ) -> syn::Result<Self> {
         if !generics.params.is_empty() || generics.where_clause.is_some() {
             return Err(syn::Error::new(

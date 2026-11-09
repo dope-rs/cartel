@@ -9,7 +9,7 @@ pub(in crate::plan) mod window;
 pub(in crate::plan) use qualify::Qualify;
 
 pub(in crate::plan) fn join_parts(
-    state: &mut super::State<'_>,
+    state: &mut super::State<'_, '_>,
     source: &crate::shape::QuerySource,
 ) -> syn::Result<Vec<Vec<proc_macro2::TokenStream>>> {
     let mut parts = Vec::with_capacity(source.joins.len());

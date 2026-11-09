@@ -7,10 +7,10 @@ use syn::spanned::Spanned as _;
 
 use crate::plan::read::{Qualify, filter, join_parts, select};
 
-pub(in crate::plan) fn build(
-    state: &mut plan::State<'_>,
+pub(in crate::plan) fn build<'a>(
+    state: &mut plan::State<'_, 'a>,
     agg: &shape::Aggregate,
-) -> syn::Result<emit::Plan> {
+) -> syn::Result<emit::Plan<'a>> {
     agg.qualifiers
         .lock
         .reject("row locking is not supported on aggregate queries")?;

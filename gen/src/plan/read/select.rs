@@ -12,15 +12,15 @@ use crate::ext::ExprExt as _;
 
 use crate::plan::read::{Qualify, filter, join_parts, project};
 
-pub(in crate::plan) fn build(
-    state: &mut plan::State<'_>,
+pub(in crate::plan) fn build<'a>(
+    state: &mut plan::State<'_, 'a>,
     source: &shape::QuerySource,
     preds: &[syn::Ident],
     pred: &syn::Expr,
     proj: Option<&shape::Projection>,
     term: shape::Terminator,
     quals: &qualify::State,
-) -> syn::Result<emit::Plan> {
+) -> syn::Result<emit::Plan<'a>> {
     let explicit = match shape::ReturnShape::parse(state.return_type) {
         shape::ReturnShape::Default => {
             return Err(syn::Error::new(
@@ -72,7 +72,7 @@ pub(in crate::plan) fn build(
         let table = &source.primary_path;
         sql.push(quote::quote! { <#table>::__CARTEL_SELECT_COLS });
     } else {
-        sql.extend(row::View::new(&row_ty).select(source, state.dialect)?);
+        sql.extend(row::View::new(row_ty).select(source, state.dialect)?);
     }
     from_clause(&mut sql, source, ons, state.dialect);
     if !skip {
@@ -96,7 +96,7 @@ pub(in crate::plan) fn build(
             let n = actual as u16;
             quote::quote! { #n }
         }
-        None => row::View::new(&row_ty).cols(),
+        None => row::View::new(row_ty).cols(),
     };
 
     let dispatch = match actual {

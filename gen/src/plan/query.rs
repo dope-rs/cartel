@@ -6,10 +6,10 @@ use shape::mutation;
 use crate::plan::read::{agg, select, set};
 use crate::plan::write::{insert, update};
 
-pub(crate) fn build(
-    state: &mut plan::State<'_>,
+pub(crate) fn build<'a>(
+    state: &mut plan::State<'_, 'a>,
     shape: &shape::QueryShape,
-) -> syn::Result<emit::Plan> {
+) -> syn::Result<emit::Plan<'a>> {
     use mutation::{Input, Mutation};
 
     match shape {

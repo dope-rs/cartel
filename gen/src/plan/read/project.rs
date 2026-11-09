@@ -9,7 +9,7 @@ use shape::join;
 use crate::plan::read::{Qualify, filter, window};
 
 pub(in crate::plan) fn element(
-    state: &mut plan::State<'_>,
+    state: &mut plan::State<'_, '_>,
     elem: &syn::Expr,
     scope: &pred::RowScope<'_>,
     lock: shape::lock::Lock,
@@ -33,7 +33,7 @@ pub(in crate::plan) fn element(
 }
 
 pub(in crate::plan) fn lateral(
-    state: &mut plan::State<'_>,
+    state: &mut plan::State<'_, '_>,
     j: &join::Join,
     index: usize,
     source: &shape::QuerySource,
@@ -71,7 +71,7 @@ pub(in crate::plan) fn lateral(
 }
 
 pub(in crate::plan) fn distinct(
-    state: &mut plan::State<'_>,
+    state: &mut plan::State<'_, '_>,
     quals: &qualify::State,
     scope: &pred::RowScope<'_>,
 ) -> syn::Result<Vec<proc_macro2::TokenStream>> {

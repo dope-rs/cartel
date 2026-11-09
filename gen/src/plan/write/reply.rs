@@ -3,6 +3,7 @@ use crate::emit;
 use crate::plan;
 use crate::plan::row;
 use crate::shape;
+use std::borrow::Cow;
 
 use syn::spanned::Spanned as _;
 
@@ -12,71 +13,50 @@ pub(in crate::plan) enum Op {
     Delete,
 }
 
-pub(in crate::plan) struct Output {
-    output: syn::ReturnType,
-    returning: Option<Returning>,
-}
-
-struct Returning {
+pub(in crate::plan) struct Output<'a> {
+    output: Cow<'a, syn::ReturnType>,
     cols: proc_macro2::TokenStream,
-    dispatch: emit::Kind,
+    dispatch: emit::Kind<'a>,
 }
 
-pub(in crate::plan) fn build(
-    state: &plan::State<'_>,
-    base: Vec<proc_macro2::TokenStream>,
+pub(in crate::plan) fn build<'a>(
+    state: &plan::State<'_, '_>,
+    mut sql: Vec<proc_macro2::TokenStream>,
     table: &syn::Path,
     prefix: proc_macro2::TokenStream,
-    output: Output,
-) -> emit::Plan {
-    let Output {
-        output,
-        returning: rows,
-    } = output;
-    match rows {
-        None => emit::Plan::no_rows(output, base),
-        Some(Returning { cols, dispatch }) => {
-            let mut sql = base;
-            sql.push(state.dialect.kw("RETURNING_KW"));
-            let columns = match state.dialect.kind {
-                backend::Kind::Pg => {
-                    let ty = syn::parse_quote!(#table);
-                    state.dialect.columns(&ty, prefix)
-                }
-                backend::Kind::Sqlite => quote::quote! { <#table>::__CARTEL_SELECT_COLS },
-            };
-            sql.push(columns);
-            emit::Plan {
-                output,
-                sql_parts: sql,
-                n_result_cols: cols,
-                dispatch,
-                probe_override: None,
+    output: Output<'a>,
+) -> emit::Plan<'a> {
+    if !matches!(output.dispatch, emit::Kind::NoRows) {
+        sql.push(state.dialect.kw("RETURNING_KW"));
+        let columns = match state.dialect.kind {
+            backend::Kind::Pg => {
+                let ty = syn::parse_quote!(#table);
+                state.dialect.columns(&ty, prefix)
             }
-        }
+            backend::Kind::Sqlite => quote::quote! { <#table>::__CARTEL_SELECT_COLS },
+        };
+        sql.push(columns);
+    }
+    emit::Plan {
+        output: output.output,
+        sql_parts: sql,
+        n_result_cols: output.cols,
+        dispatch: output.dispatch,
+        probe_override: None,
     }
 }
 
-pub(in crate::plan) fn validate(
-    state: &plan::State<'_>,
+pub(in crate::plan) fn validate<'a>(
+    state: &plan::State<'_, 'a>,
     op: Op,
     ret: shape::Returning,
     table: &syn::Path,
-) -> syn::Result<Output> {
+) -> syn::Result<Output<'a>> {
     let rt = &state.dialect.rt_crate;
     let (op, command) = match op {
-        Op::Insert => (
-            "INSERT",
-            syn::parse_quote!(-> #rt::dsl::write::Insert<#table>),
-        ),
-        Op::Update => (
-            "UPDATE",
-            syn::parse_quote!(-> #rt::dsl::write::Update<#table>),
-        ),
-        Op::Delete => (
-            "DELETE",
-            syn::parse_quote!(-> #rt::dsl::write::Delete<#table>),
-        ),
+        Op::Insert => ("INSERT", "Insert"),
+        Op::Update => ("UPDATE", "Update"),
+        Op::Delete => ("DELETE", "Delete"),
     };
     let output = shape::ReturnShape::parse(state.return_type);
     Ok(match ret {
@@ -89,9 +69,11 @@ pub(in crate::plan) fn validate(
                     ),
                 ));
             }
+            let command = syn::Ident::new(command, proc_macro2::Span::call_site());
             Output {
-                output: command,
-                returning: None,
+                output: Cow::Owned(syn::parse_quote!(-> #rt::dsl::write::#command<#table>)),
+                cols: quote::quote! { 0u16 },
+                dispatch: emit::Kind::NoRows,
             }
         }
         kind => {
@@ -119,19 +101,17 @@ pub(in crate::plan) fn validate(
             }
             let (output, row, actual) = explicit.into_parts();
             let dispatch = match actual {
-                shape::RowReturn::Plain => emit::Kind::One(row.clone()),
-                shape::RowReturn::Optional => emit::Kind::First(row.clone()),
-                shape::RowReturn::Many => emit::Kind::All(row.clone()),
+                shape::RowReturn::Plain => emit::Kind::One(row),
+                shape::RowReturn::Optional => emit::Kind::First(row),
+                shape::RowReturn::Many => emit::Kind::All(row),
                 shape::RowReturn::Stream => {
                     return Err(syn::Error::new(row.span(), "invalid RETURNING output kind"));
                 }
             };
             Output {
                 output,
-                returning: Some(Returning {
-                    cols: row::View::new(&row).cols(),
-                    dispatch,
-                }),
+                cols: row::View::new(row).cols(),
+                dispatch,
             }
         }
     })

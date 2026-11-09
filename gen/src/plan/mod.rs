@@ -16,16 +16,16 @@ pub(super) enum Bound {
     Offset,
 }
 
-pub(super) struct State<'a> {
+pub(super) struct State<'a, 'output> {
     pub(super) params: &'a [backend::Param],
     pub(super) captures: Vec<backend::Capture>,
     pub(super) nonnegative: Vec<(usize, Bound)>,
-    pub(super) return_type: &'a syn::ReturnType,
+    pub(super) return_type: &'output syn::ReturnType,
     pub(super) dialect: &'a backend::Dialect,
     pub(super) cte_map: collections::BTreeMap<String, syn::Path>,
 }
 
-impl State<'_> {
+impl State<'_, '_> {
     pub(super) fn context(&self) -> pred::WhereContext<'_> {
         pred::WhereContext {
             params: self.params,

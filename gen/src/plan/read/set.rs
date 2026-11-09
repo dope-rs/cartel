@@ -13,9 +13,9 @@ use crate::ext::ExprExt as _;
 use crate::ext::PatExt as _;
 use crate::plan::read::{Qualify, filter};
 
-struct Output {
-    ty: syn::ReturnType,
-    row: syn::Type,
+struct Output<'a> {
+    ty: std::borrow::Cow<'a, syn::ReturnType>,
+    row: &'a syn::Type,
     kind: shape::RowReturn,
 }
 
@@ -24,12 +24,12 @@ struct Order {
     dir: qualify::Dir,
 }
 
-pub(in crate::plan) fn build(
-    state: &mut plan::State<'_>,
+pub(in crate::plan) fn build<'a>(
+    state: &mut plan::State<'_, 'a>,
     set: &shape::SetQuery,
     end: shape::Terminator,
     outer: &qualify::State,
-) -> syn::Result<emit::Plan> {
+) -> syn::Result<emit::Plan<'a>> {
     let output = Output::new(state, set, end)?;
     let qual = Qualify::bounds(outer, end, state)?;
     let groups = match state.dialect.kind {
@@ -78,7 +78,7 @@ pub(in crate::plan) fn build(
     }
     sql.extend(qual.render(state));
 
-    let cols = row::View::new(&output.row).cols();
+    let cols = row::View::new(output.row).cols();
     let dispatch = match output.kind {
         shape::RowReturn::Plain => emit::Kind::One(output.row),
         shape::RowReturn::Optional => emit::Kind::First(output.row),
@@ -94,9 +94,9 @@ pub(in crate::plan) fn build(
     })
 }
 
-impl Output {
+impl<'a> Output<'a> {
     fn new(
-        state: &plan::State<'_>,
+        state: &plan::State<'_, 'a>,
         set: &shape::SetQuery,
         end: shape::Terminator,
     ) -> syn::Result<Self> {

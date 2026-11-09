@@ -2,7 +2,8 @@ use crate::{
     backend,
     ext::{ExprExt as _, SqlIdent as _},
 };
-use syn::{spanned::Spanned as _, token};
+use std::borrow::Cow;
+use syn::spanned::Spanned as _;
 
 pub(super) mod bound;
 pub(super) mod join;
@@ -371,7 +372,7 @@ impl Return {
     }
 }
 pub(super) struct Explicit<'a> {
-    arrow: &'a token::RArrow,
+    output: &'a syn::ReturnType,
     ty: &'a syn::Type,
     row: &'a syn::Type,
     kind: RowReturn,
@@ -416,12 +417,8 @@ impl<'a> Explicit<'a> {
         self.row = self.ty;
     }
 
-    pub(super) fn into_parts(self) -> (syn::ReturnType, syn::Type, RowReturn) {
-        (
-            syn::ReturnType::Type(*self.arrow, Box::new(self.ty.clone())),
-            self.row.clone(),
-            self.kind,
-        )
+    pub(super) fn into_parts(self) -> (Cow<'a, syn::ReturnType>, &'a syn::Type, RowReturn) {
+        (Cow::Borrowed(self.output), self.row, self.kind)
     }
 }
 
@@ -432,7 +429,7 @@ pub(super) enum ReturnShape<'a> {
 
 impl<'a> ReturnShape<'a> {
     pub(super) fn parse(output: &'a syn::ReturnType) -> Self {
-        let syn::ReturnType::Type(arrow, ty) = output else {
+        let syn::ReturnType::Type(_, ty) = output else {
             return Self::Default;
         };
         let (row, kind) = if let syn::Type::Path(path) = ty.as_ref()
@@ -454,7 +451,7 @@ impl<'a> ReturnShape<'a> {
             (ty.as_ref(), RowReturn::Plain)
         };
         Self::Explicit(Explicit {
-            arrow,
+            output,
             ty,
             row,
             kind,

@@ -2,7 +2,7 @@ use crate::plan;
 use crate::pred;
 
 pub(in crate::plan) fn build(
-    state: &mut plan::State<'_>,
+    state: &mut plan::State<'_, '_>,
     expr: &syn::Expr,
     scope: &pred::RowScope<'_>,
     columns: bool,
@@ -13,7 +13,7 @@ pub(in crate::plan) fn build(
 }
 
 pub(in crate::plan) fn join(
-    state: &plan::State<'_>,
+    state: &plan::State<'_, '_>,
     expr: &syn::Expr,
     scope: &pred::RowScope<'_>,
 ) -> syn::Result<Vec<proc_macro2::TokenStream>> {

@@ -38,7 +38,7 @@ impl Qualify {
         quals: &qualify::State,
         end: Option<shape::Terminator>,
         parent: &pred::RowScope<'_>,
-        state: &plan::State<'_>,
+        state: &plan::State<'_, '_>,
     ) -> syn::Result<Self> {
         if !matches!(quals.distinct, qualify::Distinct::None) {
             quals
@@ -63,7 +63,7 @@ impl Qualify {
     pub(in crate::plan) fn bounds(
         quals: &qualify::State,
         end: shape::Terminator,
-        state: &plan::State<'_>,
+        state: &plan::State<'_, '_>,
     ) -> syn::Result<Self> {
         quals
             .lock
@@ -86,7 +86,7 @@ impl Qualify {
 
     pub(in crate::plan) fn render(
         self,
-        state: &mut plan::State<'_>,
+        state: &mut plan::State<'_, '_>,
     ) -> Vec<proc_macro2::TokenStream> {
         let mut value = if self.clauses.is_empty() {
             Vec::new()
@@ -171,7 +171,7 @@ impl Integer {
 
     pub(in crate::plan) fn render(
         self,
-        state: &mut plan::State<'_>,
+        state: &mut plan::State<'_, '_>,
         bound: plan::Bound,
     ) -> proc_macro2::TokenStream {
         match self {
@@ -200,7 +200,11 @@ impl Limit {
         }
     }
 
-    fn render(self, state: &mut plan::State<'_>, offset: &Offset) -> Vec<proc_macro2::TokenStream> {
+    fn render(
+        self,
+        state: &mut plan::State<'_, '_>,
+        offset: &Offset,
+    ) -> Vec<proc_macro2::TokenStream> {
         match self {
             Self::None
                 if matches!(state.dialect.kind, backend::Kind::Sqlite)
@@ -226,7 +230,7 @@ impl Offset {
         }
     }
 
-    fn render(self, state: &mut plan::State<'_>) -> Vec<proc_macro2::TokenStream> {
+    fn render(self, state: &mut plan::State<'_, '_>) -> Vec<proc_macro2::TokenStream> {
         match self {
             Self::None => Vec::new(),
             Self::Value(value) => vec![
@@ -239,7 +243,7 @@ impl Offset {
 
 impl Clause {
     fn new(
-        state: &plan::State<'_>,
+        state: &plan::State<'_, '_>,
         clause: &qualify::Order,
         parent: &pred::RowScope<'_>,
     ) -> syn::Result<Self> {

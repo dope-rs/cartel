@@ -86,7 +86,7 @@ impl Unary {
 }
 
 impl Keyword {
-    fn render(self, state: &plan::State<'_>) -> proc_macro2::TokenStream {
+    fn render(self, state: &plan::State<'_, '_>) -> proc_macro2::TokenStream {
         state.dialect.kw(match self {
             Self::RowNumber => "ROW_NUMBER_OVER",
             Self::Rank => "RANK_OVER",
@@ -159,7 +159,7 @@ impl Head {
     fn new(
         call: &syn::ExprCall,
         scope: &pred::RowScope<'_>,
-        state: &plan::State<'_>,
+        state: &plan::State<'_, '_>,
     ) -> syn::Result<Self> {
         match Function::parse(call.func.as_ref())? {
             Function::Nullary(function) => {
@@ -225,7 +225,7 @@ impl Head {
         }
     }
 
-    fn render(self, state: &mut plan::State<'_>) -> Vec<proc_macro2::TokenStream> {
+    fn render(self, state: &mut plan::State<'_, '_>) -> Vec<proc_macro2::TokenStream> {
         match self {
             Self::Keyword(keyword) => vec![keyword.render(state)],
             Self::Expr(keyword, sql) => {
@@ -294,7 +294,7 @@ impl Part {
     fn new(
         call: &syn::ExprMethodCall,
         scope: &pred::RowScope<'_>,
-        state: &plan::State<'_>,
+        state: &plan::State<'_, '_>,
     ) -> syn::Result<Self> {
         if call.args.len() != 1 {
             return Err(syn::Error::new(
@@ -333,7 +333,7 @@ impl Spec {
     fn new(
         chain: Chain<'_>,
         scope: &pred::RowScope<'_>,
-        state: &plan::State<'_>,
+        state: &plan::State<'_, '_>,
     ) -> syn::Result<Self> {
         let mut parts = Vec::new();
         for call in chain.0 {
@@ -342,7 +342,7 @@ impl Spec {
         Ok(Self(parts))
     }
 
-    fn render(self, state: &mut plan::State<'_>) -> Vec<proc_macro2::TokenStream> {
+    fn render(self, state: &mut plan::State<'_, '_>) -> Vec<proc_macro2::TokenStream> {
         let mut groups = Vec::new();
         let mut orders = Vec::new();
         for part in self.0 {
@@ -382,7 +382,7 @@ impl Spec {
 }
 
 pub(in crate::plan) fn build(
-    state: &mut plan::State<'_>,
+    state: &mut plan::State<'_, '_>,
     call: &syn::ExprMethodCall,
     scope: &pred::RowScope<'_>,
 ) -> syn::Result<Vec<proc_macro2::TokenStream>> {

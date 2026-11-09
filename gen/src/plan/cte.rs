@@ -6,7 +6,7 @@ use crate::shape::qualify;
 use crate::plan::read::{Qualify, filter, join_parts, project, select};
 
 pub(crate) fn build(
-    state: &mut plan::State<'_>,
+    state: &mut plan::State<'_, '_>,
     inner: &syn::Expr,
 ) -> syn::Result<(syn::Path, Vec<proc_macro2::TokenStream>)> {
     let mut quals = qualify::State::default();

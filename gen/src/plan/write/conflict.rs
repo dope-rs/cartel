@@ -29,7 +29,7 @@ impl Conflict {
     pub(in crate::plan) fn new(
         kind: &shape::Conflict,
         source: &shape::QuerySource,
-        state: &plan::State<'_>,
+        state: &plan::State<'_, '_>,
     ) -> syn::Result<Self> {
         match kind {
             shape::Conflict::None => Ok(Self::None),
@@ -63,7 +63,7 @@ impl Conflict {
 
     pub(in crate::plan) fn render(
         self,
-        state: &mut plan::State<'_>,
+        state: &mut plan::State<'_, '_>,
     ) -> Vec<proc_macro2::TokenStream> {
         match self {
             Self::None => Vec::new(),

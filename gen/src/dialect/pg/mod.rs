@@ -21,8 +21,8 @@ impl backend::Backend for PgBackend {
     }
 }
 
-pub(super) struct GroupQuery {
-    pub(super) compiled: backend::Compiled,
+pub(super) struct GroupQuery<'a> {
+    pub(super) compiled: backend::Compiled<'a>,
     pub(super) group_ty: syn::Type,
     pub(super) group_ident: syn::Ident,
     pub(super) marker: syn::Ident,
@@ -37,7 +37,7 @@ impl PgBackend {
     }
 
     pub(super) fn emit_query(
-        q: GroupQuery,
+        q: GroupQuery<'_>,
         attrs: &[syn::Attribute],
     ) -> syn::Result<proc_macro2::TokenStream> {
         let GroupQuery {
@@ -179,7 +179,7 @@ impl PgBackend {
                     }
                     None => quote::quote! {},
                 };
-                let (row, shape) = match (&plan.dispatch, &plan.output) {
+                let (row, shape) = match (&plan.dispatch, plan.output.as_ref()) {
                     (emit::Kind::Aggregate(_), syn::ReturnType::Type(_, declared)) => (
                         quote::quote! { <#declared as ::core::iter::IntoIterator>::Item },
                         quote::quote! { ::cartel_pg::schema::result::Rows<true> },

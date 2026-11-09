@@ -27,7 +27,7 @@ fn table(source: &shape::QuerySource) -> syn::Result<&syn::Path> {
 }
 
 fn join_ons(
-    state: &plan::State<'_>,
+    state: &plan::State<'_, '_>,
     source: &shape::QuerySource,
 ) -> syn::Result<Vec<Vec<proc_macro2::TokenStream>>> {
     let mut joins = Vec::with_capacity(source.joins.len());
@@ -38,15 +38,15 @@ fn join_ons(
     Ok(joins)
 }
 
-pub(in crate::plan) fn build(
-    state: &mut plan::State<'_>,
+pub(in crate::plan) fn build<'a>(
+    state: &mut plan::State<'_, 'a>,
     source: &shape::QuerySource,
     preds: &[syn::Ident],
     pred: &syn::Expr,
     set_id: &syn::Ident,
     set_body: &syn::Expr,
     ret: shape::Returning,
-) -> syn::Result<emit::Plan> {
+) -> syn::Result<emit::Plan<'a>> {
     let table = table(source)?;
     let output = reply::validate(state, Op::Update, ret, table)?;
     let lowered;
@@ -120,13 +120,13 @@ pub(in crate::plan) fn build(
     Ok(reply::build(state, sql, table, source.qualifier(0), output))
 }
 
-pub(in crate::plan) fn delete(
-    state: &mut plan::State<'_>,
+pub(in crate::plan) fn delete<'a>(
+    state: &mut plan::State<'_, 'a>,
     source: &shape::QuerySource,
     preds: &[syn::Ident],
     pred: &syn::Expr,
     ret: shape::Returning,
-) -> syn::Result<emit::Plan> {
+) -> syn::Result<emit::Plan<'a>> {
     let table = table(source)?;
     let output = reply::validate(state, Op::Delete, ret, table)?;
 
@@ -157,11 +157,11 @@ pub(in crate::plan) fn delete(
     Ok(reply::build(state, sql, table, source.qualifier(0), output))
 }
 
-pub(in crate::plan) fn each(
-    state: &mut plan::State<'_>,
+pub(in crate::plan) fn each<'a>(
+    state: &mut plan::State<'_, 'a>,
     input: &shape::mutation::Each,
     ret: shape::Returning,
-) -> syn::Result<emit::Plan> {
+) -> syn::Result<emit::Plan<'a>> {
     let shape::mutation::Each {
         source,
         data,

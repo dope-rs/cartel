@@ -17,37 +17,37 @@ enum Kind {
     Each,
 }
 
-pub(in crate::plan) fn build(
-    state: &mut plan::State<'_>,
+pub(in crate::plan) fn build<'a>(
+    state: &mut plan::State<'_, 'a>,
     table: &syn::Path,
     arg: &syn::Ident,
     body: &syn::Expr,
     ret: shape::Returning,
     conflict: &shape::Conflict,
-) -> syn::Result<emit::Plan> {
+) -> syn::Result<emit::Plan<'a>> {
     insert(state, table, arg, body, ret, conflict, Kind::Single)
 }
 
-pub(in crate::plan) fn each(
-    state: &mut plan::State<'_>,
+pub(in crate::plan) fn each<'a>(
+    state: &mut plan::State<'_, 'a>,
     table: &syn::Path,
     arg: &syn::Ident,
     body: &syn::Expr,
     ret: shape::Returning,
     conflict: &shape::Conflict,
-) -> syn::Result<emit::Plan> {
+) -> syn::Result<emit::Plan<'a>> {
     insert(state, table, arg, body, ret, conflict, Kind::Each)
 }
 
-fn insert(
-    state: &mut plan::State<'_>,
+fn insert<'a>(
+    state: &mut plan::State<'_, 'a>,
     table: &syn::Path,
     arg: &syn::Ident,
     body: &syn::Expr,
     ret: shape::Returning,
     conflict: &shape::Conflict,
     kind: Kind,
-) -> syn::Result<emit::Plan> {
+) -> syn::Result<emit::Plan<'a>> {
     let output = reply::validate(state, Op::Insert, ret, table)?;
 
     let assigns = assign::Assign::collect(
@@ -97,12 +97,12 @@ fn insert(
     Ok(reply::build(state, sql, table, target.qualifier(0), output))
 }
 
-pub(in crate::plan) fn from(
-    state: &mut plan::State<'_>,
+pub(in crate::plan) fn from<'a>(
+    state: &mut plan::State<'_, 'a>,
     input: &shape::mutation::From,
     ret: shape::Returning,
     conflict: &shape::Conflict,
-) -> syn::Result<emit::Plan> {
+) -> syn::Result<emit::Plan<'a>> {
     let shape::mutation::From {
         table,
         source: query,
