@@ -96,8 +96,8 @@ impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Target<'app, 's, 'b, '
     }
 }
 
-impl<'lease, 'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Target<'app, 's, 'b, 'c, 'd, ID>
-    for &'lease mut schedule::Lease<'app, 's, 'b, 'c, 'd, B, ID>
+impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Target<'app, 's, 'b, 'c, 'd, ID>
+    for &mut schedule::Lease<'app, 's, 'b, 'c, 'd, B, ID>
 {
     type Provider = B;
 

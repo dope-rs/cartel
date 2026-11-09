@@ -1,6 +1,6 @@
 //! Retained diagnostics from one explicitly synchronized command group.
 
-use std::{mem::MaybeUninit, slice};
+use std::{mem::MaybeUninit, num::NonZero, slice};
 
 use o3::{buffer::storage, depot::arena::pool};
 
@@ -18,14 +18,14 @@ pub(crate) struct Record {
 pub(crate) struct Records<'s> {
     slots: &'s mut [MaybeUninit<Record>],
     len: usize,
-    unknown: Option<usize>,
+    unknown: Option<NonZero<usize>>,
 }
 
 /// The admitted next record and its sole publication authority.
 pub(crate) struct Vacant<'a> {
     slot: &'a mut MaybeUninit<Record>,
     len: &'a mut usize,
-    unknown: &'a mut Option<usize>,
+    unknown: &'a mut Option<NonZero<usize>>,
 }
 
 impl<'s> Records<'s> {
@@ -60,34 +60,30 @@ impl<'s> Records<'s> {
         })
     }
 
-    pub(crate) fn resolve(&mut self, position: Position) -> Resolution {
+    pub(crate) fn resolve(&mut self, position: Position) -> bool {
         let Some(index) = self.unknown.take() else {
-            return Resolution::Unchanged;
+            return false;
         };
-        // SAFETY: commit alone records this index, after writing this exact
+        let index = index.get() - 1;
+        // SAFETY: commit alone records this prefix length, after writing this exact
         // backing's next record. No operation removes records before clear,
         // which clears the unknown position along with the published length.
         unsafe { self.slots.get_unchecked_mut(index).assume_init_mut() }.position = position;
-        Resolution::Resolved
+        true
     }
 }
 
 impl Vacant<'_> {
     pub(crate) fn commit(self, record: Record) {
         self.slot.write(record);
-        if record.position == Position::Unknown {
-            *self.unknown = Some(*self.len);
-        }
         *self.len += 1;
+        if record.position == Position::Unknown {
+            *self.unknown = NonZero::new(*self.len);
+        }
     }
 }
 
-const _: () = assert!(size_of::<Records<'static>>() == 5 * size_of::<usize>());
-
-pub(crate) enum Resolution {
-    Resolved,
-    Unchanged,
-}
+const _: () = assert!(size_of::<Records<'static>>() == 4 * size_of::<usize>());
 
 const _: () = assert!(size_of::<Record>() == size_of::<Position>() + 2 * size_of::<u32>());
 

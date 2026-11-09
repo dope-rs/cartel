@@ -54,14 +54,7 @@ impl pred::RowScope<'_> {
                 let scope = pred::RowScope::for_primary(&source, arg).with_outer(self);
                 let prefix = format!("{}(", name.upper());
                 sql.push(quote::quote! { #prefix });
-                if !scope.parse_into(
-                    body,
-                    Some(context.fn_params),
-                    context.param_tys,
-                    dialect,
-                    context.cte_map,
-                    sql,
-                )? {
+                if !scope.parse_into(body, Some(context.params), dialect, context.cte_map, sql)? {
                     return Err(syn::Error::new(
                         body.span(),
                         format!(

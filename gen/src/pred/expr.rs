@@ -206,20 +206,6 @@ impl<'a> Method<'a> {
     }
 }
 
-pub(crate) enum Parsed {
-    Sql(sql::Sql),
-    Unsupported,
-}
-
-impl Parsed {
-    pub(crate) fn required(self, error: syn::Error) -> syn::Result<sql::Sql> {
-        match self {
-            Self::Sql(sql) => Ok(sql),
-            Self::Unsupported => Err(error),
-        }
-    }
-}
-
 impl pred::RowScope<'_> {
     pub(super) fn has_column(&self, expr: &syn::Expr) -> bool {
         if self.column_ref(expr).is_some() || self.unnest_ref(expr).is_some() {
@@ -246,30 +232,25 @@ impl pred::RowScope<'_> {
     pub(crate) fn parse(
         &self,
         expr: &syn::Expr,
-        params: Option<&[syn::Ident]>,
-        types: &[syn::Type],
+        params: Option<&[backend::Param]>,
         dialect: &backend::Dialect,
         cte_map: &collections::BTreeMap<String, syn::Path>,
-    ) -> syn::Result<Parsed> {
+    ) -> syn::Result<Option<sql::Sql>> {
         let mut sql = sql::Sql::new();
-        if self.parse_into(expr, params, types, dialect, cte_map, &mut sql)? {
-            Ok(Parsed::Sql(sql))
-        } else {
-            Ok(Parsed::Unsupported)
-        }
+        let parsed = self.parse_into(expr, params, dialect, cte_map, &mut sql)?;
+        Ok(parsed.then_some(sql))
     }
 
     pub(super) fn parse_into(
         &self,
         expr: &syn::Expr,
-        params: Option<&[syn::Ident]>,
-        types: &[syn::Type],
+        params: Option<&[backend::Param]>,
         dialect: &backend::Dialect,
         cte_map: &collections::BTreeMap<String, syn::Path>,
         sql: &mut sql::Sql,
     ) -> syn::Result<bool> {
         let start = sql.len();
-        let parsed = self.write_expr(expr, params, types, dialect, cte_map, sql)?;
+        let parsed = self.write_expr(expr, params, dialect, cte_map, sql)?;
         if !parsed {
             sql.truncate(start);
         }
@@ -279,8 +260,7 @@ impl pred::RowScope<'_> {
     fn write_expr(
         &self,
         expr: &syn::Expr,
-        params: Option<&[syn::Ident]>,
-        types: &[syn::Type],
+        params: Option<&[backend::Param]>,
         dialect: &backend::Dialect,
         cte_map: &collections::BTreeMap<String, syn::Path>,
         sql: &mut sql::Sql,
@@ -295,18 +275,20 @@ impl pred::RowScope<'_> {
         }
         if let Some(params) = params
             && let Some(ident) = Path::new(expr).and_then(|path| path.single())
-            && params.iter().any(|param| param.unraw() == ident.unraw())
+            && let Some(index) = params
+                .iter()
+                .position(|(param, _)| param.unraw() == ident.unraw())
         {
-            sql.capture(ident.clone());
+            sql.capture((index, ident.span()));
             return Ok(true);
         }
         if let Some(binary) = Binary::new(expr) {
             sql.push(dialect.kw("PAREN_OPEN"));
-            if !self.write_expr(&binary.syntax.left, params, types, dialect, cte_map, sql)? {
+            if !self.write_expr(&binary.syntax.left, params, dialect, cte_map, sql)? {
                 return Ok(false);
             }
             sql.push(binary.operator.tokens());
-            if !self.write_expr(&binary.syntax.right, params, types, dialect, cte_map, sql)? {
+            if !self.write_expr(&binary.syntax.right, params, dialect, cte_map, sql)? {
                 return Ok(false);
             }
             sql.push(dialect.kw("PAREN_CLOSE"));
@@ -329,7 +311,7 @@ impl pred::RowScope<'_> {
                 if index > 0 {
                     sql.push(dialect.kw("COMMA"));
                 }
-                if !self.write_expr(arg, params, types, dialect, cte_map, sql)? {
+                if !self.write_expr(arg, params, dialect, cte_map, sql)? {
                     return Ok(false);
                 }
             }
@@ -340,7 +322,7 @@ impl pred::RowScope<'_> {
             if !paren.attrs.is_empty() {
                 return Ok(false);
             }
-            return self.write_expr(&paren.expr, params, types, dialect, cte_map, sql);
+            return self.write_expr(&paren.expr, params, dialect, cte_map, sql);
         }
         if let Some(method) = Method::new(expr) {
             if let syn::Expr::Call(receiver) = method.syntax.receiver.as_ref() {
@@ -351,8 +333,7 @@ impl pred::RowScope<'_> {
                     return Ok(false);
                 };
                 let context = pred::WhereContext {
-                    fn_params: params,
-                    param_tys: types,
+                    params,
                     dialect,
                     cte_map,
                 };
@@ -379,7 +360,7 @@ impl pred::RowScope<'_> {
                 };
                 let prefix = format!("{}(", function.upper());
                 sql.push(quote::quote! { #prefix });
-                if !self.write_expr(arg, None, types, dialect, cte_map, sql)? {
+                if !self.write_expr(arg, None, dialect, cte_map, sql)? {
                     return Ok(false);
                 }
                 sql.push(dialect.kw("PAREN_CLOSE"));

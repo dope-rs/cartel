@@ -1,4 +1,4 @@
-use crate::{api, port::pool::access};
+use crate::{port::pool::access, reply::Pressure};
 use cartel_core::reply;
 use dope::core::driver::{self, route::table::conn, schedule::app};
 use dope_fiber::wait::Capacity;
@@ -115,13 +115,13 @@ impl<'d> Egress<'d> {
 
     pub(crate) fn try_register<'target, 'poll>(
         &'target self,
-        cause: &api::Pressure,
+        cause: &Pressure,
         waiter: pin::Pin<&wait::Waiter<'target, 'd>>,
         context: pin::Pin<&context::Context<'poll, 'd>>,
     ) -> Result<(), wait::Error<'d>> {
         match cause {
-            api::Pressure::Full { .. } => self.full.try_register(waiter, context),
-            api::Pressure::Capacity { lane, .. } => {
+            Pressure::Full { .. } => self.full.try_register(waiter, context),
+            Pressure::Capacity { lane, .. } => {
                 let index = lane.get();
                 let queue = self.lanes.try_entry(index).map_err(index_error)?;
                 queue.state().try_register(waiter, context)
@@ -129,10 +129,7 @@ impl<'d> Egress<'d> {
         }
     }
 
-    pub(crate) fn release(
-        &self,
-        released: reply::Released<'_>,
-    ) -> Result<(), shared::Bounds> {
+    pub(crate) fn release(&self, released: reply::Released<'_>) -> Result<(), shared::Bounds> {
         let lane = released.index();
         let slot = self.lanes.try_entry(lane.get())?;
         self.full.notify();

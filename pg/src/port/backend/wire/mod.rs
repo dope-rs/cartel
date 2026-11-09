@@ -10,7 +10,7 @@ mod storage;
 
 #[repr(transparent)]
 #[doc(hidden)]
-pub struct Payload(pool::Span<owners::Plain<pool::Width<16>>, pool::Owned, state::Initialized>);
+pub struct Payload(pool::Span<owners::Plain<pool::Width<16>>, pool::Owned, state::Uninit>);
 
 impl AsRef<[u8]> for Payload {
     fn as_ref(&self) -> &[u8] {

@@ -116,7 +116,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         };
         let replies = self.port.lane(token.lane());
         let conn = permit.slot();
-        let (batch, boundary) = permit.parts();
+        let batch = permit.batch();
         let result = handoff::Lane::new(&self.port.request_queue, replies).try_with(
             region,
             weight.get(),

@@ -159,9 +159,9 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         self,
         target: Option<api::Target<'d, ID>>,
         params: [Q::Params<'_>; N],
-    ) -> group::Group<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, N>
+    ) -> group::Group<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, N>
     where
-        Q: schema::TypedQuery,
+        Q: schema::TypedQuery<Result = schema::result::Rows>,
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {

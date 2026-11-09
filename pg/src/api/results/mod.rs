@@ -6,8 +6,7 @@ use cartel_core::reply;
 use dope_fiber::abi;
 use dope_fiber::context;
 use dope_fiber::wait;
-use o3::depot::array::init;
-use std::{marker, mem, ops::ControlFlow, task::Poll};
+use std::{marker, task::Poll};
 
 use crate::api::{
     task,
@@ -38,8 +37,8 @@ pub(in crate::api) type StoredCollection<S, Q> = Collection<<S as Storage>::Batc
 pub(in crate::api) type FirstResult<'d, S, Q, const ID: u8, const SCALAR: bool = false> =
     Result<Option<StoredRow<S, Q, SCALAR>>, Error<'d, ID>>;
 
-pub(in crate::api) type GroupResult<T, E, D, const N: usize> =
-    Result<[T; N], GroupFailure<T, E, D, N>>;
+pub(in crate::api) type GroupResult<'d, T, D, const N: usize, const ID: u8> =
+    Result<[T; N], GroupFailure<'d, T, D, N, ID>>;
 
 /// One row retaining its original immutable payload and reply credits.
 pub struct Row<P, Q, const SCALAR: bool = false>
@@ -308,17 +307,15 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
 ///
 /// `cause` retains admission, capacity, timeout or transport failures alongside
 /// command and server failures, even when all commands completed before timeout.
-#[derive(Debug)]
-pub struct GroupFailure<T, E, D, const N: usize> {
-    pub(crate) outcomes: [Outcome<T, E>; N],
+pub struct GroupFailure<'d, T, D, const N: usize, const ID: u8 = 0> {
+    pub(crate) outcomes: [Outcome<T, replies::ReplyFailure<'d>>; N],
     pub(crate) diagnostics: D,
-    pub(crate) sync: Sync,
-    pub(crate) sync_error: Option<E>,
-    pub(crate) cause: Option<E>,
+    pub(crate) sync: Option<Result<(), Error<'d, ID>>>,
+    pub(crate) cause: Option<Error<'d, ID>>,
 }
 
-impl<T, E, D, const N: usize> GroupFailure<T, E, D, N> {
-    pub fn outcomes(&self) -> &[Outcome<T, E>; N] {
+impl<'d, T, D, const N: usize, const ID: u8> GroupFailure<'d, T, D, N, ID> {
+    pub fn outcomes(&self) -> &[Outcome<T, replies::ReplyFailure<'d>>; N] {
         &self.outcomes
     }
 
@@ -327,92 +324,31 @@ impl<T, E, D, const N: usize> GroupFailure<T, E, D, N> {
     }
 
     pub fn sync(&self) -> Sync {
-        self.sync
+        match self.sync {
+            Some(Ok(())) => Sync::Complete,
+            _ => Sync::Unobserved,
+        }
     }
 
     /// A failure that ended admission or the caller's wait, including timeout.
     /// Any failure already posted to the Sync response remains separately available.
-    pub fn cause(&self) -> Option<&E> {
+    pub fn cause(&self) -> Option<&Error<'d, ID>> {
         self.cause.as_ref()
     }
 
     /// The exact failure posted to the terminal Sync response, if observed.
     /// This is preserved even when the caller's deadline also expired.
-    pub fn sync_error(&self) -> Option<&E> {
-        self.sync_error.as_ref()
+    pub fn sync_error(&self) -> Option<&Error<'d, ID>> {
+        self.sync.as_ref()?.as_ref().err()
     }
 }
 
-impl<T, E, D: Diagnostics, const N: usize> GroupFailure<T, E, D, N> {
+impl<T, D: Diagnostics, const N: usize, const ID: u8> GroupFailure<'_, T, D, N, ID> {
     /// Borrows the first exact server diagnostic associated with this command.
     pub fn diagnostic(&self, index: usize) -> Option<server::Fields<'_>> {
         self.diagnostics
             .iter()
             .find(|entry| entry.position == Position::Command(index))
             .map(|entry| entry.fields)
-    }
-}
-
-impl<P: source::Payload, E: From<crate::Error>, D: Diagnostics, const N: usize>
-    GroupFailure<Option<P>, E, D, N>
-{
-    /// Each insertion takes the matching payload; Full leaves only `Completed(None)`.
-    /// Vacant owns fewer than N rows. Restoration over N outcome slots stops only
-    /// on prefix exhaustion, leaving no unread owner to release.
-    pub(in crate::api) fn required<Q>(mut self) -> GroupResult<Row<P, Q>, E, D, N>
-    where
-        Q: schema::TypedQuery<Result = schema::result::Rows>,
-    {
-        if self.sync == Sync::Complete
-            && self.sync_error.is_none()
-            && self.cause.is_none()
-            && self.diagnostics.is_empty()
-        {
-            let mut storage = mem::MaybeUninit::uninit();
-            let mut rows = init::Guard::<Row<P, Q>, N>::new(&mut storage);
-            loop {
-                let vacant = match rows.next() {
-                    ControlFlow::Break(full) => {
-                        mem::forget(self.outcomes);
-                        return Ok(full.into_array());
-                    }
-                    ControlFlow::Continue(vacant) => vacant,
-                };
-                let payload = match vacant.get_mut(&mut self.outcomes) {
-                    Outcome::Completed(payload) => payload.take(),
-                    _ => None,
-                };
-                match payload {
-                    Some(payload) => rows = vacant.insert(Row::new(payload)),
-                    None => {
-                        let mut prefix = vacant.into_iter();
-                        for outcome in &mut self.outcomes {
-                            let Some(row) = prefix.next() else {
-                                break;
-                            };
-                            *outcome = Outcome::Completed(Some(row.payload));
-                        }
-                        mem::forget(prefix);
-                        break;
-                    }
-                }
-            }
-        }
-        let outcomes = self.outcomes.map(|outcome| match outcome {
-            Outcome::Completed(Some(payload)) => Outcome::Completed(Row::new(payload)),
-            Outcome::Completed(None) => Outcome::Failed(crate::Error::NotFound.into()),
-            Outcome::Failed(error) => Outcome::Failed(error),
-            Outcome::Interrupted(error) => Outcome::Interrupted(error),
-            Outcome::Server => Outcome::Server,
-            Outcome::Skipped => Outcome::Skipped,
-            Outcome::Unobserved => Outcome::Unobserved,
-        });
-        Err(GroupFailure {
-            outcomes,
-            diagnostics: self.diagnostics,
-            sync: self.sync,
-            sync_error: self.sync_error,
-            cause: self.cause,
-        })
     }
 }

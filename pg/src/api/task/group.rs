@@ -1,10 +1,4 @@
-use std::{
-    array,
-    mem::{self, MaybeUninit},
-    ops::ControlFlow,
-    pin::Pin,
-    task::Poll,
-};
+use std::{array, marker::PhantomData, mem, ops::ControlFlow, pin::Pin, task::Poll};
 
 use cartel_core::{deadline, reply};
 use dope::{
@@ -26,8 +20,8 @@ use crate::{
     api::{
         self, Response,
         results::{
-            GroupFailure,
-            group::{Outcome, Sync},
+            GroupFailure, GroupResult, Row,
+            group::{Diagnostics, Outcome},
         },
     },
     port::replies::{self, groups},
@@ -37,15 +31,17 @@ use crate::{
 
 use crate::api::task::{State, lease};
 
-type Output<'r, 's, 'b, 'c, 'd, const ID: u8, const N: usize> =
-    GroupFailure<Option<replies::Payload<'b, 'c, 'd>>, Error<'d, ID>, Ledger<'r, 's>, N>;
+type Output<'r, 's, 'b, 'c, 'd, Q, const ID: u8, const N: usize> =
+    GroupResult<'d, Row<replies::Payload<'b, 'c, 'd>, Q>, Ledger<'r, 's>, N, ID>;
 
-struct First<const ID: u8>;
+struct First<Q>(PhantomData<Q>);
 
-impl<'app, 'b, 'c: 'b, 'd: 'c, const ID: u8>
-    recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>> for First<ID>
+impl<'app, 'b, 'c: 'b, 'd: 'c, Q>
+    recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>> for First<Q>
+where
+    Q: schema::TypedQuery<Result = schema::result::Rows>,
 {
-    type Output = Outcome<Option<replies::Payload<'b, 'c, 'd>>, Error<'d, ID>>;
+    type Output = Outcome<Row<replies::Payload<'b, 'c, 'd>, Q>, replies::ReplyFailure<'d>>;
     type Context = ();
     const ACCEPTANCE: recv::Acceptance = recv::Acceptance::First;
 
@@ -54,21 +50,27 @@ impl<'app, 'b, 'c: 'b, 'd: 'c, const ID: u8>
         slot: &mut Slot<'_, 'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>,
     ) -> Option<Self::Output> {
         Some(match slot.terminal()? {
-            Terminal::Complete(mut done) => match done.try_node() {
-                Ok(payload) => Outcome::Completed(payload.map(replies::Payload::from_node)),
-                Err(error) => Outcome::Failed(crate::Error::ResponseRetain(error).into()),
-            },
+            Terminal::Complete(mut done) => {
+                match Row::required(
+                    done.try_node()
+                        .map(|payload| payload.map(replies::Payload::from_node))
+                        .map_err(crate::Error::ResponseRetain),
+                ) {
+                    Ok(row) => Outcome::Completed(row),
+                    Err(error) => Outcome::Failed(replies::ReplyFailure::Failed(error)),
+                }
+            }
             Terminal::Failed(failure) => match failure.into_error() {
-                replies::ReplyFailure::Server(error) => Outcome::Failed(Error::Server(error)),
+                error @ replies::ReplyFailure::Server(_) => Outcome::Failed(error),
                 replies::ReplyFailure::GroupServer => Outcome::Server,
                 replies::ReplyFailure::Failed(crate::Error::Skipped) => Outcome::Skipped,
-                replies::ReplyFailure::Failed(error) => Outcome::Interrupted(error.into()),
+                error @ replies::ReplyFailure::Failed(_) => Outcome::Interrupted(error),
             },
         })
     }
 }
 
-type Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, const ID: u8, const N: usize> = State<
+type Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, const ID: u8> = State<
     'app,
     'g,
     'r,
@@ -79,7 +81,7 @@ type Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, const ID: u8, const N: usize> = S
     B,
     I,
     ID,
-    Ready<'g, 'r, 's, 'b, 'c, 'd, N>,
+    groups::Draft<'g, 'r, 's, 'b, 'c, 'd>,
     conn::Id<'d, KeyTag<ID>>,
     lease::Detached,
     groups::Owner<'g, 'r, 's, 'b, 'c, 'd>,
@@ -91,128 +93,19 @@ enum Stop<'d, const ID: u8> {
     Sync,
 }
 
-struct Completed<'r, 's, 'd, const ID: u8> {
-    diagnostics: Ledger<'r, 's>,
-    sync: Sync,
-    sync_error: Option<Error<'d, ID>>,
-    cause: Option<Error<'d, ID>>,
-}
-
-fn collect<'app, 'g, 'r, 's, 'b, 'c: 'b, 'd: 'c, const ID: u8, const N: usize>(
-    commands: &mut [Response<'app, 'g, 'r, 's, 'b, 'c, 'd, First<ID>>; N],
+fn take<'app, 'g, 'r, 's, 'b, 'c: 'b, 'd: 'c, Q>(
+    command: &mut Response<'app, 'g, 'r, 's, 'b, 'c, 'd, First<Q>>,
     token: &mut region::Token<region::Identity<'d>>,
-) -> [Outcome<Option<replies::Payload<'b, 'c, 'd>>, Error<'d, ID>>; N] {
-    commands
-        .each_mut()
-        .map(|command| match command.try_take(token) {
-            Some(outcome) => outcome,
-            None => {
-                command.detach();
-                Outcome::Unobserved
-            }
-        })
-}
-
-/// Snapshots before detachment and cancellation can retire another order.
-fn complete<
-    'app,
-    'g,
-    'r,
-    's,
-    'b,
-    'c: 'b,
-    'd: 'c + 'app,
-    B: ?Sized,
-    I: schema::QuerySet + 'd,
-    const ID: u8,
-    const N: usize,
->(
-    admit: &mut Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, N>,
-    reply: &mut Response<'app, 'g, 'r, 's, 'b, 'c, 'd, api::ExtractUnit<ID>>,
-    guard: Pin<&mut Result<deadline::Guard<'d>, timer::Exhausted>>,
-    waiter: Pin<&wait::Waiter<'app, 'd>>,
-    stop: Stop<'d, ID>,
-    sync: Option<Result<(), Error<'d, ID>>>,
-) -> Completed<'r, 's, 'd, ID> {
-    waiter.unregister();
-    let (mut cause, abort) = match stop {
-        Stop::Deadline(error) => (None, Some(error)),
-        Stop::Admission(error) => (Some(error), None),
-        Stop::Sync => (None, None),
-    };
-    let (sync, failure) = match sync {
-        Some(Ok(())) => (Sync::Complete, None),
-        Some(Err(error)) => (Sync::Unobserved, Some(error)),
-        None => (Sync::Unobserved, None),
-    };
-    let ledger = match &*admit {
-        State::Admitted(_, owner) => owner.snapshot(),
-        _ => Ledger::empty(),
-    };
-    reply.detach();
-    match abort {
-        Some(error) => cause = Some(admit.cancel(error)),
-        None => {
-            admit.take();
-            if let Ok(guard) = guard.get_mut() {
-                guard.complete();
-            }
-        }
-    }
-    Completed {
-        diagnostics: ledger,
-        sync,
-        sync_error: failure,
-        cause,
-    }
-}
-
-struct Replies<'app, 'g, 'r, 's, 'b, 'c: 'b, 'd: 'c, const ID: u8, const N: usize> {
-    commands: [Response<'app, 'g, 'r, 's, 'b, 'c, 'd, First<ID>>; N],
-    sync: Response<'app, 'g, 'r, 's, 'b, 'c, 'd, api::ExtractUnit<ID>>,
-}
-
-impl<'app, 'g, 'r, 's, 'b, 'c: 'b, 'd: 'c, const ID: u8, const N: usize>
-    Replies<'app, 'g, 'r, 's, 'b, 'c, 'd, ID, N>
+) -> Outcome<Row<replies::Payload<'b, 'c, 'd>, Q>, replies::ReplyFailure<'d>>
+where
+    Q: schema::TypedQuery<Result = schema::result::Rows>,
 {
-    fn new() -> Self {
-        const { assert!(N > 0 && N < u32::MAX as usize) };
-        Self {
-            commands: array::from_fn(|_| Response::new()),
-            sync: Response::new(),
+    match command.try_take(token) {
+        Some(outcome) => outcome,
+        None => {
+            command.detach();
+            Outcome::Unobserved
         }
-    }
-}
-
-/// Unpublished diagnostic owners retained by the pending request until admission.
-pub(in crate::api) struct Ready<'g, 'r, 's, 'b, 'c, 'd, const N: usize> {
-    collector: groups::Draft<'g, 'r, 's, 'b, 'c, 'd>,
-    commands: [groups::Owner<'g, 'r, 's, 'b, 'c, 'd>; N],
-    sync: groups::Owner<'g, 'r, 's, 'b, 'c, 'd>,
-}
-
-impl<'g, 'r, 's, 'b, 'c, 'd, const N: usize> Ready<'g, 'r, 's, 'b, 'c, 'd, N> {
-    pub(in crate::api) fn new(
-        access: &groups::Access<'g, 'r, 's, 'b, 'c, 'd>,
-    ) -> Result<Self, crate::Error> {
-        let owner = access.prepare()?;
-        let mut storage = MaybeUninit::uninit();
-        let mut guard = init::Guard::<_, N>::new(&mut storage);
-        let commands = loop {
-            match guard.next() {
-                ControlFlow::Break(full) => break full.into_array(),
-                ControlFlow::Continue(vacant) => {
-                    let item = owner.try_clone().map_err(crate::Error::ResponseRetain)?;
-                    guard = vacant.insert(item);
-                }
-            }
-        };
-        let sync = owner.try_clone().map_err(crate::Error::ResponseRetain)?;
-        Ok(Self {
-            collector: owner,
-            commands,
-            sync,
-        })
     }
 }
 
@@ -227,12 +120,14 @@ pub(in crate::api) struct Group<
     'd: 'c + 'app,
     B: ?Sized,
     I: schema::QuerySet + 'd,
+    Q: schema::TypedQuery<Result = schema::result::Rows>,
     const ID: u8,
     const N: usize,
 > {
     client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-    admission: Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, N>,
-    reply: Replies<'app, 'g, 'r, 's, 'b, 'c, 'd, ID, N>,
+    admission: Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    commands: [Response<'app, 'g, 'r, 's, 'b, 'c, 'd, First<Q>>; N],
+    sync: Response<'app, 'g, 'r, 's, 'b, 'c, 'd, api::ExtractUnit<ID>>,
     #[pin]
     deadline: Result<deadline::Guard<'d>, timer::Exhausted>,
     #[pin]
@@ -249,21 +144,24 @@ impl<
     'd: 'c + 'app,
     B: ?Sized,
     I: schema::QuerySet + 'd,
+    Q: schema::TypedQuery<Result = schema::result::Rows>,
     const ID: u8,
     const N: usize,
-> Group<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, N>
+> Group<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, N>
 {
     pub(in crate::api) fn new(
         client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         target: Option<api::Target<'d, ID>>,
-        next: Result<api::Pending<'d, Ready<'g, 'r, 's, 'b, 'c, 'd, N>>, crate::Error>,
+        next: Result<api::Pending<'d, groups::Draft<'g, 'r, 's, 'b, 'c, 'd>>, crate::Error>,
     ) -> Self {
+        const { assert!(N > 0 && N < u32::MAX as usize) };
         let admit = State::new(target, next);
         let deadline = client.port.lifecycle.deadline.guard();
         Self {
             client,
             admission: admit,
-            reply: Replies::new(),
+            commands: array::from_fn(|_| Response::new()),
+            sync: Response::new(),
             deadline,
             waiter: wait::Waiter::new(),
         }
@@ -280,11 +178,12 @@ impl<
     'd: 'c + 'app,
     B: ?Sized,
     I: schema::QuerySet + 'd,
+    Q: schema::TypedQuery<Result = schema::result::Rows>,
     const ID: u8,
     const N: usize,
-> abi::Fiber<'d> for Group<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, N>
+> abi::Fiber<'d> for Group<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, N>
 {
-    type Output = Output<'r, 's, 'b, 'c, 'd, ID, N>;
+    type Output = Output<'r, 's, 'b, 'c, 'd, Q, ID, N>;
 
     fn poll(call: context::PollCall<'_, '_, 'd, Self>) -> Poll<Self::Output> {
         let (this, mut cx) = call.into_parts();
@@ -316,53 +215,28 @@ impl<
                                     let State::Connecting { request, .. } = &*admit else {
                                         unreachable!("connecting");
                                     };
-                                    let reserved =
-                                        match lane.try_reserve(request.state.collector.usage()) {
-                                            Ok(reserved) => reserved,
-                                            Err(error) => {
-                                                return Err((attach::Error::Payload(error), admit));
-                                            }
-                                        };
-                                    Response::try_group_by(
+                                    let reserved = match lane.try_reserve(request.state.usage()) {
+                                        Ok(reserved) => reserved,
+                                        Err(error) => {
+                                            return Err((attach::Error::Payload(error), admit));
+                                        }
+                                    };
+                                    replies::try_group_by(
                                         token,
                                         lane,
-                                        &mut this.reply.commands,
-                                        &mut this.reply.sync,
-                                        (admit, reserved),
-                                        |(admit, reserved)| match mem::replace(admit, State::Done) {
+                                        this.commands,
+                                        this.sync,
+                                        tag.batch(),
+                                        admit,
+                                        move |admit| match mem::replace(admit, State::Done) {
                                             State::Connecting { request, .. } => {
-                                                let api::Pending {
-                                                    frame,
-                                                    state:
-                                                        Ready {
-                                                            collector,
-                                                            commands,
-                                                            sync,
-                                                        },
-                                                    ..
-                                                } = request;
-                                                let owner = collector.admit(reserved);
-                                                let mut index = 0u32;
-                                                let commands = commands.map(|owner| {
-                                                    let position = index;
-                                                    index += 1;
-                                                    replies::Tag::command(
-                                                        tag.batch(),
-                                                        position,
-                                                        index as usize == N,
-                                                        owner,
-                                                    )
-                                                });
-                                                (
-                                                    commands,
-                                                    replies::Tag::sync(tag.batch(), sync),
-                                                    (admit, frame, owner),
-                                                )
+                                                let api::Pending { frame, state, .. } = request;
+                                                let (owner, sync) = state.admit(reserved);
+                                                (sync, (admit, frame, owner))
                                             }
                                             _ => unreachable!("connecting"),
                                         },
                                     )
-                                    .map_err(|(error, (admit, _))| (error, admit))
                                 },
                                 |(admit, frame, owner), conn| {
                                     *admit = State::Admitted(
@@ -379,7 +253,7 @@ impl<
                     Poll::Ready(Err(error)) => Stop::Admission(error),
                     Poll::Ready(Ok(())) => {
                         let Poll::Ready(observed) =
-                            Pin::new(&mut this.reply.sync).poll_reply(cx.as_mut())
+                            Pin::new(&mut *this.sync).poll_reply(cx.as_mut())
                         else {
                             return Poll::Pending;
                         };
@@ -390,22 +264,75 @@ impl<
             }
         };
         let token = cx.region_token();
-        let sync = sync.or_else(|| this.reply.sync.try_take(token));
-        let outcomes = collect(&mut this.reply.commands, token);
-        let done = complete(
-            this.admission,
-            &mut this.reply.sync,
-            this.deadline,
-            this.waiter.as_ref(),
-            stop,
-            sync,
-        );
-        Poll::Ready(GroupFailure {
+        let sync = sync.or_else(|| this.sync.try_take(token));
+        let mut storage = mem::MaybeUninit::uninit();
+        let mut failures = mem::MaybeUninit::uninit();
+        let mut rows = init::Guard::<_, N>::new(&mut storage);
+        let collected = loop {
+            let vacant = match rows.next() {
+                ControlFlow::Break(full) => break Ok(full),
+                ControlFlow::Continue(vacant) => vacant,
+            };
+            match take(vacant.get_mut(this.commands), token) {
+                Outcome::Completed(row) => rows = vacant.insert(row),
+                outcome => {
+                    let mut prefix = vacant
+                        .into_iter()
+                        .map(Outcome::Completed)
+                        .chain(Some(outcome));
+                    let mut outcomes = init::Guard::<_, N>::new(&mut failures);
+                    let outcomes = loop {
+                        match outcomes.next() {
+                            ControlFlow::Break(full) => break full,
+                            ControlFlow::Continue(vacant) => {
+                                let outcome = prefix
+                                    .next()
+                                    .unwrap_or_else(|| take(vacant.get_mut(this.commands), token));
+                                outcomes = vacant.insert(outcome);
+                            }
+                        }
+                    };
+                    // Vacant owns fewer than N rows, so N visits consume this prefix and error.
+                    mem::forget(prefix);
+                    break Err(outcomes);
+                }
+            }
+        };
+        this.waiter.as_ref().unregister();
+        // Snapshot before detachment and cancellation can retire another order.
+        let diagnostics = match &*this.admission {
+            State::Admitted(_, owner) => owner.snapshot(),
+            _ => Ledger::empty(),
+        };
+        this.sync.detach();
+        let cause = match stop {
+            Stop::Deadline(error) => Some(this.admission.cancel(error)),
+            stop => {
+                this.admission.take();
+                if let Ok(guard) = this.deadline.get_mut() {
+                    guard.complete();
+                }
+                if let Stop::Admission(error) = stop {
+                    Some(error)
+                } else {
+                    None
+                }
+            }
+        };
+        let outcomes = match collected {
+            Ok(rows)
+                if matches!(sync, Some(Ok(()))) && cause.is_none() && diagnostics.is_empty() =>
+            {
+                return Poll::Ready(Ok(rows.into_array()));
+            }
+            Ok(rows) => rows.map_with([(); N], |row, ()| Outcome::Completed(row)),
+            Err(outcomes) => outcomes.into_array(),
+        };
+        Poll::Ready(Err(GroupFailure {
             outcomes,
-            diagnostics: done.diagnostics,
-            sync: done.sync,
-            sync_error: done.sync_error,
-            cause: done.cause,
-        })
+            diagnostics,
+            sync,
+            cause,
+        }))
     }
 }

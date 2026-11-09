@@ -21,7 +21,7 @@ pub fn streamed(listener: &mut peer::TcpAcceptor<'_>) -> Result<(), Error> {
     Database::start(&socket)?;
     socket.read_wait(Some(GUARD))?;
     // BEGIN must follow the stream's Sync without waiting for its response.
-    for expected in [b'B', b'E', b'S', b'P', b'B', b'E', b'S'] {
+    for expected in *b"BESPBES" {
         let mut tag = [0];
         socket.read_exact(&mut tag)?;
         let body = startup::read(&socket)?;

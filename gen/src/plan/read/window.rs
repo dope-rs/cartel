@@ -175,14 +175,12 @@ impl Head {
             Function::Count if call.args.is_empty() => Ok(Self::Keyword(Keyword::CountStar)),
             Function::Count if call.args.len() == 1 => {
                 let expr = &call.args[0];
-                let sql = state.parse(
-                    scope,
-                    expr,
+                let sql = state.parse(scope, expr, || {
                     syn::Error::new(
                         expr.span(),
                         "`count(...)` window arg must be a column / expression",
-                    ),
-                )?;
+                    )
+                })?;
                 Ok(Self::Expr(Keyword::Count, sql))
             }
             Function::Count => Err(syn::Error::new(
@@ -198,14 +196,12 @@ impl Head {
                     ));
                 }
                 let expr = &call.args[0];
-                let sql = state.parse(
-                    scope,
-                    expr,
+                let sql = state.parse(scope, expr, || {
                     syn::Error::new(
                         expr.span(),
                         format!("`{name}(...)` window arg must be a column / expression"),
-                    ),
-                )?;
+                    )
+                })?;
                 Ok(Self::Expr(keyword, sql))
             }
             Function::Offset(function) => {
@@ -217,15 +213,13 @@ impl Head {
                     ));
                 }
                 let expr = &call.args[0];
-                let sql = state.parse(
-                    scope,
-                    expr,
+                let sql = state.parse(scope, expr, || {
                     syn::Error::new(
                         expr.span(),
                         format!("`{name}(...)` first arg must be a column / expression"),
-                    ),
-                )?;
-                let offset = Integer::parse(&call.args[1], state.fn_params)?;
+                    )
+                })?;
+                let offset = Integer::parse(&call.args[1], state.params)?;
                 Ok(Self::Offset(open, sql, offset))
             }
         }
@@ -322,17 +316,15 @@ impl Part {
             }
         };
         let expr = &call.args[0];
-        let sql = state.parse(
-            scope,
-            expr,
+        let sql = state.parse(scope, expr, || {
             syn::Error::new(
                 expr.span(),
                 format!(
                     "`.{}(...)` arg must be a column / arithmetic / function expression",
                     call.method,
                 ),
-            ),
-        )?;
+            )
+        })?;
         Ok(Self { sql, kind })
     }
 }

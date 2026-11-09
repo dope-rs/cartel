@@ -6,7 +6,7 @@ use o3::{
     buffer::{resident, storage},
     mem::rc,
 };
-use protocol::{Length, Offset, Text, Wire};
+use protocol::{Length, Offset, Wire};
 use std::{
     mem::{self, MaybeUninit},
     str,
@@ -68,7 +68,13 @@ impl<'a> Fields<'a> {
 
     /// The complete source must retain a successfully parsed diagnostic.
     pub(super) unsafe fn from_valid(payload: &'a [u8]) -> Self {
-        let mut build = Build::new();
+        let mut build = Build {
+            severity: MaybeUninit::uninit(),
+            severity_nonlocalized: None,
+            code: MaybeUninit::uninit(),
+            message: MaybeUninit::uninit(),
+            context: reply::Context::default(),
+        };
         let mut cursor = payload;
         loop {
             let kind = unsafe { *cursor.as_ptr() };
@@ -81,69 +87,111 @@ impl<'a> Fields<'a> {
                 end += 1;
             }
             let value = unsafe { str::from_utf8_unchecked(tail.get_unchecked(..end)) };
-            build.set(kind, value);
+            if let Some(field) = Field::new(kind) {
+                if field == Field::Severity {
+                    build.severity.write(value);
+                } else if field == Field::NonlocalizedSeverity {
+                    build.severity_nonlocalized = Some(value);
+                } else if field == Field::Code {
+                    build.code.write(value);
+                } else if field == Field::Message {
+                    build.message.write(value);
+                } else if let Some(number) = build.context.field(field, value) {
+                    *number = Some(reply::raw::number(Number(value)));
+                }
+            }
             cursor = unsafe { tail.get_unchecked(end + 1..) };
         }
-        unsafe { build.finish() }
+        Self {
+            severity: match build.severity_nonlocalized {
+                Some(value) => value,
+                None => unsafe { build.severity.assume_init() },
+            },
+            code: reply::Code::from_valid(unsafe { build.code.assume_init() }),
+            message: unsafe { build.message.assume_init() },
+            context: build.context,
+        }
     }
 
-    pub(crate) fn try_parse(payload: Wire<'a>) -> Result<Self, crate::Error> {
-        let mut parts = Parts::default();
+    pub(crate) fn try_classify(
+        payload: Wire<'a>,
+    ) -> Result<(reply::Scope, reply::Class), protocol::Reason> {
+        let mut severity = None;
+        let mut code = None;
         let mut seen = 0u32;
         let mut cursor = payload;
         let length = payload.length().get();
         loop {
             let Some((kind, tail)) = cursor.split_first() else {
-                return Err(crate::Error::Protocol(
-                    protocol::Reason::DiagnosticResponseTerminator {
-                        offset: Offset::from_u32(length - cursor.length().get()),
-                    },
-                ));
+                return Err(protocol::Reason::DiagnosticResponseTerminator {
+                    offset: Offset::from_u32(length - cursor.length().get()),
+                });
             };
             if kind == 0 {
                 if !tail.is_empty() {
-                    return Err(crate::Error::Protocol(
-                        protocol::Reason::DiagnosticTrailing {
-                            offset: Offset::from_u32(length - tail.length().get()),
-                            actual: tail.length(),
-                        },
-                    ));
+                    return Err(protocol::Reason::DiagnosticTrailing {
+                        offset: Offset::from_u32(length - tail.length().get()),
+                        actual: tail.length(),
+                    });
                 }
                 break;
             }
             let Some((value, rest)) = tail.split_byte(0) else {
-                return Err(crate::Error::Protocol(
-                    protocol::Reason::DiagnosticTerminator {
-                        kind,
-                        offset: Offset::from_u32(length - tail.length().get()),
-                        actual: tail.length(),
-                    },
-                ));
+                return Err(protocol::Reason::DiagnosticTerminator {
+                    kind,
+                    offset: Offset::from_u32(length - tail.length().get()),
+                    actual: tail.length(),
+                });
             };
             let value = match value.try_text() {
                 Ok(value) => value,
                 Err(error) => {
                     let offset = length - (tail.length().get() - error.valid.get());
-                    return Err(crate::Error::Protocol(protocol::Reason::DiagnosticUtf8 {
+                    return Err(protocol::Reason::DiagnosticUtf8 {
                         kind,
                         offset: Offset::from_u32(offset),
                         error: error.error,
-                    }));
+                    });
                 }
             };
-            if let Some(bit) = recognized_bit(kind) {
-                let mask = 1u32 << bit;
+            if let Some(field) = Field::new(kind) {
+                let mask = field.mask();
                 if seen & mask != 0 {
-                    return Err(crate::Error::Protocol(
-                        protocol::Reason::DuplicateDiagnostic { kind },
-                    ));
+                    return Err(protocol::Reason::DuplicateDiagnostic { kind });
                 }
                 seen |= mask;
+                if field.selects_severity(seen & Field::NonlocalizedSeverity.mask() != 0) {
+                    severity = Some(value.as_str());
+                } else {
+                    match field {
+                        Field::Code => code = Some(value),
+                        Field::Position | Field::InnerPosition | Field::Line => {
+                            reply::context::try_number(kind, value)?;
+                        }
+                        _ => {}
+                    }
+                }
             }
-            parts.try_set(kind, value)?;
             cursor = rest;
         }
-        parts.try_finish()
+        let Some(severity) = severity.filter(|value| !value.is_empty()) else {
+            return Err(protocol::Reason::DiagnosticSeverity);
+        };
+        let Some(code) = code else {
+            return Err(protocol::Reason::DiagnosticSqlstateLength {
+                actual: Length::from_u32(0),
+            });
+        };
+        let code = reply::Code::try_new(code)?;
+        if seen & Field::Message.mask() == 0 {
+            return Err(protocol::Reason::DiagnosticMessage);
+        }
+        let scope = match severity {
+            "ERROR" => reply::Scope::Command,
+            "FATAL" | "PANIC" => reply::Scope::Connection,
+            _ => reply::Scope::Unknown,
+        };
+        Ok((scope, code.class()))
     }
 
     pub const fn severity(self) -> &'a str {
@@ -171,136 +219,59 @@ struct Build<'a> {
     context: reply::Context<'a>,
 }
 
-impl<'a> Build<'a> {
-    fn new() -> Self {
-        Self {
-            severity: MaybeUninit::uninit(),
-            severity_nonlocalized: None,
-            code: MaybeUninit::uninit(),
-            message: MaybeUninit::uninit(),
-            context: reply::Context::default(),
-        }
-    }
-
-    fn set(&mut self, kind: u8, value: &'a str) {
-        if kind == b'S' {
-            self.severity.write(value);
-        } else if kind == b'V' {
-            self.severity_nonlocalized = Some(value);
-        } else if kind == b'C' {
-            self.code.write(value);
-        } else if kind == b'M' {
-            self.message.write(value);
-        } else if let Some(number) = self.context.write().field(kind, value) {
-            *number = Some(reply::raw::number(Number(value)));
-        }
-    }
-
-    unsafe fn finish(self) -> Fields<'a> {
-        let severity = match self.severity_nonlocalized {
-            Some(severity) => severity,
-            None => unsafe { self.severity.assume_init() },
-        };
-        Fields {
-            severity,
-            code: reply::Code::from_valid(unsafe { self.code.assume_init() }),
-            message: unsafe { self.message.assume_init() },
-            context: self.context,
-        }
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Field {
+    Severity,
+    NonlocalizedSeverity,
+    Code,
+    Message,
+    Detail,
+    Hint,
+    Position,
+    InnerPosition,
+    InnerQuery,
+    Location,
+    Schema,
+    Table,
+    Column,
+    DataType,
+    Constraint,
+    File,
+    Line,
+    Routine,
 }
 
-#[derive(Default)]
-struct Parts<'a> {
-    severity: Option<Text<'a>>,
-    severity_nonlocalized: Option<Text<'a>>,
-    code: Option<Text<'a>>,
-    message: Option<Text<'a>>,
-    context: reply::Context<'a>,
-}
-
-impl<'a> Parts<'a> {
-    fn try_set(&mut self, kind: u8, value: Text<'a>) -> Result<(), crate::Error> {
-        if kind == b'S' {
-            self.severity = Some(value);
-        } else if kind == b'V' {
-            self.severity_nonlocalized = Some(value);
-        } else if kind == b'C' {
-            self.code = Some(value);
-        } else if kind == b'M' {
-            self.message = Some(value);
-        } else {
-            self.context.write().try_set(kind, value)?;
-        }
-        Ok(())
-    }
-
-    fn try_finish(self) -> Result<Fields<'a>, crate::Error> {
-        let Some(severity) = self
-            .severity_nonlocalized
-            .or(self.severity)
-            .filter(|value| !value.as_str().is_empty())
-        else {
-            return Err(crate::Error::Protocol(protocol::Reason::DiagnosticSeverity));
-        };
-        let Some(code) = self.code else {
-            return Err(crate::Error::Protocol(
-                protocol::Reason::DiagnosticSqlstateLength {
-                    actual: Length::from_u32(0),
-                },
-            ));
-        };
-        let code = reply::Code::try_new(code).map_err(crate::Error::Protocol)?;
-        let Some(message) = self.message else {
-            return Err(crate::Error::Protocol(protocol::Reason::DiagnosticMessage));
-        };
-        Ok(Fields {
-            severity: severity.as_str(),
-            code,
-            message: message.as_str(),
-            context: self.context,
+impl Field {
+    #[inline]
+    fn new(kind: u8) -> Option<Self> {
+        Some(match kind {
+            b'S' => Self::Severity,
+            b'V' => Self::NonlocalizedSeverity,
+            b'C' => Self::Code,
+            b'M' => Self::Message,
+            b'D' => Self::Detail,
+            b'H' => Self::Hint,
+            b'P' => Self::Position,
+            b'p' => Self::InnerPosition,
+            b'q' => Self::InnerQuery,
+            b'W' => Self::Location,
+            b's' => Self::Schema,
+            b't' => Self::Table,
+            b'c' => Self::Column,
+            b'd' => Self::DataType,
+            b'n' => Self::Constraint,
+            b'F' => Self::File,
+            b'L' => Self::Line,
+            b'R' => Self::Routine,
+            _ => return None,
         })
     }
-}
 
-fn recognized_bit(kind: u8) -> Option<u8> {
-    if kind == b'S' {
-        Some(0)
-    } else if kind == b'V' {
-        Some(1)
-    } else if kind == b'C' {
-        Some(2)
-    } else if kind == b'M' {
-        Some(3)
-    } else if kind == b'D' {
-        Some(4)
-    } else if kind == b'H' {
-        Some(5)
-    } else if kind == b'P' {
-        Some(6)
-    } else if kind == b'p' {
-        Some(7)
-    } else if kind == b'q' {
-        Some(8)
-    } else if kind == b'W' {
-        Some(9)
-    } else if kind == b's' {
-        Some(10)
-    } else if kind == b't' {
-        Some(11)
-    } else if kind == b'c' {
-        Some(12)
-    } else if kind == b'd' {
-        Some(13)
-    } else if kind == b'n' {
-        Some(14)
-    } else if kind == b'F' {
-        Some(15)
-    } else if kind == b'L' {
-        Some(16)
-    } else if kind == b'R' {
-        Some(17)
-    } else {
-        None
+    const fn mask(self) -> u32 {
+        1 << self as u32
+    }
+
+    fn selects_severity(self, nonlocalized: bool) -> bool {
+        self == Self::NonlocalizedSeverity || self == Self::Severity && !nonlocalized
     }
 }

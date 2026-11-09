@@ -73,8 +73,7 @@ pub(in crate::plan) fn build(
         body,
         set_id,
         &scope,
-        state.fn_params,
-        state.param_tys,
+        state.params,
         state.dialect,
         &state.cte_map,
     )?;
@@ -176,14 +175,9 @@ pub(in crate::plan) fn each(
 
     let mut params: Vec<proc_macro2::TokenStream> = Vec::with_capacity(data.len());
     for ds in data {
-        let captured = state.fn_params.resolve_ref(ds)?;
+        let captured = state.params.resolve_ref(ds)?;
         let idx = pred::sql::intern(&mut state.captures, captured);
-        let ctx = backend::ParamCtx {
-            captures: &state.captures,
-            param_ids: state.fn_params,
-            param_tys: state.param_tys,
-        };
-        params.push(state.dialect.placeholder(idx, &ctx));
+        params.push(state.dialect.placeholder(idx, &state.params[captured.0].1));
     }
 
     let scope = pred::RowScope::for_source(source, slice::from_ref(row_var))?.with_unnest(col_vars);
@@ -192,8 +186,7 @@ pub(in crate::plan) fn each(
         set_body,
         row_var,
         &scope,
-        state.fn_params,
-        state.param_tys,
+        state.params,
         state.dialect,
         &state.cte_map,
     )?;
@@ -247,24 +240,26 @@ pub(in crate::plan) fn each(
         let rt = &state.dialect.rt_crate;
         let mut names = backend::Names::default();
         for name in state
-            .fn_params
+            .params
             .iter()
+            .map(|(id, _)| id)
             .chain(col_vars)
             .chain(slice::from_ref(row_var))
         {
             names.visit_ident(name);
         }
-        names.visit_expr(pred);
-        names.visit_expr(set_body);
+        let wildcard = syn::Ident::new("_", proc_macro2::Span::call_site());
+        let mut patterns = vec![&wildcard; 2 * col_vars.len()];
+        let (when, set) = patterns.split_at_mut(col_vars.len());
+        for (body, patterns) in [(pred, &mut *when), (set_body, &mut *set)] {
+            Binding {
+                names: &mut names,
+                columns: col_vars,
+                patterns,
+            }
+            .visit_expr(body);
+        }
         let inputs: Vec<_> = data.iter().map(|_| names.fresh("column")).collect();
-        let when: Vec<_> = col_vars
-            .iter()
-            .map(|name| Binding::pattern(name, pred))
-            .collect();
-        let set: Vec<_> = col_vars
-            .iter()
-            .map(|name| Binding::pattern(name, set_body))
-            .collect();
         syn::parse_quote! {
             {
                 let (#(#inputs,)*) = (#(#data,)*);
@@ -290,26 +285,25 @@ pub(in crate::plan) fn each(
     Ok(plan)
 }
 
-struct Binding<'a> {
-    name: &'a syn::Ident,
-    used: bool,
+struct Binding<'a, 'n> {
+    names: &'n mut backend::Names,
+    columns: &'a [syn::Ident],
+    patterns: &'n mut [&'a syn::Ident],
 }
 
-impl Binding<'_> {
-    fn pattern(name: &syn::Ident, body: &syn::Expr) -> proc_macro2::TokenStream {
-        let mut binding = Binding { name, used: false };
-        binding.visit_expr(body);
-        if binding.used {
-            quote::quote! { #name }
-        } else {
-            quote::quote! { _ }
-        }
+impl<'ast> visit::Visit<'ast> for Binding<'_, '_> {
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        self.names.visit_ident(ident);
     }
-}
 
-impl<'ast> visit::Visit<'ast> for Binding<'_> {
     fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
-        self.used |= path.qself.is_none() && path.path.is_ident(self.name);
+        if path.qself.is_none() {
+            for (name, pattern) in self.columns.iter().zip(self.patterns.iter_mut()) {
+                if path.path.is_ident(name) {
+                    *pattern = name;
+                }
+            }
+        }
         visit::visit_expr_path(self, path);
     }
 }

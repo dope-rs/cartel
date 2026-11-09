@@ -48,16 +48,16 @@ fn reconnect_replays_init() {
                 assert_eq!(socket.read(&mut [0])?, 0, "AUTH needs a free request frame");
             }
             for epoch in 0..2 {
-                let mut socket = peer.accept()?;
+                let socket = peer.accept()?;
                 for (request, step) in REQUESTS {
                     assert_eq!(
-                        read_request(&mut socket, request.len())?,
+                        read_request(&socket, request.len())?,
                         request,
                         "{step:?}"
                     );
                     socket.write_all(b"+OK\r\n")?;
                 }
-                assert_eq!(read_request(&mut socket, PING.len())?, PING);
+                assert_eq!(read_request(&socket, PING.len())?, PING);
                 socket.write_all(b"+PONG\r\n")?;
                 if epoch == 1 {
                     socket.read_wait(Some(GUARD))?;
@@ -165,10 +165,10 @@ fn rejection_stops_init() {
     for expected in [Step::Authenticate, Step::Select, Step::SetClientName] {
         AcceptScript::with(
             move |peer| {
-                let mut socket = peer.accept()?;
+                let socket = peer.accept()?;
                 for (request, step) in REQUESTS {
                     assert_eq!(
-                        read_request(&mut socket, request.len())?,
+                        read_request(&socket, request.len())?,
                         request,
                         "{step:?}"
                     );

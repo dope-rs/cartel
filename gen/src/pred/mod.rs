@@ -20,8 +20,7 @@ use input::{Input, Method, Op};
 use var::Var;
 
 pub(super) struct WhereContext<'a> {
-    pub(super) fn_params: &'a [syn::Ident],
-    pub(super) param_tys: &'a [syn::Type],
+    pub(super) params: &'a [backend::Param],
     pub(super) dialect: &'a backend::Dialect,
     pub(super) cte_map: &'a collections::BTreeMap<String, syn::Path>,
 }
@@ -65,8 +64,7 @@ fn build_into(
     context: &WhereContext<'_>,
     sql: &mut sql::Sql,
 ) -> syn::Result<()> {
-    let params = context.fn_params;
-    let types = context.param_tys;
+    let params = context.params;
     let dialect = context.dialect;
     let cte_map = context.cte_map;
     match Input::new(expr) {
@@ -120,14 +118,14 @@ fn build_into(
                     Ok(())
                 }
                 Op::Compare(op) => {
-                    if !scope.parse_into(left, Some(params), types, dialect, cte_map, sql)? {
+                    if !scope.parse_into(left, Some(params), dialect, cte_map, sql)? {
                         return Err(syn::Error::new(
                             syntax.span(),
                             "expected at least one side of the comparison to be a column / arithmetic / function expression",
                         ));
                     }
                     sql.push(op.sql_ref(dialect));
-                    if scope.parse_into(right, None, types, dialect, cte_map, sql)? {
+                    if scope.parse_into(right, None, dialect, cte_map, sql)? {
                         if !columns && scope.has_column(left) && scope.has_column(right) {
                             return Err(syn::Error::new(
                                 syntax.span(),
@@ -163,7 +161,7 @@ fn build_into(
                     "attributes are not supported on a boolean column predicate",
                 ));
             }
-            if !scope.parse_into(expr, None, types, dialect, cte_map, sql)? {
+            if !scope.parse_into(expr, None, dialect, cte_map, sql)? {
                 return Err(syn::Error::new(
                     syntax.span(),
                     "boolean predicate must reference a column",
@@ -180,7 +178,7 @@ fn build_into(
                     "attributes are not supported on a negated predicate",
                 ));
             }
-            if !scope.parse_into(&syntax.expr, None, types, dialect, cte_map, sql)? {
+            if !scope.parse_into(&syntax.expr, None, dialect, cte_map, sql)? {
                 return Err(syn::Error::new(
                     syntax.expr.span(),
                     "negated boolean predicate must reference a column",
@@ -262,7 +260,7 @@ fn build_into(
                     format!("method `.{name}(arg)` requires exactly one argument"),
                 ));
             }
-            if !scope.parse_into(&syntax.receiver, Some(params), types, dialect, cte_map, sql)? {
+            if !scope.parse_into(&syntax.receiver, Some(params), dialect, cte_map, sql)? {
                 return Err(syn::Error::new(
                     syntax.receiver.span(),
                     format!(
@@ -285,7 +283,7 @@ fn build_into(
                 }
                 Method::Fts => {
                     sql.push(cmp::Cmp::FtsMatch.sql_ref(dialect));
-                    if !scope.parse_into(arg, Some(params), types, dialect, cte_map, sql)? {
+                    if !scope.parse_into(arg, Some(params), dialect, cte_map, sql)? {
                         sql.capture(params.resolve_ref(arg)?);
                     }
                 }

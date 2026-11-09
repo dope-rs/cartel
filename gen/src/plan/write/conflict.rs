@@ -44,8 +44,7 @@ impl Conflict {
                     &update.set_body,
                     &update.set_arg,
                     &scope,
-                    state.fn_params,
-                    state.param_tys,
+                    state.params,
                     state.dialect,
                     &state.cte_map,
                 )?;

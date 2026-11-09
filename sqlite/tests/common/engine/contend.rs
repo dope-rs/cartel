@@ -13,6 +13,7 @@ pub const COMMANDS: &[&str] = &["CREATE TABLE IF NOT EXISTS items (id INTEGER PR
 
 statements! {
     INSERT_ITEM(1, 0) = "INSERT INTO items (id) VALUES (?1)",
+    INSERT_RETURNING(1, 1) = "INSERT INTO items (id) VALUES (?1) RETURNING id",
     COUNT_ITEMS(0, 1) = "SELECT count(*) FROM items",
 }
 
@@ -100,6 +101,10 @@ impl<'app> Blocker<'app> {
 
     pub fn commit(&mut self) -> Result<(), Error> {
         self.exec(c"COMMIT")
+    }
+
+    pub fn read(&mut self) -> Result<(), Error> {
+        self.exec(c"BEGIN; SELECT id FROM items")
     }
 
     fn exec(&mut self, sql: &ffi::CStr) -> Result<(), Error> {

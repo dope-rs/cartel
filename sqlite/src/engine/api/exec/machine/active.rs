@@ -27,10 +27,11 @@ impl<'query, 'connection, 'd, P, A: Access> Active<'query, 'connection, 'd, P, A
 
     pub(in crate::engine::api::exec) fn poll(
         &mut self,
+        retry: bool,
         context: pin::Pin<&mut context::Context<'_, 'd>>,
     ) -> task::Poll<result::Result<stmt::Step, crate::Error>> {
         self.state
-            .poll(self.bound.prepared(), &self.access, context)
+            .poll(self.bound.prepared(), &self.access, retry, context)
     }
 
     pub(in crate::engine::api::exec) fn config(&self) -> &config::Config {
@@ -64,7 +65,7 @@ impl<'query, 'connection, 'd, P, A: Access> Active<'query, 'connection, 'd, P, A
             }
             (Err(error), Ok(())) => Err(error),
             (Err(error), Err(reset)) => {
-                self.defer(reset);
+                drop(self.state.defer(reset));
                 Err(error)
             }
         }
@@ -72,15 +73,8 @@ impl<'query, 'connection, 'd, P, A: Access> Active<'query, 'connection, 'd, P, A
 
     pub(in crate::engine::api::exec) fn cancel(mut self) {
         if let Err(error) = self.state.reset(&mut self.bound, &self.access) {
-            self.defer(error);
+            drop(self.state.defer(error));
         }
-    }
-
-    /// Preserves native reset, parameter release, meter finish, then retry finish.
-    fn defer(self, error: crate::Error) {
-        let deferred = self.state.defer(error);
-        drop(self.bound);
-        drop(deferred);
     }
 }
 

@@ -16,8 +16,7 @@ impl Assign {
         body: &syn::Expr,
         row_var: &syn::Ident,
         scope: &pred::RowScope<'_>,
-        params: &[syn::Ident],
-        types: &[syn::Type],
+        params: &[backend::Param],
         dialect: &backend::Dialect,
         cte_map: &collections::BTreeMap<String, syn::Path>,
     ) -> syn::Result<Vec<Self>> {
@@ -50,13 +49,13 @@ impl Assign {
                         ));
                     }
                     assigns.push(Self::parse_single(
-                        expr, row_var, scope, params, types, dialect, cte_map,
+                        expr, row_var, scope, params, dialect, cte_map,
                     )?);
                 }
                 Ok(assigns)
             }
             single => Ok(vec![Self::parse_single(
-                single, row_var, scope, params, types, dialect, cte_map,
+                single, row_var, scope, params, dialect, cte_map,
             )?]),
         }
     }
@@ -65,8 +64,7 @@ impl Assign {
         expr: &syn::Expr,
         row_var: &syn::Ident,
         scope: &pred::RowScope<'_>,
-        params: &[syn::Ident],
-        types: &[syn::Type],
+        params: &[backend::Param],
         dialect: &backend::Dialect,
         cte_map: &collections::BTreeMap<String, syn::Path>,
     ) -> syn::Result<Self> {
@@ -91,8 +89,8 @@ impl Assign {
             )
         })?;
         let value = scope
-            .parse(right, Some(params), types, dialect, cte_map)?
-            .required(syn::Error::new(
+            .parse(right, Some(params), dialect, cte_map)?
+            .ok_or_else(|| syn::Error::new(
                 right.span(),
                 "right side of assignment must be a fn-parameter, literal, or arithmetic/function expression",
             ))?;

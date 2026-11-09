@@ -138,7 +138,6 @@ where
                     },
                 )
                 .expect("scoped PostgreSQL")
-                .ok()
                 .expect("application scope");
             assert!(
                 reports.events().expect("native reclamation").is_empty(),

@@ -12,11 +12,39 @@ pub const DATA_ROW: Frame<'static> = Frame::new(b'D', b"\0\x01\0\0\0\x011");
 #[derive(Debug)]
 pub enum Rejection<'a> {
     Protocol(Reason),
-    Number { kind: u8, error: &'a str },
+    Debug(&'a str),
 }
 
-pub const REPLIES: [(Frame<'static>, Option<Rejection<'static>>); 8] = [
+pub const REPLIES: [(Frame<'static>, Option<Rejection<'static>>); 14] = [
     (Frame::new(b'E', DIAGNOSTIC), None),
+    (
+        Frame::new(b'E', DIAGNOSTIC.split_at(b"Slocalized\0".len()).1),
+        None,
+    ),
+    (
+        Frame::new(b'E', b"Cinvalid\0\0"),
+        Some(Rejection::Protocol(Reason::DiagnosticSeverity)),
+    ),
+    (
+        Frame::new(b'E', b"V\0SERROR\0Cinvalid\0\0"),
+        Some(Rejection::Protocol(Reason::DiagnosticSeverity)),
+    ),
+    (
+        Frame::new(b'E', b"SERROR\0\0"),
+        Some(Rejection::Debug(
+            "DiagnosticSqlstateLength { actual: Length(0) }",
+        )),
+    ),
+    (
+        Frame::new(b'E', b"SERROR\0C23505\0\0"),
+        Some(Rejection::Protocol(Reason::DiagnosticMessage)),
+    ),
+    (
+        Frame::new(b'E', b"SERROR\0C23505\0Mduplicate\0P1\0P\0\0"),
+        Some(Rejection::Protocol(Reason::DuplicateDiagnostic {
+            kind: b'P',
+        })),
+    ),
     (
         Frame::new(b'E', DUPLICATE),
         Some(Rejection::Protocol(Reason::DuplicateDiagnostic {
@@ -40,30 +68,27 @@ pub const REPLIES: [(Frame<'static>, Option<Rejection<'static>>); 8] = [
     ),
     (
         Frame::new(b'E', b"SERROR\0C23505\0Mdigit\0L12x\0\0"),
-        Some(Rejection::Number {
-            kind: b'L',
-            error: "Invalid { offset: Offset(2), byte: 120 }",
-        }),
+        Some(Rejection::Debug(
+            "DiagnosticPosition { kind: 76, error: Invalid { offset: Offset(2), byte: 120 } }",
+        )),
     ),
     (
         Frame::new(b'E', b"SERROR\0C23505\0Maddition\0P4294967296\0\0"),
-        Some(Rejection::Number {
-            kind: b'P',
-            error: "Overflow { offset: Offset(9), byte: 54 }",
-        }),
+        Some(Rejection::Debug(
+            "DiagnosticPosition { kind: 80, error: Overflow { offset: Offset(9), byte: 54 } }",
+        )),
     ),
     (
         Frame::new(b'E', b"SERROR\0C23505\0Mmultiplication\0p4294967300\0\0"),
-        Some(Rejection::Number {
-            kind: b'p',
-            error: "Overflow { offset: Offset(9), byte: 48 }",
-        }),
+        Some(Rejection::Debug(
+            "DiagnosticPosition { kind: 112, error: Overflow { offset: Offset(9), byte: 48 } }",
+        )),
     ),
 ];
 
 pub fn reply(socket: &mut &peer::Stream<'_>, frame: Frame<'_>) -> Result<(), Error> {
     socket.prepare()?;
-    Database::start(&mut *socket)?;
+    Database::start(socket)?;
     read_empty(socket, b'S')?;
     socket.write_all(&[frame.encode(), Frame::new(b'Z', b"I").encode()].concat())?;
     socket.read_closed()
@@ -197,7 +222,7 @@ impl<'a> Listener<'a> for peer::TcpAcceptor<'a> {
     }
 
     fn group_settle(&self) -> Result<(), SettleError> {
-        let mut stream = self
+        let stream = self
             .accept_within(Duration::from_secs(1))
             .map_err(SettleError::Connect)?;
         stream
@@ -205,7 +230,7 @@ impl<'a> Listener<'a> for peer::TcpAcceptor<'a> {
             .map_err(Error::Io)
             .map_err(SettleError::Startup)?;
         Database::start(&stream).map_err(SettleError::Startup)?;
-        read_empty(&mut stream, b'S').map_err(SettleError::Begin)?;
+        read_empty(&stream, b'S').map_err(SettleError::Begin)?;
         stream
             .write_all(
                 &[
@@ -217,7 +242,7 @@ impl<'a> Listener<'a> for peer::TcpAcceptor<'a> {
             .map_err(Error::Io)
             .map_err(SettleError::Begin)?;
 
-        read_empty(&mut stream, b'S').map_err(SettleError::Group)?;
+        read_empty(&stream, b'S').map_err(SettleError::Group)?;
         stream
             .write_all(
                 &[
@@ -230,7 +255,7 @@ impl<'a> Listener<'a> for peer::TcpAcceptor<'a> {
             .map_err(SettleError::Group)?;
         stream.read_closed().map_err(SettleError::Close)?;
 
-        let mut stream = self
+        let stream = self
             .accept_within(Duration::from_secs(1))
             .map_err(SettleError::Reconnect)?;
         stream
@@ -238,7 +263,7 @@ impl<'a> Listener<'a> for peer::TcpAcceptor<'a> {
             .map_err(Error::Io)
             .map_err(SettleError::Restart)?;
         Database::start(&stream).map_err(SettleError::Restart)?;
-        read_empty(&mut stream, b'S').map_err(SettleError::Command)?;
+        read_empty(&stream, b'S').map_err(SettleError::Command)?;
         stream
             .write_all(
                 &[
@@ -256,7 +281,7 @@ impl<'a> Listener<'a> for peer::TcpAcceptor<'a> {
         let mut stream = self.accept_within(Duration::from_secs(1))?;
         stream.try_start(None)?;
 
-        read_empty(&mut stream, b'S')?;
+        read_empty(&stream, b'S')?;
         let reply = [
             Frame::new(b'C', b"SELECT 1\0").encode(),
             Frame::new(b'A', b"\0\0\0\x01settlement\0complete\0").encode(),
@@ -264,7 +289,7 @@ impl<'a> Listener<'a> for peer::TcpAcceptor<'a> {
         .concat();
         stream.write_all(&reply)?;
 
-        read_empty(&mut stream, b'S')?;
+        read_empty(&stream, b'S')?;
         let response = [
             Frame::new(b'E', b"SERROR\0C23505\0Mlate sync\0\0").encode(),
             Frame::new(b'Z', b"I").encode(),
@@ -279,7 +304,7 @@ impl<'a> Listener<'a> for peer::TcpAcceptor<'a> {
     fn finalizer(&self) -> Result<(), Error> {
         let mut stream = self.accept_within(Duration::from_secs(1))?;
         stream.try_start(None)?;
-        read_empty(&mut stream, b'S')?;
+        read_empty(&stream, b'S')?;
         stream.write_all(
             &[
                 Frame::new(b'C', b"BEGIN\0").encode(),
@@ -287,7 +312,7 @@ impl<'a> Listener<'a> for peer::TcpAcceptor<'a> {
             ]
             .concat(),
         )?;
-        read_empty(&mut stream, b'S')?;
+        read_empty(&stream, b'S')?;
         stream.write_all(
             &[
                 Frame::new(b'E', b"SERROR\0VERROR\0C23505\0Mfinish rejected\0\0").encode(),
@@ -299,7 +324,7 @@ impl<'a> Listener<'a> for peer::TcpAcceptor<'a> {
 
         let mut stream = self.accept_within(Duration::from_secs(1))?;
         stream.try_start(None)?;
-        read_empty(&mut stream, b'S')?;
+        read_empty(&stream, b'S')?;
         stream.write_all(
             &[
                 Frame::new(b'C', b"SELECT 1\0").encode(),
@@ -314,7 +339,7 @@ impl<'a> Listener<'a> for peer::TcpAcceptor<'a> {
         let mut stream = self.accept_within(Duration::from_secs(1))?;
         stream.try_start(None)?;
         for _ in 0..2 {
-            read_empty(&mut stream, b'd')?;
+            read_empty(&stream, b'd')?;
             let rejected = [
                 Frame::new(b'E', b"SERROR\0C42P01\0Mmissing copy relation\0\0").encode(),
                 Frame::new(b'A', b"\0\0\0\x01copy\0rejected\0").encode(),
@@ -324,7 +349,7 @@ impl<'a> Listener<'a> for peer::TcpAcceptor<'a> {
             stream.read_closed()?;
             stream = self.accept_within(Duration::from_secs(1))?;
             stream.try_start(None)?;
-            read_empty(&mut stream, b'S')?;
+            read_empty(&stream, b'S')?;
             let reply = [
                 Frame::new(b'C', b"SELECT 1\0").encode(),
                 Frame::new(b'Z', b"I").encode(),
@@ -370,12 +395,12 @@ impl<'a> Listener<'a> for peer::TcpAcceptor<'a> {
         let mut first = self.accept_within(Duration::from_secs(1))?;
         first.try_start(None)?;
         for _ in 0..initial {
-            read_empty(&mut first, b'S')?;
+            read_empty(&first, b'S')?;
         }
 
         let mut second = self.accept_within(Duration::from_secs(1))?;
         second.try_start(None)?;
-        read_empty(&mut second, b'S')?;
+        read_empty(&second, b'S')?;
         let response = [
             Frame::new(b'C', b"SELECT 1\0").encode(),
             Frame::new(b'Z', b"I").encode(),

@@ -117,7 +117,6 @@ impl Null<'_> {
         if !scope.parse_into(
             &syntax.receiver,
             None,
-            context.param_tys,
             context.dialect,
             context.cte_map,
             sql,

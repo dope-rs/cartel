@@ -102,7 +102,7 @@ pub fn serve(
 ) {
     let mut peers: Vec<_> = (0..connections)
         .map(|_| {
-            let mut socket = Listener::accept_within(listener, Duration::from_secs(10))
+            let socket = Listener::accept_within(listener, Duration::from_secs(10))
                 .expect("peer connection");
             socket.set_nodelay(true).expect("TCP_NODELAY");
             socket
@@ -111,9 +111,9 @@ pub fn serve(
             socket
                 .write_wait(Some(Duration::from_secs(10)))
                 .expect("write timeout");
-            let startup = read(&mut socket, None);
+            let startup = read(&socket, None);
             assert_eq!(&startup[..4], &196608_u32.to_be_bytes());
-            try_auth(&mut socket, 10, b"SCRAM-SHA-256\0\0").expect("authentication message");
+            try_auth(&socket, 10, b"SCRAM-SHA-256\0\0").expect("authentication message");
             socket
         })
         .collect();

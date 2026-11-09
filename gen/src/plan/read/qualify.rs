@@ -14,7 +14,7 @@ pub(in crate::plan) struct Qualify {
 
 pub(in crate::plan) enum Integer {
     Literal(proc_macro2::TokenStream),
-    Param(syn::Ident),
+    Param(backend::Capture),
 }
 
 struct Clause {
@@ -46,8 +46,8 @@ impl Qualify {
                 .reject("row locking is not supported with DISTINCT")?;
         }
         let lock = quals.lock.try_render(state.dialect)?;
-        let limit = Limit::new(&quals.limit, end, state.fn_params)?;
-        let offset = Offset::new(&quals.offset, state.fn_params)?;
+        let limit = Limit::new(&quals.limit, end, state.params)?;
+        let offset = Offset::new(&quals.offset, state.params)?;
         let mut clauses = Vec::with_capacity(quals.order_by.len());
         for clause in &quals.order_by {
             clauses.push(Clause::new(state, clause, parent)?);
@@ -74,8 +74,8 @@ impl Qualify {
                 "DISTINCT qualifiers are not supported on set-operation queries",
             ));
         }
-        let limit = Limit::new(&quals.limit, Some(end), state.fn_params)?;
-        let offset = Offset::new(&quals.offset, state.fn_params)?;
+        let limit = Limit::new(&quals.limit, Some(end), state.params)?;
+        let offset = Offset::new(&quals.offset, state.params)?;
         Ok(Self {
             clauses: Vec::new(),
             limit,
@@ -117,7 +117,7 @@ impl Integer {
         )
     }
 
-    pub(in crate::plan) fn parse(expr: &syn::Expr, params: &[syn::Ident]) -> syn::Result<Self> {
+    pub(in crate::plan) fn parse(expr: &syn::Expr, params: &[backend::Param]) -> syn::Result<Self> {
         if let syn::Expr::Lit(literal) = expr {
             let syn::ExprLit { attrs, lit } = literal;
             if let Some(attr) = attrs.first() {
@@ -155,13 +155,16 @@ impl Integer {
                 }
             }
             let id = &segment.ident;
-            if !params.iter().any(|param| param.unraw() == id.unraw()) {
+            let Some(index) = params
+                .iter()
+                .position(|(param, _)| param.unraw() == id.unraw())
+            else {
                 return Err(syn::Error::new(
                     id.span(),
                     format!("`{id}` is not a fn parameter"),
                 ));
-            }
-            return Ok(Self::Param(id.clone()));
+            };
+            return Ok(Self::Param((index, id.span())));
         }
         Err(Self::invalid(expr.span()))
     }
@@ -173,15 +176,10 @@ impl Integer {
     ) -> proc_macro2::TokenStream {
         match self {
             Self::Literal(value) => value,
-            Self::Param(id) => {
-                let idx = pred::sql::intern(&mut state.captures, id.clone());
-                state.mark_nonneg(id, bound);
-                let ctx = backend::ParamCtx {
-                    captures: &state.captures,
-                    param_ids: state.fn_params,
-                    param_tys: state.param_tys,
-                };
-                state.dialect.placeholder(idx, &ctx)
+            Self::Param(capture) => {
+                let idx = pred::sql::intern(&mut state.captures, capture);
+                state.mark_nonneg(capture.0, bound);
+                state.dialect.placeholder(idx, &state.params[capture.0].1)
             }
         }
     }
@@ -191,7 +189,7 @@ impl Limit {
     fn new(
         bound: &bound::Bound,
         end: Option<shape::Terminator>,
-        params: &[syn::Ident],
+        params: &[backend::Param],
     ) -> syn::Result<Self> {
         match bound {
             bound::Bound::Expr(expr) => Ok(Self::Value(Integer::parse(expr, params)?)),
@@ -221,7 +219,7 @@ impl Limit {
 }
 
 impl Offset {
-    fn new(bound: &bound::Bound, params: &[syn::Ident]) -> syn::Result<Self> {
+    fn new(bound: &bound::Bound, params: &[backend::Param]) -> syn::Result<Self> {
         match bound {
             bound::Bound::None => Ok(Self::None),
             bound::Bound::Expr(expr) => Ok(Self::Value(Integer::parse(expr, params)?)),
@@ -252,14 +250,12 @@ impl Clause {
             ));
         };
         let scope = pred::RowScope::for_order(parent, &closure.inputs)?;
-        let sql = state.parse(
-            &scope,
-            &closure.body,
+        let sql = state.parse(&scope, &closure.body, || {
             syn::Error::new(
                 closure.body.span(),
                 "`.order_by(...)` body must be a column / arithmetic / function expression",
-            ),
-        )?;
+            )
+        })?;
         Ok(Self {
             sql,
             dir: clause.dir,

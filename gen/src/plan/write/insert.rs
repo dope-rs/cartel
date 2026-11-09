@@ -54,8 +54,7 @@ fn insert(
         body,
         arg,
         &pred::RowScope::single(arg.clone()),
-        state.fn_params,
-        state.param_tys,
+        state.params,
         state.dialect,
         &state.cte_map,
     )?;
@@ -120,8 +119,7 @@ pub(in crate::plan) fn from(
         body,
         target,
         &scope,
-        state.fn_params,
-        state.param_tys,
+        state.params,
         state.dialect,
         &state.cte_map,
     )?;

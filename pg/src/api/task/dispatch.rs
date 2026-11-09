@@ -191,11 +191,7 @@ impl<'d> Budget<'d> {
             return Poll::Ready(deadline::Elapsed::new(phase));
         }
         let wake = ctx.as_ref().completion();
-        if !alarm.is_armed() {
-            alarm.arm(due, wake);
-            return Poll::Pending;
-        }
-        if alarm.poll(now, wake).is_ready() {
+        if alarm.poll_or_arm(due, now, wake).is_ready() {
             self.state = BudgetState::Elapsed;
             Poll::Ready(deadline::Elapsed::new(phase))
         } else {

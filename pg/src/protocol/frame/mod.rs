@@ -1,4 +1,4 @@
-use o3::buffer::{self, bytes::bounded, hold, hold::scope, resident};
+use o3::buffer::{self, bytes::bounded, hold, hold::scope};
 
 use crate::protocol::Wire;
 
@@ -20,10 +20,6 @@ pub struct Message<'input, 'd, R: buffer::Cursor> {
 #[repr(transparent)]
 pub struct Payload<'input, 'd, R: buffer::Cursor>(scope::Deferred<'input, 'd, R>);
 
-/// Immutable retained bytes carrying their original frame's extent admission.
-#[repr(transparent)]
-pub(crate) struct Retained<'d>(hold::Retained<'d>);
-
 impl<'input, 'd, R: buffer::Cursor> Payload<'input, 'd, R> {
     pub fn as_slice(&self) -> &'input [u8] {
         self.0.as_slice()
@@ -41,31 +37,6 @@ impl<'input, 'd, R: buffer::Cursor> Payload<'input, 'd, R> {
     pub(crate) fn into_inner(self) -> scope::Deferred<'input, 'd, R> {
         self.0
     }
-
-    pub(crate) fn try_retain(
-        self,
-        policy: hold::Policy,
-    ) -> Result<Retained<'d>, (Self, hold::Error)>
-    where
-        R: hold::raw::Retain<'d>,
-    {
-        self.0
-            .bind(policy)
-            .try_retain()
-            .map(Retained)
-            .map_err(|(payload, error)| (Self(payload.defer()), error))
-    }
-}
-
-impl Retained<'_> {
-    pub(crate) fn wire(&self) -> Wire<'_> {
-        // SAFETY: retention preserves the same admitted payload's bytes and extent.
-        Wire::from_raw(unsafe { bounded::raw::Input::new(self.0.as_slice()) })
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.0.as_slice().len()
-    }
 }
 
 const _: () = {
@@ -73,5 +44,4 @@ const _: () = {
         size_of::<Payload<'static, 'static, buffer::storage::Shared>>()
             == size_of::<scope::Deferred<'static, 'static, buffer::storage::Shared>>()
     );
-    assert!(size_of::<Retained<'static>>() == size_of::<resident::Shared<'static>>());
 };

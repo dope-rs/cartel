@@ -148,14 +148,12 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         params: [Q::Params<'_>; N],
     ) -> impl abi::Fiber<
         'd,
-        Output = Result<
-            [results::Row<<Self::Results as Storage>::Payload, Q>; N],
-            results::GroupFailure<
-                results::Row<<Self::Results as Storage>::Payload, Q>,
-                Error<'d, ID>,
-                <Self::Results as Storage>::Diagnostics,
-                N,
-            >,
+        Output = results::GroupResult<
+            'd,
+            results::Row<<Self::Results as Storage>::Payload, Q>,
+            <Self::Results as Storage>::Diagnostics,
+            N,
+            ID,
         >,
     > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, N>
     where
@@ -163,10 +161,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        abi::Map::new(
-            self.client.group::<Q, N>(self.target, params),
-            results::GroupFailure::required::<Q>,
-        )
+        self.client.group::<Q, N>(self.target, params)
     }
 
     fn run_first<Q>(

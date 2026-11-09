@@ -9,7 +9,7 @@ use o3::buffer::{
 use crate::{port::backend::wire::Payload, protocol::messages::Fe};
 
 pub(crate) struct Storage {
-    pool: pool::Pool<state::Initialized, owners::Plain<pool::Width<16>>>,
+    pool: pool::Pool<state::Uninit, owners::Plain<pool::Width<16>>>,
     slots: NonZero<usize>,
 }
 

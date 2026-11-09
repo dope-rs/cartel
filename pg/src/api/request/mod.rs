@@ -2,7 +2,6 @@ pub(in crate::api) mod stateful;
 
 use crate::api::{sql, tx};
 use crate::{api, port, protocol, schema};
-use api::task::group;
 use port::requests;
 use protocol::encode;
 
@@ -238,7 +237,10 @@ impl<'d> Pending<'d> {
     pub(in crate::api) fn group<'app, 'g, 'r, 's, 'b, 'c, Q, I, const ID: u8, const N: usize>(
         port: &'app port::Port<'app, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
         params: [Q::Params<'_>; N],
-    ) -> Result<Pending<'d, group::Ready<'g, 'r, 's, 'b, 'c, 'd, N>>, crate::Error>
+    ) -> Result<
+        Pending<'d, crate::port::replies::groups::Draft<'g, 'r, 's, 'b, 'c, 'd>>,
+        crate::Error,
+    >
     where
         Q: schema::TypedQuery,
         I: schema::QuerySet,
@@ -251,7 +253,7 @@ impl<'d> Pending<'d> {
             .diagnostics
             .as_ref()
             .ok_or(crate::Error::GroupDisabled)?;
-        let ready = group::Ready::new(access)?;
+        let ready = access.prepare()?;
         let frame = port.request().encode(|frame| {
             let query = schema::QueryMeta::validate::<Q>()?;
             for params in params {

@@ -10,7 +10,6 @@ use o3::{
         arena::pool::{Shared, Unique, recycle, shared},
         capacity,
     },
-    mem::rc,
 };
 
 use crate::{
@@ -18,8 +17,6 @@ use crate::{
     port::config::{Error, Groups},
     reply::{self, group},
 };
-
-use crate::reply::group::Resolution;
 
 pub(crate) struct Active<'r, 's> {
     records: Unique<'r, group::Records<'s>>,
@@ -33,13 +30,13 @@ pub(crate) struct State<'r, 's, 'b, 'c, 'd> {
 }
 
 type Header<'r, 's, 'b, 'c, 'd> = shared::Header<State<'r, 's, 'b, 'c, 'd>>;
-pub(crate) struct Owner<'g, 'r, 's, 'b, 'c, 'd> {
-    state: Shared<'g, State<'r, 's, 'b, 'c, 'd>>,
-}
+pub(crate) type Owner<'g, 'r, 's, 'b, 'c, 'd> = Shared<'g, State<'r, 's, 'b, 'c, 'd>>;
 
 /// The sole admission authority for a newly initialized, unpublished collector.
-#[repr(transparent)]
-pub(crate) struct Draft<'g, 'r, 's, 'b, 'c, 'd>(Owner<'g, 'r, 's, 'b, 'c, 'd>);
+pub(crate) struct Draft<'g, 'r, 's, 'b, 'c, 'd> {
+    owner: Owner<'g, 'r, 's, 'b, 'c, 'd>,
+    sync: Owner<'g, 'r, 's, 'b, 'c, 'd>,
+}
 
 pub(crate) struct Access<'g, 'r, 's, 'b, 'c, 'd> {
     bytes: pool::Pool,
@@ -78,19 +75,21 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Access<'g, 'r, 's, 'b, 'c, 'd> {
             .ok_or(crate::Error::GroupBytesCapacity)?;
         records.get_mut().get_mut().clear();
         let active = Cell::new(Some(Active { records, bytes }));
-        Ok(Draft(Owner {
-            state: owner.reserve().commit(State {
+        let (owner, sync) = owner
+            .reserve()
+            .begin(State {
                 limits: self.limits,
                 active,
                 reservation: Cell::new(None),
-            }),
-        }))
+            })
+            .freeze_pair();
+        Ok(Draft { owner, sync })
     }
 }
 
 impl<'g, 'r, 's, 'b, 'c, 'd> Draft<'g, 'r, 's, 'b, 'c, 'd> {
     pub(crate) fn usage(&self) -> usage::Usage {
-        let (records, bytes) = self.0.state.limits;
+        let (records, bytes) = self.owner.limits;
         usage::Usage::new(
             usage::Bytes::new(bytes.get()),
             usage::Values::new(records.get()),
@@ -100,43 +99,32 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Draft<'g, 'r, 's, 'b, 'c, 'd> {
     pub(crate) fn admit(
         self,
         permit: retain::Reservation<'b, 'c, 'd>,
-    ) -> Owner<'g, 'r, 's, 'b, 'c, 'd> {
-        self.0.state.reservation.set(Some(permit));
-        self.0
-    }
-
-    /// Clones are retained privately by the pending API attachment until admission.
-    pub(crate) fn try_clone(&self) -> Result<Owner<'g, 'r, 's, 'b, 'c, 'd>, rc::Error> {
-        self.0.try_clone()
+    ) -> (Owner<'g, 'r, 's, 'b, 'c, 'd>, Owner<'g, 'r, 's, 'b, 'c, 'd>) {
+        self.owner.reservation.set(Some(permit));
+        (self.owner, self.sync)
     }
 }
 
-impl<'g, 'r, 's, 'b, 'c, 'd> Owner<'g, 'r, 's, 'b, 'c, 'd> {
-    pub(crate) fn try_clone(&self) -> Result<Self, rc::Error> {
-        Ok(Self {
-            state: self.state.try_clone()?,
-        })
-    }
-
+impl<'r, 's, 'b, 'c, 'd> State<'r, 's, 'b, 'c, 'd> {
     pub(crate) fn record<R: buffer::Cursor>(
         &self,
         position: Position,
         plan: reply::Plan<'_, 'd, R>,
     ) -> Result<(), crate::Error> {
-        let Some(mut active) = self.state.active.take() else {
+        let Some(mut active) = self.active.take() else {
             return Ok(());
         };
-        let result = active.record(position, plan, self.state.limits.0);
-        self.state.active.set(Some(active));
+        let result = active.record(position, plan, self.limits.0);
+        self.active.set(Some(active));
         result
     }
 
     pub(crate) fn snapshot(&self) -> group::Ledger<'r, 's> {
-        let Some(active) = self.state.active.take() else {
+        let Some(active) = self.active.take() else {
             return group::Ledger::empty();
         };
         let Active { records, bytes } = active;
-        drop(self.state.reservation.take());
+        drop(self.reservation.take());
         if records.get().get_ref().len() == 0 {
             return group::Ledger::empty();
         }
@@ -148,13 +136,13 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Owner<'g, 'r, 's, 'b, 'c, 'd> {
         }
     }
 
-    pub(crate) fn resolve(&self, position: Position) -> Resolution {
-        let Some(mut active) = self.state.active.take() else {
-            return Resolution::Unchanged;
-        };
-        let resolved = active.records.get_mut().get_mut().resolve(position);
-        self.state.active.set(Some(active));
-        resolved
+    pub(crate) fn resolve(&self, position: Position) -> bool {
+        // SAFETY: no active borrow escapes this thread-bound owner. Resolution
+        // only mutates its records and invokes no user code or drop.
+        let active = unsafe { &mut *self.active.as_ptr() };
+        active
+            .as_mut()
+            .is_some_and(|active| active.records.get_mut().get_mut().resolve(position))
     }
 }
 

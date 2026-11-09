@@ -5,10 +5,9 @@ use syn::visit::{self, Visit as _};
 use syn::visit_mut::{self, VisitMut as _};
 
 /// Both SQL planning and the Rust proof consume this same lowered block.
-pub(super) fn lower(block: &syn::Block, params: &[syn::Ident]) -> syn::Result<syn::Block> {
-    let mut names = Names(params.iter().map(crate::ext::name).collect());
-    names.visit_block(block);
-    let mut block = block.clone();
+pub(super) fn lower(mut block: syn::Block, params: &[super::Param]) -> syn::Result<syn::Block> {
+    let mut names = Names(params.iter().map(|(id, _)| crate::ext::name(id)).collect());
+    names.visit_block(&block);
     for stmt in &mut block.stmts {
         let expr = match stmt {
             syn::Stmt::Expr(expr, _) => expr,

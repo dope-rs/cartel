@@ -72,9 +72,10 @@ fn missing_keeps_rows() {
                                 assert!(failure.sync_error().is_none());
                                 assert!(matches!(failure.outcomes(), [
                                     Outcome::Completed(first),
-                                    Outcome::Failed(reply::Error::Driver(cartel_pg::Error::NotFound)),
+                                    Outcome::Failed(error),
                                     Outcome::Completed(last),
-                                ] if first.decode().expect("first row").lease == 3
+                                ] if matches!(error.kind(), reply::Kind::Driver(cartel_pg::Error::NotFound))
+                                    && first.decode().expect("first row").lease == 3
                                     && last.decode().expect("last row").lease == 7));
                             })
                         })

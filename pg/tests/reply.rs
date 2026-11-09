@@ -1,6 +1,6 @@
 use crate::common::topology;
 use cartel_pg::api::traits::{Client as _, Query as _, Status as _, Stream as _, Unchecked as _};
-use cartel_pg::{port, protocol::Reason, reply::owned};
+use cartel_pg::{port, reply::owned};
 use common::postgres::{accept, startup::Stream as _};
 use dope::{
     core::{
@@ -257,15 +257,7 @@ fn request_errors() {
                 .expect("invalid response must preserve its protocol reason");
                 match expected {
                     accept::Rejection::Protocol(reason) => assert_eq!(*actual, reason),
-                    accept::Rejection::Number { kind, error } => {
-                        let (tag, number) = match actual {
-                            Reason::DiagnosticPosition { kind, error } => Some((*kind, *error)),
-                            _ => None,
-                        }
-                        .expect("numeric diagnostic");
-                        assert_eq!(tag, kind);
-                        assert_eq!(format!("{number:?}"), error);
-                    }
+                    accept::Rejection::Debug(error) => assert_eq!(format!("{actual:?}"), error),
                 }
                 assert_eq!(alloc, 0, "driver errors must not allocate while escaping");
             }

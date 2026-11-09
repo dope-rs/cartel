@@ -159,7 +159,6 @@ pub(crate) struct Permit<'a, 'd, const ID: u8> {
     slot: &'a Slot<'d, ID>,
     next: Sync,
     current: replies::Batch,
-    boundary: requests::Boundary,
 }
 
 impl<'a, 'd, const ID: u8> Permit<'a, 'd, ID> {
@@ -167,8 +166,8 @@ impl<'a, 'd, const ID: u8> Permit<'a, 'd, ID> {
         self.slot
     }
 
-    pub(in crate::port) const fn parts(&self) -> (replies::Batch, requests::Boundary) {
-        (self.current, self.boundary)
+    pub(in crate::port) const fn batch(&self) -> replies::Batch {
+        self.current
     }
 
     /// Publication admits an order, or an existing automatic/COPY order owns its Sync.
@@ -178,18 +177,12 @@ impl<'a, 'd, const ID: u8> Permit<'a, 'd, ID> {
         let unchanged =
             !matches!(self.next, Sync::Synced) || matches!(self.slot.sync.get(), Sync::Synced);
         self.slot.sync.set(self.next);
-        match self.boundary {
-            requests::Boundary::Close
-            | requests::Boundary::Begin
-            | requests::Boundary::Commit
-            | requests::Boundary::Group => {
-                self.slot.batch.set(self.current.next());
-                let count = self.slot.pending.get().get() + 1;
-                // SAFETY: consumed Sync admission retains at most one pending Sync
-                // per live order plus the single currently parsed Sync.
-                self.slot.pending.set(unsafe { bounded::raw::u32(count) });
-            }
-            requests::Boundary::Open | requests::Boundary::External => {}
+        if matches!(self.next, Sync::Synced) {
+            self.slot.batch.set(self.current.next());
+            let count = self.slot.pending.get().get() + 1;
+            // SAFETY: consumed Sync admission retains at most one pending Sync
+            // per live order plus the single currently parsed Sync.
+            self.slot.pending.set(unsafe { bounded::raw::u32(count) });
         }
         unchanged
     }
@@ -216,7 +209,7 @@ impl<'a, 'd, const ID: u8> Ready<'a, 'd, ID> {
         boundary: requests::Boundary,
     ) -> Result<Permit<'a, 'd, ID>, crate::Error> {
         let next = self.slot.sync.get().try_next(boundary)?;
-        Ok(self.slot.permit(next, boundary))
+        Ok(self.slot.permit(next))
     }
 
     pub(crate) fn try_finish(self) -> Result<Permit<'a, 'd, ID>, crate::Error> {
@@ -227,7 +220,7 @@ impl<'a, 'd, const ID: u8> Ready<'a, 'd, ID> {
                 return Err(crate::Error::CopyFinishDuringPipeline { depth });
             }
         }
-        Ok(self.slot.permit(Sync::Synced, requests::Boundary::Close))
+        Ok(self.slot.permit(Sync::Synced))
     }
 
     pub(crate) fn wake(self) {
@@ -459,15 +452,14 @@ impl<'d, const ID: u8> Slot<'d, ID> {
         if bound.token != token || !matches!(self.sync.get(), Sync::Automatic(_)) {
             return Flush::Idle;
         }
-        Flush::Pending(self.permit(Sync::Synced, requests::Boundary::Close))
+        Flush::Pending(self.permit(Sync::Synced))
     }
 
-    fn permit(&self, next: Sync, boundary: requests::Boundary) -> Permit<'_, 'd, ID> {
+    fn permit(&self, next: Sync) -> Permit<'_, 'd, ID> {
         Permit {
             slot: self,
             next,
             current: self.batch.get(),
-            boundary,
         }
     }
 }
