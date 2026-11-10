@@ -2,6 +2,7 @@ pub(in crate::api) mod stateful;
 
 use crate::api::{sql, tx};
 use crate::{api, port, protocol, schema};
+use o3::buffer::write::Sink as _;
 use port::requests;
 use protocol::encode;
 
@@ -50,57 +51,57 @@ impl Sql<'_> {
                 if let Some(position) = sql.bytes().position(|byte| byte == 0) {
                     return Err(encode::Error::StatementSqlNul { position });
                 }
-                out.extend(sql.as_bytes())?;
+                out.write_slice(sql.as_bytes())?;
             }
             Self::Begin(begin) => {
-                out.extend(b"BEGIN")?;
+                out.write_slice(b"BEGIN")?;
                 match begin.isolation {
                     tx::Isolation::Default => {}
                     tx::Isolation::ReadCommitted => {
-                        out.extend(b" ISOLATION LEVEL READ COMMITTED")?;
+                        out.write_slice(b" ISOLATION LEVEL READ COMMITTED")?;
                     }
                     tx::Isolation::RepeatableRead => {
-                        out.extend(b" ISOLATION LEVEL REPEATABLE READ")?;
+                        out.write_slice(b" ISOLATION LEVEL REPEATABLE READ")?;
                     }
                     tx::Isolation::Serializable => {
-                        out.extend(b" ISOLATION LEVEL SERIALIZABLE")?;
+                        out.write_slice(b" ISOLATION LEVEL SERIALIZABLE")?;
                     }
                 }
                 match begin.access {
                     tx::AccessMode::Default => {}
-                    tx::AccessMode::ReadWrite => out.extend(b" READ WRITE")?,
-                    tx::AccessMode::ReadOnly => out.extend(b" READ ONLY")?,
+                    tx::AccessMode::ReadWrite => out.write_slice(b" READ WRITE")?,
+                    tx::AccessMode::ReadOnly => out.write_slice(b" READ ONLY")?,
                 }
                 match begin.deferral {
                     tx::Deferral::Default => {}
-                    tx::Deferral::Deferred => out.extend(b" DEFERRABLE")?,
+                    tx::Deferral::Deferred => out.write_slice(b" DEFERRABLE")?,
                 }
             }
             Self::StatementTimeout(timeout) => {
-                out.extend(b"SET LOCAL statement_timeout TO ")?;
+                out.write_slice(b"SET LOCAL statement_timeout TO ")?;
                 out.write_u32(timeout.milliseconds())?;
             }
             Self::Quoted(cmd, name) => {
                 match cmd {
-                    Quoted::Savepoint => out.extend(b"SAVEPOINT \"")?,
+                    Quoted::Savepoint => out.write_slice(b"SAVEPOINT \"")?,
                     Quoted::ReleaseSavepoint => {
-                        out.extend(b"RELEASE SAVEPOINT \"")?;
+                        out.write_slice(b"RELEASE SAVEPOINT \"")?;
                     }
                     Quoted::RollbackToSavepoint => {
-                        out.extend(b"ROLLBACK TO SAVEPOINT \"")?;
+                        out.write_slice(b"ROLLBACK TO SAVEPOINT \"")?;
                     }
-                    Quoted::Listen => out.extend(b"LISTEN \"")?,
-                    Quoted::Unlisten => out.extend(b"UNLISTEN \"")?,
+                    Quoted::Listen => out.write_slice(b"LISTEN \"")?,
+                    Quoted::Unlisten => out.write_slice(b"UNLISTEN \"")?,
                 }
                 let mut parts = name.split('"');
                 if let Some(first) = parts.next() {
-                    out.extend(first.as_bytes())?;
+                    out.write_slice(first.as_bytes())?;
                 }
                 for part in parts.by_ref() {
-                    out.extend(b"\"\"")?;
-                    out.extend(part.as_bytes())?;
+                    out.write_slice(b"\"\"")?;
+                    out.write_slice(part.as_bytes())?;
                 }
-                out.push(b'"')?;
+                out.write_byte(b'"')?;
             }
         }
         Ok(())

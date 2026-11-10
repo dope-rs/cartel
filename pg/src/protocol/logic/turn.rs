@@ -9,7 +9,7 @@ use dope::{
 };
 use o3::{
     base::cell::region,
-    buffer::{self, hold},
+    buffer::{self, hold, write::Sink as _},
 };
 
 use crate::{
@@ -264,8 +264,8 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                             scram::Scram::new(&self.port.shared.scram, self.conn, |nonce| {
                                 let frame = self.port.request().control(|frame| {
                                     frame.sasl_first(mode.as_str(), |frame| {
-                                        frame.extend(b"n,,n=,r=")?;
-                                        frame.extend(nonce)
+                                        frame.write_slice(b"n,,n=,r=")?;
+                                        frame.write_slice(nonce)
                                     })
                                 })?;
                                 Self::enqueue(&self.sink, self.region, frame)

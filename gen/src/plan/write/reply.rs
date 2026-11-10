@@ -59,8 +59,8 @@ pub(in crate::plan) fn validate<'a>(
         Op::Delete => ("DELETE", "Delete"),
     };
     let output = shape::ReturnShape::parse(state.return_type);
-    Ok(match ret {
-        shape::Returning::None => {
+    Ok(match ret.expected() {
+        None => {
             if !output.is_unit() {
                 return Err(syn::Error::new(
                     state.return_type.span(),
@@ -76,42 +76,34 @@ pub(in crate::plan) fn validate<'a>(
                 dispatch: emit::Kind::NoRows,
             }
         }
-        kind => {
+        Some(kind) => {
             let shape::ReturnShape::Explicit(explicit) = output else {
                 return Err(syn::Error::new(
                     state.return_type.span(),
                     format!(
                         "{op} with `.returning_{}()` requires an explicit return type ({})",
-                        kind.suffix(),
-                        kind.expected().syntax(),
+                        kind.method(),
+                        kind.syntax(),
                     ),
                 ));
             };
             let actual = explicit.kind();
-            if actual != kind.expected() {
+            if actual != kind {
                 return Err(syn::Error::new(
                     explicit.row().span(),
                     format!(
                         "return type {} does not match `.returning_{}()`; expected {}",
                         actual.syntax(),
-                        kind.suffix(),
-                        kind.expected().syntax(),
+                        kind.method(),
+                        kind.syntax(),
                     ),
                 ));
             }
-            let (output, row, actual) = explicit.into_parts();
-            let dispatch = match actual {
-                shape::RowReturn::Plain => emit::Kind::One(row),
-                shape::RowReturn::Optional => emit::Kind::First(row),
-                shape::RowReturn::Many => emit::Kind::All(row),
-                shape::RowReturn::Stream => {
-                    return Err(syn::Error::new(row.span(), "invalid RETURNING output kind"));
-                }
-            };
+            let (output, row, kind) = explicit.into_parts();
             Output {
                 output,
                 cols: row::View::new(row).cols(),
-                dispatch,
+                dispatch: emit::Kind::rows(kind, row),
             }
         }
     })

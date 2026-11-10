@@ -286,21 +286,12 @@ impl Returning {
         })
     }
 
-    pub(super) fn expected(self) -> Return {
+    pub(super) fn expected(self) -> Option<Terminator> {
         match self {
-            Self::One => Return::Plain,
-            Self::First => Return::Optional,
-            Self::All => Return::Many,
-            Self::None => Return::Unit,
-        }
-    }
-
-    pub(super) fn suffix(&self) -> &str {
-        match self {
-            Self::None => "none",
-            Self::One => "one",
-            Self::First => "first",
-            Self::All => "all",
+            Self::One => Some(Terminator::One),
+            Self::First => Some(Terminator::First),
+            Self::All => Some(Terminator::All),
+            Self::None => None,
         }
     }
 }
@@ -324,7 +315,7 @@ pub(super) struct Update {
     pub(super) set_body: syn::Expr,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Terminator {
     One,
     First,
@@ -333,15 +324,6 @@ pub(super) enum Terminator {
 }
 
 impl Terminator {
-    pub(super) fn expected(self) -> Return {
-        match self {
-            Self::One => Return::Plain,
-            Self::First => Return::Optional,
-            Self::All => Return::Many,
-            Self::Stream => Return::Stream,
-        }
-    }
-
     pub(super) fn method(&self) -> &str {
         match self {
             Self::One => "one",
@@ -350,23 +332,12 @@ impl Terminator {
             Self::Stream => "stream",
         }
     }
-}
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Return {
-    Unit,
-    Plain,
-    Optional,
-    Many,
-    Stream,
-}
-impl Return {
     pub(super) fn syntax(&self) -> &str {
         match self {
-            Self::Unit => "()",
-            Self::Plain => "T",
-            Self::Optional => "Option<T>",
-            Self::Many => "Vec<T>",
+            Self::One => "T",
+            Self::First => "Option<T>",
+            Self::All => "Vec<T>",
             Self::Stream => "Stream<T>",
         }
     }
@@ -375,30 +346,12 @@ pub(super) struct Explicit<'a> {
     output: &'a syn::ReturnType,
     ty: &'a syn::Type,
     row: &'a syn::Type,
-    kind: RowReturn,
-}
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum RowReturn {
-    Plain,
-    Optional,
-    Many,
-    Stream,
-}
-
-impl RowReturn {
-    pub(super) fn kind(self) -> Return {
-        match self {
-            Self::Plain => Return::Plain,
-            Self::Optional => Return::Optional,
-            Self::Many => Return::Many,
-            Self::Stream => Return::Stream,
-        }
-    }
+    kind: Terminator,
 }
 
 impl<'a> Explicit<'a> {
-    pub(super) fn kind(&self) -> Return {
-        self.kind.kind()
+    pub(super) fn kind(&self) -> Terminator {
+        self.kind
     }
 
     pub(super) fn row(&self) -> &syn::Type {
@@ -417,7 +370,7 @@ impl<'a> Explicit<'a> {
         self.row = self.ty;
     }
 
-    pub(super) fn into_parts(self) -> (Cow<'a, syn::ReturnType>, &'a syn::Type, RowReturn) {
+    pub(super) fn into_parts(self) -> (Cow<'a, syn::ReturnType>, &'a syn::Type, Terminator) {
         (Cow::Borrowed(self.output), self.row, self.kind)
     }
 }
@@ -441,14 +394,14 @@ impl<'a> ReturnShape<'a> {
             && let syn::GenericArgument::Type(inner) = &args.args[0]
         {
             if seg.ident == "Option" {
-                (inner, RowReturn::Optional)
+                (inner, Terminator::First)
             } else if seg.ident == "Vec" {
-                (inner, RowReturn::Many)
+                (inner, Terminator::All)
             } else {
-                (inner, RowReturn::Stream)
+                (inner, Terminator::Stream)
             }
         } else {
-            (ty.as_ref(), RowReturn::Plain)
+            (ty.as_ref(), Terminator::One)
         };
         Self::Explicit(Explicit {
             output,

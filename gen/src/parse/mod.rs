@@ -25,7 +25,7 @@ impl shape::QueryShape {
                 if !top.args.is_empty() {
                     return Err(syn::Error::new(
                         top.args.span(),
-                        format!("`.returning_{}()` takes no arguments", ret.suffix()),
+                        format!("`.{method}()` takes no arguments"),
                     ));
                 }
                 return Self::parse(top.receiver.as_ref(), cte_map)?

@@ -16,7 +16,7 @@ use crate::plan::read::{Qualify, filter};
 struct Output<'a> {
     ty: std::borrow::Cow<'a, syn::ReturnType>,
     row: &'a syn::Type,
-    kind: shape::RowReturn,
+    kind: shape::Terminator,
 }
 
 struct Order {
@@ -79,17 +79,11 @@ pub(in crate::plan) fn build<'a>(
     sql.extend(qual.render(state));
 
     let cols = row::View::new(output.row).cols();
-    let dispatch = match output.kind {
-        shape::RowReturn::Plain => emit::Kind::One(output.row),
-        shape::RowReturn::Optional => emit::Kind::First(output.row),
-        shape::RowReturn::Many => emit::Kind::All(output.row),
-        shape::RowReturn::Stream => emit::Kind::Stream(output.row),
-    };
     Ok(emit::Plan {
         output: output.ty,
         sql_parts: sql,
         n_result_cols: cols,
-        dispatch,
+        dispatch: emit::Kind::rows(output.kind, output.row),
         probe_override: None,
     })
 }
@@ -110,14 +104,14 @@ impl<'a> Output<'a> {
             shape::ReturnShape::Explicit(explicit) => explicit,
         };
         let actual = explicit.kind();
-        if actual != end.expected() {
+        if actual != end {
             return Err(syn::Error::new(
                 explicit.row().span(),
                 format!(
                     "return type {} does not match terminator `.{}()`; expected {}",
                     actual.syntax(),
                     end.method(),
-                    end.expected().syntax(),
+                    end.syntax(),
                 ),
             ));
         }

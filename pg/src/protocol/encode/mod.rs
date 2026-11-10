@@ -50,21 +50,29 @@ fn write_cstr(out: &mut Writer<'_>, value: &str) -> Result<(), Error> {
 }
 
 fn write_search_path(out: &mut Writer<'_>, schema: &str) -> Result<(), Error> {
-    out.push(b'"')?;
+    out.write_byte(b'"')?;
     let mut parts = schema.split('"');
     if let Some(first) = parts.next() {
-        out.extend(first.as_bytes())?;
+        out.write_slice(first.as_bytes())?;
     }
     for part in parts.by_ref() {
-        out.extend(b"\"\"")?;
-        out.extend(part.as_bytes())?;
+        out.write_slice(b"\"\"")?;
+        out.write_slice(part.as_bytes())?;
     }
-    out.extend(b"\",public")?;
-    out.push(0)
+    out.write_slice(b"\",public")?;
+    out.write_byte(0)
 }
 
 #[repr(transparent)]
 pub(crate) struct Writer<'a>(write::Spare<'a>);
+
+impl write::Sink for Writer<'_> {
+    type Error = Error;
+
+    fn write_slices<const N: usize>(&mut self, slices: [&[u8]; N]) -> Result<(), Error> {
+        self.0.write_slices(slices).map_err(Error::capacity)
+    }
+}
 
 impl Writer<'_> {
     /// Commits initialized partial writes before the frame's secret clearing.
@@ -78,21 +86,6 @@ impl Writer<'_> {
         writer.0.commit();
         let frame = frame::Buffer::new(span, kind);
         Ok((frame, result?))
-    }
-
-    pub(crate) fn push(&mut self, byte: u8) -> Result<(), Error> {
-        self.0.write_byte(byte).map_err(Error::capacity)
-    }
-
-    pub(crate) fn extend(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        self.0.write_slice(bytes).map_err(Error::capacity)
-    }
-
-    pub(in crate::protocol) fn write_slices<const N: usize>(
-        &mut self,
-        slices: [&[u8]; N],
-    ) -> Result<(), Error> {
-        self.0.write_slices(slices).map_err(Error::capacity)
     }
 
     /// The retained owner bounds the prefix and its appended suffix together.
@@ -125,7 +118,7 @@ impl Writer<'_> {
         timeout: u32,
     ) -> Result<(), Error> {
         self.patch::<true, _>(|out| {
-            out.extend(&messages::Fe::STARTUP_PROTOCOL.to_be_bytes())?;
+            out.write_slice(&messages::Fe::STARTUP_PROTOCOL.to_be_bytes())?;
             write_cstr(out, "user")?;
             write_cstr(out, user)?;
             write_cstr(out, "database")?;
@@ -137,13 +130,13 @@ impl Writer<'_> {
             if timeout > 0 {
                 write_cstr(out, "statement_timeout")?;
                 out.write_u32(timeout)?;
-                out.push(0)?;
+                out.write_byte(0)?;
             }
             if let Some(schema) = schema {
                 write_cstr(out, "search_path")?;
                 write_search_path(out, schema)?;
             }
-            out.push(0)
+            out.write_byte(0)
         })
     }
 
@@ -153,14 +146,14 @@ impl Writer<'_> {
 
     pub(crate) fn write_u32(&mut self, value: u32) -> Result<(), Error> {
         let mut digits = core::fmt::NumBuffer::new();
-        self.extend(value.format_into(&mut digits).as_bytes())
+        self.write_slice(value.format_into(&mut digits).as_bytes())
     }
 
     pub(crate) fn copy_data(&mut self, data: &[u8]) -> Result<(), Error> {
         let length = data.len() + 4;
-        self.push(messages::Fe::COPY_DATA)?;
-        self.extend(&wire_length(length)?.to_be_bytes())?;
-        self.extend(data)
+        self.write_byte(messages::Fe::COPY_DATA)?;
+        self.write_slice(&wire_length(length)?.to_be_bytes())?;
+        self.write_slice(data)
     }
 
     pub(crate) fn copy_done(&mut self) -> Result<(), Error> {
@@ -172,7 +165,7 @@ impl Writer<'_> {
         name: &str,
         write: impl FnOnce(&mut Writer<'_>) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        self.push(messages::Fe::PASSWORD)?;
+        self.write_byte(messages::Fe::PASSWORD)?;
         self.patch::<true, _>(|out| {
             write_cstr(out, name)?;
             out.patch::<false, _>(write)
@@ -183,7 +176,7 @@ impl Writer<'_> {
         &mut self,
         write: impl FnOnce(&mut Writer<'_>) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        self.push(messages::Fe::PASSWORD)?;
+        self.write_byte(messages::Fe::PASSWORD)?;
         self.patch::<true, _>(write)
     }
 
@@ -191,12 +184,12 @@ impl Writer<'_> {
         &mut self,
         write: impl FnOnce(&mut Writer<'_>) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        self.push(messages::Fe::PARSE)?;
+        self.write_byte(messages::Fe::PARSE)?;
         self.patch::<true, _>(|out| {
-            out.push(0)?;
+            out.write_byte(0)?;
             write(out)?;
-            out.push(0)?;
-            out.extend(&0i16.to_be_bytes())
+            out.write_byte(0)?;
+            out.write_slice(&0i16.to_be_bytes())
         })
     }
 
@@ -208,12 +201,12 @@ impl Writer<'_> {
         results: &[u16],
         write: impl FnOnce(&mut Writer<'_>) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        self.push(messages::Fe::BIND)?;
+        self.write_byte(messages::Fe::BIND)?;
         self.patch::<true, _>(|out| {
-            out.push(0)?;
+            out.write_byte(0)?;
             write_cstr(out, name)?;
             out.write_formats(formats)?;
-            out.extend(&params.to_be_bytes())?;
+            out.write_slice(&params.to_be_bytes())?;
             let value = write(out)?;
             out.write_formats(results)?;
             Ok(value)
@@ -222,16 +215,16 @@ impl Writer<'_> {
 
     fn write_formats(&mut self, formats: &[u16]) -> Result<(), Error> {
         // Bind callers retain query admission or supply the fixed singleton format.
-        self.extend(&(formats.len() as i16).to_be_bytes())?;
+        self.write_slice(&(formats.len() as i16).to_be_bytes())?;
         for format in formats {
-            self.extend(&format.to_be_bytes())?;
+            self.write_slice(&format.to_be_bytes())?;
         }
         Ok(())
     }
 
     pub(crate) fn execute(&mut self) -> Result<(), Error> {
         const MESSAGE: [u8; 10] = [messages::Fe::EXECUTE, 0, 0, 0, 9, 0, 0, 0, 0, 0];
-        self.extend(&MESSAGE)
+        self.write_slice(&MESSAGE)
     }
 }
 

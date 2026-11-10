@@ -30,16 +30,15 @@ pub(in crate::plan) fn build<'a>(
         }
         shape::ReturnShape::Explicit(explicit) => explicit,
     };
-    let (output, row_ty, actual) = explicit.into_parts();
-    let kind = actual.kind();
-    if kind != term.expected() {
+    let (output, row_ty, kind) = explicit.into_parts();
+    if kind != term {
         return Err(syn::Error::new(
             row_ty.span(),
             format!(
                 "return type {} does not match terminator `.{}()`; expected {}",
                 kind.syntax(),
                 term.method(),
-                term.expected().syntax(),
+                term.syntax(),
             ),
         ));
     }
@@ -99,18 +98,11 @@ pub(in crate::plan) fn build<'a>(
         None => row::View::new(row_ty).cols(),
     };
 
-    let dispatch = match actual {
-        shape::RowReturn::Plain => emit::Kind::One(row_ty),
-        shape::RowReturn::Optional => emit::Kind::First(row_ty),
-        shape::RowReturn::Many => emit::Kind::All(row_ty),
-        shape::RowReturn::Stream => emit::Kind::Stream(row_ty),
-    };
-
     Ok(emit::Plan {
         output,
         sql_parts: sql,
         n_result_cols: cols,
-        dispatch,
+        dispatch: emit::Kind::rows(kind, row_ty),
         probe_override: None,
     })
 }

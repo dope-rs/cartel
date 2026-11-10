@@ -5,6 +5,7 @@ use base64::engine::general_purpose;
 use dope::core::{Backend, dope_sys::thread::Thread as _, driver::route};
 use dope::manifold::client::conn;
 use o3::buffer::bytes::bounded;
+use o3::buffer::write::Sink as _;
 use sha2::block_api::compress256;
 use std::mem;
 use subtle::ConstantTimeEq as _;
@@ -278,10 +279,10 @@ impl Deriving {
             &mut expected,
         );
 
-        out.extend(b"c=biws,r=")?;
-        out.extend(nonce)?;
-        out.extend(b",p=")?;
-        out.extend(encoded.as_slice())?;
+        out.write_slice(b"c=biws,r=")?;
+        out.write_slice(nonce)?;
+        out.write_slice(b",p=")?;
+        out.write_slice(encoded.as_slice())?;
         Ok(Signature(expected))
     }
 }

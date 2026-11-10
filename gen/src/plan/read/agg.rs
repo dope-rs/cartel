@@ -31,22 +31,20 @@ pub(in crate::plan) fn build<'a>(
     };
     let scalar = agg.group_by.is_none()
         && matches!(agg.kind, shape::Aggregation::Column(..))
-        && explicit.kind() != shape::Return::Stream;
+        && explicit.kind() != shape::Terminator::Stream;
     if scalar && matches!(state.dialect.kind, crate::backend::Kind::Sqlite) {
         explicit.scalar();
     }
     let (output, row, kind) = explicit.into_parts();
     let dispatch = match kind {
         _ if scalar => emit::Kind::Aggregate(row),
-        shape::RowReturn::Plain => emit::Kind::One(row),
-        shape::RowReturn::Optional => emit::Kind::First(row),
-        shape::RowReturn::Many => emit::Kind::All(row),
-        shape::RowReturn::Stream => {
+        shape::Terminator::Stream => {
             return Err(syn::Error::new(
                 row.span(),
                 "aggregate (.count/.sum/.avg/.min/.max) does not support `.stream()` — aggregate returns a single row",
             ));
         }
+        kind => emit::Kind::rows(kind, row),
     };
     if let (Some(having), None) = (&agg.having, &agg.group_by) {
         return Err(syn::Error::new(

@@ -1,4 +1,5 @@
 use crate::protocol::encode;
+use o3::buffer::write::Sink as _;
 
 fn wire_length(value: usize) -> Result<i32, encode::Error> {
     const MAXIMUM: usize = i32::MAX as usize;
@@ -68,7 +69,7 @@ impl<'a, 'out> BindWriter<'a, 'out> {
 
     pub fn write_null(&mut self) -> Result<(), encode::Error> {
         self.check_any()?;
-        self.out.extend(&(-1i32).to_be_bytes())?;
+        self.out.write_slice(&(-1i32).to_be_bytes())?;
         self.index += 1;
         Ok(())
     }
