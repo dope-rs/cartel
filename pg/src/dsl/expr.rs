@@ -1,8 +1,9 @@
-use crate::dsl::{self, scope::never::Never};
+use crate::dsl;
+use std::convert::Infallible;
 
-pub struct TsVector(Never<()>);
+pub struct TsVector(Infallible);
 
-pub struct TsQuery(Never<()>);
+pub struct TsQuery(Infallible);
 
 impl TsVector {
     pub fn is_match(&self, scope: &dsl::Scope, _: TsQuery) -> bool {

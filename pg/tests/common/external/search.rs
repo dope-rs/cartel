@@ -1,9 +1,6 @@
 use crate::common::external::user::User;
 use cartel_gen::query_group;
-use cartel_pg::{
-    dsl::expr::Text as _, dsl::query::ops::Arrange as _, dsl::query::ops::Fetch as _,
-    dsl::query::ops::Project as _,
-};
+use cartel_pg::dsl::expr::Text as _;
 
 pub enum Pattern {}
 

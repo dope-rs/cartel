@@ -2,8 +2,6 @@ use crate::common::external::user::User;
 use cartel_gen::query_group;
 use cartel_pg::{
     Date, PgRow, PgTable, Timestamp, Uuid, dsl::expr::Array as _, dsl::expr::Ltree as _,
-    dsl::query::ops::Arrange as _, dsl::query::ops::Change as _, dsl::query::ops::Fetch as _,
-    dsl::query::ops::Project as _, dsl::query::ops::Reduce as _,
 };
 
 #[derive(PgTable, PgRow, PartialEq)]

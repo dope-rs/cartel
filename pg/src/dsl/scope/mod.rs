@@ -1,5 +1,3 @@
-pub(super) mod never;
-
 use crate::dsl::{expr, shape, window};
 use std::convert;
 

@@ -55,7 +55,6 @@ pub fn post_titles_by_user(uid: i64) -> Vec<String> {
 pub fn users_union() -> Vec<User> {
     User::filter(|u| u.id <= 1)
         .union(User::filter(|u| u.id >= 4))
-        .rows()
         .order_by(|u| u.id)
         .all()
 }
@@ -64,7 +63,6 @@ pub fn users_union() -> Vec<User> {
 pub fn users_union_all() -> Vec<User> {
     User::filter(|u| u.id <= 1)
         .union_all(User::filter(|u| u.id == 1))
-        .rows()
         .order_by(|u| u.id)
         .all()
 }
@@ -73,7 +71,6 @@ pub fn users_union_all() -> Vec<User> {
 pub fn users_intersect() -> Vec<User> {
     User::filter(|u| u.age >= 25)
         .intersect(User::filter(|u| u.active))
-        .rows()
         .order_by(|u| u.id)
         .all()
 }
@@ -82,7 +79,6 @@ pub fn users_intersect() -> Vec<User> {
 pub fn users_except() -> Vec<User> {
     User::filter(|_u| true)
         .except(User::filter(|u| !u.active))
-        .rows()
         .order_by(|u| u.id)
         .all()
 }
@@ -90,29 +86,19 @@ pub fn users_except() -> Vec<User> {
 #[cartel_sqlite::query]
 pub fn cte_active_users() -> Vec<User> {
     let active = User::filter(User::active).cte();
-    active
-        .filter(|u| u.age >= 25)
-        .rows()
-        .order_by(|u| u.id)
-        .all()
+    active.filter(|u| u.age >= 25).order_by(|u| u.id).all()
 }
 
 #[cartel_sqlite::query]
 pub fn cte_union(min_age: i32) -> Vec<User> {
-    let young = User::filter(User::age < 30).cte();
-    let actives = User::filter(User::active).cte();
-    young
-        .filter(|u| u.age >= min_age)
-        .union(actives.filter(|u| u.age >= min_age))
-        .rows()
-        .order_by(|u| u.id)
-        .all()
+    let young = User::filter(|u| u.age < 30 && u.age >= min_age).cte();
+    let actives = User::filter(|u| u.active && u.age >= min_age).cte();
+    young.union(actives).order_by(|u| u.id).all()
 }
 
 #[cartel_sqlite::query]
 pub fn users_with_any_post() -> Vec<User> {
     User::filter(|u| Dialect::exists(Post::filter(|p| p.author_id == u.id)))
-        .rows()
         .order_by(|u| u.id)
         .all()
 }
@@ -120,7 +106,6 @@ pub fn users_with_any_post() -> Vec<User> {
 #[cartel_sqlite::query]
 pub fn users_without_post() -> Vec<User> {
     User::filter(|u| Dialect::not_exists(Post::filter(|p| p.author_id == u.id)))
-        .rows()
         .order_by(|u| u.id)
         .all()
 }
@@ -128,7 +113,6 @@ pub fn users_without_post() -> Vec<User> {
 #[cartel_sqlite::query]
 pub fn user_post_counts() -> Vec<(i64, i64, Option<i64>)> {
     User::filter(|_u| true)
-        .rows()
         .order_by(|u| u.id)
         .select(|u| {
             (

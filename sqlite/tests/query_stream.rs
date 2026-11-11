@@ -34,7 +34,10 @@ fn stream_visits_rows(runtime: Runtime) -> Result<(), plan::Error> {
                         let mut ids = Vec::new();
                         users(conn.query())
                             .visit(|user| {
-                                ids.push(user.id);
+                                ids.push(user.0);
+                                if user.0 == 1 {
+                                    assert_eq!(user.1, "alice");
+                                }
                                 ::core::ops::ControlFlow::Continue(())
                             })
                             .await?;
@@ -69,7 +72,7 @@ fn stream_stop_releases(runtime: Runtime) -> Result<(), plan::Error> {
                         let mut ids = Vec::new();
                         users(conn.query())
                             .visit(|user| {
-                                ids.push(user.id);
+                                ids.push(user.0);
                                 if ids.len() == 2 {
                                     ::core::ops::ControlFlow::Break(())
                                 } else {

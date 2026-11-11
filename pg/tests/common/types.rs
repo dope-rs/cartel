@@ -1,6 +1,3 @@
-use cartel_pg::dsl::query::ops::{
-    Arrange as _, Change as _, Fetch as _, Project as _, Reduce as _, Set as _,
-};
 use cartel_pg::{PgRow, PgTable};
 
 #[derive(PgRow, PgTable)]

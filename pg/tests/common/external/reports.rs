@@ -1,11 +1,6 @@
 use crate::common::{external::user::User, types::UserId};
 use cartel_gen::query_group;
 use cartel_pg::{
-    dsl::query::ops::Arrange as _,
-    dsl::query::ops::Fetch as _,
-    dsl::query::ops::Project as _,
-    dsl::query::ops::Reduce as _,
-    dsl::query::ops::Set as _,
     protocol::{Reason, value::decode::RowReader},
     schema::{Row, desc},
 };

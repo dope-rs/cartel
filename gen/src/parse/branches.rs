@@ -59,7 +59,6 @@ impl shape::SelectBranch {
 impl qualify::State {
     pub(crate) fn peel<'a>(&mut self, expr: &'a syn::Expr) -> syn::Result<&'a syn::Expr> {
         enum Method {
-            Rows,
             Order(qualify::Dir),
             Limit,
             Offset,
@@ -71,9 +70,7 @@ impl qualify::State {
         let mut parsed = Self::default();
         let mut current = expr.unbrace();
         while let syn::Expr::MethodCall(mc) = current {
-            let method = if mc.method == "rows" {
-                Method::Rows
-            } else if mc.method == "order_by" {
+            let method = if mc.method == "order_by" {
                 Method::Order(qualify::Dir::Asc)
             } else if mc.method == "order_by_desc" {
                 Method::Order(qualify::Dir::Desc)
@@ -93,14 +90,6 @@ impl qualify::State {
                 break;
             };
             match method {
-                Method::Rows => {
-                    if !mc.args.is_empty() {
-                        return Err(syn::Error::new(
-                            mc.args.span(),
-                            "`.rows()` takes no arguments",
-                        ));
-                    }
-                }
                 Method::Order(dir) => {
                     if mc.args.len() != 1 {
                         return Err(syn::Error::new(

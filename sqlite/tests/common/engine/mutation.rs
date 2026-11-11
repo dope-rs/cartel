@@ -39,7 +39,6 @@ cartel_sqlite::catalog! {
     #[query]
     pub fn legacy(__cartel_row: i64) -> Vec<(i64, i64)> {
         Item::filter(|row| row.id >= __cartel_row)
-            .rows()
             .order_by(|row| row.id)
             .select(|row| (row.id + __cartel_row, row.r#select))
             .all()
@@ -48,7 +47,6 @@ cartel_sqlite::catalog! {
     #[query]
     pub fn shorthand(__cartel_row: i64) -> Vec<(i64, i64)> {
         Item::filter(|row| row.id >= __cartel_row)
-            .rows()
             .order_by(Item::id)
             .select((Item::id + __cartel_row, Item::r#select))
             .all()

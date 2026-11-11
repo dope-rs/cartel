@@ -183,7 +183,7 @@ impl backend::TableBackend for Backend {
                     scope: &#rt::dsl::Scope,
                     pred: impl ::core::ops::FnOnce(#name #type_g) -> bool,
                 )
-                    -> #rt::dsl::query::Filter<#name #type_g>
+                    -> #rt::dsl::query::Query<#name #type_g>
                 {
                     match (scope.0, pred) {}
                 }
@@ -209,10 +209,10 @@ impl backend::TableBackend for Backend {
                 {
                     match (scope.0, init) {}
                 }
-                pub fn insert_from<#input_ty: #rt::dsl::shape::Source>(
+                pub fn insert_from<#input_ty>(
                     scope: &#rt::dsl::Scope,
-                    source: #input_ty,
-                    init: impl ::core::ops::FnOnce(&mut #name #type_g, #input_ty::Row),
+                    source: #rt::dsl::query::Query<#input_ty>,
+                    init: impl ::core::ops::FnOnce(&mut #name #type_g, #input_ty),
                 ) -> #rt::dsl::write::Insert<#name #type_g> {
                     match (scope.0, source, init) {}
                 }

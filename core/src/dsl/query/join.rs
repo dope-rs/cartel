@@ -1,4 +1,4 @@
-use crate::dsl::{query, scope::never::Never};
+use crate::dsl::{never::Never, query};
 
 pub struct Plan2<A, B>(Never<(A, B)>);
 pub struct Plan3<A, B, C>(Never<(A, B, C)>);
@@ -35,6 +35,18 @@ impl<A, B, C, D> Plan4<A, B, C, D> {
 }
 
 impl<A, B> Rows2<A, B> {
+    pub fn one(self) -> (A, B) {
+        self.0.infer(())
+    }
+
+    pub fn first(self) -> Option<(A, B)> {
+        self.0.infer(())
+    }
+
+    pub fn stream(self) -> query::Stream<(A, B)> {
+        self.0.infer(())
+    }
+
     pub fn all<R>(self) -> Vec<R> {
         self.0.infer(())
     }
@@ -50,7 +62,7 @@ impl<A, B> Rows2<A, B> {
         self.0.infer(key)
     }
 
-    pub fn select<F, R>(self, map: F) -> query::Select<R>
+    pub fn select<F, R>(self, map: F) -> query::Query<R, query::Projected>
     where
         F: FnOnce(A, B) -> R,
     {
@@ -59,6 +71,18 @@ impl<A, B> Rows2<A, B> {
 }
 
 impl<A, B, C> Rows3<A, B, C> {
+    pub fn one(self) -> (A, B, C) {
+        self.0.infer(())
+    }
+
+    pub fn first(self) -> Option<(A, B, C)> {
+        self.0.infer(())
+    }
+
+    pub fn stream(self) -> query::Stream<(A, B, C)> {
+        self.0.infer(())
+    }
+
     pub fn all<R>(self) -> Vec<R> {
         self.0.infer(())
     }
@@ -72,6 +96,18 @@ impl<A, B, C> Rows3<A, B, C> {
 }
 
 impl<A, B, C, D> Rows4<A, B, C, D> {
+    pub fn one(self) -> (A, B, C, D) {
+        self.0.infer(())
+    }
+
+    pub fn first(self) -> Option<(A, B, C, D)> {
+        self.0.infer(())
+    }
+
+    pub fn stream(self) -> query::Stream<(A, B, C, D)> {
+        self.0.infer(())
+    }
+
     pub fn all<R>(self) -> Vec<R> {
         self.0.infer(())
     }

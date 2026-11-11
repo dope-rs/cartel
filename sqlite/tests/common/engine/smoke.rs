@@ -58,17 +58,17 @@ pub struct User {
 
 #[query]
 pub fn user_by_id(id: i64) -> User {
-    User::filter(|u| u.id == id).rows().one()
+    User::filter(|u| u.id == id).one()
 }
 
 #[query]
 pub fn user_names(min_id: i64) -> Vec<String> {
-    User::filter(|u| u.id >= min_id).rows().select(|u| u.name).all()
+    User::filter(|u| u.id >= min_id).select(|u| u.name).all()
 }
 
 #[query]
 pub fn maybe_user(id: i64) -> Option<User> {
-    User::filter(|u| u.id == id).rows().first()
+    User::filter(|u| u.id == id).first()
 }
 
 #[query]

@@ -1,4 +1,4 @@
-use crate::dsl::scope::never::Never;
+use crate::dsl::never::Never;
 
 pub struct Group<T, K>(Never<(T, K)>);
 pub struct Handle(Never<()>);
@@ -6,6 +6,13 @@ pub struct Handle(Never<()>);
 impl<T, K> Group<T, K> {
     pub fn count(self) -> Vec<(K, i64)> {
         self.0.infer(())
+    }
+
+    pub fn sum<F, U>(self, map: F) -> Vec<(K, Option<U>)>
+    where
+        F: FnOnce(T) -> U,
+    {
+        self.0.infer(map)
     }
 
     pub fn max<F, U>(self, map: F) -> Vec<(K, Option<U>)>

@@ -1,4 +1,5 @@
 pub mod deadline;
+pub mod dsl;
 pub mod frame;
 pub mod handoff;
 pub mod memory;

@@ -56,7 +56,7 @@ impl backend::TableBackend for super::PgBackend {
             pub fn filter(
                 scope: &#rt::dsl::Scope,
                 pred: impl ::core::ops::FnOnce(Self) -> bool,
-            ) -> #rt::dsl::query::Filter<Self> {
+            ) -> #rt::dsl::query::Query<Self> {
                 match (scope.0, pred) {}
             }
         };
@@ -150,13 +150,13 @@ impl backend::TableBackend for super::PgBackend {
                 }
                 pub fn lateral_join<T>(
                     scope: &#rt::dsl::Scope,
-                    plan: impl ::core::ops::FnOnce(Self) -> #rt::dsl::query::Filter<T>,
+                    plan: impl ::core::ops::FnOnce(Self) -> #rt::dsl::query::Query<T>,
                 ) -> #rt::dsl::query::join::Plan2<Self, T> {
                     match (scope.0, plan) {}
                 }
                 pub fn lateral_left<T>(
                     scope: &#rt::dsl::Scope,
-                    plan: impl ::core::ops::FnOnce(Self) -> #rt::dsl::query::Filter<T>,
+                    plan: impl ::core::ops::FnOnce(Self) -> #rt::dsl::query::Query<T>,
                 ) -> #rt::dsl::query::join::Plan2<Self, T> {
                     match (scope.0, plan) {}
                 }
@@ -169,10 +169,10 @@ impl backend::TableBackend for super::PgBackend {
                 {
                     match (scope.0, init) {}
                 }
-                pub fn insert_from<S: #rt::dsl::shape::SourceRow>(
+                pub fn insert_from<S>(
                     scope: &#rt::dsl::Scope,
-                    source: S,
-                    init: impl ::core::ops::FnOnce(&mut Self, S::Row),
+                    source: #rt::dsl::query::Query<S>,
+                    init: impl ::core::ops::FnOnce(&mut Self, S),
                 ) -> #rt::dsl::write::Insert<Self> {
                     match (scope.0, source, init) {}
                 }

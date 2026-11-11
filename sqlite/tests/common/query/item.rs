@@ -7,7 +7,7 @@ type S = i32;
 #[doc = "Selects an item by its composite key."]
 #[must_use]
 pub fn by_key(source: i32, query: S) -> Option<I> {
-    I::filter(|i| i.a == source && i.b == query).rows().first()
+    I::filter(|i| i.a == source && i.b == query).first()
 }
 
 #[cartel_sqlite::query]

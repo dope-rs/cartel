@@ -12,7 +12,7 @@ use std::{
 use cartel_pg::{
     PgRow, PgTable,
     api::traits::{self, Stream as _},
-    dsl::query::{self, ops::Fetch as _},
+    dsl::query,
     pg_instance,
     port::{self, config},
     query_group, reply,

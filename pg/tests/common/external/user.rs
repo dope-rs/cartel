@@ -1,8 +1,5 @@
 use cartel_gen::query_group;
-use cartel_pg::{
-    PgRow, PgTable, dsl::expr::In as _, dsl::query, dsl::query::ops::Arrange as _,
-    dsl::query::ops::Change as _, dsl::query::ops::Fetch as _, dsl::query::ops::Project as _,
-};
+use cartel_pg::{PgRow, PgTable, dsl::expr::In as _, dsl::query};
 
 #[derive(PgTable, PgRow, PartialEq)]
 #[table_name("cartel_pg_users")]

@@ -1,4 +1,4 @@
-use crate::dsl::scope::never::Never;
+use crate::dsl::never::Never;
 
 pub struct Expr<T>(Never<T>);
 pub struct Spec(Never<()>);

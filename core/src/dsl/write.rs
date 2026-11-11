@@ -1,4 +1,4 @@
-use crate::dsl::scope::never::Never;
+use crate::dsl::never::Never;
 
 pub struct Insert<T>(Never<T>);
 pub struct Update<T>(Never<T>);
@@ -35,11 +35,11 @@ impl<T> Conflict<T> {
         self.0.infer(())
     }
 
-    pub fn update<F>(self, change: F) -> Insert<T>
+    pub fn update<F>(self, update: F) -> Insert<T>
     where
         F: FnOnce(&mut T),
     {
-        self.0.infer(change)
+        self.0.infer(update)
     }
 }
 

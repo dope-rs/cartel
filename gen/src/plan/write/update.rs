@@ -263,7 +263,7 @@ pub(in crate::plan) fn each<'a>(
         syn::parse_quote! {
             {
                 let (#(#inputs,)*) = (#(#data,)*);
-                #rt::dsl::query::ops::Change::update(
+                #rt::dsl::query::Query::update(
                     <#table>::filter(
                         #scope,
                         |#row_var: #table| -> bool {

@@ -19,21 +19,21 @@ pub struct Entry<T = String> {
 
 #[query]
 pub fn all_entries() -> Vec<Entry> {
-    Entry::filter(|_entry| true).rows()
+    Entry::filter(|_entry| true)
         .order_by(|entry| entry.id)
         .all()
 }
 
 #[query]
 pub fn scan_entries() -> query::Stream<Entry> {
-    Entry::filter(|_entry| true).rows()
+    Entry::filter(|_entry| true)
         .order_by(|entry| entry.id)
         .stream()
 }
 
 #[query]
 pub fn entries_named(name: String) -> Vec<Entry> {
-    Entry::filter(|entry| entry.name == name).rows().all()
+    Entry::filter(|entry| entry.name == name).all()
 }
 
 pub const COMMANDS: &[&str] = &["CREATE TABLE entries (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"];
