@@ -26,7 +26,7 @@ impl<'a, 'd, const ID: u8> Backend<'a, 'd, ID> {
         token: conn::Id<'d, KeyTag<ID>>,
         key: key::Key,
     ) -> Result<(), protocol::Reason> {
-        let slot::Phase::Handshaking(bound) = self.slot.phase.get() else {
+        let Some((bound, slot::Lifecycle::Handshaking)) = self.slot.snapshot() else {
             return Err(protocol::Reason::BackendKeyStale);
         };
         if bound.token != token {
@@ -52,7 +52,7 @@ impl<'a, 'd, const ID: u8> Backend<'a, 'd, ID> {
     }
 
     fn pid(&self, token: conn::Id<'d, KeyTag<ID>>) -> Option<i32> {
-        let slot::Phase::Ready { bound, .. } = self.slot.phase.get() else {
+        let Some((bound, slot::Lifecycle::Ready { .. })) = self.slot.snapshot() else {
             return None;
         };
         if bound.token != token {

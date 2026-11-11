@@ -1,4 +1,4 @@
-use crate::api::{Client, decode};
+use crate::api::{Commands, decode};
 use crate::request::encode;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,7 +24,7 @@ impl Unit {
 #[repr(transparent)]
 pub struct Geo<C, const ID: u8 = 0>(pub(crate) C);
 
-impl<'d, C: Client<'d, ID>, const ID: u8> Geo<C, ID> {
+impl<'d, C: Commands<'d, ID>, const ID: u8> Geo<C, ID> {
     pub fn add(self, key: &[u8], lon: f64, lat: f64, member: &[u8]) -> C::Call<u64> {
         self.0.encode::<u64>(move |out| {
             let mut first = ryu::Buffer::new();

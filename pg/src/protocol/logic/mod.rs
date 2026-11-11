@@ -342,10 +342,10 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         let Some(cause) = owner.root().connection().try_fail(conn, reason) else {
             return egress::Cleared::Done;
         };
-        let Some(reps) = owner.root().responses(conn) else {
+        let Some(reps) = owner.root().responses(conn, region) else {
             return egress::Cleared::Done;
         };
-        match reps.fail(work, region, cause) {
+        match reps.fail(work, cause) {
             reply::Progress::Complete(_) => egress::Cleared::Done,
             reply::Progress::Pending(_) => egress::Cleared::Retry,
         }
@@ -397,8 +397,11 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
             region::Token<region::Identity<'d, 1>>,
         ),
     ) {
-        owner.root().maintain(work, &mut region.0);
-        owner.root().shared.waiters().flush(work);
+        let port = owner.root();
+        port.notify_frames();
+        port.shared
+            .waiters()
+            .flush(work, || port.maintain(work, &mut region.0));
     }
     fn shutdown(owner: &mut Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>) {
         owner.root().shared.waiters().wake_all();
@@ -408,8 +411,10 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         _: &region::Token<region::Identity<'d>>,
         _clock: clock::Clock<'_, 'd>,
     ) -> schedule::Progress<'d> {
-        match owner.root().maint() {
-            reply::Work::Idle if !owner.root().shared.waiters().is_pending() => {
+        let port = owner.root();
+        port.notify_frames();
+        match port.maint() {
+            reply::Work::Idle if !port.shared.waiters().is_pending() => {
                 schedule::Progress::Quiescent
             }
             reply::Work::Pending | reply::Work::Idle => schedule::Progress::Runnable,
@@ -427,7 +432,6 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         if load == Some(0)
             && port
                 .shared
-                .ready
                 .connection(conn)
                 .is_some_and(|slot| slot.is_receiving())
         {

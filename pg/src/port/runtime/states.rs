@@ -1,10 +1,8 @@
-use crate::{
-    protocol::runtime::waiters,
-    reply::{self, server},
-};
+use crate::reply::{self, server};
 use dope::core::driver::route;
 use dope::manifold::client::attempt;
 use dope::net::link::pool::change::opening;
+use dope_fiber::wait;
 use std::cell;
 
 pub(super) enum Failure<'d, const ID: u8> {
@@ -15,7 +13,7 @@ pub(super) enum Failure<'d, const ID: u8> {
 
 pub(crate) struct Signals<'d, const ID: u8> {
     pub(super) cause: cell::Cell<Option<Failure<'d, ID>>>,
-    pub(crate) egress: waiters::Egress<'d>,
+    pub(crate) egress: wait::Notifier<'d>,
 }
 
 impl<'d, const ID: u8> Signals<'d, ID> {
@@ -51,7 +49,7 @@ impl<'d, const ID: u8> Signals<'d, ID> {
         self.record_cause(Failure::Driver(error));
     }
 
-    pub(in crate::protocol) fn record_reply(&self, error: server::Diagnostic<'d>) {
+    pub(crate) fn record_reply(&self, error: server::Diagnostic<'d>) {
         self.record_cause(Failure::Server(error));
     }
 
@@ -67,7 +65,7 @@ impl<'d, const ID: u8> Signals<'d, ID> {
         }
     }
 
-    pub(in crate::protocol) fn exhaust(
+    pub(crate) fn exhaust(
         &self,
         key: attempt::Id<'d, route::KeyTag<ID>>,
         cause: opening::Exhaustion,
@@ -75,7 +73,7 @@ impl<'d, const ID: u8> Signals<'d, ID> {
         self.record_cause(Failure::Open(reply::Open::Exhaustion { key, cause }));
     }
 
-    pub(in crate::protocol) fn failed(
+    pub(crate) fn failed(
         &self,
         key: attempt::Id<'d, route::KeyTag<ID>>,
         cause: attempt::ConnectFault,

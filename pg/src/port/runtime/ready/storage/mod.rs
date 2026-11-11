@@ -1,10 +1,10 @@
 use block::Block;
 use buckets::Buckets;
-pub(in crate::protocol::runtime::ready) use entry::Entry;
+pub(crate) use entry::Entry;
 pub(crate) use entry::Listed;
 use header::Header;
-pub(in crate::protocol::runtime::ready) use index::Index;
-pub(crate) use index::Reservation;
+pub(in crate::port::runtime) use index::Index;
+pub(crate) use index::{Remaining, Reservation};
 pub(super) use layout::Layout;
 use node::Node;
 use o3::depot::{self, index::bitmap::entry::Row};
@@ -19,6 +19,7 @@ mod entry;
 mod header;
 mod index;
 mod node;
+pub(crate) mod pool;
 mod round;
 
 /// An admitted row kept only in the allocation which issued it.

@@ -6,8 +6,7 @@ use crate::{
 };
 use api::task::tx::{Begin, Held};
 use api::{
-    ops,
-    request::{self, stateful},
+    ops, request,
     results::copy::Chunk,
     sql,
     traits::{self, copy::Transfer, sealed},
@@ -100,10 +99,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             let lease = Begin::new(client, request::Begin::new(level, access, deferral)).await?;
             let target = lease.target();
             if let Some(time) = limit {
-                let setting = client.raw::<api::ExtractUnit<ID>>(
-                    Some(api::Target::from_tx(target)),
-                    request::Request::timeout(time),
-                );
+                let setting = ops::Query::from_parts(client, api::Target::from_tx(target)).raw(request::Request::timeout(time));
                 setting.await?;
             }
             Ok(Guard { lease })
@@ -145,7 +141,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     type Diagnostics = Ledger<'r, 's>;
     type CopyChunk = Chunk<'b, 'c, 'd>;
     type Query<'tx>
-        = ops::Query<'tx, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+        = ops::Query<api::Client<'tx, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, api::Target<'d, ID>>
     where
         Self: 'tx;
     type Savepoint<'tx>
@@ -192,16 +188,16 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     fn query(&self) -> Self::Query<'_> {
         ops::Query::from_parts(
             self.lease.reborrow(),
-            Some(api::Target::from_tx(self.lease.target())),
+            api::Target::from_tx(self.lease.target()),
         )
     }
 
     fn unchecked(&self) -> impl traits::Unchecked<'d, ID> + '_ {
-        ops::Unchecked(self.query())
+        self.query()
     }
 
     fn copy(&self) -> impl Transfer<'d, ID, Chunk = Self::CopyChunk> + '_ {
-        ops::Transfer(self.query())
+        self.query()
     }
 
     fn savepoint<'tx>(
@@ -211,11 +207,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         let client = self.lease.reborrow();
         let target = self.lease.target();
         dope_fiber::fiber!('d => async move {
-            let lease = stateful::Stateful::new(
-                client,
-                Some(api::Target::from_tx(target)),
-                request::Request::savepoint(&name),
-            )
+            let lease = ops::Query::from_parts(client, api::Target::from_tx(target)).stateful(request::Request::savepoint(&name))
             .await?
             .retarget(target)?;
             Ok(control::Savepoint {

@@ -1,10 +1,10 @@
-use crate::api::{Client, decode};
+use crate::api::{Commands, decode};
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct Server<C, const ID: u8 = 0>(pub(crate) C);
 
-impl<'d, C: Client<'d, ID>, const ID: u8> Server<C, ID> {
+impl<'d, C: Commands<'d, ID>, const ID: u8> Server<C, ID> {
     pub fn ping(self) -> C::Call<()> {
         self.0.encode::<()>(|out| out.command(&[b"PING"]))
     }
@@ -14,7 +14,7 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Server<C, ID> {
             .encode::<i64>(move |out| out.command(&[b"PUBLISH", channel, message]))
     }
 
-    pub fn get_user<D: decode::Decode<C>>(self, username: &[u8]) -> C::Call<D> {
+    pub fn get_user<D: decode::Decode<C::Client>>(self, username: &[u8]) -> C::Call<D> {
         self.0
             .encode::<D>(move |out| out.command(&[b"ACL", b"GETUSER", username]))
     }

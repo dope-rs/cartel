@@ -35,6 +35,11 @@ pub enum Pressure {
         required: usize,
         available: usize,
     },
+    Queue {
+        queued: usize,
+        required: usize,
+        available: usize,
+    },
 }
 
 const _: () = {

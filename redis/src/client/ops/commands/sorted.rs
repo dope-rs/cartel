@@ -1,4 +1,4 @@
-use crate::api::{Client, decode};
+use crate::api::{Commands, decode};
 use crate::client::nonempty;
 use crate::request::encode;
 use std::num::NonZero;
@@ -7,7 +7,7 @@ use std::num::NonZero;
 #[repr(transparent)]
 pub struct Sorted<C, const ID: u8 = 0>(pub(crate) C);
 
-impl<'d, C: Client<'d, ID>, const ID: u8> Sorted<C, ID> {
+impl<'d, C: Commands<'d, ID>, const ID: u8> Sorted<C, ID> {
     pub fn add<M: AsRef<[u8]>>(self, key: &[u8], score: f64, member: M) -> C::Call<u64> {
         self.0
             .encode::<u64>(move |out| out.float::<false>(b"ZADD", key, score, member.as_ref()))

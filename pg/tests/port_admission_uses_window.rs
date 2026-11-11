@@ -1,7 +1,8 @@
-use cartel_pg::api::traits::{Client as _, Unchecked as _};
+use cartel_pg::api::traits::{Client as _, Query as _, Unchecked as _};
 use dope::core::driver::life::recovery;
 use std::{
     net::{SocketAddr, TcpListener},
+    pin::pin,
     time::Duration,
 };
 
@@ -13,7 +14,11 @@ use dope::{
     net::{tcp::Tcp, wire::Identity},
     runtime::executor::session::Completion,
 };
-use dope_fiber::BlockOn as _;
+use dope_fiber::{
+    BlockOn as _,
+    abi::{Task, poll_fn},
+    context::raw::Live,
+};
 use dope_test::{
     fibers,
     harness::{GUARD, peer::AcceptScript},
@@ -123,10 +128,23 @@ fn admission_uses_window() {
                             stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
                                 let client: api::Client<'_, '_, '_, '_, '_, '_, '_, _, _> = runtime.root_client();
 
+                let mut held = Some(client.unchecked().command("SELECT 1"));
+                let mut waiting = pin!(client.query().acquire());
+                let acquired = runtime.block_on(poll_fn(|context| {
+                    // SAFETY: waiting stays pinned; Ready ends polling authority.
+                    let poll = unsafe { Live::new(waiting.as_mut()) }.poll(context);
+                    if held.is_some() {
+                        assert!(poll.is_pending());
+                        drop(held.take());
+                    }
+                    poll
+                })).expect("frame drive").ok().expect("released frame wakes acquisition");
+                fibers::TEST.try_pause(&mut runtime, Duration::from_millis(10)).expect("original deadline fires");
+                let mut query = pin!(Task::new(acquired.command("SELECT 1")));
                 assert!(
                     matches!(
-                        runtime.block_on(client.unchecked().command("SELECT 1")),
-                        Ok(Err(reply::Error::Driver(cartel_pg::Error::RequestTimeout(timeout))))
+                        runtime.block_on(fibers::TEST.poll_once(query.as_mut())),
+                        Ok(Some(Err(reply::Error::Driver(cartel_pg::Error::RequestTimeout(timeout)))))
                             if timeout.phase() == cartel_pg::RequestPhase::Admission
                     ),
                     "request admission must time out"

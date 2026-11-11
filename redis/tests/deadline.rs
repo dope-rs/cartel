@@ -1,4 +1,4 @@
-use cartel_redis::api::{Client as _, Connection as _};
+use cartel_redis::api::{Client as _, Commands as _, Connection as _};
 use dope::core::driver::life::recovery;
 use dope::runtime::executor::session::Completion;
 use std::{net::SocketAddr, pin::pin, time::Duration};
@@ -63,6 +63,21 @@ fn waits_expire() {
                                     cartel_redis::Error::RequestTimeout(timeout)
                                 )))
                                     if timeout.phase() == cartel_redis::RequestPhase::Admission
+                            ));
+                            let acquired = runtime
+                                .block_on(redis.acquire())
+                                .expect("frame drive")
+                                .ok()
+                                .expect("request frame");
+                            fibers::TEST
+                                .try_pause(&mut runtime, Duration::from_millis(10))
+                                .expect("original deadline fires");
+                            let mut command = pin!(Task::new(acquired.server().ping()));
+                            assert!(matches!(
+                                runtime.block_on(fibers::TEST.poll_once(command.as_mut())),
+                                Ok(Some(Err(cartel_redis::value::reply::Failure::Control(
+                                    cartel_redis::Error::RequestTimeout(timeout)
+                                )))) if timeout.phase() == cartel_redis::RequestPhase::Admission
                             ));
                             let mut acquire = pin!(redis.connection());
                             let mut alarms = Vec::new();

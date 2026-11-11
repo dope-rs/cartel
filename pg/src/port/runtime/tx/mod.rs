@@ -20,17 +20,14 @@ pub(crate) struct Access<'a, 'd, const ID: u8> {
 
 impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
     pub(crate) fn is_current<const FINAL: bool>(&self, id: access::Transaction<'d, ID>) -> bool {
-        let Some(entry) = self.shared.ready.connection(id.conn) else {
+        let Some(entry) = self.shared.connection(id.conn) else {
             return false;
         };
         access::Access::new(entry).is_current::<FINAL>(id.generation)
     }
 
-    pub(crate) fn current(
-        &self,
-        slot: conn::Id<'d, route::KeyTag<ID>>,
-    ) -> access::Current<'a, 'd, ID> {
-        self.shared.ready.current(slot)
+    pub(crate) fn current(&self, slot: conn::Id<'d, route::KeyTag<ID>>) -> access::Current {
+        self.shared.current(slot)
     }
 
     pub(crate) fn reserve(
@@ -50,10 +47,6 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
         state
     }
 
-    pub(crate) fn release(&self, proof: ready::Reservation<'_, 'd, ID>) {
-        self.shared.wake_tx(proof.release());
-    }
-
     #[inline]
     pub(crate) fn poll_settled<'target>(
         &self,
@@ -66,9 +59,9 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
         'd: 'target,
     {
         match self.current(target.conn) {
-            access::Current::Reserved(current) if current.id() == target => {}
-            access::Current::Held(current) if current == target => {}
-            access::Current::Finalizing(current) if current.id() == target => {}
+            access::Current::Reserved(current) if current == target.generation => {}
+            access::Current::Held(current) if current == target.generation => {}
+            access::Current::Finalizing(current) if current == target.generation => {}
             access::Current::Shared
             | access::Current::Reserved(_)
             | access::Current::Held(_)
@@ -89,19 +82,6 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
         &self,
         id: access::Transaction<'d, ID>,
     ) -> access::Finalization<'d, ID> {
-        self.shared.ready.finalize(id)
-    }
-
-    pub(in crate::protocol) fn poll_ready(
-        &self,
-        slot: conn::Id<'d, route::KeyTag<ID>>,
-        status: poll::Status,
-        load: usize,
-    ) -> poll::Readiness {
-        let (state, wake) = self.shared.ready.poll_ready(slot, status, load);
-        if let Some(id) = wake {
-            self.shared.wake_tx(id);
-        }
-        state
+        self.shared.finalize(id)
     }
 }

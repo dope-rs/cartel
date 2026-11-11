@@ -1,4 +1,4 @@
-use cartel_redis::api::Client as _;
+use cartel_redis::api::{Client as _, Commands as _};
 use cartel_redis::{
     client::settings::{
         self, Builder,

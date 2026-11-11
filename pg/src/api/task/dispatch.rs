@@ -1,13 +1,7 @@
 use std::{mem, num::NonZero, pin::Pin, task::Poll};
 
 use cartel_core::deadline;
-use dope::{
-    core::driver::{
-        route::KeyTag,
-        schedule::clock::{self, timer},
-    },
-    manifold::client::conn,
-};
+use dope::core::driver::schedule::clock::{self, timer};
 use dope_fiber::{context, wait};
 use o3::base::time::Positive;
 
@@ -26,29 +20,21 @@ impl<
     B: ?Sized,
     I: schema::QuerySet + 'd,
     const ID: u8,
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
     S,
+    M: Copy + Into<requests::Boundary>,
     A: lease::Target<'d, ID>,
     P: lease::Policy,
     H,
-> State<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, S, A, P, H>
+>
+    State<
+        api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+        R,
+        api::Pending<'d, S, M>,
+        lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>,
+        H,
+    >
 {
-    pub(super) fn new(
-        target: Option<api::Target<'d, ID>>,
-        next: Result<api::Pending<'d, S>, crate::Error>,
-    ) -> Self {
-        match next {
-            Ok(request) => State::Connecting { target, request },
-            Err(error) => State::Failed(error),
-        }
-    }
-
-    pub(super) fn phase(&self) -> deadline::RequestPhase {
-        match self {
-            State::Admitted(..) => deadline::RequestPhase::Response,
-            _ => deadline::RequestPhase::Admission,
-        }
-    }
-
     pub(super) fn cancel(&mut self, error: crate::Error) -> Error<'d, ID> {
         match mem::replace(self, State::Done) {
             State::Failed(error) => return error.into(),
@@ -58,90 +44,131 @@ impl<
         error.into()
     }
 
-    pub(super) fn poll_with<'target>(
-        &mut self,
-        client: &api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    pub(super) fn poll_with<'this, 'target, O>(
+        &'this mut self,
         mut cx: Pin<&mut context::Context<'_, 'd>>,
         waiter: Pin<&wait::Waiter<'target, 'd>>,
-        prepare: impl FnOnce(
-            &mut Self,
+        ready: impl FnOnce(&'this mut H) -> O,
+        mut prepare: impl FnMut(
+            &'this mut Self,
             api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
             NonZero<usize>,
             requests::ReplyContext<'_, 'app, 'd, ID>,
-        ) -> Result<(), (crate::Error, conn::Id<'d, KeyTag<ID>>)>,
-    ) -> Poll<Result<(), Error<'d, ID>>>
+        ) -> Result<
+            O,
+            (
+                requests::Rejection,
+                requests::Source<'app, 'd, ID>,
+                &'this mut Self,
+            ),
+        >,
+    ) -> Poll<Result<O, Error<'d, ID>>>
     where
         'app: 'target,
         'd: 'target,
     {
-        let (client, target, request) = match &*self {
-            State::Connecting { target, request } => (*client, target, request),
-            State::Admitted(..) => return Poll::Ready(Ok(())),
-            State::Failed(_) | State::Done => {
-                return Poll::Ready(Err(self.cancel(crate::Error::Closed)));
-            }
-        };
-        client
-            .port
-            .maintain(cx.as_ref().work(), cx.as_mut().region_token());
-        let context = 'selected: {
-            let error = 'failed: {
-                if let Err(error) = api::check_open(client) {
-                    break 'failed error;
-                }
-                let ready = &client.port.shared.ready;
-                match ready.select(target, request.boundary, cx.as_mut().region_token()) {
-                    Ok(Some(context)) => break 'selected context,
-                    Ok(None) => {}
-                    Err(target) => break 'failed Error::Pinned(target),
-                }
-                if target.is_none()
-                    && let Some(count) = ready.blocking()
-                {
-                    break 'failed client.port.backpressure(count).into();
-                }
-                match ready.try_register(waiter, cx.as_ref()) {
-                    Ok(()) => return Poll::Pending,
-                    Err(error) => Error::Wait(error),
-                }
-            };
-            let request = mem::replace(self, State::Done);
-            waiter.unregister();
-            drop(request);
-            return Poll::Ready(Err(error));
-        };
-        let weight = request.frame.geometry().wire().widen();
-        let (error, conn) = match prepare(self, client, weight, context) {
-            Ok(()) => {
+        match self {
+            State::Admitted(_, item) => Poll::Ready(Ok(ready(item))),
+            this => {
+                let (client, target, request) = match &*this {
+                    State::Connecting {
+                        client,
+                        target,
+                        request,
+                    } => (*client, (*target).into(), request),
+                    State::Admitted(..) => unreachable!("admitted"),
+                    State::Failed(_) | State::Done => {
+                        return Poll::Ready(Err(this.cancel(crate::Error::Closed)));
+                    }
+                };
+                client
+                    .port
+                    .maintain(cx.as_ref().work(), cx.as_mut().region_token());
+                let unpinned = target.is_none();
+                let boundary = request.boundary.into();
+                let weight = request.frame.geometry().wire().widen();
+                let mut this = this;
+                let error = 'failed: {
+                    if let Err(error) = api::check_open(client) {
+                        break 'failed error;
+                    }
+                    let ready = &client.port.shared;
+                    let mut selected = match ready.select(&target) {
+                        Ok(source) => source,
+                        Err(target) => break 'failed Error::Pinned(target),
+                    };
+                    let mut candidates = None;
+                    let mut pressure = None;
+                    while let Some(source) = selected {
+                        let listed = match source {
+                            requests::Source::Shared(listed)
+                                if unpinned
+                                    && matches!(boundary, requests::Boundary::Group)
+                                    && !listed.slot().is_synced() =>
+                            {
+                                listed
+                            }
+                            source => {
+                                let (error, source, next) = match prepare(
+                                    this,
+                                    client,
+                                    weight,
+                                    source.context(boundary, cx.as_mut().region_token()),
+                                ) {
+                                    Ok(output) => {
+                                        waiter.unregister();
+                                        return Poll::Ready(Ok(output));
+                                    }
+                                    Err(failure) => failure,
+                                };
+                                this = next;
+                                let cause = match error {
+                                    requests::Rejection::Pressure(cause) => cause,
+                                    requests::Rejection::Failed(error) => {
+                                        drop(mem::replace(this, State::Done));
+                                        waiter.unregister();
+                                        return Poll::Ready(Err(error.into()));
+                                    }
+                                };
+                                pressure = Some((cause, source.connection()));
+                                if !unpinned || matches!(cause, crate::reply::Pressure::Full { .. })
+                                {
+                                    break;
+                                }
+                                let Some(listed) = source.into_listed() else {
+                                    break;
+                                };
+                                listed
+                            }
+                        };
+                        selected = candidates
+                            .get_or_insert_with(|| listed.remaining())
+                            .next()
+                            .map(requests::Source::Shared);
+                    }
+                    if let Some((cause, conn)) = pressure {
+                        if let Err(error) = ready.signals.egress.try_register(waiter, cx.as_ref()) {
+                            let error = cause.fail(conn, error);
+                            drop(mem::replace(this, State::Done));
+                            waiter.unregister();
+                            return Poll::Ready(Err(error));
+                        }
+                        return Poll::Pending;
+                    }
+                    if unpinned && let Some(count) = ready.blocking() {
+                        break 'failed client.port.backpressure(count).into();
+                    }
+                    match ready.try_register(waiter, cx.as_ref()) {
+                        Ok(()) => return Poll::Pending,
+                        Err(error) => Error::Wait(error),
+                    }
+                };
+                let request = mem::replace(this, State::Done);
                 waiter.unregister();
-                return Poll::Ready(Ok(()));
+                drop(request);
+                Poll::Ready(Err(error))
             }
-            Err(failure) => failure,
-        };
-        let throttle = match api::Throttle::new(conn, error) {
-            Ok(throttle) => throttle,
-            Err(error) => {
-                drop(mem::replace(self, State::Done));
-                waiter.unregister();
-                return Poll::Ready(Err(error.into()));
-            }
-        };
-        if let Err(error) =
-            client
-                .port
-                .shared
-                .signals
-                .egress
-                .try_register(&throttle.cause, waiter, cx.as_ref())
-        {
-            let error = throttle.fail(error);
-            drop(mem::replace(self, State::Done));
-            waiter.unregister();
-            return Poll::Ready(Err(error));
         }
-        // No order was published: a later poll must revalidate the original
-        // target before selecting a connection that may now belong to a transaction.
-        Poll::Pending
     }
 }
 
@@ -157,14 +184,6 @@ pub(in crate::api) struct Budget<'d> {
 }
 
 impl<'d> Budget<'d> {
-    pub(in crate::api) fn new(source: deadline::Source<'d>) -> Self {
-        let (timer, window) = source.into_parts();
-        Self {
-            timer,
-            state: BudgetState::Fresh(window),
-        }
-    }
-
     pub(in crate::api) fn guard(&self) -> Result<timer::Alarm<'d>, timer::Exhausted> {
         self.timer.try_alarm()
     }
@@ -173,11 +192,10 @@ impl<'d> Budget<'d> {
         &mut self,
         guard: Pin<&mut timer::Alarm<'d>>,
         mut ctx: Pin<&mut context::Context<'_, 'd>>,
-        phase: deadline::RequestPhase,
-    ) -> Poll<deadline::Elapsed> {
+    ) -> Poll<()> {
         let now = ctx.as_mut().driver().driver_ref().clock().now();
         let due = match self.state {
-            BudgetState::Elapsed => return Poll::Ready(deadline::Elapsed::new(phase)),
+            BudgetState::Elapsed => return Poll::Ready(()),
             BudgetState::Armed(due) => due,
             BudgetState::Fresh(window) => {
                 let due = now.clamp_add(window);
@@ -188,14 +206,40 @@ impl<'d> Budget<'d> {
         let alarm = guard.get_mut();
         if now >= due {
             self.state = BudgetState::Elapsed;
-            return Poll::Ready(deadline::Elapsed::new(phase));
+            return Poll::Ready(());
         }
         let wake = ctx.as_ref().completion();
         if alarm.poll_or_arm(due, now, wake).is_ready() {
             self.state = BudgetState::Elapsed;
-            Poll::Ready(deadline::Elapsed::new(phase))
+            Poll::Ready(())
         } else {
             Poll::Pending
         }
+    }
+}
+
+impl<'d> From<deadline::Source<'d>> for Budget<'d> {
+    fn from(source: deadline::Source<'d>) -> Self {
+        let (timer, window) = source.into_parts();
+        Self {
+            timer,
+            state: BudgetState::Fresh(window),
+        }
+    }
+}
+
+impl<'d> From<deadline::Guard<'d>> for Budget<'d> {
+    fn from(guard: deadline::Guard<'d>) -> Self {
+        let Some((alarm, window)) = guard.into_parts() else {
+            unreachable!("deadline")
+        };
+        let (timer, state) = alarm.into_parts();
+        let state = match (window, state) {
+            (Some(window), timer::heap::State::Idle) => BudgetState::Fresh(window),
+            (None, timer::heap::State::Armed(due)) => BudgetState::Armed(due),
+            (None, timer::heap::State::Fired) => BudgetState::Elapsed,
+            _ => unreachable!("deadline"),
+        };
+        Self { timer, state }
     }
 }

@@ -1,74 +1,59 @@
 use crate::api::task::{Budget, Core, State, lease};
-use crate::port::replies;
+use crate::port::{replies, requests};
 use crate::{api, reply::Error, schema};
-use cartel_core::reply;
+use cartel_core::{deadline, reply};
 use dope::core::driver::schedule::clock::timer;
 use dope_fiber::{abi, context, wait};
 use reply::recv::{self, attach::Attach};
 use std::{pin::Pin, task::Poll};
 
-pub(in crate::api) struct Stream<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, X, const ID: u8>
-where
+pub(in crate::api) struct Stream<
+    'app,
+    'g,
+    'r,
+    's,
+    'b,
+    'c,
+    'd: 'app,
+    B: ?Sized,
+    I,
+    X,
+    const ID: u8,
+    R,
+    M = requests::Boundary,
+> where
     I: schema::QuerySet + 'd,
     X: recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>,
 {
-    core: Core<
-        'app,
-        'g,
-        'r,
-        's,
-        'b,
-        'c,
-        'd,
-        B,
-        I,
-        recv::Stream<
-            'app,
-            'b,
-            'c,
-            'd,
-            replies::Row<'d>,
-            X,
-            replies::ReplyFailure<'d>,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-        >,
-        ID,
-    >,
+    core: Core<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID, R, M>,
     budget: Budget<'d>,
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, X, const ID: u8>
-    Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, X, const ID: u8, R, M>
+    Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID, R, M>
 where
     I: schema::QuerySet + 'd,
-    X: recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>,
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
+    M: Copy + Into<requests::Boundary>,
+    X: recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>, Context = ()>,
 {
     pub(in crate::api) fn new(
-        client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-        target: Option<api::Target<'d, ID>>,
-        reply: recv::Stream<
-            'app,
-            'b,
-            'c,
-            'd,
-            replies::Row<'d>,
-            X,
-            replies::ReplyFailure<'d>,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-        >,
-        next: Result<api::Pending<'d>, crate::Error>,
+        core: Core<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID, R, M>,
+        budget: impl Into<Budget<'d>>,
     ) -> Self {
         Self {
-            core: Core::new(client, target, reply, next),
-            budget: Budget::new(client.port.lifecycle.deadline),
+            core,
+            budget: budget.into(),
         }
     }
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, X, const ID: u8>
-    Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, X, const ID: u8, R, M>
+    Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID, R, M>
 where
     I: schema::QuerySet + 'd,
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
+    M: Copy + Into<requests::Boundary>,
     X: recv::Extract<
             'app,
             'b,
@@ -79,12 +64,12 @@ where
             Output = Result<T, Error<'d, ID>>,
         >,
 {
-    pub(in crate::api) fn next<'a, M, U>(
+    pub(in crate::api) fn next<'a, F, U>(
         &'a mut self,
-        map: M,
+        map: F,
     ) -> impl abi::Fiber<'d, Output = U> + 'a
     where
-        M: FnMut(Result<Option<T>, Error<'d, ID>>) -> U + 'a,
+        F: FnMut(Result<Option<T>, Error<'d, ID>>) -> U + 'a,
     {
         Next {
             deadline: match self.core.admission {
@@ -106,19 +91,17 @@ where
         'app: 'target,
         'd: 'target,
     {
-        match self
+        let reply = match self
             .core
             .poll_admit(cx.as_mut(), waiter, lease::Lease::admit)
         {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Ready(Ok(())) => {}
-        }
-        let next = Pin::new(&mut self.core.reply)
-            .poll_next(cx)
-            .map(Option::transpose);
+            Poll::Ready(Ok(reply)) => reply,
+        };
+        let next = Pin::new(&mut *reply).poll_next(cx).map(Option::transpose);
         if matches!(&next, Poll::Ready(Ok(None)) | Poll::Ready(Err(_))) {
-            self.core.reply.detach();
+            reply.detach();
             self.core.admission = State::Done;
         }
         next
@@ -126,23 +109,25 @@ where
 }
 
 #[pin_project::pin_project]
-struct Next<'borrow, 'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, X, M, const ID: u8>
+struct Next<'borrow, 'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, X, F, const ID: u8, R, M>
 where
     I: schema::QuerySet + 'd,
     X: recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>,
 {
-    stream: &'borrow mut Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID>,
+    stream: &'borrow mut Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID, R, M>,
     #[pin]
     deadline: Result<Option<timer::Alarm<'d>>, timer::Exhausted>,
     #[pin]
     waiter: wait::Waiter<'borrow, 'd>,
-    map: M,
+    map: F,
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, X, M, U, const ID: u8> abi::Fiber<'d>
-    for Next<'_, 'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, M, ID>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, X, F, U, const ID: u8, R, M>
+    abi::Fiber<'d> for Next<'_, 'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, F, ID, R, M>
 where
     I: schema::QuerySet + 'd,
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
+    M: Copy + Into<requests::Boundary>,
     X: recv::Extract<
             'app,
             'b,
@@ -152,7 +137,7 @@ where
             replies::ReplyFailure<'d>,
             Output = Result<T, Error<'d, ID>>,
         >,
-    M: FnMut(Result<Option<T>, Error<'d, ID>>) -> U,
+    F: FnMut(Result<Option<T>, Error<'d, ID>>) -> U,
 {
     type Output = U;
 
@@ -171,12 +156,13 @@ where
                     .fail(crate::Error::Deadline(*error), cx.as_mut().region_token()))));
             }
         };
-        let phase = this.stream.core.phase();
-        if let Poll::Ready(time) =
-            this.stream
-                .budget
-                .poll_expired(guard.as_mut(), cx.as_mut(), phase)
+        if this
+            .stream
+            .budget
+            .poll_expired(guard.as_mut(), cx.as_mut())
+            .is_ready()
         {
+            let time = deadline::Elapsed::new(this.stream.core.phase());
             waiter.unregister();
             let error = this.stream.core.fail(
                 crate::Error::RequestTimeout(time),

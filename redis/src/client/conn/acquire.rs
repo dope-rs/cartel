@@ -42,10 +42,8 @@ impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> abi::Fiber<'d>
                 return task::Poll::Ready(Err(crate::Error::Deadline(*error)));
             }
         };
-        if let task::Poll::Ready(due) = guard
-            .as_mut()
-            .poll_expired(ctx.as_mut(), deadline::RequestPhase::Lease)
-        {
+        if guard.as_mut().poll_expired(ctx.as_mut()).is_ready() {
+            let due = deadline::Elapsed::new(deadline::RequestPhase::Lease);
             this.waiter.as_ref().unregister();
             return task::Poll::Ready(Err(due.into()));
         }

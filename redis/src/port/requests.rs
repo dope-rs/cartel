@@ -6,7 +6,7 @@ use o3::{alloc, buffer::pool};
 use crate::{client::settings, request, request::encode};
 
 pub(crate) struct Requests {
-    direct: pool::Pool,
+    pub(crate) direct: pool::Pool,
     bulk: Option<pool::Pool>,
 }
 
@@ -17,7 +17,7 @@ impl Requests {
         Ok(Self { direct, bulk })
     }
 
-    pub(super) fn frame(&self) -> Result<pool::Span, request::Error> {
+    pub(crate) fn frame(&self) -> Result<pool::Span, request::Error> {
         let buf = self.direct.acquire().ok_or(request::Error::Entries {
             required: num::NonZero::<usize>::MIN,
         })?;

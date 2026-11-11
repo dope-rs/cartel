@@ -1,11 +1,11 @@
-use crate::api::{Client, decode};
+use crate::api::{Commands, decode};
 use crate::client::nonempty;
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct Lists<C, const ID: u8 = 0>(pub(crate) C);
 
-impl<'d, C: Client<'d, ID>, const ID: u8> Lists<C, ID> {
+impl<'d, C: Commands<'d, ID>, const ID: u8> Lists<C, ID> {
     pub fn push_front(self, key: &[u8], values: nonempty::Slice<'_, &[u8]>) -> C::Call<u64> {
         let values = values.as_slice();
         self.0

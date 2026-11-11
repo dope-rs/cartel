@@ -29,25 +29,27 @@ impl<'a, 'd, const ID: u8> Bound<'a, 'd, ID> {
         self,
         pool: &Storage,
     ) -> Result<port::Backend<'d, ID>, Rejected<'a, 'd, ID>> {
-        let bound = match self.slot.phase.get() {
-            slot::Phase::Ready { bound, .. } => bound,
-            slot::Phase::Vacant => {
+        let bound = match self.slot.snapshot() {
+            Some((bound, slot::Lifecycle::Ready { .. })) => bound,
+            None => {
                 return Err(Rejected::Inactive {
                     owner: self,
                     observed: Inactive::Vacant,
                 });
             }
-            slot::Phase::Handshaking(bound) => {
+            Some((bound, slot::Lifecycle::Handshaking)) => {
                 return Err(Rejected::Inactive {
                     owner: self,
                     observed: Inactive::Handshaking(bound.token),
                 });
             }
-            slot::Phase::Closing {
+            Some((
                 bound,
-                failure,
-                disposition: fate,
-            } => {
+                slot::Lifecycle::Closing {
+                    failure,
+                    disposition: fate,
+                },
+            )) => {
                 return Err(Rejected::Inactive {
                     owner: self,
                     observed: Inactive::Closing {

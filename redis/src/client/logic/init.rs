@@ -31,7 +31,7 @@ impl Plan {
         turn: &mut Turn<'_, 'e, 'd, ID>,
     ) -> Result<(), client::Failure<'d>> {
         let frame = port
-            .encode(|out| match command {
+            .encode(port.requests.frame(), |out| match command {
                 Command::Authenticate(auth) => match auth {
                     Auth::Password(pass) => out.auth(pass),
                     Auth::User {

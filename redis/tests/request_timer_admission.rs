@@ -1,5 +1,5 @@
 use cartel_redis::{
-    Error, api::Client as _, client::settings::init::Plan, request, value::reply::Failure,
+    Error, api::Commands as _, client::settings::init::Plan, request, value::reply::Failure,
 };
 use dope::{
     core::driver::{life::recovery, route::Id, schedule::clock::timer::Exhausted},

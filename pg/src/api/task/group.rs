@@ -70,20 +70,11 @@ where
     }
 }
 
-type Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, const ID: u8> = State<
-    'app,
-    'g,
-    'r,
-    's,
-    'b,
-    'c,
-    'd,
-    B,
-    I,
-    ID,
-    groups::Draft<'g, 'r, 's, 'b, 'c, 'd>,
-    conn::Id<'d, KeyTag<ID>>,
-    lease::Detached,
+type Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, const ID: u8, R> = State<
+    api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    R,
+    api::Pending<'d, groups::Draft<'g, 'r, 's, 'b, 'c, 'd>>,
+    lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, conn::Id<'d, KeyTag<ID>>, lease::Detached, ID>,
     groups::Owner<'g, 'r, 's, 'b, 'c, 'd>,
 >;
 
@@ -123,9 +114,9 @@ pub(in crate::api) struct Group<
     Q: schema::TypedQuery<Result = schema::result::Rows>,
     const ID: u8,
     const N: usize,
+    R,
 > {
-    client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-    admission: Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    admission: Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R>,
     commands: [Response<'app, 'g, 'r, 's, 'b, 'c, 'd, First<Q>>; N],
     sync: Response<'app, 'g, 'r, 's, 'b, 'c, 'd, api::ExtractUnit<ID>>,
     #[pin]
@@ -147,18 +138,21 @@ impl<
     Q: schema::TypedQuery<Result = schema::result::Rows>,
     const ID: u8,
     const N: usize,
-> Group<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, N>
+    R,
+> Group<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, N, R>
+where
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
 {
     pub(in crate::api) fn new(
         client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-        target: Option<api::Target<'d, ID>>,
+        target: R,
         next: Result<api::Pending<'d, groups::Draft<'g, 'r, 's, 'b, 'c, 'd>>, crate::Error>,
+        clock: impl Into<Result<deadline::Guard<'d>, timer::Exhausted>>,
     ) -> Self {
         const { assert!(N > 0 && N < u32::MAX as usize) };
-        let admit = State::new(target, next);
-        let deadline = client.port.lifecycle.deadline.guard();
+        let admit = State::new(client, target, next);
+        let deadline = clock.into();
         Self {
-            client,
             admission: admit,
             commands: array::from_fn(|_| Response::new()),
             sync: Response::new(),
@@ -181,7 +175,10 @@ impl<
     Q: schema::TypedQuery<Result = schema::result::Rows>,
     const ID: u8,
     const N: usize,
-> abi::Fiber<'d> for Group<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, N>
+    R,
+> abi::Fiber<'d> for Group<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, N, R>
+where
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
 {
     type Output = Output<'r, 's, 'b, 'c, 'd, Q, ID, N>;
 
@@ -190,8 +187,10 @@ impl<
         let mut this = this.project();
         let mut sync = None;
         let expired = match this.deadline.as_mut().get_mut() {
-            Ok(guard) => match Pin::new(guard).poll_expired(cx.as_mut(), this.admission.phase()) {
-                Poll::Ready(time) => Some(Stop::Deadline(crate::Error::RequestTimeout(time))),
+            Ok(guard) => match Pin::new(guard).poll_expired(cx.as_mut()) {
+                Poll::Ready(()) => Some(Stop::Deadline(crate::Error::RequestTimeout(
+                    deadline::Elapsed::new(this.admission.phase()),
+                ))),
                 Poll::Pending => None,
             },
             Err(error) => Some(Stop::Deadline(crate::Error::Deadline(*error))),
@@ -200,53 +199,47 @@ impl<
             Some(stop) => stop,
             None => {
                 match this.admission.poll_with(
-                    this.client,
                     cx.as_mut(),
                     this.waiter.as_ref(),
+                    |_| (),
                     |admit, client, weight, context| {
-                        client
-                            .port
-                            .request()
-                            .try_with(
-                                context,
-                                weight,
-                                admit,
-                                |token, lane, tag, admit| {
-                                    let State::Connecting { request, .. } = &*admit else {
-                                        unreachable!("connecting");
-                                    };
-                                    let reserved = match lane.try_reserve(request.state.usage()) {
-                                        Ok(reserved) => reserved,
-                                        Err(error) => {
-                                            return Err((attach::Error::Payload(error), admit));
+                        client.port.request().try_with(
+                            context,
+                            weight,
+                            admit,
+                            |token, lane, tag, admit| {
+                                let State::Connecting { request, .. } = &*admit else {
+                                    unreachable!("connecting");
+                                };
+                                let reserved = match lane.try_reserve(request.state.usage()) {
+                                    Ok(reserved) => reserved,
+                                    Err(error) => {
+                                        return Err((attach::Error::Payload(error), admit));
+                                    }
+                                };
+                                replies::try_group_by(
+                                    token,
+                                    lane,
+                                    this.commands,
+                                    this.sync,
+                                    tag.batch(),
+                                    admit,
+                                    move |admit| match mem::replace(admit, State::Done) {
+                                        State::Connecting { request, .. } => {
+                                            let api::Pending { frame, state, .. } = request;
+                                            let (owner, sync) = state.admit(reserved);
+                                            (sync, (admit, frame, owner))
                                         }
-                                    };
-                                    replies::try_group_by(
-                                        token,
-                                        lane,
-                                        this.commands,
-                                        this.sync,
-                                        tag.batch(),
-                                        admit,
-                                        move |admit| match mem::replace(admit, State::Done) {
-                                            State::Connecting { request, .. } => {
-                                                let api::Pending { frame, state, .. } = request;
-                                                let (owner, sync) = state.admit(reserved);
-                                                (sync, (admit, frame, owner))
-                                            }
-                                            _ => unreachable!("connecting"),
-                                        },
-                                    )
-                                },
-                                |(admit, frame, owner), conn| {
-                                    *admit = State::Admitted(
-                                        lease::Lease::admit((), client, conn),
-                                        owner,
-                                    );
-                                    (frame, ())
-                                },
-                            )
-                            .map_err(|(error, conn, _)| (error, conn))
+                                        _ => unreachable!("connecting"),
+                                    },
+                                )
+                            },
+                            |(admit, frame, owner), conn| {
+                                *admit =
+                                    State::Admitted(lease::Lease::admit((), client, conn), owner);
+                                (frame, ())
+                            },
+                        )
                     },
                 ) {
                     Poll::Pending => return Poll::Pending,

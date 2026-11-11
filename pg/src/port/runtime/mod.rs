@@ -4,8 +4,7 @@ use crate::port::{
     pool::{access, slot},
     replies,
 };
-use crate::protocol::scram;
-use cartel_core::reply::order;
+use crate::protocol::{self, scram};
 use dope::core::driver::{self, route};
 use dope::manifold::client::{close, conn};
 use dope_fiber::wait;
@@ -20,9 +19,13 @@ pub(crate) mod tx;
 mod waiters;
 
 pub(crate) struct Shared<'d, const ID: u8> {
-    pub(super) database: crate::Config,
+    pub(crate) database: crate::Config,
     pub(crate) config: config::Config,
-    pub(crate) ready: ready::Set<'d, ID>,
+    index: ready::Index<'d, ID>,
+    policy: cell::Cell<protocol::PickPolicy>,
+    next: cell::Cell<waiters::Step>,
+    ready_waiters: wait::Notifier<'d>,
+    pub(crate) frame_waiters: wait::Notifier<'d>,
     transactions: waiters::Table<'d, ID>,
     pub(crate) notifications: notify::Queue<'d>,
     pub(crate) signals: states::Signals<'d, ID>,
@@ -45,12 +48,17 @@ impl<'d, const ID: u8> Shared<'d, ID> {
         Ok(Self {
             database: db,
             config,
-            ready: ready::Set::try_new(ready, driver, wait)?,
+            index: ready::Index::try_new(ready)?,
+            policy: cell::Cell::new(protocol::PickPolicy::default()),
+            next: cell::Cell::new(waiters::Step::Retire),
+            ready_waiters: wait::Notifier::new(driver, wait),
+            frame_waiters: wait::Notifier::new(driver, wait),
             transactions: waiters::Table::try_new(driver, cap)?,
             notifications: notify::Queue::try_new(driver, items, bytes, wait, proof)?,
             signals: states::Signals {
                 cause: cell::Cell::new(None),
-                egress: waiters::Egress::try_new(driver, cap, wait)?,
+                // Each admission waiter retains one distinct request-pool frame.
+                egress: wait::Notifier::new(driver, wait::Capacity::new(caps.requests.frames)),
             },
             scram: scram::Runtime::try_new(cap, proof)?,
         })
@@ -62,10 +70,12 @@ impl<'d, const ID: u8> Shared<'d, ID> {
 
     pub(crate) fn waiters(&self) -> waiters::Set<'_, 'd, ID> {
         waiters::Set::new(
-            &self.ready.waiters,
+            &self.next,
+            &self.ready_waiters,
             &self.transactions,
             &self.notifications.waiters,
             &self.signals.egress,
+            &self.frame_waiters,
         )
     }
 }
@@ -74,7 +84,7 @@ impl<'d, const ID: u8> Shared<'d, ID> {
     /// Operations can use prepared peers while another connection is opening.
     pub(crate) fn failure(&self) -> Option<crate::reply::Error<'d, ID>> {
         match self.signals.failure() {
-            Some(crate::reply::Error::Open(_)) if self.ready.count() != 0 => None,
+            Some(crate::reply::Error::Open(_)) if self.count() != 0 => None,
             failure => failure,
         }
     }
@@ -89,57 +99,47 @@ impl<'d, const ID: u8> Shared<'d, ID> {
     }
 
     pub(crate) fn wake_ready(&self) {
-        self.ready.waiters.notify();
-    }
-
-    pub(crate) fn reindex(&self, slot: conn::Id<'d, route::KeyTag<ID>>, depth: order::Depth) {
-        if let Some(slot) = self.ready.reindex(slot, depth) {
-            self.wake_close(
-                slot,
-                replies::Failure::from_error(crate::Error::Closed),
-                Disposition::Reconnect,
-            );
-        }
+        self.ready_waiters.notify();
+        self.signals.egress.notify();
     }
 
     pub(crate) fn try_close(
         &self,
         conn: conn::Id<'d, route::KeyTag<ID>>,
-        cause: replies::Failure,
+        mut cause: replies::Failure,
         mode: Disposition,
     ) -> Option<replies::Failure> {
-        let close = self.ready.try_close(conn, cause, mode)?;
-        Some(self.apply_close(close))
+        self.entry(conn.index().into_usize())?
+            .close(conn, &mut cause, mode)?;
+        Some(cause)
     }
 
     pub(crate) fn wake_close(
         &self,
         conn: conn::Id<'d, route::KeyTag<ID>>,
-        cause: replies::Failure,
+        mut cause: replies::Failure,
         mode: Disposition,
     ) -> replies::Failure {
-        let Some(entry) = self.ready.connection(conn) else {
+        let Some(entry) = self.entry(conn.index().into_usize()) else {
             return cause;
         };
-        let Some(close) = self.ready.try_close(conn, cause, mode) else {
-            return cause;
-        };
-        let cause = self.apply_close(close);
-        entry.wake();
+        let slot = entry.slot();
+        if entry.close(conn, &mut cause, mode).is_some() {
+            slot.wake();
+        }
         cause
     }
 
-    fn apply_close(&self, close: slot::Close<'d, ID>) -> replies::Failure {
-        match close.state {
+    fn apply_close(&self, state: slot::Closed<'d, ID>) {
+        match state {
             slot::Closed::Reserved(tx) | slot::Closed::Held(tx) | slot::Closed::Finalizing(tx) => {
                 self.wake_tx(tx);
             }
             slot::Closed::Handshaking | slot::Closed::Shared | slot::Closed::Draining => {
-                self.ready.waiters.notify();
+                self.wake_ready();
             }
-            slot::Closed::Closing => return close.failure,
+            slot::Closed::Closing => {}
         }
-        close.failure
     }
 
     fn wake_tx(&self, target: access::Transaction<'d, ID>) {
@@ -147,6 +147,6 @@ impl<'d, const ID: u8> Shared<'d, ID> {
             self.signals
                 .record_fatal(crate::Error::TransactionSlot(cause));
         }
-        self.ready.waiters.notify();
+        self.wake_ready();
     }
 }

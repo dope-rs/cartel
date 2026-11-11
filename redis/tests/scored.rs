@@ -1,4 +1,4 @@
-use cartel_redis::api::Client as _;
+use cartel_redis::api::{Client as _, Commands as _};
 use cartel_redis::value::source::Bytes as _;
 use cartel_redis::{
     client::settings::init::Plan, value, value::list::pair::ScoredBulks, value::reply,

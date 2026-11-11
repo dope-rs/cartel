@@ -1,5 +1,5 @@
 use cartel_redis::{
-    api::Client as _,
+    api::Commands as _,
     client::{connect, settings::init},
 };
 use dope::{

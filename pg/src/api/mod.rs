@@ -11,17 +11,22 @@ use crate::protocol::{self, runtime::tx::Access};
 use crate::reply::{self, Pressure};
 use crate::schema;
 use cartel_core::reply::recv::outcome::Terminal;
-use cartel_core::reply::{
-    Slot,
-    recv::{self, attach},
-};
+use cartel_core::reply::{Slot, recv};
 use dope::manifold::client::conn;
 use dope_fiber::wait;
-use o3::mem::credit::fair;
 use std::{marker, mem};
 
 use request::Pending;
 use task::lease;
+
+#[derive(Clone, Copy)]
+pub struct Pooled;
+
+impl<'d, const ID: u8> From<Pooled> for Option<Target<'d, ID>> {
+    fn from(_: Pooled) -> Self {
+        None
+    }
+}
 
 /// Exact owner-bound destination of one request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,7 +79,7 @@ pub mod ops;
 pub(super) mod request;
 pub mod results;
 pub mod sql;
-pub mod task;
+pub(crate) mod task;
 pub mod traits;
 pub mod tx;
 
@@ -194,7 +199,7 @@ where
 }
 
 pub(in crate::api) trait Sync {
-    const BOUNDARY: Boundary = Boundary::Close;
+    const SYNC: bool = true;
 }
 
 impl<const ID: u8> Sync for ExtractAll<ID> {}
@@ -202,52 +207,24 @@ impl<const ID: u8> Sync for ExtractUnit<ID> {}
 impl<M, const ID: u8> Sync for ExtractFirst<M, ID> {}
 
 impl<const ID: u8> Sync for ExtractOne<ID> {
-    const BOUNDARY: Boundary = Boundary::Open;
+    const SYNC: bool = false;
 }
 
-#[repr(u8)]
-pub(in crate::api) enum Boundary {
-    Close,
-    Open,
-}
-
-pub(super) struct Throttle<'d, const ID: u8> {
-    conn: conn::Id<'d, KeyTag<ID>>,
-    cause: Pressure,
-}
-
-impl<'d, const ID: u8> Throttle<'d, ID> {
-    pub(in crate::api) fn new(
-        conn: conn::Id<'d, KeyTag<ID>>,
-        error: crate::Error,
-    ) -> Result<Self, crate::Error> {
-        let cause = match error {
-            crate::Error::Reply(attach::Error::Full { len, capacity }) => {
-                Pressure::Full { len, capacity }
-            }
-            crate::Error::Reply(attach::Error::Capacity {
-                lane,
-                cause:
-                    fair::Cause::Exhausted {
-                        axis,
-                        required,
-                        available: avail,
-                    },
-            }) => Pressure::Capacity {
-                lane,
-                axis,
-                required,
-                available: avail,
-            },
-            error => return Err(error),
-        };
-        Ok(Self { conn, cause })
+impl<X: Sync> From<marker::PhantomData<X>> for crate::port::requests::Boundary {
+    fn from(_: marker::PhantomData<X>) -> Self {
+        if X::SYNC { Self::Close } else { Self::Open }
     }
+}
 
-    fn fail(self, error: wait::Error<'d>) -> reply::Error<'d, ID> {
+impl Pressure {
+    fn fail<'d, const ID: u8>(
+        self,
+        conn: conn::Id<'d, KeyTag<ID>>,
+        error: wait::Error<'d>,
+    ) -> reply::Error<'d, ID> {
         reply::Error::Admission {
-            conn: self.conn,
-            cause: self.cause,
+            conn,
+            cause: self,
             error,
         }
     }
@@ -261,5 +238,3 @@ const _: () = assert!(
 );
 const _: () =
     assert!(mem::size_of::<Option<Target<'static, 0>>>() == mem::size_of::<Target<'static, 0>>());
-const _: () = assert!(mem::size_of::<Boundary>() == mem::size_of::<bool>());
-const _: () = assert!(mem::align_of::<Boundary>() == mem::align_of::<bool>());

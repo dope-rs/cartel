@@ -1,4 +1,4 @@
-use crate::api::{Client, decode};
+use crate::api::{Commands, decode};
 use crate::client::nonempty;
 use std::num;
 
@@ -6,7 +6,7 @@ use std::num;
 #[repr(transparent)]
 pub struct Hashes<C, const ID: u8 = 0>(pub(crate) C);
 
-impl<'d, C: Client<'d, ID>, const ID: u8> Hashes<C, ID> {
+impl<'d, C: Commands<'d, ID>, const ID: u8> Hashes<C, ID> {
     pub fn get(self, key: &[u8], field: &[u8]) -> C::Call<decode::MaybeBytes> {
         self.0
             .encode::<decode::MaybeBytes>(move |out| out.command(&[b"HGET", key, field]))

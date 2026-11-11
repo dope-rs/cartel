@@ -1,5 +1,5 @@
 use cartel_pg::api::traits::{
-    Begin as _, Client as _, Notify as _, Query as _, Status as _, Transaction as _,
+    Begin as _, Client as _, Notify as _, Query as _, Status as _, Stream as _, Transaction as _,
 };
 use dope::core::driver::life::recovery;
 use std::{num::NonZero, pin::pin, time::Duration};
@@ -174,11 +174,17 @@ fn rows_outlive_group() {
                                                 io
                                             }))
                                             .expect("startup driver");
+                                        let mut stream = client.query().run_stream::<TextQuery>(());
                                         let mut group = pin!(Task::new(
                                             client.query().run_group::<TextQuery, 2>([(); 2])
                                         ));
                                         let (rows, mut io) = fibers::TEST
                                             .try_run(&mut runtime, dope_fiber::fiber!('_ => async move {
+                                                assert!(fibers::TEST.poll_once(stream.next_row()).await.is_none());
+                                                assert!(fibers::TEST.poll_once(group.as_mut()).await.is_none());
+                                                startup::request(&mut io, false).await;
+                                                assert!(io.write_all(common::transaction::DETACHED_RESPONSES[0]).await.is_ok());
+                                                drop(stream);
                                                 assert!(fibers::TEST.poll_once(group.as_mut()).await.is_none());
                                                 startup::request(&mut io, false).await;
                                                 assert!(io.write_all(group::ROWS_COMPLETED).await.is_ok());

@@ -2,8 +2,8 @@ pub mod encode;
 pub mod frame;
 pub mod logic;
 pub(crate) mod messages;
-pub(crate) mod runtime;
-mod scram;
+pub(crate) use crate::port::runtime;
+pub(crate) mod scram;
 pub mod value;
 mod wire;
 

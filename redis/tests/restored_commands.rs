@@ -1,4 +1,4 @@
-use cartel_redis::api::{Client as _, decode};
+use cartel_redis::api::{Client as _, Commands as _, decode};
 use cartel_redis::value::source::{
     Bulks as _, Bytes as _, Coordinates as _, Reader as _, Reply as _, Scan as _, Scored as _,
 };

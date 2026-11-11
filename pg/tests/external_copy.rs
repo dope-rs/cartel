@@ -1,4 +1,4 @@
-use cartel_pg::api::traits::{Client as _, Notify as _, Status as _, Unchecked as _};
+use cartel_pg::api::traits::{Client as _, Notify as _, Query as _, Status as _, Unchecked as _};
 use common::env::{self, Env};
 use common::{external::runtime::check, recover};
 use dope_fiber::{BlockOn as _, abi::poll_fn, context::raw::Live};
@@ -78,13 +78,19 @@ fn finish_with_full_request_pool() {
                 let timer = rt.runtime.block_on(poll_fn(|mut context| {
                     Poll::Ready(context.as_mut().driver().driver_ref().timer())
                 }))?;
-                let mut copy = client.copy().copy_stream("COPY items FROM STDIN");
+                let mut alarms = Vec::new();
+                while let Ok(alarm) = timer.try_alarm() {
+                    alarms.push(alarm);
+                }
+                drop(alarms.pop().expect("last available timer"));
+                let acquired = rt
+                    .runtime
+                    .block_on(client.query().acquire())?
+                    .ok()
+                    .expect("request frame");
+                let mut copy = acquired.copy_stream("COPY items FROM STDIN");
                 {
                     let mut write = pin!(copy.write(&[]));
-                    let mut alarms = Vec::new();
-                    while let Ok(alarm) = timer.try_alarm() {
-                        alarms.push(alarm);
-                    }
                     assert!(
                         rt.runtime
                             .block_on(poll_fn(|context| {
@@ -96,6 +102,7 @@ fn finish_with_full_request_pool() {
                     );
                     let _alarm = timer.try_alarm().expect("completed COPY write timer");
                 }
+                drop(alarms);
                 let notice = rt
                     .runtime
                     .block_on(client.notify().next())?

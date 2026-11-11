@@ -12,11 +12,11 @@ pub(crate) struct Queue<'d> {
     buffer: region::Value<region::Identity<'d>, buffer::Buffer<'d>>,
     capacity: usize,
     dropped: cell::Cell<u64>,
-    pub(in crate::protocol) waiters: wait::Notifier<'d>,
+    pub(super) waiters: wait::Notifier<'d>,
 }
 
 impl<'d> Queue<'d> {
-    pub(in crate::protocol) fn try_new(
+    pub(super) fn try_new(
         driver: driver::Reference<'d>,
         items: NonZero<u32>,
         bytes: usize,
@@ -38,7 +38,7 @@ impl<'d> Queue<'d> {
         token.borrow_mut(&self.buffer).pop()
     }
 
-    pub(in crate::protocol) fn try_push<'input, R: Source>(
+    pub(crate) fn try_push<'input, R: Source>(
         &self,
         fields: crate::reply::raw::Fields<'input, 'd, R>,
         pid: u32,

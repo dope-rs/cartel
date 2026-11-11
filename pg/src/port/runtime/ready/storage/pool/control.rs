@@ -36,7 +36,7 @@ impl<'p, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8>
         let token = entry.connection();
         let ready = entry.ready();
         if matches!(
-            self.port.shared.ready.bind(token, ready),
+            self.port.shared.bind(token, ready),
             protocol::runtime::ready::Bind::Rejected
         ) {
             return Err(self.reject());
@@ -74,8 +74,8 @@ impl<'p, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8>
         &self,
         token: conn::Id<'d, KeyTag<ID>>,
     ) -> Result<(), protocol::Reason> {
-        self.port.shared.ready.try_ready(token)?;
-        if self.port.shared.ready.count() == self.port.capacity() {
+        self.port.shared.try_ready(token)?;
+        if self.port.shared.count() == self.port.capacity() {
             self.port.shared.signals.clear_open();
         }
         Ok(())

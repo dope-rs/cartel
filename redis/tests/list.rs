@@ -1,4 +1,4 @@
-use cartel_redis::api::Client as _;
+use cartel_redis::api::{Client as _, Commands as _};
 use cartel_redis::protocol::parser::storage;
 use cartel_redis::value::source::{
     Bulks as _, Bytes as _, Chunks as _, Exact as _, Optional as _, Pairs as _,

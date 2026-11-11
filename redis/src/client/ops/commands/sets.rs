@@ -1,4 +1,4 @@
-use crate::api::{Client, decode};
+use crate::api::{Commands, decode};
 use crate::client::nonempty;
 use std::num;
 
@@ -6,7 +6,7 @@ use std::num;
 #[repr(transparent)]
 pub struct Sets<C, const ID: u8 = 0>(pub(crate) C);
 
-impl<'d, C: Client<'d, ID>, const ID: u8> Sets<C, ID> {
+impl<'d, C: Commands<'d, ID>, const ID: u8> Sets<C, ID> {
     pub fn add(self, key: &[u8], members: nonempty::Slice<'_, &[u8]>) -> C::Call<u64> {
         let members = members.as_slice();
         self.0

@@ -89,18 +89,18 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 } else {
                     payloads::empty(typ, data.wire())?;
                 }
-                let queue = self
+                let mut queue = self
                     .port
-                    .responses(self.conn)
+                    .responses(self.conn, self.region)
                     .ok_or(crate::Error::Protocol(Reason::CommandUnknown))?;
-                let end = queue.front(self.state.batch, self.region)?.0;
+                let end = queue.front(self.state.batch)?.0;
                 let Some(end) = end else {
                     return Err(crate::Error::Protocol(Reason::CommandEmpty));
                 };
                 match end {
-                    Completion::Command | Completion::Group => queue.complete(self.region),
+                    Completion::Command | Completion::Group => queue.complete(),
                     Completion::Last => {
-                        queue.complete(self.region);
+                        queue.complete();
                         self.state.progress = state::Progress::Complete;
                     }
                     Completion::Ready | Completion::Begin => {
@@ -109,12 +109,9 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                     Completion::Commit => match data.wire().as_slice() {
                         b"COMMIT\0" => self.state.progress = state::Progress::Complete,
                         b"ROLLBACK\0" => {
-                            queue.fail_one(
-                                self.region,
-                                crate::port::replies::Failure::from_error(
-                                    crate::Error::CommitRolledBack,
-                                ),
-                            );
+                            queue.fail_one(crate::port::replies::Failure::from_error(
+                                crate::Error::CommitRolledBack,
+                            ));
                             self.state.progress = state::Progress::Skipping;
                         }
                         _ => return Err(crate::Error::Protocol(Reason::CommitTag)),
@@ -150,12 +147,12 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                     poll::Status::Transaction => {
                         match self.port.shared.transaction().current(self.conn) {
                             access::Current::Reserved(_) => {
-                                let queue = self
+                                let mut queue = self
                                     .port
-                                    .responses(self.conn)
+                                    .responses(self.conn, self.region)
                                     .ok_or(crate::Error::Protocol(Reason::ReadyUnknown))?;
                                 if !matches!(
-                                    queue.front(self.state.batch, self.region)?.0,
+                                    queue.front(self.state.batch)?.0,
                                     Some(Completion::Begin)
                                 ) {
                                     return Err(crate::Error::Protocol(Reason::TransactionLease));
@@ -201,11 +198,11 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
     {
         use crate::port::replies;
 
-        let queue = self
+        let mut queue = self
             .port
-            .responses(self.conn)
+            .responses(self.conn, self.region)
             .ok_or(crate::Error::Protocol(Reason::RowUnknown))?;
-        let (end, selected) = queue.front(self.state.batch, self.region)?;
+        let (end, selected) = queue.front(self.state.batch)?;
         match end {
             None => {
                 return Err(crate::Error::Protocol(Reason::RowEmpty));
@@ -272,11 +269,11 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         ) {
             self.state.phase = state::Phase::Ready;
         }
-        let queue = self
+        let mut queue = self
             .port
-            .responses(self.conn)
+            .responses(self.conn, self.region)
             .ok_or(crate::Error::Protocol(Reason::ResponseUnknown))?;
-        let (end, mut selected) = queue.front(self.state.batch, self.region)?;
+        let (end, mut selected) = queue.front(self.state.batch)?;
         let plan = match end {
             None => plan,
             Some(_) => {
@@ -305,9 +302,9 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                                 if command {
                                     let detached = matches!(selected.front(), Front::Detached);
                                     if detached {
-                                        queue.complete(self.region);
+                                        queue.complete();
                                     } else {
-                                        queue.fail_group(self.region);
+                                        queue.fail_group();
                                     }
                                 }
                                 self.state.progress = state::Progress::Skipping;
@@ -328,7 +325,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             Ok(failure) => match failure.try_fail(replies::ReplyFailure::Server(plan.try_build()?))
             {
                 Ok(depth) => {
-                    self.port.shared.reindex(self.conn, depth);
+                    queue.reindex(depth);
                     None
                 }
                 Err((value, usage::Acquire::Backpressure(_))) => {
@@ -339,7 +336,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 }
             },
             Err(Front::Detached) => {
-                queue.complete(self.region);
+                queue.complete();
                 None
             }
             Err(Front::Empty) => {

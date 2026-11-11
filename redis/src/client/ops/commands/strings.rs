@@ -1,4 +1,4 @@
-use crate::api::{Client, decode};
+use crate::api::{Commands, decode};
 use crate::client::nonempty;
 use crate::request::encode;
 use std::num;
@@ -7,7 +7,7 @@ use std::num;
 #[repr(transparent)]
 pub struct Basic<C, const ID: u8 = 0>(pub(crate) C);
 
-impl<'d, C: Client<'d, ID>, const ID: u8> Basic<C, ID> {
+impl<'d, C: Commands<'d, ID>, const ID: u8> Basic<C, ID> {
     pub fn get(self, key: &[u8]) -> C::Call<decode::MaybeBytes> {
         self.0
             .encode::<decode::MaybeBytes>(move |out| out.command(&[b"GET", key]))
@@ -131,7 +131,7 @@ impl Operation {
 #[repr(transparent)]
 pub struct Bits<C, const ID: u8 = 0>(pub(crate) C);
 
-impl<'d, C: Client<'d, ID>, const ID: u8> Bits<C, ID> {
+impl<'d, C: Commands<'d, ID>, const ID: u8> Bits<C, ID> {
     pub fn count(self, key: &[u8]) -> C::Call<u64> {
         self.0
             .encode::<u64>(move |out| out.command(&[b"BITCOUNT", key]))
@@ -188,7 +188,7 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Bits<C, ID> {
 #[repr(transparent)]
 pub struct Cardinal<C, const ID: u8 = 0>(pub(crate) C);
 
-impl<'d, C: Client<'d, ID>, const ID: u8> Cardinal<C, ID> {
+impl<'d, C: Commands<'d, ID>, const ID: u8> Cardinal<C, ID> {
     pub fn add(self, key: &[u8], elements: &[&[u8]]) -> C::Call<decode::Changed> {
         self.0
             .encode::<decode::Changed>(move |out| out.slices(&[b"PFADD", key], elements))

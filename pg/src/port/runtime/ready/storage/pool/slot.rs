@@ -1,20 +1,20 @@
-use std::{cell, num};
+use std::{cell, mem::MaybeUninit, num};
 
+use cartel_core::queue;
 use dope::{
     core::driver::{route::KeyTag, schedule::ready},
     manifold::client::{close, conn},
+    net::link::egress,
 };
-use o3::base::num::bounded;
-use o3::depot;
+use o3::base::{cell::region, num::bounded};
+use o3::depot::{self, index::Initialized};
 
 use crate::{
-    port::{
-        Disposition, Retirement,
-        pool::{access, key, phases},
-        replies, requests,
-    },
+    port::{Disposition, Retirement, pool::key, replies, requests},
     protocol,
 };
+
+pub(crate) mod access;
 
 type Pending = bounded::U32<0, { u32::MAX / 2 + 1 }>;
 
@@ -37,42 +37,22 @@ pub(crate) enum Bind {
     Occupied,
 }
 
-pub(crate) enum Settle {
-    Applied,
-    Closing,
-    Empty,
-    Stale,
-}
-
 pub(crate) enum Egress {
     Open,
     Close(close::Directive),
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum Phase<'d, const ID: u8> {
-    Vacant,
-    Handshaking(Bound<'d, ID>),
+pub(super) enum Lifecycle {
+    Handshaking,
     Ready {
-        bound: Bound<'d, ID>,
         access: access::State,
+        receiving: bool,
     },
     Closing {
-        bound: Bound<'d, ID>,
         failure: replies::Failure,
         disposition: Disposition,
     },
-}
-
-impl<'d, const ID: u8> Phase<'d, ID> {
-    fn bound(self) -> Option<Bound<'d, ID>> {
-        match self {
-            Self::Vacant => None,
-            Self::Handshaking(bound) | Self::Ready { bound, .. } | Self::Closing { bound, .. } => {
-                Some(bound)
-            }
-        }
-    }
 }
 
 impl Sync {
@@ -120,7 +100,8 @@ impl Sync {
 }
 
 pub(crate) struct Slot<'d, const ID: u8> {
-    pub(super) phase: phases::State<'d, ID>,
+    bound: cell::Cell<MaybeUninit<Bound<'d, ID>>>,
+    phase: cell::Cell<Option<Lifecycle>>,
     pub(super) key: cell::Cell<key::Key>,
     pub(super) pid: cell::Cell<Option<i32>>,
     sync: cell::Cell<Sync>,
@@ -133,11 +114,6 @@ pub(crate) struct Ready<'a, 'd, const ID: u8> {
     slot: &'a Slot<'d, ID>,
 }
 
-pub(crate) struct Close<'d, const ID: u8> {
-    pub(crate) state: Closed<'d, ID>,
-    pub(crate) failure: replies::Failure,
-}
-
 #[repr(u8)]
 pub(crate) enum Closed<'d, const ID: u8> {
     Handshaking,
@@ -147,11 +123,6 @@ pub(crate) enum Closed<'d, const ID: u8> {
     Finalizing(access::Transaction<'d, ID>),
     Draining,
     Closing,
-}
-
-pub(crate) enum Flush<'a, 'd, const ID: u8> {
-    Idle,
-    Pending(Permit<'a, 'd, ID>),
 }
 
 #[must_use = "a PostgreSQL reply sync transition must be committed or discarded"]
@@ -189,6 +160,10 @@ impl<'a, 'd, const ID: u8> Permit<'a, 'd, ID> {
 }
 
 impl<'a, 'd, const ID: u8> Ready<'a, 'd, ID> {
+    pub(crate) const fn reborrow(&self) -> Self {
+        Self { slot: self.slot }
+    }
+
     pub(crate) fn listed(listed: &protocol::runtime::ready::Listed<'a, 'd, ID>) -> Self {
         Self {
             slot: listed.slot(),
@@ -201,7 +176,7 @@ impl<'a, 'd, const ID: u8> Ready<'a, 'd, ID> {
 
     pub(crate) fn connection(&self) -> conn::Id<'d, KeyTag<ID>> {
         // SAFETY: every Ready constructor retains its original initialized binding.
-        phases::State::bound(unsafe { depot::raw::Proof::new(self.slot) }).token
+        Slot::bound(unsafe { depot::raw::Proof::new(self.slot) }).token
     }
 
     pub(crate) fn try_reply(
@@ -230,11 +205,32 @@ impl<'a, 'd, const ID: u8> Ready<'a, 'd, ID> {
 
 impl<'d, const ID: u8> Slot<'d, ID> {
     pub(crate) fn is_receiving(&self) -> bool {
-        self.phase.is_receiving()
+        matches!(
+            self.phase.get(),
+            Some(Lifecycle::Ready {
+                receiving: true,
+                ..
+            })
+        )
     }
 
-    pub(crate) fn set_receiving(&self, token: conn::Id<'d, KeyTag<ID>>, receiving: bool) -> bool {
-        self.phase.set_receiving(token, receiving)
+    fn set_access(&self, access: access::State) {
+        self.phase.set(Some(Lifecycle::Ready {
+            access,
+            receiving: self.is_receiving(),
+        }));
+    }
+
+    pub(super) fn snapshot(&self) -> Option<(Bound<'d, ID>, Lifecycle)> {
+        let phase = self.phase.get()?;
+        // SAFETY: bind initializes the binding before publishing a live phase.
+        // Retirement leaves it initialized until the next binding replaces it.
+        Some((unsafe { self.bound.get().assume_init() }, phase))
+    }
+
+    fn bound(proof: depot::raw::Proof<&Self, Initialized<Bound<'d, ID>>>) -> Bound<'d, ID> {
+        // SAFETY: the synchronous Ready proof retains this exact initialized binding.
+        unsafe { proof.into_inner().bound.get().assume_init() }
     }
 
     pub(crate) fn is_synced(&self) -> bool {
@@ -247,7 +243,8 @@ impl<'d, const ID: u8> Slot<'d, ID> {
 
     pub(crate) fn new() -> Self {
         Self {
-            phase: phases::State::new(),
+            bound: cell::Cell::new(MaybeUninit::uninit()),
+            phase: cell::Cell::new(None),
             key: cell::Cell::new(key::Key::empty()),
             pid: cell::Cell::new(None),
             sync: cell::Cell::new(Sync::Synced),
@@ -257,11 +254,12 @@ impl<'d, const ID: u8> Slot<'d, ID> {
     }
 
     pub(crate) fn bind(&self, token: conn::Id<'d, KeyTag<ID>>, ready: ready::Target<'d>) -> Bind {
-        if !matches!(self.phase.get(), Phase::Vacant) {
+        if self.phase.get().is_some() {
             return Bind::Occupied;
         }
         self.batch.set(replies::Batch::INITIAL);
-        self.phase.set(Phase::Handshaking(Bound { token, ready }));
+        self.bound.set(MaybeUninit::new(Bound { token, ready }));
+        self.phase.set(Some(Lifecycle::Handshaking));
         Bind::Bound
     }
 
@@ -269,12 +267,12 @@ impl<'d, const ID: u8> Slot<'d, ID> {
         &self,
         token: conn::Id<'d, KeyTag<ID>>,
     ) -> Result<(), protocol::Reason> {
-        match self.phase.get() {
-            Phase::Handshaking(bound) if bound.token == token => {
-                self.phase.set(Phase::Ready {
-                    bound,
+        match self.snapshot() {
+            Some((bound, Lifecycle::Handshaking)) if bound.token == token => {
+                self.phase.set(Some(Lifecycle::Ready {
                     access: access::State::Shared(access::Sequence::INITIAL),
-                });
+                    receiving: false,
+                }));
                 Ok(())
             }
             _ => Err(protocol::Reason::PrepareReady),
@@ -282,18 +280,16 @@ impl<'d, const ID: u8> Slot<'d, ID> {
     }
 
     pub(crate) fn matches(&self, token: conn::Id<'d, KeyTag<ID>>) -> bool {
-        self.phase
-            .get()
-            .bound()
-            .is_some_and(|bound| bound.token == token)
+        self.snapshot()
+            .is_some_and(|(bound, _)| bound.token == token)
     }
 
     pub(crate) fn ready(
         &self,
         token: conn::Id<'d, KeyTag<ID>>,
     ) -> Result<Ready<'_, 'd, ID>, crate::Error> {
-        match self.phase.get() {
-            Phase::Ready { bound, access }
+        match self.snapshot() {
+            Some((bound, Lifecycle::Ready { access, .. }))
                 if bound.token == token && !matches!(access, access::State::Draining) =>
             {
                 Ok(Ready { slot: self })
@@ -307,7 +303,7 @@ impl<'d, const ID: u8> Slot<'d, ID> {
         token: conn::Id<'d, KeyTag<ID>>,
         generation: Option<access::Generation>,
     ) -> Option<Ready<'_, 'd, ID>> {
-        let Phase::Ready { bound, access } = self.phase.get() else {
+        let Some((bound, Lifecycle::Ready { access, .. })) = self.snapshot() else {
             return None;
         };
         if bound.token != token {
@@ -326,38 +322,29 @@ impl<'d, const ID: u8> Slot<'d, ID> {
         self.pending.get().into_usize() + usize::from(!self.is_synced())
     }
 
-    pub(crate) fn settle(&self, token: conn::Id<'d, KeyTag<ID>>) -> Settle {
-        match self.phase.get() {
-            Phase::Ready { bound, .. } if bound.token == token => {}
-            Phase::Closing { bound, .. } if bound.token == token => return Settle::Closing,
-            _ => return Settle::Stale,
-        }
-        let Some(next) = self.pending.get().get().checked_sub(1) else {
-            return Settle::Empty;
-        };
+    pub(super) fn try_settle(&self) -> Option<()> {
+        let next = self.pending.get().get().checked_sub(1)?;
         // SAFETY: checked subtraction preserves the retained inclusive upper bound.
         self.pending.set(unsafe { bounded::raw::u32(next) });
-        Settle::Applied
+        Some(())
     }
 
     pub(crate) fn egress(&self) -> Egress {
         match self.phase.get() {
-            Phase::Closing {
+            Some(Lifecycle::Closing {
                 failure: cause,
                 disposition: Disposition::Reconnect,
-                ..
-            } => Egress::Close(close::Directive::cut_retry(cause.close_reason())),
-            Phase::Closing {
+            }) => Egress::Close(close::Directive::cut_retry(cause.close_reason())),
+            Some(Lifecycle::Closing {
                 failure: cause,
                 disposition: Disposition::Permanent,
-                ..
-            } => Egress::Close(close::Directive::cut_final(cause.close_reason())),
+            }) => Egress::Close(close::Directive::cut_final(cause.close_reason())),
             _ => Egress::Open,
         }
     }
 
     pub(crate) fn wake(&self) {
-        if let Some(bound) = self.phase.get().bound() {
+        if let Some((bound, _)) = self.snapshot() {
             bound.ready.wake();
         }
     }
@@ -365,17 +352,14 @@ impl<'d, const ID: u8> Slot<'d, ID> {
     pub(crate) fn try_close(
         &self,
         token: conn::Id<'d, KeyTag<ID>>,
-        cause: replies::Failure,
+        cause: &mut replies::Failure,
         fate: Disposition,
-    ) -> Option<Close<'d, ID>> {
-        let (bound, state, cause, fate) = match self.phase.get() {
-            Phase::Handshaking(bound) if bound.token == token => {
-                (bound, Closed::Handshaking, cause, fate)
+    ) -> Option<Closed<'d, ID>> {
+        let (state, fate) = match self.snapshot() {
+            Some((bound, Lifecycle::Handshaking)) if bound.token == token => {
+                (Closed::Handshaking, fate)
             }
-            Phase::Ready {
-                bound,
-                access: state,
-            } if bound.token == token => {
+            Some((bound, Lifecycle::Ready { access: state, .. })) if bound.token == token => {
                 let state = match state {
                     access::State::Shared(_) => Closed::Shared,
                     access::State::Reserved(value) => Closed::Reserved(access::Transaction {
@@ -392,19 +376,22 @@ impl<'d, const ID: u8> Slot<'d, ID> {
                     }),
                     access::State::Draining => Closed::Draining,
                 };
-                (bound, state, cause, fate)
+                (state, fate)
             }
-            Phase::Closing {
+            Some((
                 bound,
-                failure,
-                disposition: old,
-            } if bound.token == token => {
+                Lifecycle::Closing {
+                    failure,
+                    disposition: old,
+                },
+            )) if bound.token == token => {
+                *cause = failure;
                 let fate = if matches!(fate, Disposition::Permanent) {
                     Disposition::Permanent
                 } else {
                     old
                 };
-                (bound, Closed::Closing, failure, fate)
+                (Closed::Closing, fate)
             }
             _ => return None,
         };
@@ -412,47 +399,37 @@ impl<'d, const ID: u8> Slot<'d, ID> {
         self.pending.set(Pending::exact::<0>());
         self.pid.set(None);
         self.key.set(key::Key::empty());
-        self.phase.set(Phase::Closing {
-            bound,
-            failure: cause,
+        self.phase.set(Some(Lifecycle::Closing {
+            failure: *cause,
             disposition: fate,
-        });
-        Some(Close {
-            state,
-            failure: cause,
-        })
+        }));
+        Some(state)
     }
 
     pub(super) fn try_retire(&self, token: conn::Id<'d, KeyTag<ID>>) -> Result<(), crate::Error> {
-        let phase = match self.phase.get() {
-            Phase::Closing { bound, .. } if bound.token == token => {
-                self.phase.set(Phase::Vacant);
+        let phase = match self.snapshot() {
+            Some((bound, Lifecycle::Closing { .. })) if bound.token == token => {
+                self.phase.set(None);
                 return Ok(());
             }
-            Phase::Handshaking(bound) if bound.token == token => Retirement::Handshaking,
-            Phase::Ready { bound, access } if bound.token == token => match access {
-                access::State::Shared(_) => Retirement::Shared,
-                access::State::Reserved(_) => Retirement::Reserved,
-                access::State::Held(_) => Retirement::Held,
-                access::State::Finalizing(_) => Retirement::Finalizing,
-                access::State::Draining => Retirement::Draining,
-            },
+            Some((bound, Lifecycle::Handshaking)) if bound.token == token => {
+                Retirement::Handshaking
+            }
+            Some((bound, Lifecycle::Ready { access, .. })) if bound.token == token => {
+                match access {
+                    access::State::Shared(_) => Retirement::Shared,
+                    access::State::Reserved(_) => Retirement::Reserved,
+                    access::State::Held(_) => Retirement::Held,
+                    access::State::Finalizing(_) => Retirement::Finalizing,
+                    access::State::Draining => Retirement::Draining,
+                }
+            }
             _ => return Ok(()),
         };
         Err(crate::Error::Retirement {
             slot: token.index(),
             phase,
         })
-    }
-
-    pub(crate) fn flush(&self, token: conn::Id<'d, KeyTag<ID>>) -> Flush<'_, 'd, ID> {
-        let Phase::Ready { bound, .. } = self.phase.get() else {
-            return Flush::Idle;
-        };
-        if bound.token != token || !matches!(self.sync.get(), Sync::Automatic(_)) {
-            return Flush::Idle;
-        }
-        Flush::Pending(self.permit(Sync::Synced))
     }
 
     fn permit(&self, next: Sync) -> Permit<'_, 'd, ID> {
@@ -464,15 +441,36 @@ impl<'d, const ID: u8> Slot<'d, ID> {
     }
 }
 
+impl<'d, const ID: u8> protocol::runtime::ready::Entry<'_, 'd, ID> {
+    pub(crate) fn try_flush<E>(
+        self,
+        requests: queue::Lane<'_, 'd, egress::NonEmpty<requests::Frame<'d>>>,
+        region: &mut region::Token<region::Identity<'d>>,
+        send: impl FnOnce(&mut region::Token<region::Identity<'d>>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let slot = self.slot();
+        if !matches!(slot.phase.get(), Some(Lifecycle::Ready { .. }))
+            || !matches!(slot.sync.get(), Sync::Automatic(_))
+        {
+            return Ok(());
+        }
+        let sync = slot.permit(Sync::Synced);
+        if !requests.is_empty(region) {
+            return Ok(());
+        }
+        send(region)?;
+        if !sync.commit() {
+            self.core.wake_ready();
+        }
+        Ok(())
+    }
+}
+
 const _: () = {
     assert!(
         std::mem::size_of::<Closed<'static, 0>>()
             == std::mem::size_of::<access::Transaction<'static, 0>>()
                 + std::mem::align_of::<access::Transaction<'static, 0>>()
-    );
-    assert!(
-        std::mem::size_of::<Close<'static, 0>>()
-            == std::mem::size_of::<Closed<'static, 0>>() + std::mem::size_of::<replies::Failure>()
     );
     assert!(std::mem::size_of::<Slot<'static, 0>>() == 17 * std::mem::size_of::<usize>());
     assert!(std::mem::size_of::<Permit<'static, 'static, 0>>() <= 7 * std::mem::size_of::<usize>());

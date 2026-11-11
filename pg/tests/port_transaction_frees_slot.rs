@@ -4,7 +4,7 @@ use cartel_pg::api::traits::{
 };
 use dope::core::driver::life::recovery;
 use dope_test::harness::peer;
-use std::{pin::pin, time::Duration};
+use std::{pin::pin, task::Poll, time::Duration};
 
 use cartel_pg::{api::tx::FinishError, port, port::config, protocol::PickPolicy, reply};
 use common::{
@@ -120,14 +120,6 @@ fn throttled_query_cannot_enter_later_transaction() {
                                     .block_on(dope_fiber::fiber!('_ => async move {
                                         ::core::assert!(fibers::TEST.poll_once(first.as_mut()).await.is_none());
                                         ::core::assert!(fibers::TEST.poll_once(waiting.as_mut()).await.is_none());
-                                        ::core::assert!(matches!(
-                                            client.unchecked().command("SELECT 3").await,
-                                            Err(reply::Error::Admission {
-                                                cause: reply::Pressure::Full { len, capacity },
-                                                error: dope_fiber::wait::Error::QueueFull { capacity: waiters, .. },
-                                                ..
-                                            }) if len.get() == 1 && capacity.get() == 1 && waiters.get() == 1
-                                        ));
                                         ::core::assert!(matches!(first.as_mut().await, Ok(())));
                                         let tx = client.transaction().begin().await
                                             .ok().expect("exclusive transaction");
@@ -148,6 +140,115 @@ fn throttled_query_cannot_enter_later_transaction() {
             );
             assert!(reports.events().expect("reclamation").is_empty());
             assert!(matches!(server.finish(), Ok(Ok(()))), "transaction peer");
+        },
+    )
+    .expect("spawn transaction peer");
+}
+
+#[test]
+fn pinned_queries_wait_for_request_capacity() {
+    use common::postgres::{Frame, read_empty};
+    use dope::core::dope_sys::io::poll::{Entry, Poll as _};
+    use dope_fiber::abi::Join;
+    use std::os::fd::AsFd as _;
+
+    peer::AcceptScript::with(
+        |listener| {
+            let sockets = [(); 2].map(|()| {
+                let mut socket = listener.accept().expect("connection");
+                socket.try_start(None).expect("startup");
+                socket
+            });
+            let mut entries = sockets
+                .each_ref()
+                .map(|socket| Entry::readable(socket.as_fd()));
+            let events = dope::core::Backend::wait::<_, dope::core::Errno>(&mut entries, 1_000)
+                .expect("transaction readiness");
+            let lane = events
+                .entries()
+                .iter()
+                .position(|entry| entry.is_readable())
+                .expect("transaction request");
+            let socket = &sockets[lane];
+            read_empty(socket, b'S').expect("begin");
+            socket
+                .write_all(
+                    &[
+                        Frame::new(b'C', b"BEGIN\0").encode(),
+                        Frame::new(b'Z', b"T").encode(),
+                    ]
+                    .concat(),
+                )
+                .expect("begin response");
+            for _ in 0..2 {
+                read_empty(socket, b'S').expect("pipelined request");
+                socket
+                    .write_all(
+                        &[
+                            Frame::new(b'C', b"SELECT 1\0").encode(),
+                            Frame::new(b'Z', b"T").encode(),
+                        ]
+                        .concat(),
+                    )
+                    .expect("query response");
+            }
+            read_empty(socket, b'S').expect("commit");
+            socket
+                .write_all(
+                    &[
+                        Frame::new(b'C', b"COMMIT\0").encode(),
+                        Frame::new(b'Z', b"I").encode(),
+                    ]
+                    .concat(),
+                )
+                .expect("commit response");
+            for socket in &sockets {
+                socket.read_closed().expect("closed");
+            }
+        },
+        |server| {
+            let mut capacity = Queries::try_cancel().expect("PG capacity").capacities();
+            capacity.connections = 2;
+            let prepared = topology::try_new::<_, Env>(
+                port::Port::<Queries>::plan(
+                    Queries::try_config().expect("database config"),
+                    config::Config::new(capacity).expect("one request slot per lane"),
+                ),
+                server.addr(),
+                Duration::from_millis(1),
+                Duration::from_secs(1),
+            )
+            .expect("transaction topology");
+            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+            let mut report = Completion::new();
+            prepared.with_local(
+                |worker| {
+                    worker.lend(|node, stage| {
+                        node.install(stage, |host, stage| {
+                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+                                let client = runtime.root_client();
+                                assert!(matches!(
+                                    runtime.block_on(client.status().wait_ready()),
+                                    Ok(Ok(()))
+                                ));
+                                runtime.block_on(dope_fiber::fiber!('_ => async move {
+                            let tx = client.transaction().begin().await.ok().expect("transaction");
+                            let (first, second) = Join::new(
+                                tx.unchecked().command("SELECT 1"),
+                                tx.unchecked().command("SELECT 1"),
+                            ).await;
+                            assert!(first.is_ok() && second.is_ok());
+                            assert!(tx.commit().await.is_ok());
+                        })).expect("pipelined transaction driver");
+                            })
+                        })
+                    })
+                },
+                recovery::Policy::new(|event| reports.push(event), common::recover),
+                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "transaction scope"),
+            );
+            assert!(reports.events().expect("reclamation").is_empty());
+            server.finish().expect("transaction peer");
         },
     )
     .expect("spawn transaction peer");
@@ -621,16 +722,16 @@ fn transaction_frees_slot() {
         let addr = bound.local_addr();
         let config = config::Config::with_window(
             config::Capacities {
-                connections: 1,
-                inflight: 1,
+                connections: 2,
+                inflight: 2,
                 admission_waiters: 2,
                 requests: config::Request {
                     frames: 2,
                     frame_bytes: 512,
                 },
                 responses: config::Response {
-                    items: 1,
-                    bytes: 128,
+                    items: 2,
+                    bytes: 256,
                     frame_bytes: 128,
                 },
                 notifications: config::Notification {
@@ -638,7 +739,7 @@ fn transaction_frees_slot() {
                     bytes: 128,
                 },
             },
-            Positive::from_millis::<20>(),
+            Positive::from_millis::<100>(),
         )
         .expect("valid pg configuration");
         let snapshot = service::Snapshot::from_one(
@@ -654,9 +755,9 @@ fn transaction_frees_slot() {
                 )
                 .expect("PostgreSQL plan")
                 .into_parts();
-        let peer = server::Plan::<Identity, KeyTag<1>>::new(Capacity::fixed::<1>(), Identity);
+        let peer = server::Plan::<Identity, KeyTag<1>>::new(Capacity::fixed::<2>(), Identity);
         let layout =
-            listener::topology::Layout::<KeyTag<1>, receive::Owned>::new(Capacity::fixed::<1>());
+            listener::topology::Layout::<KeyTag<1>, receive::Owned>::new(Capacity::fixed::<2>());
         let prepared = dope::runtime::topology::Plan::new((), (node, layout))
             .for_install::<Throughput>()
             .expect("PostgreSQL topology");
@@ -704,10 +805,14 @@ fn transaction_frees_slot() {
                                                 io
                                             }))
                                             .expect("startup driver");
-                                        assert!(
-                                            matches!(runtime.block_on(client.status().wait_ready()), Ok(Ok(()))),
-                                            "PostgreSQL connection ready"
-                                        );
+                                        fibers::TEST.try_run(&mut runtime, dope_fiber::abi::poll_fn(|context| {
+                                            if client.status().is_ready() {
+                                                Poll::Ready(())
+                                            } else {
+                                                context.wake();
+                                                Poll::Pending
+                                            }
+                                        })).expect("first PostgreSQL connection ready");
                                         assert!(
                                             matches!(
                                                 runtime.block_on(fibers::TEST.poll_once(
@@ -728,6 +833,34 @@ fn transaction_frees_slot() {
                                         fibers::TEST
                                             .try_run(&mut runtime, startup::request(&mut io, false))
                                             .expect("detached request");
+                                        let mut waiting = pin!(Task::new(client.unchecked().command("SELECT 2")));
+                                        assert!(matches!(
+                                            runtime.block_on(fibers::TEST.poll_once(waiting.as_mut())),
+                                            Ok(None)
+                                        ));
+                                        let exchange = dope_fiber::fiber!('_ => async move {
+                                            let mut second = peer.accept().await.ok().expect("second connection");
+                                            startup::request(&mut second, true).await;
+                                            assert!(second.write_all(startup::AUTHENTICATED).await.is_ok());
+                                            startup::request(&mut second, false).await;
+                                            assert!(second.write_all(startup::IDLE).await.is_ok());
+                                            startup::request(&mut second, false).await;
+                                            assert!(second.write_all(transaction::DETACHED_RESPONSES[0]).await.is_ok());
+                                            second
+                                        });
+                                        let (result, mut second) = fibers::TEST
+                                            .try_run(&mut runtime, Join::new(waiting.as_mut(), exchange))
+                                            .expect("new peer admission driver");
+                                        assert!(result.is_ok(), "new peer must wake and admit the waiting query");
+                                        client.status().set_policy(PickPolicy::LeastInflight);
+                                        let mut held = pin!(Task::new(client.unchecked().command("SELECT 3")));
+                                        assert!(matches!(
+                                            runtime.block_on(fibers::TEST.poll_once(held.as_mut())),
+                                            Ok(None)
+                                        ));
+                                        fibers::TEST.try_run(&mut runtime, startup::request(&mut second, false))
+                                            .expect("retained request");
+                                        let fence = b"A\0\0\0\x0c\0\0\0\x01a\0f\0";
                                         assert!(
                                             matches!(
                                                 fibers::TEST.try_run(
@@ -738,6 +871,28 @@ fn transaction_frees_slot() {
                                             ),
                                             "server must send detached response"
                                         );
+                                        assert!(matches!(fibers::TEST.try_run(&mut runtime, io.write_all(fence)), Ok(Ok(()))));
+                                        assert!(matches!(runtime.block_on(client.notify().next()), Ok(Ok(_))));
+                                        assert!(matches!(fibers::TEST.try_run(&mut runtime, second.write_all(transaction::DETACHED_RESPONSES[0])), Ok(Ok(()))));
+                                        assert!(matches!(fibers::TEST.try_run(&mut runtime, second.write_all(fence)), Ok(Ok(()))));
+                                        assert!(matches!(runtime.block_on(client.notify().next()), Ok(Ok(_))));
+                                        let peer = &mut io;
+                                        let exchange = dope_fiber::fiber!('_ => async move {
+                                            startup::request(peer, false).await;
+                                            assert!(peer.write_all(b"C\0\0\0\x0aBEGIN\0Z\0\0\0\x05T").await.is_ok());
+                                        });
+                                        let (result, ()) = fibers::TEST.try_run(&mut runtime,
+                                            Join::new(client.transaction().begin(), exchange))
+                                            .expect("least-inflight transaction driver");
+                                        let tx = result.ok().expect("skip the retained completed response");
+                                        let peer = &mut io;
+                                        let exchange = dope_fiber::fiber!('_ => async move {
+                                            startup::request(peer, false).await;
+                                            assert!(peer.write_all(b"C\0\0\0\x0bCOMMIT\0Z\0\0\0\x05I").await.is_ok());
+                                        });
+                                        let (result, ()) = fibers::TEST.try_run(&mut runtime, Join::new(tx.commit(), exchange))
+                                            .expect("least-inflight commit driver");
+                                        assert!(result.is_ok());
                                         let peer = &mut io;
                                         let exchange = dope_fiber::fiber!('_ => async move {
                                             startup::request(peer, false).await;

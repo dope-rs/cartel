@@ -23,7 +23,6 @@ use crate::{
         pool::{control, slot},
         replies::groups,
     },
-    protocol::runtime,
     schema,
 };
 
@@ -31,7 +30,8 @@ mod backend;
 pub mod config;
 mod node;
 mod plan;
-pub(crate) mod pool;
+pub(crate) mod runtime;
+pub(crate) use runtime::ready::pool;
 pub mod ready;
 pub mod replies;
 #[doc(hidden)]
@@ -70,7 +70,7 @@ pub struct Port<'e, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8 = 
     pub(super) shared: runtime::Shared<'d, ID>,
     pub(super) lifecycle: Lifecycle<'d, ID>,
     request_queue: queue::Scoped<'b, 'd, egress::NonEmpty<requests::Frame<'d>>>,
-    requests: Pool,
+    pub(crate) requests: Pool,
     controls: Pool,
     responses: &'e reply::Arena<
         'b,
@@ -141,24 +141,29 @@ impl<'e, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8>
     }
 
     fn conn(&self, token: conn::Id<'d, KeyTag<ID>>) -> Option<&slot::Slot<'d, ID>> {
-        self.shared.ready.connection(token)
+        self.shared.connection(token)
     }
 
     pub(super) fn connection(&self) -> control::Control<'_, 'g, 'r, 's, 'b, 'c, 'd, I, ID> {
         control::Control::new(self)
     }
 
+    pub(super) fn notify_frames(&self) {
+        if self.requests.available() != 0 {
+            self.shared.frame_waiters.notify();
+        }
+    }
+
     pub(super) fn request(&self) -> requests::Access<'_, 'g, 'r, 's, 'b, 'c, 'd, I, ID> {
         requests::Access::new(self)
     }
 
-    pub(super) fn responses(
-        &self,
+    pub(super) fn responses<'turn>(
+        &'turn self,
         token: conn::Id<'d, KeyTag<ID>>,
-    ) -> Option<replies::Lane<'_, 'g, 'r, 's, 'b, 'c, 'd, I, ID>> {
-        self.conn(token)?;
-        let lane = self.lane(token.lane());
-        Some(replies::Lane::new(self, token, lane))
+        region: &'turn mut region::Token<region::Identity<'d>>,
+    ) -> Option<replies::Lane<'turn, 'g, 'r, 's, 'b, 'c, 'd, ID>> {
+        replies::Lane::try_new(self, token, region)
     }
 
     pub(super) fn depth(
@@ -166,7 +171,7 @@ impl<'e, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8>
         token: conn::Id<'d, KeyTag<ID>>,
         region: &mut region::Token<region::Identity<'d>>,
     ) -> Option<order::Depth> {
-        self.responses(token).map(|lane| lane.depth(region))
+        self.responses(token, region).map(|mut lane| lane.depth())
     }
 
     /// Both counts retain u32 domains; o3 admits only usize widths of at least
@@ -186,11 +191,8 @@ impl<'e, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8>
         work: Work<'_, 'd>,
         region: &mut region::Token<region::Identity<'d>>,
     ) {
-        if let Some(released) = self.responses.maintain(work, region) {
-            let signals = &self.shared.signals;
-            if let Err(cause) = signals.egress.release(released) {
-                signals.record_fatal(crate::Error::EgressSlot(cause));
-            }
+        if self.responses.maintain(work, region).is_some() {
+            self.shared.signals.egress.notify();
         }
     }
 

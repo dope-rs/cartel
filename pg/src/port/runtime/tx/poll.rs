@@ -5,12 +5,12 @@ pub(crate) enum Disposition {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
-pub(in crate::protocol) enum Status {
+pub(crate) enum Status {
     Idle,
     Transaction,
 }
 
-pub(in crate::protocol) enum Readiness {
+pub(crate) enum Readiness {
     Ready,
     Pending,
 }

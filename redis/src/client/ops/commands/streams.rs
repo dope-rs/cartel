@@ -1,4 +1,4 @@
-use crate::api::{Client, decode};
+use crate::api::{Commands, decode};
 use crate::client::nonempty;
 use std::num::NonZero;
 
@@ -6,7 +6,7 @@ use std::num::NonZero;
 #[repr(transparent)]
 pub struct Streams<C, const ID: u8 = 0>(pub(crate) C);
 
-impl<'d, C: Client<'d, ID>, const ID: u8> Streams<C, ID> {
+impl<'d, C: Commands<'d, ID>, const ID: u8> Streams<C, ID> {
     /// Encodes the field/value tail unchanged; Redis validates its arity.
     /// The returned call retains no input.
     pub fn add<K: AsRef<[u8]>>(
@@ -25,7 +25,7 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Streams<C, ID> {
         })
     }
 
-    pub fn range<D: decode::Decode<C>>(
+    pub fn range<D: decode::Decode<C::Client>>(
         self,
         key: &[u8],
         start: &[u8],
@@ -35,7 +35,7 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Streams<C, ID> {
         self.range_with::<D>(b"XRANGE", key, start, end, count)
     }
 
-    pub fn rev_range<D: decode::Decode<C>>(
+    pub fn rev_range<D: decode::Decode<C::Client>>(
         self,
         key: &[u8],
         end: &[u8],
@@ -68,7 +68,7 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Streams<C, ID> {
     }
 
     /// Reads new deliveries from one stream without blocking.
-    pub fn read_group<D: decode::Decode<C>>(
+    pub fn read_group<D: decode::Decode<C::Client>>(
         self,
         key: &[u8],
         group: &[u8],
@@ -104,12 +104,12 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Streams<C, ID> {
         })
     }
 
-    pub fn pending<D: decode::Decode<C>>(self, key: &[u8], group: &[u8]) -> C::Call<D> {
+    pub fn pending<D: decode::Decode<C::Client>>(self, key: &[u8], group: &[u8]) -> C::Call<D> {
         self.0
             .encode::<D>(move |out| out.command(&[b"XPENDING", key, group]))
     }
 
-    fn range_with<D: decode::Decode<C>>(
+    fn range_with<D: decode::Decode<C::Client>>(
         self,
         verb: &[u8],
         key: &[u8],

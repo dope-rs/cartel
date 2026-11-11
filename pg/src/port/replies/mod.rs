@@ -17,8 +17,11 @@ use crate::{
         results::{group::Position, source},
         traits::sealed::Sealed,
     },
-    port::{self, pool::slot, requests::Boundary},
-    protocol::{self, Reason, frame},
+    port::{self, requests::Boundary},
+    protocol::{
+        self, Reason, frame,
+        runtime::{ready, tx::poll},
+    },
     reply::{Error, server},
     schema,
 };
@@ -412,116 +415,102 @@ type Front<'turn, 'g, 'r, 's, 'b, 'c, 'd, R = Option<Completion>> = (
     reply::Push<'turn, 'b, 'c, 'd, Row<'d>, ReplyFailure<'d>, Tag<'g, 'r, 's, 'b, 'c, 'd>>,
 );
 
-pub(crate) struct Lane<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8> {
-    port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
-    conn: conn::Id<'d, KeyTag<ID>>,
+pub(crate) struct Lane<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, const ID: u8> {
+    entry: ready::Entry<'life, 'd, ID>,
     lane: reply::Lane<'life, 'b, 'c, 'd, Row<'d>, ReplyFailure<'d>, Tag<'g, 'r, 's, 'b, 'c, 'd>>,
+    region: &'life mut region::Token<region::Identity<'d>>,
 }
 
-impl<I: schema::QuerySet, const ID: u8> Copy for Lane<'_, '_, '_, '_, '_, '_, '_, I, ID> {}
-
-impl<I: schema::QuerySet, const ID: u8> Clone for Lane<'_, '_, '_, '_, '_, '_, '_, I, ID> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
-    Lane<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
-{
-    pub(super) const fn new(
+impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, const ID: u8> Lane<'life, 'g, 'r, 's, 'b, 'c, 'd, ID> {
+    pub(super) fn try_new<I: schema::QuerySet>(
         port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
         conn: conn::Id<'d, KeyTag<ID>>,
-        lane: reply::Lane<
-            'life,
-            'b,
-            'c,
-            'd,
-            Row<'d>,
-            ReplyFailure<'d>,
-            Tag<'g, 'r, 's, 'b, 'c, 'd>,
-        >,
-    ) -> Self {
-        Self { port, conn, lane }
+        region: &'life mut region::Token<region::Identity<'d>>,
+    ) -> Option<Self> {
+        let entry = port.shared.connection_entry(conn)?;
+        let lane = port.lane(conn.lane());
+        Some(Self {
+            entry,
+            lane,
+            region,
+        })
     }
 
-    pub(crate) fn depth(self, token: &mut region::Token<region::Identity<'d>>) -> order::Depth {
-        self.lane.depth(token)
+    pub(crate) fn set_receiving(&mut self, receiving: bool) {
+        self.entry
+            .set_receiving(receiving, || self.lane.depth(self.region));
     }
 
-    pub(crate) fn try_push(
+    pub(crate) fn depth(&mut self) -> order::Depth {
+        self.lane.depth(self.region)
+    }
+
+    pub(crate) fn try_flush<E, I: schema::QuerySet>(
         self,
-        token: &mut region::Token<region::Identity<'d>>,
-        row: Row<'d>,
-    ) -> Result<(), usage::InsertError<Row<'d>>> {
-        self.lane.select(token).try_push(row)
+        port: &port::Port<'_, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
+        send: impl FnOnce(&mut region::Token<region::Identity<'d>>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.entry
+            .try_flush(port.request_queue.lane_for(self.lane), self.region, send)
+    }
+
+    pub(crate) fn try_push(&mut self, row: Row<'d>) -> Result<(), usage::InsertError<Row<'d>>> {
+        self.lane.select(self.region).try_push(row)
     }
 
     pub(crate) fn try_fail(
-        self,
-        token: &mut region::Token<region::Identity<'d>>,
+        &mut self,
         failure: ReplyFailure<'d>,
     ) -> Result<(), usage::InsertError<ReplyFailure<'d>>> {
-        let depth = self.lane.select(token).try_fail(failure)?;
-        self.port.shared.reindex(self.conn, depth);
+        let depth = self.lane.select(self.region).try_fail(failure)?;
+        self.reindex(depth);
         Ok(())
     }
 
-    pub(crate) fn complete(self, token: &mut region::Token<region::Identity<'d>>) {
-        let depth = self.lane.complete(token);
-        self.port.shared.reindex(self.conn, depth);
+    pub(crate) fn complete(mut self) {
+        let depth = self.lane.complete(self.region);
+        self.reindex(depth);
     }
 
-    pub(crate) fn settle(self, depth: order::Depth) -> Result<Option<usize>, crate::Error> {
-        let slot = self
-            .port
-            .conn(self.conn)
-            .ok_or(crate::Error::Protocol(Reason::TransactionLane))?;
-        match slot.settle(self.conn) {
-            slot::Settle::Applied => {}
-            slot::Settle::Closing => return Ok(None),
-            slot::Settle::Empty | slot::Settle::Stale => {
-                return Err(crate::Error::Protocol(Reason::ReadyUnknown));
-            }
-        }
-        self.port.shared.reindex(self.conn, depth);
-        Ok(Some(depth.get() + slot.barriers()))
+    pub(crate) fn reindex(&mut self, depth: order::Depth) {
+        self.entry.reindex(depth);
     }
 
-    pub(crate) fn fail_one(self, token: &mut region::Token<region::Identity<'d>>, cause: Failure) {
-        let depth = self.lane.fail_one(token, cause);
-        self.port.shared.reindex(self.conn, depth);
+    pub(crate) fn settle(
+        mut self,
+        status: poll::Status,
+        depth: order::Depth,
+    ) -> Option<poll::Readiness> {
+        self.entry.try_settle(status, depth)
     }
 
-    pub(crate) fn fail_group(self, token: &mut region::Token<region::Identity<'d>>) {
-        let depth = self.lane.fail_one(token, GroupServer);
-        self.port.shared.reindex(self.conn, depth);
+    pub(crate) fn fail_one(&mut self, cause: Failure) {
+        let depth = self.lane.fail_one(self.region, cause);
+        self.reindex(depth);
     }
 
-    pub(crate) fn fail(
-        self,
-        work: app::Work<'_, 'd>,
-        token: &mut region::Token<region::Identity<'d>>,
-        cause: Failure,
-    ) -> reply::Progress {
-        reply::Retirement::new(token).fail(work, self.lane, &cause)
+    pub(crate) fn fail_group(&mut self) {
+        let depth = self.lane.fail_one(self.region, GroupServer);
+        self.reindex(depth);
+    }
+
+    pub(crate) fn fail(self, work: app::Work<'_, 'd>, cause: Failure) -> reply::Progress {
+        reply::Retirement::new(self.region).fail(work, self.lane, &cause)
     }
 
     pub(crate) fn front<'turn>(
-        self,
+        &'turn mut self,
         expected: Batch,
-        token: &'turn mut region::Token<region::Identity<'d>>,
     ) -> Result<Front<'turn, 'g, 'r, 's, 'b, 'c, 'd>, crate::Error>
     where
         'life: 'turn,
     {
-        self.inspect(expected, token, |end, _| end.map(|kind| kind.completion()))
+        self.inspect(expected, |end, _| end.map(|kind| kind.completion()))
     }
 
     pub(crate) fn inspect<'turn, R>(
-        self,
+        &'turn mut self,
         expected: Batch,
-        token: &'turn mut region::Token<region::Identity<'d>>,
         inspect: impl for<'tag> FnOnce(
             Option<Kind<&'tag groups::State<'r, 's, 'b, 'c, 'd>>>,
             order::Front,
@@ -530,7 +519,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
     where
         'life: 'turn,
     {
-        let mut selected = self.lane.select(token);
+        let mut selected = self.lane.select(self.region);
         let front = selected.front();
         let Some(tag) = selected.tag() else {
             return Ok((inspect(None, front), selected));

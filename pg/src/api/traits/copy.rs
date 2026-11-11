@@ -4,7 +4,7 @@ use dope_fiber::abi::Fiber;
 use std::ops::Deref;
 
 /// COPY operations retaining their original client or transaction borrow.
-pub trait Transfer<'d, const ID: u8 = 0>: Sealed + Copy {
+pub trait Transfer<'d, const ID: u8 = 0>: Sealed + Sized {
     type Chunk: AsRef<[u8]> + Deref<Target = [u8]>;
     type Sink: Sink<'d, ID>;
     type Stream: Stream<'d, ID, Chunk = Self::Chunk>;

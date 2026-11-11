@@ -236,24 +236,51 @@ where
     }
 }
 
-pub struct RunStream<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, Q, const ID: u8 = 0>
-where
+pub struct RunStream<
+    'app,
+    'g,
+    'r,
+    's,
+    'b,
+    'c,
+    'd: 'app,
+    B: ?Sized,
+    I,
+    Q,
+    const ID: u8 = 0,
+    R = api::Pooled,
+> where
     I: schema::QuerySet + 'd,
     Q: schema::TypedQuery,
 {
-    pub(super) state: stream::Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, api::ExtractOne<ID>, ID>,
+    pub(super) state: stream::Stream<
+        'app,
+        'g,
+        'r,
+        's,
+        'b,
+        'c,
+        'd,
+        B,
+        I,
+        api::ExtractOne<ID>,
+        ID,
+        R,
+        marker::PhantomData<api::ExtractOne<ID>>,
+    >,
     pub(super) marker: marker::PhantomData<Q>,
 }
 
-impl<B: ?Sized, I: schema::QuerySet, Q: schema::TypedQuery, const ID: u8> Sealed
-    for RunStream<'_, '_, '_, '_, '_, '_, '_, B, I, Q, ID>
+impl<B: ?Sized, I: schema::QuerySet, Q: schema::TypedQuery, const ID: u8, R> Sealed
+    for RunStream<'_, '_, '_, '_, '_, '_, '_, B, I, Q, ID, R>
 {
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, Q, const ID: u8> traits::Stream<'d, Q, ID>
-    for RunStream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, Q, const ID: u8, R> traits::Stream<'d, Q, ID>
+    for RunStream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R>
 where
     I: schema::QuerySet + 'd,
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
     Q: schema::TypedQuery<Result = schema::result::Rows>,
 {
     type Payload = replies::Payload<'b, 'c, 'd>;

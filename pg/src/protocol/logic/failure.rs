@@ -40,7 +40,6 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             | crate::Error::ServerFinal(_)
             | crate::Error::ServerFinalBase64(_)
             | crate::Error::TransactionSlot(_)
-            | crate::Error::EgressSlot(_)
             | crate::Error::ScramSlot(_)
             | crate::Error::ScramIterations { .. }
             | crate::Error::Protocol(_)

@@ -272,7 +272,7 @@ fn clear_budget() {
 
 #[test]
 fn deadline_expires_at_clock_limit() {
-    use cartel_core::deadline::{Elapsed, RequestPhase, Source};
+    use cartel_core::deadline::Source;
     use dope::core::driver::{route, schedule::clock};
     use dope_fiber::context::Context;
     use o3::base::time::Positive;
@@ -298,10 +298,8 @@ fn deadline_expires_at_clock_limit() {
             let turn = control.begin_at(clock::Sample::new(last));
             Context::with_target(ready.target(), turn.turn().app(), driver, |context| {
                 assert_eq!(
-                    guard
-                        .as_mut()
-                        .poll_expired(context, RequestPhase::Admission),
-                    Poll::Ready(Elapsed::new(RequestPhase::Admission))
+                    guard.as_mut().poll_expired(context),
+                    Poll::Ready(())
                 );
             });
         },

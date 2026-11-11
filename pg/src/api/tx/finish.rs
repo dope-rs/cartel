@@ -35,8 +35,10 @@ where
             'd,
             B,
             I,
-            api::Response<'app, 'g, 'r, 's, 'b, 'c, 'd, api::ExtractUnit<ID>>,
+            api::ExtractUnit<ID>,
             ID,
+            api::Target<'d, ID>,
+            crate::port::requests::Boundary,
             Held<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
             access::Finalization<'d, ID>,
             Recover,
@@ -116,13 +118,13 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             }
         };
         loop {
-            let phase = match &*this.state {
-                State::Dispatching(call) => call.phase(),
-                State::Holding(_) | State::Settling { .. } | State::Done => {
-                    deadline::RequestPhase::Settlement
-                }
-            };
-            if let Poll::Ready(time) = timer.as_mut().poll_expired(cx.as_mut(), phase) {
+            if timer.as_mut().poll_expired(cx.as_mut()).is_ready() {
+                let time = deadline::Elapsed::new(match &*this.state {
+                    State::Dispatching(call) => call.phase(),
+                    State::Holding(_) | State::Settling { .. } | State::Done => {
+                        deadline::RequestPhase::Settlement
+                    }
+                });
                 let error = Self::fail(this.state, crate::Error::RequestTimeout(time));
                 waiter.unregister();
                 return Poll::Ready(Err(error));
@@ -155,7 +157,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                     let owner = lease.client();
                     let tx = lease.target();
                     match owner.port.shared.transaction().current(tx.conn) {
-                        access::Current::Held(current) if current == tx => {}
+                        access::Current::Held(current) if current == tx.generation => {}
                         access::Current::Stale
                         | access::Current::Handshaking
                         | access::Current::Shared
@@ -193,9 +195,11 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                     }
                     let req = match end {
                         End::Commit => api::Pending::commit(owner.port),
-                        End::Rollback => {
-                            api::Pending::raw(owner.port, request::Request::raw("ROLLBACK"))
-                        }
+                        End::Rollback => api::Pending::raw(
+                            owner.port,
+                            request::Request::raw("ROLLBACK"),
+                            o3::buffer::pool::Pool::acquire,
+                        ),
                     };
                     let req = match req {
                         Ok(req) => req,
@@ -207,8 +211,8 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                     };
                     let call = Core::new(
                         owner,
-                        Some(api::Target::from_tx(tx)),
-                        api::Response::new(),
+                        api::Target::from_tx(tx),
+                        (),
                         Ok(req.map_state(|()| lease)),
                     );
                     *this.state = State::Dispatching(call);

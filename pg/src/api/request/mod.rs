@@ -1,10 +1,11 @@
-pub(in crate::api) mod stateful;
-
 use crate::api::{sql, tx};
 use crate::{api, port, protocol, schema};
-use o3::buffer::write::Sink as _;
+use cartel_core::deadline;
+use dope::core::driver::schedule::clock::timer;
+use o3::buffer::{pool, write::Sink as _};
 use port::requests;
 use protocol::encode;
+use std::marker::PhantomData;
 
 #[derive(Clone, Copy)]
 pub(super) struct Begin {
@@ -192,14 +193,14 @@ pub(super) enum Extra<'a> {
 }
 
 /// One encoded request retaining its exact publication boundary and owner state.
-pub(super) struct Pending<'d, S = ()> {
+pub(super) struct Pending<'d, S = (), M = requests::Boundary> {
     pub(in crate::api) frame: requests::Complete<'d>,
-    pub(in crate::api) boundary: requests::Boundary,
+    pub(in crate::api) boundary: M,
     pub(in crate::api) state: S,
 }
 
-impl<'d, S> Pending<'d, S> {
-    pub(in crate::api) fn map_state<R>(self, map: impl FnOnce(S) -> R) -> Pending<'d, R> {
+impl<'d, S, M> Pending<'d, S, M> {
+    pub(in crate::api) fn map_state<R>(self, map: impl FnOnce(S) -> R) -> Pending<'d, R, M> {
         Pending {
             frame: self.frame,
             boundary: self.boundary,
@@ -209,28 +210,26 @@ impl<'d, S> Pending<'d, S> {
 }
 
 impl<'d> Pending<'d> {
-    pub(in crate::api) fn typed<Q: schema::TypedQuery, I: schema::QuerySet, const ID: u8>(
+    pub(in crate::api) fn typed<
+        Q: schema::TypedQuery,
+        I: schema::QuerySet,
+        X: api::Sync,
+        const ID: u8,
+    >(
         port: &port::Port<'_, '_, '_, '_, '_, '_, 'd, I, ID>,
         params: Q::Params<'_>,
-        boundary: api::Boundary,
-    ) -> Result<Self, crate::Error> {
+        frame: impl FnOnce(&pool::Pool) -> Option<pool::Span>,
+    ) -> Result<Pending<'d, (), PhantomData<X>>, crate::Error> {
         if !schema::contains::<I, Q>() {
             return Err(crate::Error::QueryMetadata);
         }
-        let frame = port.request().encode(|frame| {
+        let frame = port.request().encode(frame(&port.requests), |frame| {
             schema::QueryMeta::validate::<Q>()?.write(frame, params)?;
-            match boundary {
-                api::Boundary::Close => frame.sync(),
-                api::Boundary::Open => Ok(()),
-            }
+            if X::SYNC { frame.sync() } else { Ok(()) }
         })?;
-        let boundary = match boundary {
-            api::Boundary::Close => requests::Boundary::Close,
-            api::Boundary::Open => requests::Boundary::Open,
-        };
-        Ok(Self {
+        Ok(Pending {
             frame,
-            boundary,
+            boundary: PhantomData,
             state: (),
         })
     }
@@ -238,6 +237,7 @@ impl<'d> Pending<'d> {
     pub(in crate::api) fn group<'app, 'g, 'r, 's, 'b, 'c, Q, I, const ID: u8, const N: usize>(
         port: &'app port::Port<'app, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
         params: [Q::Params<'_>; N],
+        frame: impl FnOnce(&pool::Pool) -> Option<pool::Span>,
     ) -> Result<
         Pending<'d, crate::port::replies::groups::Draft<'g, 'r, 's, 'b, 'c, 'd>>,
         crate::Error,
@@ -255,7 +255,7 @@ impl<'d> Pending<'d> {
             .as_ref()
             .ok_or(crate::Error::GroupDisabled)?;
         let ready = access.prepare()?;
-        let frame = port.request().encode(|frame| {
+        let frame = port.request().encode(frame(&port.requests), |frame| {
             let query = schema::QueryMeta::validate::<Q>()?;
             for params in params {
                 query.write(frame, params)?;
@@ -272,13 +272,16 @@ impl<'d> Pending<'d> {
     pub(in crate::api) fn raw<I: schema::QuerySet, const ID: u8>(
         port: &port::Port<'_, '_, '_, '_, '_, '_, 'd, I, ID>,
         req: Request<'_>,
+        frame: impl FnOnce(&pool::Pool) -> Option<pool::Span>,
     ) -> Result<Self, crate::Error> {
         let boundary = match (req.sql, req.extra) {
             (Sql::Begin(_), _) => requests::Boundary::Begin,
             (_, Extra::Plain | Extra::CopyIn { .. }) => requests::Boundary::Close,
             (_, Extra::CopyInOpen) => requests::Boundary::External,
         };
-        let frame = port.request().encode(|frame| req.write(frame))?;
+        let frame = port
+            .request()
+            .encode(frame(&port.requests), |frame| req.write(frame))?;
         Ok(Self {
             frame,
             boundary,
@@ -289,7 +292,7 @@ impl<'d> Pending<'d> {
     pub(in crate::api) fn commit<I: schema::QuerySet, const ID: u8>(
         port: &port::Port<'_, '_, '_, '_, '_, '_, 'd, I, ID>,
     ) -> Result<Self, crate::Error> {
-        let mut request = Self::raw(port, Request::raw("COMMIT"))?;
+        let mut request = Self::raw(port, Request::raw("COMMIT"), pool::Pool::acquire)?;
         request.boundary = requests::Boundary::Commit;
         Ok(request)
     }
@@ -314,5 +317,47 @@ impl<Q: schema::TypedQuery> schema::Admission<Q> {
             },
         )?;
         out.execute()
+    }
+}
+
+pub struct Acquired<'d> {
+    pub(in crate::api) frame: pool::Span,
+    pub(in crate::api) deadline: deadline::Guard<'d>,
+}
+
+pub(super) trait Input<'d> {
+    type Clock: Into<Result<deadline::Guard<'d>, timer::Exhausted>> + Into<api::task::Budget<'d>>;
+
+    fn into_parts(
+        self,
+    ) -> (
+        impl FnOnce(&pool::Pool) -> Option<pool::Span>,
+        impl FnOnce(deadline::Source<'d>) -> Self::Clock,
+    );
+}
+
+impl<'d> Input<'d> for () {
+    type Clock = deadline::Source<'d>;
+
+    fn into_parts(
+        self,
+    ) -> (
+        impl FnOnce(&pool::Pool) -> Option<pool::Span>,
+        impl FnOnce(deadline::Source<'d>) -> Self::Clock,
+    ) {
+        (pool::Pool::acquire, std::convert::identity)
+    }
+}
+
+impl<'d> Input<'d> for Acquired<'d> {
+    type Clock = deadline::Guard<'d>;
+
+    fn into_parts(
+        self,
+    ) -> (
+        impl FnOnce(&pool::Pool) -> Option<pool::Span>,
+        impl FnOnce(deadline::Source<'d>) -> Self::Clock,
+    ) {
+        (move |_| Some(self.frame), move |_| self.deadline)
     }
 }

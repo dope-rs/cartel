@@ -177,7 +177,16 @@ fn typed_queries_free_timer() {
                                     }
                                     drop(alarms.pop().expect("last available timer"));
 
-                                    let mut stream = client.query().run_stream::<TextQuery>(());
+                                    let acquired = runtime
+                                        .block_on(client.query().acquire())
+                                        .expect("frame drive")
+                                        .ok()
+                                        .expect("request frame");
+                                    assert!(matches!(timer.try_alarm(), Err(Exhausted::Slots)));
+                                    let mut stream = acquired.run_stream::<TextQuery>(());
+                                    drop(
+                                        timer.try_alarm().expect("stream releases acquired timer"),
+                                    );
                                     {
                                         let mut next = pin!(stream.next_row());
                                         assert!(matches!(

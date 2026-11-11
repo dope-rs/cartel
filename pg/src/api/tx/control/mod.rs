@@ -2,13 +2,9 @@ use crate::port;
 use crate::port::replies;
 use crate::reply::group::Ledger;
 use crate::{api, reply, schema};
-use api::task::{
-    Call,
-    lease::{Lease, Recover},
-};
+use api::task::lease::{Lease, Recover};
 use api::{
-    ops,
-    request::{self, stateful},
+    ops, request,
     results::copy::Chunk,
     traits::{self, copy::Transfer, sealed},
 };
@@ -136,10 +132,13 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     fn dispatch(
         &self,
         request: request::Request<'_>,
-    ) -> Call<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, api::ExtractUnit<ID>, ID> {
-        self.lease
-            .client()
-            .raw::<api::ExtractUnit<ID>>(Some(api::Target::from_tx(self.lease.target())), request)
+    ) -> impl abi::Fiber<'d, Output = Result<(), reply::Error<'d, ID>>>
+    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID> {
+        ops::Query::from_parts(
+            self.lease.client(),
+            api::Target::from_tx(self.lease.target()),
+        )
+        .raw(request)
     }
 }
 
@@ -156,7 +155,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     type Diagnostics = Ledger<'r, 's>;
     type CopyChunk = Chunk<'b, 'c, 'd>;
     type Query<'save>
-        = ops::Query<'save, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+        = ops::Query<api::Client<'save, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, api::Target<'d, ID>>
     where
         Self: 'save;
     type Savepoint<'parent>
@@ -171,16 +170,16 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     fn query(&self) -> Self::Query<'_> {
         ops::Query::from_parts(
             self.lease.reborrow(),
-            Some(api::Target::from_tx(self.lease.target())),
+            api::Target::from_tx(self.lease.target()),
         )
     }
 
     fn unchecked(&self) -> impl traits::Unchecked<'d, ID> + '_ {
-        ops::Unchecked(self.query())
+        self.query()
     }
 
     fn copy(&self) -> impl Transfer<'d, ID, Chunk = Self::CopyChunk> + '_ {
-        ops::Transfer(self.query())
+        self.query()
     }
 
     fn cancel(self) {
@@ -213,11 +212,8 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     ) -> impl abi::Fiber<'d, Output = Result<Self::Savepoint<'parent>, reply::Error<'d, ID>>> {
         let client = self.lease.reborrow();
         let target = self.lease.target();
-        let opening = stateful::Stateful::new(
-            client,
-            Some(api::Target::from_tx(target)),
-            request::Request::savepoint(&name),
-        );
+        let opening = ops::Query::from_parts(client, api::Target::from_tx(target))
+            .stateful(request::Request::savepoint(&name));
         dope_fiber::fiber!('d => async move {
             let lease = opening.await?.retarget(target)?;
             Ok(Savepoint {
@@ -251,10 +247,9 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     fn dispatch(
         &self,
         request: request::Request<'_>,
-    ) -> Call<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, api::ExtractUnit<ID>, ID> {
-        self.lease
-            .client()
-            .raw::<api::ExtractUnit<ID>>(Some(self.lease.target()), request)
+    ) -> impl abi::Fiber<'d, Output = Result<(), reply::Error<'d, ID>>>
+    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID> {
+        ops::Query::from_parts(self.lease.client(), self.lease.target()).raw(request)
     }
 }
 
@@ -270,7 +265,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     type Payload = replies::Payload<'b, 'c, 'd>;
     type Diagnostics = Ledger<'r, 's>;
     type Query<'listen>
-        = ops::Query<'listen, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+        = ops::Query<api::Client<'listen, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, api::Target<'d, ID>>
     where
         Self: 'listen;
 
@@ -279,11 +274,11 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 
     fn query(&self) -> Self::Query<'_> {
-        ops::Query::from_parts(self.lease.reborrow(), Some(self.lease.target()))
+        ops::Query::from_parts(self.lease.reborrow(), self.lease.target())
     }
 
     fn unchecked(&self) -> impl traits::Unchecked<'d, ID> + '_ {
-        ops::Unchecked(self.query())
+        self.query()
     }
 
     fn notify(
@@ -295,7 +290,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         Payload = Self::Payload,
         Diagnostics = Self::Diagnostics,
     > + '_ {
-        ops::Notify(self.query())
+        self.query()
     }
 
     fn unlisten(self) -> impl abi::Fiber<'d, Output = Result<(), reply::Error<'d, ID>>> {

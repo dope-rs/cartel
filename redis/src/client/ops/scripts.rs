@@ -1,6 +1,6 @@
 //! Redis EVAL requests and their borrowed invocation contract.
 
-use crate::api::{Client, decode::Decode};
+use crate::api::{Commands, decode::Decode};
 use crate::request::{self, encode, encode::write::script};
 
 pub use script::wire_len;
@@ -53,65 +53,10 @@ impl<K: AsRef<[u8]>, A: request::Bulk> Prepared<'_, K, A> {
 #[repr(transparent)]
 pub struct Calls<C, const ID: u8 = 0>(pub(crate) C);
 
-/// One reserved bulk frame, consumed by eager EVAL encoding.
-pub trait Reserved<'d, C: Client<'d, ID>, const ID: u8 = 0>: crate::api::Sealed {
-    fn eval_prepared<R: Decode<C>, K: AsRef<[u8]>, A: request::Bulk>(
-        self,
-        call: Prepared<'_, K, A>,
-    ) -> C::Call<R>;
-}
-
-pub struct Reservation<C: o3::mem::Return<Item = o3::buffer::pool::Span>>(
-    o3::mem::Lease<C, o3::mem::lease::Open>,
-);
-
-impl<C: o3::mem::Return<Item = o3::buffer::pool::Span>> Reservation<C> {
-    pub(crate) const fn new(client: C, frame: o3::buffer::pool::Span) -> Self {
-        Self(o3::mem::Lease::open(client, frame))
-    }
-}
-
-impl<C: o3::mem::Return<Item = o3::buffer::pool::Span>> crate::api::Sealed for Reservation<C> {}
-
-impl<'app, 's, 'b, 'c: 'b, 'd: 'app + 'c, B: ?Sized, const ID: u8>
-    Reserved<'d, crate::client::Redis<'app, 's, 'b, 'c, 'd, B, ID>, ID>
-    for Reservation<crate::client::Redis<'app, 's, 'b, 'c, 'd, B, ID>>
-{
-    fn eval_prepared<R, K, A>(
-        self,
-        call: Prepared<'_, K, A>,
-    ) -> <crate::client::Redis<'app, 's, 'b, 'c, 'd, B, ID> as Client<'d, ID>>::Call<R>
-    where
-        R: Decode<crate::client::Redis<'app, 's, 'b, 'c, 'd, B, ID>>,
-        K: AsRef<[u8]>,
-        A: request::Bulk,
-    {
-        use crate::client::dispatch::command::{Command, Pooled};
-        use cartel_core::frame::Sensitivity;
-
-        let (client, frame) = self.0.into_parts();
-        let frame = encode::Encoder::new(frame)
-            .admit_with(call.length, Sensitivity::Plain, |out| call.encode(out))
-            .inspect_err(|_| client.port.activity.wake_send());
-        Command::new(Pooled::new(client), frame)
-    }
-}
-
-impl<'d, C: Client<'d, ID>, const ID: u8> Calls<C, ID> {
-    /// Waits for one bulk frame whose capacity covers `required`.
-    pub fn try_reserve_bulk(
-        self,
-        required: std::num::NonZero<usize>,
-    ) -> Result<
-        impl dope_fiber::abi::Fiber<'d, Output = Result<C::Reserved, C::DriverError>>,
-        request::Error,
-    > {
-        self.0.try_reserve_bulk(required)
-    }
-
+impl<'d, C: Commands<'d, ID>, const ID: u8> Calls<C, ID> {
     pub fn eval_prepared<R, K, A>(self, call: Prepared<'_, K, A>) -> C::Call<R>
     where
-        R: Decode<C>,
+        R: Decode<C::Client>,
         K: AsRef<[u8]>,
         A: request::Bulk,
     {
@@ -123,7 +68,7 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Calls<C, ID> {
     /// the declared key count is derived from `keys`.
     pub fn eval<R, K, A>(self, script: &[u8], keys: &[K], args: &[A]) -> C::Call<R>
     where
-        R: Decode<C>,
+        R: Decode<C::Client>,
         K: AsRef<[u8]>,
         A: request::Bulk,
     {
@@ -135,7 +80,7 @@ impl<'d, C: Client<'d, ID>, const ID: u8> Calls<C, ID> {
     /// Borrows one invocation's views once before eager length validation and encoding.
     pub fn eval_call<R, I>(self, call: &I) -> C::Call<R>
     where
-        R: Decode<C>,
+        R: Decode<C::Client>,
         I: Invocation,
     {
         self.eval::<R, _, _>(call.script(), call.keys(), call.arguments())

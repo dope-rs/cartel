@@ -9,11 +9,18 @@ use dope::{
 use o3::{
     base::cell::region,
     buffer::{Residency, pool},
+    mem::credit::fair,
 };
 use port::{pool::slot, replies};
 use reply::{order, recv::attach};
 
+use crate::reply::Pressure;
 use crate::{error, port, port::Disposition, protocol::encode, schema};
+
+pub(crate) enum Rejection {
+    Pressure(Pressure),
+    Failed(error::Error),
+}
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
@@ -31,7 +38,7 @@ const _: () = {
     assert!(mem::align_of::<Boundary>() == mem::align_of::<bool>());
 };
 
-pub(crate) use crate::protocol::runtime::ready::ReplyContext;
+pub(crate) use crate::protocol::runtime::ready::{ReplyContext, Source};
 
 pub(crate) struct Access<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8> {
     port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
@@ -45,11 +52,11 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
     }
 
     fn frame<T>(
-        pool: &pool::Pool,
+        span: Option<pool::Span>,
         kind: frame::Sensitivity,
         write: impl FnOnce(&mut encode::Writer) -> Result<T, encode::Error>,
     ) -> Result<(Complete<'d>, T), error::Error> {
-        let span = pool.acquire().ok_or(error::Error::RequestCapacity)?;
+        let span = span.ok_or(error::Error::RequestCapacity)?;
         let (frame, value) =
             encode::Writer::encode(span, kind, write).map_err(error::Error::Request)?;
         let frame = egress::NonEmpty::try_new(Frame(Body::Owned(frame)))
@@ -59,23 +66,33 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
 
     pub(crate) fn encode(
         &self,
+        span: Option<pool::Span>,
         write: impl FnOnce(&mut encode::Writer) -> Result<(), encode::Error>,
     ) -> Result<Complete<'d>, error::Error> {
-        Self::frame(&self.port.requests, frame::Sensitivity::Plain, write).map(|(frame, ())| frame)
+        Self::frame(span, frame::Sensitivity::Plain, write).map(|(frame, ())| frame)
     }
 
     pub(crate) fn control(
         &self,
         write: impl FnOnce(&mut encode::Writer) -> Result<(), encode::Error>,
     ) -> Result<Complete<'d>, error::Error> {
-        Self::frame(&self.port.controls, frame::Sensitivity::Plain, write).map(|(frame, ())| frame)
+        Self::frame(
+            self.port.controls.acquire(),
+            frame::Sensitivity::Plain,
+            write,
+        )
+        .map(|(frame, ())| frame)
     }
 
     pub(crate) fn secret<T>(
         &self,
         write: impl FnOnce(&mut encode::Writer) -> Result<T, encode::Error>,
     ) -> Result<(Complete<'d>, T), error::Error> {
-        Self::frame(&self.port.controls, frame::Sensitivity::Secret, write)
+        Self::frame(
+            self.port.controls.acquire(),
+            frame::Sensitivity::Secret,
+            write,
+        )
     }
 
     fn request_lane(
@@ -87,9 +104,9 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
             .lane_for(self.port.lane(token.lane()))
     }
 
-    pub(crate) fn try_with<J, K, R>(
+    pub(crate) fn try_with<'a, J, K, R>(
         &self,
-        context: ReplyContext<'_, '_, 'd, ID>,
+        context: ReplyContext<'_, 'a, 'd, ID>,
         weight: NonZero<usize>,
         input: J,
         prepare: impl FnOnce(
@@ -107,12 +124,12 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
             J,
         ) -> Result<(order::Depth, K), (attach::Error, J)>,
         build: impl FnOnce(K, conn::Id<'d, KeyTag<ID>>) -> (Complete<'d>, R),
-    ) -> Result<R, (error::Error, conn::Id<'d, KeyTag<ID>>, J)> {
-        let (ready, listed, boundary, region) = context.into_parts();
+    ) -> Result<R, (Rejection, Source<'a, 'd, ID>, J)> {
+        let (ready, source, boundary, region) = context.into_parts();
         let token = ready.connection();
         let permit = match ready.try_reply(boundary) {
             Ok(permit) => permit,
-            Err(error) => return Err((error, token, input)),
+            Err(error) => return Err((Rejection::Failed(error), source, input)),
         };
         let replies = self.port.lane(token.lane());
         let conn = permit.slot();
@@ -121,14 +138,17 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
             region,
             weight.get(),
             replies::Tag::new(batch, boundary),
-            input,
-            prepare,
-            |input, depth| {
+            (source, input),
+            |region, lane, tag, (source, input)| match prepare(region, lane, tag, input) {
+                Ok((depth, output)) => Ok((depth, (source, output))),
+                Err((cause, input)) => Err((cause, (source, input))),
+            },
+            |(source, input), depth| {
                 let (bytes, done) = build(input, token);
                 if !permit.commit() {
                     self.port.shared.wake_ready();
                 }
-                if let Some(listed) = listed {
+                if let Source::Shared(listed) = source {
                     listed.reprioritize(depth.get() + conn.barriers());
                 }
                 (bytes, done)
@@ -139,21 +159,49 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
                 conn.wake();
                 Ok(done)
             }
-            Err((handoff::Failure::Reply(cause), input)) => {
-                Err((error::Error::Reply(cause), token, input))
+            Err((handoff::Failure::Reply(cause), (source, input))) => {
+                let cause = match cause {
+                    attach::Error::Full { len, capacity } => {
+                        Rejection::Pressure(Pressure::Full { len, capacity })
+                    }
+                    attach::Error::Capacity {
+                        lane,
+                        cause:
+                            fair::Cause::Exhausted {
+                                axis,
+                                required,
+                                available,
+                            },
+                    } => Rejection::Pressure(Pressure::Capacity {
+                        lane,
+                        axis,
+                        required,
+                        available,
+                    }),
+                    cause => Rejection::Failed(error::Error::Reply(cause)),
+                };
+                Err((cause, source, input))
             }
-            Err((handoff::Failure::Queue(cause), input)) => Err((
-                error::Error::RequestQueue {
-                    queued: self.port.request_queue.lane_for(replies).weight(region),
-                    cause,
-                },
-                token,
-                input,
-            )),
+            Err((handoff::Failure::Queue(cause), (source, input))) => {
+                let queued = self.port.request_queue.lane_for(replies).weight(region);
+                let cause = match cause {
+                    queue::Rejection::Capacity(fair::Cause::Exhausted {
+                        required,
+                        available,
+                        ..
+                    }) => Rejection::Pressure(Pressure::Queue {
+                        queued,
+                        required,
+                        available,
+                    }),
+                    cause => Rejection::Failed(error::Error::RequestQueue { queued, cause }),
+                };
+                Err((cause, source, input))
+            }
         }
     }
 
-    pub(crate) fn try_reply<J, R>(
+    pub(crate) fn try_reply<'a, J, R>(
         &self,
         weight: NonZero<usize>,
         input: J,
@@ -166,9 +214,9 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
             replies::ReplyFailure<'d>,
             replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
         >,
-        context: ReplyContext<'_, '_, 'd, ID>,
+        context: ReplyContext<'_, 'a, 'd, ID>,
         build: impl FnOnce(J, conn::Id<'d, KeyTag<ID>>) -> (Complete<'d>, R),
-    ) -> Result<R, (error::Error, conn::Id<'d, KeyTag<ID>>, J)> {
+    ) -> Result<R, (Rejection, Source<'a, 'd, ID>, J)> {
         self.try_with(
             context,
             weight,
@@ -220,7 +268,12 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
             }
         }
         let lane = self.request_lane(token);
-        let Err(cause) = lane.drain(requests) else {
+        let queued = lane.len(requests.region());
+        let result = lane.drain(requests);
+        if lane.len(requests.region()) != queued {
+            self.port.shared.signals.egress.notify();
+        }
+        let Err(cause) = result else {
             return;
         };
         let error = error::Error::RequestReserve(cause);
@@ -261,30 +314,6 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         Ok(())
     }
 
-    pub(crate) fn try_flush<E>(
-        &self,
-        token: conn::Id<'d, KeyTag<ID>>,
-        region: &mut region::Token<region::Identity<'d>>,
-        send: impl FnOnce(&mut region::Token<region::Identity<'d>>) -> Result<(), E>,
-    ) -> Result<(), E> {
-        let Some(conn) = self.port.conn(token) else {
-            return Ok(());
-        };
-        let sync = match conn.flush(token) {
-            slot::Flush::Idle => return Ok(()),
-            slot::Flush::Pending(sync) => sync,
-        };
-        let requests = self.request_lane(token);
-        if !requests.is_empty(region) {
-            return Ok(());
-        }
-        send(region)?;
-        if !sync.commit() {
-            self.port.shared.wake_ready();
-        }
-        Ok(())
-    }
-
     pub(crate) fn retire(
         &self,
         token: conn::Id<'d, KeyTag<ID>>,
@@ -295,7 +324,12 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
             return egress::Cleared::Done;
         }
         let requests = self.request_lane(token);
-        match requests.clear(work, region, drop) {
+        let queued = requests.len(region);
+        let result = requests.clear(work, region, drop);
+        if requests.len(region) != queued {
+            self.port.shared.signals.egress.notify();
+        }
+        match result {
             queue::Drain::Empty => egress::Cleared::Done,
             queue::Drain::Exhausted => egress::Cleared::Retry,
         }

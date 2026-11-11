@@ -243,10 +243,10 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Port<'s, 'storage, 'b, 'c, 'd, ID> 
 
     pub(super) fn encode(
         &self,
+        frame: Result<o3::buffer::pool::Span, request::Error>,
         encode: impl FnOnce(encode::Encoder) -> Result<encode::Complete, request::Error>,
     ) -> Result<encode::Complete, request::Error> {
-        let frame = self.requests.frame()?;
-        encode(encode::Encoder::new(frame))
+        encode(encode::Encoder::new(frame?)).inspect_err(|_| self.activity.wake_send())
     }
 
     pub(super) fn encode_sized(

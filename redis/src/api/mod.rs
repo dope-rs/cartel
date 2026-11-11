@@ -8,7 +8,7 @@ pub mod decode;
 mod sealed;
 mod storage;
 
-pub use client::Client;
+pub use client::{Acquired, Client, Commands};
 pub(crate) use sealed::Sealed;
 pub use storage::Storage;
 

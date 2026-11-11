@@ -44,12 +44,12 @@ impl<'d> Pending<'d> {
             KeyTag<ID>,
         >,
     ) -> response::Settlement<Self> {
-        let Some(queue) = port.responses(ctx.conn_id) else {
+        let Some(mut queue) = port.responses(ctx.conn_id, ctx.region()) else {
             Turn::new(port, ctx).fail(crate::Error::Protocol(Reason::RowUnknown));
             return response::Settlement::Ready;
         };
         match pending {
-            replies::Pending::Row(row) => match queue.try_push(ctx.region(), row) {
+            replies::Pending::Row(row) => match queue.try_push(row) {
                 Ok(()) => response::Settlement::Ready,
                 Err(usage::InsertError::Backpressure { value, .. }) => {
                     response::Settlement::Blocked(Self::row(replies::Pending::Row(value)))
@@ -67,7 +67,7 @@ impl<'d> Pending<'d> {
                     response::Settlement::Ready
                 }
             },
-            replies::Pending::Failure(failed) => match queue.try_fail(ctx.region(), failed) {
+            replies::Pending::Failure(failed) => match queue.try_fail(failed) {
                 Ok(()) => response::Settlement::Ready,
                 Err(usage::InsertError::Backpressure { value, .. }) => {
                     response::Settlement::Blocked(Self::row(replies::Pending::Failure(value)))
@@ -80,7 +80,7 @@ impl<'d> Pending<'d> {
                     front: order::Front::Detached,
                     ..
                 }) => {
-                    queue.complete(ctx.region());
+                    queue.complete();
                     response::Settlement::Ready
                 }
                 Err(usage::InsertError::Front { front, .. }) => {

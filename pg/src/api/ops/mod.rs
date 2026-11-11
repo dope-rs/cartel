@@ -1,5 +1,4 @@
 use crate::{api, port::replies, reply, reply::Error, schema};
-use dope::{core::driver::route::KeyTag, manifold::client::conn};
 use dope_fiber::{abi, wait};
 use schema::result;
 use std::marker;
@@ -7,7 +6,6 @@ use std::marker;
 use api::tx::control;
 use api::{request, results, task, traits};
 use reply::group;
-use request::stateful;
 use results::Storage;
 use results::copy::{Chunk, Sink, Stream};
 use task::lease;
@@ -18,109 +16,86 @@ mod status;
 pub use status::Status;
 
 /// A route- and driver-lifetime-branded PostgreSQL operation view.
-pub struct Query<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0>
-where
-    I: schema::QuerySet + 'd,
-{
-    pub(super) client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-    pub(super) target: Option<api::Target<'d, ID>>,
+#[derive(Clone, Copy)]
+pub struct Query<C, R = api::Pooled, S = ()> {
+    pub(super) client: C,
+    pub(super) target: R,
+    pub(super) input: S,
 }
 
-pub struct Unchecked<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0>(
-    pub(super) Query<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-)
-where
-    I: schema::QuerySet + 'd;
-
-pub struct Transfer<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0>(
-    pub(super) Query<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-)
-where
-    I: schema::QuerySet + 'd;
-
-pub struct Notify<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0>(
-    pub(super) Query<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-)
-where
-    I: schema::QuerySet + 'd;
-
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Copy
-    for Query<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-}
-
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Clone
-    for Query<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-    fn clone(&self) -> Self {
-        *self
+impl<C, R> Query<C, R> {
+    pub(crate) const fn from_parts(client: C, target: R) -> Self {
+        Self {
+            client,
+            target,
+            input: (),
+        }
     }
 }
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Copy
-    for Unchecked<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-}
+impl<C, R, S> Sealed for Query<C, R, S> {}
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Clone
-    for Unchecked<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Copy
-    for Transfer<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-}
-
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Clone
-    for Transfer<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Copy
-    for Notify<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-}
-
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Clone
-    for Notify<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8>
-    Query<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R, S>
+    traits::Query<'d, ID> for Query<api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
 where
-    I: schema::QuerySet + 'd,
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
+    S: request::Input<'d>,
 {
-    pub(crate) const fn from_parts(
-        client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-        target: Option<api::Target<'d, ID>>,
-    ) -> Self {
-        Self { client, target }
+    type Acquired =
+        Query<api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, request::Acquired<'d>>;
+
+    fn acquire(self) -> impl abi::Fiber<'d, Output = Result<Self::Acquired, Error<'d, ID>>>
+    where
+        Self: Copy,
+    {
+        use cartel_core::deadline;
+        use dope_fiber::task::done::Wait;
+        use std::{pin::Pin, task::Poll};
+
+        let Self { client, target, .. } = self;
+        let mut deadline = client.port.lifecycle.deadline.guard();
+        Wait::new(move |mut cx, waiter| {
+            let guard = match &mut deadline {
+                Ok(guard) => guard,
+                Err(error) => return Poll::Ready(Err(crate::Error::Deadline(*error).into())),
+            };
+            if Pin::new(&mut *guard).poll_expired(cx.as_mut()).is_ready() {
+                return Poll::Ready(Err(crate::Error::RequestTimeout(deadline::Elapsed::new(
+                    deadline::RequestPhase::Admission,
+                ))
+                .into()));
+            }
+            let cause = if let Err(error) = api::check_open(client) {
+                error
+            } else if let Some(frame) = client.port.requests.acquire() {
+                return Poll::Ready(Ok(Query {
+                    client,
+                    target,
+                    input: request::Acquired {
+                        frame,
+                        deadline: guard.take(),
+                    },
+                }));
+            } else {
+                match client
+                    .port
+                    .shared
+                    .frame_waiters
+                    .try_register(waiter, cx.as_ref())
+                {
+                    Ok(()) => return Poll::Pending,
+                    Err(error) => Error::Wait(error),
+                }
+            };
+            guard.complete();
+            Poll::Ready(Err(cause))
+        })
     }
-}
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Sealed
-    for Query<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-}
-
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    traits::Query<'d, ID> for Query<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
-{
     type Schema = I;
     type Results = api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>;
     type Stream<Q>
-        = results::RunStream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID>
+        = results::RunStream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R>
     where
         Q: schema::TypedQuery<Result = result::Rows>;
 
@@ -130,17 +105,13 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     ) -> impl abi::Fiber<
         'd,
         Output = Result<results::Row<<Self::Results as Storage>::Payload, Q>, Error<'d, ID>>,
-    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID>
+    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        self.client.typed::<Q, api::ExtractFirst<_, ID>>(
-            self.target,
-            params,
-            results::Row::<_, Q>::required,
-        )
+        self.typed::<Q, api::ExtractFirst<_, ID>, _>(params, results::Row::<_, Q>::required)
     }
 
     fn run_group<Q, const N: usize>(
@@ -155,13 +126,15 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             N,
             ID,
         >,
-    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, N>
+    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, N, R, S>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        self.client.group::<Q, N>(self.target, params)
+        let (client, target, frame, clock) = self.into_parts();
+        let next = api::Pending::group::<Q, I, ID, N>(client.port, params, frame);
+        task::group::Group::new(client, target, next, clock(client.port.lifecycle.deadline))
     }
 
     fn run_first<Q>(
@@ -173,17 +146,13 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             Option<results::Row<<Self::Results as Storage>::Payload, Q>>,
             Error<'d, ID>,
         >,
-    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID>
+    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        self.client.typed::<Q, api::ExtractFirst<_, ID>>(
-            self.target,
-            params,
-            results::Row::<_, Q>::optional,
-        )
+        self.typed::<Q, api::ExtractFirst<_, ID>, _>(params, results::Row::<_, Q>::optional)
     }
 
     fn run_scalar<Q>(
@@ -195,17 +164,13 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             Option<results::Row<<Self::Results as Storage>::Payload, Q, true>>,
             Error<'d, ID>,
         >,
-    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID>
+    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
     where
         Q: schema::TypedQuery<Result = result::Rows<true>>,
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        self.client.typed::<Q, api::ExtractFirst<_, ID>>(
-            self.target,
-            params,
-            results::Row::<_, Q, true>::optional,
-        )
+        self.typed::<Q, api::ExtractFirst<_, ID>, _>(params, results::Row::<_, Q, true>::optional)
     }
 
     fn run_all<Q>(
@@ -214,18 +179,15 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     ) -> impl abi::Fiber<
         'd,
         Output = Result<results::Collection<<Self::Results as Storage>::Batch, Q>, Error<'d, ID>>,
-    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID>
+    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
+        let batches = self.client.port.batches;
         abi::Map::new(
-            self.client.typed::<Q, api::ExtractAll<ID>>(
-                self.target,
-                params,
-                self.client.port.batches,
-            ),
+            self.typed::<Q, api::ExtractAll<ID>, _>(params, batches),
             results::Collection::<_, Q>::from_result,
         )
     }
@@ -234,103 +196,91 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         self,
         params: Q::Params<'_>,
     ) -> impl abi::Fiber<'d, Output = Result<(), Error<'d, ID>>>
-    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID>
+    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
     where
         Q: schema::TypedQuery<Row = (), Result = result::Command>,
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        self.client
-            .typed::<Q, api::ExtractUnit<ID>>(self.target, params, ())
+        self.typed::<Q, api::ExtractUnit<ID>, _>(params, ())
     }
 
-    fn run_stream<Q>(self, params: Q::Params<'_>) -> Self::Stream<Q>
+    fn run_stream<Q>(self, params: Q::Params<'_>) -> <Self as traits::Query<'d, ID>>::Stream<Q>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
+        let (client, target, frame, clock) = self.into_parts();
+        let next = api::Pending::typed::<Q, I, api::ExtractOne<ID>, ID>(client.port, params, frame);
         results::RunStream {
-            state: self
-                .client
-                .stream::<Q, api::ExtractOne<ID>>(self.target, params),
+            state: task::stream::Stream::new(
+                task::Core::new(client, target, (), next),
+                clock(client.port.lifecycle.deadline),
+            ),
             marker: marker::PhantomData,
         }
     }
 }
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Sealed
-    for Unchecked<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-}
-
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    traits::Unchecked<'d, ID> for Unchecked<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R, S>
+    traits::Unchecked<'d, ID> for Query<api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
+where
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
+    S: request::Input<'d>,
 {
     fn command(
         self,
         sql: &str,
     ) -> impl abi::Fiber<'d, Output = Result<(), Error<'d, ID>>>
-    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID> {
-        self.0
-            .client
-            .raw::<api::ExtractUnit<ID>>(self.0.target, request::Request::raw(sql))
+    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R, S> {
+        self.raw(request::Request::raw(sql))
     }
 }
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Sealed
-    for Transfer<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-}
-
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    copy::Transfer<'d, ID> for Transfer<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R, S>
+    copy::Transfer<'d, ID> for Query<api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
+where
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
+    S: request::Input<'d>,
 {
     type Chunk = Chunk<'b, 'c, 'd>;
-    type Sink = Sink<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>;
-    type Stream = Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>;
+    type Sink = Sink<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R>;
+    type Stream = Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R>;
 
     fn copy_in(
         self,
         sql: &str,
         data: &[u8],
     ) -> impl abi::Fiber<'d, Output = Result<(), Error<'d, ID>>>
-    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID> {
-        self.0.client.raw::<api::ExtractUnit<ID>>(
-            self.0.target,
-            request::Request::raw_extra(sql, request::Extra::CopyIn { data }),
-        )
+    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R, S> {
+        self.raw(request::Request::raw_extra(
+            sql,
+            request::Extra::CopyIn { data },
+        ))
     }
 
     fn copy_stream(self, sql: &str) -> Self::Sink {
+        let (dispatched, budget) = self.raw_core::<api::ExtractUnit<ID>, lease::Recover>(
+            request::Request::raw_extra(sql, request::Extra::CopyInOpen),
+        );
         Sink {
-            dispatched: self
-                .0
-                .client
-                .raw_core_as::<api::ExtractUnit<ID>, conn::Id<'d, KeyTag<ID>>, lease::Recover>(
-                    self.0.target,
-                    request::Request::raw_extra(sql, request::Extra::CopyInOpen),
-                ),
-            budget: task::Budget::new(self.0.client.port.lifecycle.deadline),
+            dispatched,
+            budget: budget.into(),
         }
     }
 
-    fn copy_out(self, sql: &str) -> Self::Stream {
-        Stream::new(
-            self.0
-                .client
-                .stream_raw::<api::ExtractOne<ID>>(self.0.target, request::Request::raw(sql)),
-        )
+    fn copy_out(self, sql: &str) -> <Self as copy::Transfer<'d, ID>>::Stream {
+        let (core, clock) =
+            self.raw_core::<api::ExtractOne<ID>, lease::Detached>(request::Request::raw(sql));
+        Stream::new(task::stream::Stream::new(core, clock))
     }
 }
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Sealed
-    for Notify<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-}
-
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    traits::Notify<'d, ID> for Notify<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R>
+    traits::Notify<'d, ID> for Query<api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R>
+where
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
 {
     type Schema = I;
     type Payload = replies::Payload<'b, 'c, 'd>;
@@ -338,12 +288,12 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     type Listener = control::ListenGuard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>;
 
     fn dropped(self) -> u64 {
-        self.0.client.port.shared.notifications.dropped()
+        self.client.port.shared.notifications.dropped()
     }
 
     fn next(self) -> impl abi::Fiber<'d, Output = Result<reply::Notice<'d>, reply::Error<'d, ID>>> {
         results::Next {
-            client: self.0.client,
+            client: self.client,
             waiter: wait::Waiter::new(),
         }
     }
@@ -352,12 +302,11 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         self,
         channel: crate::Identifier,
     ) -> impl abi::Fiber<'d, Output = Result<Self::Listener, reply::Error<'d, ID>>> {
-        let client = self.0.client;
-        let target = self.0.target;
-        let opening = stateful::Stateful::new(client, target, request::Request::listen(&channel));
+        let target = self.target;
+        let opening = self.stateful(request::Request::listen(&channel));
         dope_fiber::fiber!('d => async move {
             let lease = opening.await?;
-            let target = match target {
+            let target = match target.into() {
                 Some(target) => target,
                 None => api::Target::new(lease.target()),
             };

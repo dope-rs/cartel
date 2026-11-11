@@ -1,4 +1,4 @@
-use cartel_redis::api::{Client as _, Connection as _};
+use cartel_redis::api::{Client as _, Commands as _, Connection as _};
 use cartel_redis::value::source::Bulks as _;
 use dope::core::driver::life::recovery;
 use dope::runtime::executor::session::Completion;

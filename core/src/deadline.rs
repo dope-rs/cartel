@@ -74,12 +74,11 @@ impl<'d> Guard<'d> {
     pub fn poll_expired(
         self: pin::Pin<&mut Self>,
         mut ctx: pin::Pin<&mut context::Context<'_, 'd>>,
-        phase: RequestPhase,
-    ) -> task::Poll<Elapsed> {
+    ) -> task::Poll<()> {
         let state = &mut self.get_mut().state;
         let (alarm, window) = match state {
             GuardState::Live { alarm, window } => (alarm, window),
-            GuardState::Elapsed => return task::Poll::Ready(Elapsed::new(phase)),
+            GuardState::Elapsed => return task::Poll::Ready(()),
             GuardState::Complete => return task::Poll::Pending,
         };
         let wake = ctx.as_ref().completion();
@@ -90,14 +89,41 @@ impl<'d> Guard<'d> {
         };
         if expired.is_ready() {
             *state = GuardState::Elapsed;
-            task::Poll::Ready(Elapsed::new(phase))
+            task::Poll::Ready(())
         } else {
             task::Poll::Pending
         }
     }
 
+    pub fn take(&mut self) -> Self {
+        Self {
+            state: mem::replace(&mut self.state, GuardState::Complete),
+        }
+    }
+
+    pub fn into_parts(self) -> Option<(timer::Alarm<'d>, Option<Positive>)> {
+        match self.state {
+            GuardState::Live { alarm, window } => Some((alarm, window)),
+            GuardState::Elapsed | GuardState::Complete => None,
+        }
+    }
+
     pub fn complete(&mut self) {
         self.state = GuardState::Complete;
+    }
+}
+
+impl<'d> From<Source<'d>> for Result<Guard<'d>, timer::Exhausted> {
+    #[inline]
+    fn from(source: Source<'d>) -> Self {
+        source.guard()
+    }
+}
+
+impl<'d> From<Guard<'d>> for Result<Guard<'d>, timer::Exhausted> {
+    #[inline]
+    fn from(guard: Guard<'d>) -> Self {
+        Ok(guard)
     }
 }
 

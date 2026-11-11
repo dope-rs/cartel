@@ -1,17 +1,15 @@
 use crate::reply::group::Ledger;
-use crate::{api, port, port::replies, schema};
+use crate::{api, port, port::replies, reply::Error, schema};
 use api::results::copy;
 use api::traits::{copy::Transfer, sealed::Sealed};
-use api::{Response, ops, request, results, task, traits, tx};
+use api::{ops, request, results, task, traits, tx};
 use cartel_core::reply::Batch;
 use cartel_core::reply::recv;
 use dope::runtime::client;
 use dope::{core::driver::route::KeyTag, manifold::client::conn};
-use task::{
-    group,
-    lease::{self, Policy, Target},
-    stream::Stream,
-};
+use dope_fiber::abi;
+use std::marker::PhantomData;
+use task::lease::{self, Policy, Target};
 
 pub struct Client<
     'app,
@@ -81,23 +79,20 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     traits::Client<'d, ID> for Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     type Schema = I;
-    type Query = ops::Query<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>;
+    type Query = ops::Query<Self>;
     type CopyChunk = copy::Chunk<'b, 'c, 'd>;
     type Transaction = tx::Guard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>;
 
     fn query(self) -> Self::Query {
-        ops::Query {
-            client: self,
-            target: None,
-        }
+        ops::Query::from_parts(self, api::Pooled)
     }
 
     fn unchecked(self) -> impl traits::Unchecked<'d, ID> {
-        ops::Unchecked(self.query())
+        self.query()
     }
 
     fn copy(self) -> impl Transfer<'d, ID, Chunk = Self::CopyChunk> {
-        ops::Transfer(self.query())
+        self.query()
     }
 
     fn notify(
@@ -109,7 +104,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         Payload = Self::Payload,
         Diagnostics = Self::Diagnostics,
     > {
-        ops::Notify(self.query())
+        self.query()
     }
 
     fn transaction(self) -> impl traits::Begin<'d, ID, Guard = Self::Transaction> {
@@ -127,119 +122,34 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R, S>
+    ops::Query<Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
+where
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
 {
-    pub(in crate::api) fn typed<Q, X>(
+    pub(in crate::api) fn into_parts(
         self,
-        target: Option<api::Target<'d, ID>>,
+    ) -> (
+        Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+        R,
+        impl FnOnce(&o3::buffer::pool::Pool) -> Option<o3::buffer::pool::Span>,
+        impl FnOnce(cartel_core::deadline::Source<'d>) -> S::Clock,
+    )
+    where
+        S: request::Input<'d>,
+    {
+        let (frame, clock) = self.input.into_parts();
+        (self.client, self.target, frame, clock)
+    }
+
+    pub(in crate::api) fn typed<Q, X, T>(
+        self,
         params: Q::Params<'_>,
         context: X::Context,
-    ) -> task::Call<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID>
+    ) -> impl abi::Fiber<'d, Output = Result<T, Error<'d, ID>>>
+    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, X, ID, R, T, S>
     where
-        Q: schema::TypedQuery,
-        X: recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>> + api::Sync,
-        I: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
-    {
-        let reply = recv::Response::<
-            replies::Row<'_>,
-            X,
-            replies::ReplyFailure<'_>,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-        >::with(context);
-        let next = api::Pending::typed::<Q, I, ID>(self.port, params, X::BOUNDARY);
-        task::Call::from_core(
-            task::Core::new(self, target, reply, next),
-            self.port.lifecycle.deadline,
-        )
-    }
-
-    pub(in crate::api) fn group<Q, const N: usize>(
-        self,
-        target: Option<api::Target<'d, ID>>,
-        params: [Q::Params<'_>; N],
-    ) -> group::Group<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, N>
-    where
-        Q: schema::TypedQuery<Result = schema::result::Rows>,
-        I: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
-    {
-        let next = api::Pending::group::<Q, I, ID, N>(self.port, params);
-        group::Group::new(self, target, next)
-    }
-
-    pub(in crate::api) fn raw<X>(
-        self,
-        target: Option<api::Target<'d, ID>>,
-        req: request::Request<'_>,
-    ) -> task::Call<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID>
-    where
-        X: recv::Extract<
-                'app,
-                'b,
-                'c,
-                'd,
-                replies::Row<'d>,
-                replies::ReplyFailure<'d>,
-                Context = (),
-            >,
-    {
-        task::Call::from_core(
-            self.raw_core_as::<X, conn::Id<'d, KeyTag<ID>>, lease::Detached>(target, req),
-            self.port.lifecycle.deadline,
-        )
-    }
-
-    pub(in crate::api) fn raw_core_as<X, A, P>(
-        self,
-        target: Option<api::Target<'d, ID>>,
-        req: request::Request<'_>,
-    ) -> task::Core<
-        'app,
-        'g,
-        'r,
-        's,
-        'b,
-        'c,
-        'd,
-        B,
-        I,
-        Response<'app, 'g, 'r, 's, 'b, 'c, 'd, X>,
-        ID,
-        (),
-        A,
-        P,
-    >
-    where
-        X: recv::Extract<
-                'app,
-                'b,
-                'c,
-                'd,
-                replies::Row<'d>,
-                replies::ReplyFailure<'d>,
-                Context = (),
-            >,
-        A: Target<'d, ID>,
-        P: Policy,
-    {
-        let reply = recv::Response::<
-            replies::Row<'_>,
-            X,
-            replies::ReplyFailure<'_>,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-        >::new();
-        let next = api::Pending::raw(self.port, req);
-        task::Core::new(self, target, reply, next)
-    }
-
-    pub(in crate::api) fn stream<Q, X>(
-        self,
-        target: Option<api::Target<'d, ID>>,
-        params: Q::Params<'_>,
-    ) -> Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID>
-    where
+        S: request::Input<'d>,
         Q: schema::TypedQuery,
         X: recv::Extract<
                 'app,
@@ -248,27 +158,97 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                 'd,
                 replies::Row<'d>,
                 replies::ReplyFailure<'d>,
-                Context = (),
+                Output = Result<T, Error<'d, ID>>,
             > + api::Sync,
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        let reply = recv::Stream::<
-            replies::Row<'_>,
-            X,
-            replies::ReplyFailure<'_>,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-        >::new();
-        let next = api::Pending::typed::<Q, I, ID>(self.port, params, X::BOUNDARY);
-        Stream::new(self, target, reply, next)
+        let (client, target, frame, clock) = self.into_parts();
+        let next = api::Pending::typed::<Q, I, X, ID>(client.port, params, frame);
+        task::Call::new(
+            task::Core::<B, I, X, ID, R, PhantomData<X>>::new(client, target, context, next),
+            clock(client.port.lifecycle.deadline).into(),
+            |_, outcome| outcome,
+        )
     }
 
-    pub(in crate::api) fn stream_raw<X>(
+    pub(in crate::api) fn raw(
         self,
-        target: Option<api::Target<'d, ID>>,
         req: request::Request<'_>,
-    ) -> Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID>
+    ) -> impl abi::Fiber<'d, Output = Result<(), Error<'d, ID>>>
+    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R, S>
     where
+        S: request::Input<'d>,
+    {
+        let (core, clock) = self.raw_core::<api::ExtractUnit<ID>, lease::Detached>(req);
+        task::Call::new(core, clock.into(), |_, outcome| outcome)
+    }
+
+    pub(in crate::api) fn stateful(
+        self,
+        req: request::Request<'_>,
+    ) -> impl abi::Fiber<
+        'd,
+        Output = Result<
+            lease::Lease<
+                'app,
+                'g,
+                'r,
+                's,
+                'b,
+                'c,
+                'd,
+                B,
+                I,
+                conn::Id<'d, KeyTag<ID>>,
+                lease::Recover,
+                ID,
+            >,
+            Error<'d, ID>,
+        >,
+    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R, S>
+    where
+        S: request::Input<'d>,
+    {
+        let (core, clock) = self.raw_core::<api::ExtractUnit<ID>, lease::Recover>(req);
+        task::Call::new(core, clock.into(), |core, outcome| {
+            let (outcome, lease) = core.complete(outcome)?;
+            match outcome {
+                Ok(()) => Ok(lease),
+                Err(error) => {
+                    lease.settle();
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    pub(in crate::api) fn raw_core<X, P>(
+        self,
+        req: request::Request<'_>,
+    ) -> (
+        task::Core<
+            'app,
+            'g,
+            'r,
+            's,
+            'b,
+            'c,
+            'd,
+            B,
+            I,
+            X,
+            ID,
+            R,
+            port::requests::Boundary,
+            (),
+            conn::Id<'d, KeyTag<ID>>,
+            P,
+        >,
+        S::Clock,
+    )
+    where
+        S: request::Input<'d>,
         X: recv::Extract<
                 'app,
                 'b,
@@ -278,14 +258,13 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                 replies::ReplyFailure<'d>,
                 Context = (),
             >,
+        P: Policy,
     {
-        let reply = recv::Stream::<
-            replies::Row<'_>,
-            X,
-            replies::ReplyFailure<'_>,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-        >::new();
-        let next = api::Pending::raw(self.port, req);
-        Stream::new(self, target, reply, next)
+        let (client, target, frame, clock) = self.into_parts();
+        let next = api::Pending::raw(client.port, req, frame);
+        (
+            task::Core::new(client, target, (), next),
+            clock(client.port.lifecycle.deadline),
+        )
     }
 }

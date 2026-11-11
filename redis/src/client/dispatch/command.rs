@@ -176,10 +176,8 @@ where
                     let Some(mut guard) = guard else {
                         unreachable!("deadline")
                     };
-                    if let Poll::Ready(due) = guard
-                        .as_mut()
-                        .poll_expired(cx.as_mut(), deadline::RequestPhase::Response)
-                    {
+                    if guard.as_mut().poll_expired(cx.as_mut()).is_ready() {
+                        let due = deadline::Elapsed::new(deadline::RequestPhase::Response);
                         let redis = this.target.redis();
                         if matches!(
                             reply.detach_order(cx.as_mut().region_token()),
@@ -210,10 +208,8 @@ where
                     let Some(mut guard) = guard else {
                         unreachable!("deadline")
                     };
-                    if let Poll::Ready(due) = guard
-                        .as_mut()
-                        .poll_expired(cx.as_mut(), deadline::RequestPhase::Admission)
-                    {
+                    if guard.as_mut().poll_expired(cx.as_mut()).is_ready() {
+                        let due = deadline::Elapsed::new(deadline::RequestPhase::Admission);
                         this.waiter.as_ref().unregister();
                         this.target.as_ref().discard(frame);
                         return Poll::Ready(Err(crate::Error::from(due).into()));
@@ -281,13 +277,17 @@ impl<'app, 's, 'b, 'c, 'd: 'app + 's, T, D, const ID: u8> Command<'app, 's, 'b, 
 where
     T: AsRef<crate::Port<'s, 'app, 'b, 'c, 'd, ID>>,
 {
-    pub(in crate::client) fn new(target: T, frame: Result<encode::Complete, request::Error>) -> Self
-    where
-        T: Target<'app, 's, 'b, 'c, 'd, ID>,
-    {
+    pub(in crate::client) fn new(
+        target: T,
+        frame: Result<encode::Complete, request::Error>,
+        deadline: impl FnOnce() -> Result<
+            deadline::Guard<'d>,
+            dope::core::driver::schedule::clock::timer::Exhausted,
+        >,
+    ) -> Self {
         let (state, deadline) = match frame {
             Err(error) => (State::Request(error), None),
-            Ok(frame) => match target.redis().port.deadline.guard() {
+            Ok(frame) => match deadline() {
                 Ok(deadline) => (State::Admission(frame), Some(deadline)),
                 Err(error) => {
                     target.as_ref().discard(frame);

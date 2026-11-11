@@ -1,5 +1,6 @@
 use crate::{api, port::replies, schema};
 use crate::{api::results::source::Payload as _, reply::Error};
+use cartel_core::deadline;
 use dope::{
     core::driver::{route::KeyTag, schedule::clock::timer},
     manifold::client::conn,
@@ -20,7 +21,7 @@ enum Finishing {
     Response,
 }
 
-pub struct Sink<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0>
+pub struct Sink<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0, R = api::Pooled>
 where
     I: schema::QuerySet + 'd,
 {
@@ -34,8 +35,10 @@ where
         'd,
         B,
         I,
-        api::Response<'app, 'g, 'r, 's, 'b, 'c, 'd, api::ExtractUnit<ID>>,
+        api::ExtractUnit<ID>,
         ID,
+        R,
+        crate::port::requests::Boundary,
         (),
         conn::Id<'d, KeyTag<ID>>,
         Recover,
@@ -43,13 +46,15 @@ where
     pub(in crate::api) budget: task::Budget<'d>,
 }
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Sealed
-    for Sink<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
+impl<B: ?Sized, I: schema::QuerySet, const ID: u8, R> Sealed
+    for Sink<'_, '_, '_, '_, '_, '_, '_, B, I, ID, R>
 {
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    copy::Sink<'d, ID> for Sink<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R>
+    copy::Sink<'d, ID> for Sink<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R>
+where
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
 {
     fn write<'a>(
         &'a mut self,
@@ -80,11 +85,11 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
 }
 
 #[pin_project::pin_project]
-struct Write<'borrow, 'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8>
+struct Write<'borrow, 'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8, R>
 where
     I: schema::QuerySet + 'd,
 {
-    guard: &'borrow mut Sink<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    guard: &'borrow mut Sink<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R>,
     chunk: &'borrow [u8],
     #[pin]
     deadline: Result<Option<timer::Alarm<'d>>, timer::Exhausted>,
@@ -92,8 +97,10 @@ where
     waiter: wait::Waiter<'borrow, 'd>,
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    abi::Fiber<'d> for Write<'_, 'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R>
+    abi::Fiber<'d> for Write<'_, 'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R>
+where
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
 {
     type Output = Result<(), Error<'d, ID>>;
 
@@ -109,11 +116,12 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                 return Poll::Ready(Err(guard.dispatched.abort(crate::Error::Deadline(*error))));
             }
         };
-        let phase = guard.dispatched.phase();
-        if let Poll::Ready(cause) = guard
+        if guard
             .budget
-            .poll_expired(timer.as_mut(), cx.as_mut(), phase)
+            .poll_expired(timer.as_mut(), cx.as_mut())
+            .is_ready()
         {
+            let cause = deadline::Elapsed::new(guard.dispatched.phase());
             this.waiter.as_ref().unregister();
             let error = guard.dispatched.abort(crate::Error::RequestTimeout(cause));
             this.deadline.set(Ok(None));
@@ -149,11 +157,11 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
 }
 
 #[pin_project::pin_project]
-struct Finish<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8>
+struct Finish<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8, R>
 where
     I: schema::QuerySet + 'd,
 {
-    guard: Sink<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    guard: Sink<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R>,
     state: Finishing,
     #[pin]
     deadline: Result<Option<timer::Alarm<'d>>, timer::Exhausted>,
@@ -161,8 +169,10 @@ where
     waiter: wait::Waiter<'app, 'd>,
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    abi::Fiber<'d> for Finish<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R>
+    abi::Fiber<'d> for Finish<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R>
+where
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
 {
     type Output = Result<(), Error<'d, ID>>;
 
@@ -178,12 +188,13 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                 return Poll::Ready(Err(error));
             }
         };
-        let phase = this.guard.dispatched.phase();
-        if let Poll::Ready(cause) =
-            this.guard
-                .budget
-                .poll_expired(timer.as_mut(), cx.as_mut(), phase)
+        if this
+            .guard
+            .budget
+            .poll_expired(timer.as_mut(), cx.as_mut())
+            .is_ready()
         {
+            let cause = deadline::Elapsed::new(this.guard.dispatched.phase());
             this.waiter.as_ref().unregister();
             let error = this
                 .guard
@@ -234,11 +245,22 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 }
 
-pub struct Stream<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0>
-where
+pub struct Stream<
+    'app,
+    'g,
+    'r,
+    's,
+    'b,
+    'c,
+    'd: 'app,
+    B: ?Sized,
+    I,
+    const ID: u8 = 0,
+    R = api::Pooled,
+> where
     I: schema::QuerySet + 'd,
 {
-    state: stream::Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, api::ExtractOne<ID>, ID>,
+    state: stream::Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, api::ExtractOne<ID>, ID, R>,
 }
 
 /// One COPY OUT chunk retaining its exact driver resource lease.
@@ -266,23 +288,27 @@ impl ops::Deref for Chunk<'_, '_, '_> {
     }
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R>
+    Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R>
+where
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
 {
     pub(in crate::api) fn new(
-        state: stream::Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, api::ExtractOne<ID>, ID>,
+        state: stream::Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, api::ExtractOne<ID>, ID, R>,
     ) -> Self {
         Self { state }
     }
 }
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Sealed
-    for Stream<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
+impl<B: ?Sized, I: schema::QuerySet, const ID: u8, R> Sealed
+    for Stream<'_, '_, '_, '_, '_, '_, '_, B, I, ID, R>
 {
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    copy::Stream<'d, ID> for Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R>
+    copy::Stream<'d, ID> for Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R>
+where
+    R: Copy + Into<Option<api::Target<'d, ID>>>,
 {
     type Chunk = Chunk<'b, 'c, 'd>;
 
@@ -302,7 +328,9 @@ fn send<'d, B: ?Sized, I: schema::QuerySet, const ID: u8>(
     api::check_open(client)?;
     let requests = client.port.request();
     let frame = requests
-        .encode(|frame| frame.copy_data(data))
+        .encode(client.port.requests.acquire(), |frame| {
+            frame.copy_data(data)
+        })
         .map_err(Error::from)?;
     requests
         .try_enqueue(target, frame, region)

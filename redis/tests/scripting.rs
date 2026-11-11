@@ -1,4 +1,4 @@
-use cartel_redis::api::Client as _;
+use cartel_redis::api::{Client as _, Commands as _};
 use cartel_redis::value::source::{Bytes as _, Reader as _, Reply as _};
 use dope::core::driver::life::recovery;
 use dope::runtime::executor::session::Completion;
@@ -8,7 +8,7 @@ use cartel_redis::{
     client::{
         GeoCoord,
         nonempty::Slice,
-        ops::scripts::{self, Invocation as _, Reserved as _},
+        ops::scripts::{self, Invocation as _},
         settings::init::Plan,
     },
     request, value,
@@ -424,8 +424,7 @@ fn bulk_boundary() {
                                             );
                                             let waiting = Box::pin(Task::new(
                                                 redis
-                                                    .scripts()
-                                                    .try_reserve_bulk(prepared.wire_len())
+                                                    .try_acquire_bulk(prepared.wire_len())
                                                     .expect("bulk capacity"),
                                             ));
                                             let reserved = runtime
@@ -435,8 +434,7 @@ fn bulk_boundary() {
                                                 .expect("command return wakes reservation");
                                             let waiting = Box::pin(Task::new(
                                                 redis
-                                                    .scripts()
-                                                    .try_reserve_bulk(prepared.wire_len())
+                                                    .try_acquire_bulk(prepared.wire_len())
                                                     .expect("bulk capacity"),
                                             ));
                                             let reserved = runtime
@@ -444,7 +442,7 @@ fn bulk_boundary() {
                                                 .expect("reservation drive")
                                                 .ok()
                                                 .expect("reservation return wakes reservation");
-                                            reserved.eval_prepared::<i64, _, _>(prepared)
+                                            reserved.scripts().eval_prepared::<i64, _, _>(prepared)
                                         } else {
                                             redis.scripts().eval_call::<i64, _>(&call)
                                         };
@@ -531,9 +529,7 @@ fn bulk_reservation_retains_reply() {
                                         Box::pin(Task::new(redis.scripts().eval_call::<i64, _>(&call)));
                                     drop(call);
                                     let mut reserve = Box::pin(Task::new(
-                                        redis
-                                            .scripts()
-                                            .try_reserve_bulk(need)
+                                        redis.try_acquire_bulk(need)
                                             .expect("bulk capacity"),
                                     ));
                                     let kept = &held;

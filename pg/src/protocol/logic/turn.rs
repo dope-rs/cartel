@@ -102,49 +102,40 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
     }
 
     pub(super) fn try_flush(self, input: Input) -> Result<(), crate::Error> {
-        if matches!(
-            self.state.phase,
-            state::Phase::Ready | state::Phase::CopyInActive | state::Phase::CopyOutActive
-        ) {
-            let lane = self
-                .port
-                .responses(self.conn)
-                .ok_or(crate::Error::Protocol(Reason::ResponseUnknown))?;
-            let receiving = match input {
-                Input::Empty => false,
-                Input::Partial => lane.front(self.state.batch, self.region)?.0.is_none(),
-                Input::Yield | Input::Blocked => true,
-            };
-            self.port
-                .shared
-                .ready
-                .set_receiving(self.conn, receiving, || lane.depth(self.region));
-        }
         match &mut self.state.phase {
             state::Phase::Sasl { scram } => {
                 Self::drive_scram(self.port, &self.sink, self.region, scram)?
             }
-            state::Phase::Ready => {
-                let result = self
+            phase @ (state::Phase::Ready
+            | state::Phase::CopyInActive
+            | state::Phase::CopyOutActive) => {
+                let mut lane = self
                     .port
-                    .request()
-                    .try_flush(self.conn, self.region, |region| {
+                    .responses(self.conn, self.region)
+                    .ok_or(crate::Error::Protocol(Reason::ResponseUnknown))?;
+                let receiving = match input {
+                    Input::Empty => false,
+                    Input::Partial => lane.front(self.state.batch)?.0.is_none(),
+                    Input::Yield | Input::Blocked => true,
+                };
+                lane.set_receiving(receiving);
+                if matches!(phase, state::Phase::Ready) {
+                    let result = lane.try_flush(self.port, |region| {
                         let frame = egress::NonEmpty::try_new(Frame::from(encode::SYNC.as_slice()))
                             .map_err(crate::Error::RequestLoad)?;
                         Self::enqueue(&self.sink, region, frame)
                     });
-                if let Err(error) = result {
-                    self.port
-                        .connection()
-                        .reconnect(self.conn, replies::Failure::from_error(error));
+                    if let Err(error) = result {
+                        self.port
+                            .connection()
+                            .reconnect(self.conn, replies::Failure::from_error(error));
+                    }
                 }
             }
             state::Phase::NeedsStartup
             | state::Phase::StartupSent
             | state::Phase::AwaitingReady
             | state::Phase::Preparing { .. }
-            | state::Phase::CopyInActive
-            | state::Phase::CopyOutActive
             | state::Phase::Failed => {}
         }
         Ok(())

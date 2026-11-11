@@ -3,14 +3,14 @@ use o3::depot::queue::links;
 use std::cell;
 
 #[repr(C)]
-pub(in crate::protocol::runtime::ready::storage) struct Node {
-    pub(in crate::protocol::runtime::ready::storage) round: links::Hook,
-    pub(in crate::protocol::runtime::ready::storage) bucket: links::Hook,
-    pub(in crate::protocol::runtime::ready::storage) priority: cell::Cell<Option<storage::Rank>>,
+pub(in crate::port::runtime::ready::storage) struct Node {
+    pub(in crate::port::runtime::ready::storage) round: links::Hook,
+    pub(in crate::port::runtime::ready::storage) bucket: links::Hook,
+    pub(in crate::port::runtime::ready::storage) priority: cell::Cell<Option<storage::Rank>>,
 }
 
 impl Node {
-    pub(in crate::protocol::runtime::ready::storage) fn new(index: links::Index) -> Self {
+    pub(in crate::port::runtime::ready::storage) fn new(index: links::Index) -> Self {
         Self {
             round: links::Hook::new(index),
             bucket: links::Hook::new(index),

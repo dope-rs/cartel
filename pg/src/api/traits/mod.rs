@@ -17,7 +17,7 @@ use sealed::Sealed;
 /// One exact runtime-issued client, with its storage details carried by its type.
 pub trait Client<'d, const ID: u8 = 0>: Sealed + results::Storage + Copy {
     type Schema: schema::QuerySet + 'd;
-    type Query: Query<'d, ID, Schema = Self::Schema, Results = Self>;
+    type Query: Query<'d, ID, Schema = Self::Schema, Results = Self> + Copy;
     type CopyChunk: AsRef<[u8]> + Deref<Target = [u8]>;
     type Transaction: Transaction<
             'd,
@@ -45,7 +45,14 @@ pub trait Client<'d, const ID: u8 = 0>: Sealed + results::Storage + Copy {
 }
 
 /// A query view whose result owners retain the admitted storage and route.
-pub trait Query<'d, const ID: u8 = 0>: Sealed + Copy {
+pub trait Query<'d, const ID: u8 = 0>: Sealed + Sized {
+    type Acquired: Query<'d, ID, Schema = Self::Schema, Results = Self::Results>
+        + Unchecked<'d, ID>
+        + Transfer<'d, ID>;
+
+    fn acquire(self) -> impl Fiber<'d, Output = Result<Self::Acquired, Error<'d, ID>>>
+    where
+        Self: Copy;
     type Schema: schema::QuerySet + 'd;
     type Results: results::Storage;
     type Stream<Q>: Stream<'d, Q, ID, Payload = <Self::Results as Storage>::Payload>
@@ -129,7 +136,7 @@ pub trait Query<'d, const ID: u8 = 0>: Sealed + Copy {
 }
 
 /// Unchecked SQL on the exact connection and owner carried by this view.
-pub trait Unchecked<'d, const ID: u8 = 0>: Sealed + Copy {
+pub trait Unchecked<'d, const ID: u8 = 0>: Sealed + Sized {
     /// Encodes the SQL before returning the future.
     fn command(
         self,
@@ -168,7 +175,7 @@ pub trait Transaction<'d, const ID: u8 = 0>: Sealed + Sized {
             ID,
             Schema = Self::Schema,
             Results: results::Storage<Payload = Self::Payload, Diagnostics = Self::Diagnostics>,
-        >
+        > + Copy
     where
         Self: 'tx;
     type Savepoint<'tx>: Savepoint<
@@ -210,7 +217,7 @@ pub trait Savepoint<'d, const ID: u8 = 0>: Sealed + Sized {
             ID,
             Schema = Self::Schema,
             Results: results::Storage<Payload = Self::Payload, Diagnostics = Self::Diagnostics>,
-        >
+        > + Copy
     where
         Self: 'save;
     type Savepoint<'parent>: Savepoint<
@@ -268,7 +275,7 @@ pub trait Listener<'d, const ID: u8 = 0>: Sealed + Sized {
             ID,
             Schema = Self::Schema,
             Results: results::Storage<Payload = Self::Payload, Diagnostics = Self::Diagnostics>,
-        >
+        > + Copy
     where
         Self: 'listen;
 

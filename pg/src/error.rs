@@ -53,7 +53,6 @@ pub enum Error {
     Scram(scram::Error),
     ScramSlot(shared::Bounds),
     TransactionSlot(shared::Bounds),
-    EgressSlot(shared::Bounds),
     Protocol(Reason),
     NotificationDropOverflow,
     DescriptionLtreeOidZero,

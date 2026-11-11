@@ -7,16 +7,16 @@ use crate::port::{pool::slot, ready};
 use crate::protocol::runtime::ready::storage;
 
 #[derive(Clone, Copy)]
-pub(in crate::protocol::runtime::ready) struct Layout {
-    pub(in crate::protocol::runtime::ready) allocation: alloc::Layout,
-    pub(in crate::protocol::runtime::ready) nodes: usize,
-    pub(in crate::protocol::runtime::ready) heads: usize,
-    pub(in crate::protocol::runtime::ready) header: usize,
-    pub(in crate::protocol::runtime::ready) shape: bitmap::Shape<num::NonZero<u32>>,
+pub(in crate::port::runtime::ready) struct Layout {
+    pub(in crate::port::runtime::ready) allocation: alloc::Layout,
+    pub(in crate::port::runtime::ready) nodes: usize,
+    pub(in crate::port::runtime::ready) heads: usize,
+    pub(in crate::port::runtime::ready) header: usize,
+    pub(in crate::port::runtime::ready) shape: bitmap::Shape<num::NonZero<u32>>,
 }
 
 impl Layout {
-    pub(in crate::protocol::runtime::ready) fn try_new(
+    pub(in crate::port::runtime::ready) fn try_new(
         capacity: conn::Capacity,
         buckets: num::NonZero<u32>,
     ) -> Result<Self, ready::Error> {

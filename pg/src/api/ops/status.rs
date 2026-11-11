@@ -31,11 +31,11 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             waiter.unregister();
             return task::Poll::Ready(Err(error));
         }
-        if shared.ready.count() == this.client.port.capacity() {
+        if shared.count() == this.client.port.capacity() {
             waiter.unregister();
             return task::Poll::Ready(Ok(()));
         }
-        match shared.ready.try_register(waiter, context.as_ref()) {
+        match shared.try_register(waiter, context.as_ref()) {
             Ok(()) => task::Poll::Pending,
             Err(error) => {
                 waiter.unregister();
@@ -71,11 +71,11 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 
     fn is_ready(self) -> bool {
-        self.0.port.shared.ready.count() != 0
+        self.0.port.shared.count() != 0
     }
 
     fn live_count(self) -> usize {
-        self.0.port.shared.ready.count()
+        self.0.port.shared.count()
     }
 
     fn wait_ready(self) -> impl abi::Fiber<'d, Output = Result<(), Error<'d, ID>>> {
@@ -86,6 +86,6 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 
     fn set_policy(self, policy: protocol::PickPolicy) {
-        self.0.port.shared.ready.set_policy(policy);
+        self.0.port.shared.set_policy(policy);
     }
 }

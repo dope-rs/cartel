@@ -43,64 +43,21 @@ fn views_keep_owner_layout() {
         );
         let query = Layout::new::<
             ops::Query<
-                'static,
-                'static,
-                'static,
-                'static,
-                'static,
-                'static,
-                'static,
-                B,
-                Queries,
-                ID,
+                Client<
+                    'static,
+                    'static,
+                    'static,
+                    'static,
+                    'static,
+                    'static,
+                    'static,
+                    B,
+                    Queries,
+                    ID,
+                >,
             >,
         >();
-        for layout in [
-            Layout::new::<
-                ops::Unchecked<
-                    'static,
-                    'static,
-                    'static,
-                    'static,
-                    'static,
-                    'static,
-                    'static,
-                    B,
-                    Queries,
-                    ID,
-                >,
-            >(),
-            Layout::new::<
-                ops::Transfer<
-                    'static,
-                    'static,
-                    'static,
-                    'static,
-                    'static,
-                    'static,
-                    'static,
-                    B,
-                    Queries,
-                    ID,
-                >,
-            >(),
-            Layout::new::<
-                ops::Notify<
-                    'static,
-                    'static,
-                    'static,
-                    'static,
-                    'static,
-                    'static,
-                    'static,
-                    B,
-                    Queries,
-                    ID,
-                >,
-            >(),
-        ] {
-            assert_eq!(layout, query);
-        }
+        assert_eq!(query, client);
     }
     check::<
         bindings::Bound<

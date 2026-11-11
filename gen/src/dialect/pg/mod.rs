@@ -291,7 +291,7 @@ impl PgBackend {
                     #count,
                 >
                 where
-                    #caller: ::cartel_pg::api::traits::Query<#driver, #route_id>,
+                    #caller: ::cartel_pg::api::traits::Query<#driver, #route_id> + ::core::marker::Copy,
                     #caller::Schema: ::cartel_pg::schema::HasGroup<Self>,
                 {
                     ::cartel_pg::dope_fiber::task::batch::Join::from_map(
