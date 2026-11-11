@@ -102,7 +102,7 @@ fn least_inflight_selects() {
 
                                 {
                                     let mut first =
-                                        pin!(Task::new(client.unchecked().command("SELECT 1")));
+                                        pin!(Task::new(client.command("SELECT 1")));
                                     assert!(
                                         matches!(
                                             runtime
@@ -115,7 +115,7 @@ fn least_inflight_selects() {
                                         assert!(
                                             matches!(
                                                 runtime.block_on(fibers::TEST.poll_once(
-                                                    client.unchecked().command("SELECT 1")
+                                                    client.command("SELECT 1")
                                                 )),
                                                 Ok(None)
                                             ),
@@ -134,7 +134,7 @@ fn least_inflight_selects() {
                                         matches!(
                                             runtime.block_on(
                                                 fibers::TEST.poll_once(
-                                                    client.unchecked().command("SELECT 1")
+                                                    client.command("SELECT 1")
                                                 ),
                                             ),
                                             Ok(None)
@@ -150,7 +150,7 @@ fn least_inflight_selects() {
                                 }
                                 assert!(
                                     matches!(
-                                        runtime.block_on(client.unchecked().command("SELECT 1")),
+                                        runtime.block_on(client.command("SELECT 1")),
                                         Ok(Ok(()))
                                     ),
                                     "least-inflight command"

@@ -71,7 +71,7 @@ where
 }
 
 type Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, const ID: u8, R> = State<
-    api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     R,
     api::Pending<'d, groups::Draft<'g, 'r, 's, 'b, 'c, 'd>>,
     lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, conn::Id<'d, KeyTag<ID>>, lease::Detached, ID>,
@@ -144,7 +144,7 @@ where
     R: Copy + Into<Option<api::Target<'d, ID>>>,
 {
     pub(in crate::api) fn new(
-        client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+        client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         target: R,
         next: Result<api::Pending<'d, groups::Draft<'g, 'r, 's, 'b, 'c, 'd>>, crate::Error>,
         clock: impl Into<Result<deadline::Guard<'d>, timer::Exhausted>>,

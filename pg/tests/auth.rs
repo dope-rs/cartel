@@ -57,8 +57,9 @@ fn authenticates_peers() {
                             worker.lend(|node, stage| {
                                 node.install(stage, |host, stage| {
                                     stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                        let client: api::Client<'_, '_, '_, '_, '_, '_, '_, _, _> =
-                                            runtime.root_client();
+                                        let client: api::Client<
+                                            api::Context<'_, '_, '_, '_, '_, '_, '_, _, _>,
+                                        > = runtime.root_client();
 
                                         let result = runtime
                                             .block_on(client.status().wait_ready())

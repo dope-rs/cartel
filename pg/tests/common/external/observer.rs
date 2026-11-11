@@ -1,4 +1,4 @@
-use cartel_pg::api::traits::{Client, Query as _, Status as _};
+use cartel_pg::api::traits::{Client, Status as _};
 
 use cartel_pg::{
     protocol::{encode, value::encode::BindWriter},
@@ -56,7 +56,7 @@ impl Observer {
         fibers::TEST.within(dope_fiber::fiber!('d => async move {
             client.status().wait_ready().await.map_err(own::Error::Query)?;
             loop {
-                if client.query().run_one::<Self>(pid).await.try_own()? {
+                if client.run_one::<Self>(pid).await.try_own()? {
                     return Ok::<(), own::Error<'d, 1>>(());
                 }
             }

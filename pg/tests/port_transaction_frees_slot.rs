@@ -1,3 +1,4 @@
+use cartel_pg::api::traits::Connection as _;
 use cartel_pg::api::traits::{
     Begin as _, Client as _, Notify as _, Query as _, Status as _, Stream as _, Transaction as _,
     Unchecked as _,
@@ -56,7 +57,7 @@ fn transaction_does_not_join_open_stream() {
                                 ));
                                 runtime
                                     .block_on(dope_fiber::fiber!('_ => async move {
-                                        let mut stream = client.query().run_stream::<TextQuery>(());
+                                        let mut stream = client.run_stream::<TextQuery>(());
                                         ::core::assert!(
                                             fibers::TEST.poll_once(stream.next_row()).await.is_none()
                                         );
@@ -113,9 +114,9 @@ fn throttled_query_cannot_enter_later_transaction() {
                                     Ok(Ok(()))
                                 ));
                                 let mut first =
-                                    pin!(Task::new(client.unchecked().command("SELECT 1")));
+                                    pin!(Task::new(client.command("SELECT 1")));
                                 let mut waiting =
-                                    pin!(Task::new(client.unchecked().command("SELECT 2")));
+                                    pin!(Task::new(client.command("SELECT 2")));
                                 runtime
                                     .block_on(dope_fiber::fiber!('_ => async move {
                                         ::core::assert!(fibers::TEST.poll_once(first.as_mut()).await.is_none());
@@ -128,7 +129,7 @@ fn throttled_query_cannot_enter_later_transaction() {
                                             Err(reply::Error::Driver(cartel_pg::Error::Backpressure { .. }))
                                         ));
                                         ::core::assert!(matches!(tx.commit().await, Ok(())));
-                                        ::core::assert!(matches!(client.unchecked().command("SELECT 1").await, Ok(())));
+                                        ::core::assert!(matches!(client.command("SELECT 1").await, Ok(())));
                                     }))
                                     .expect("throttled transaction driver");
                             })
@@ -234,8 +235,8 @@ fn pinned_queries_wait_for_request_capacity() {
                                 runtime.block_on(dope_fiber::fiber!('_ => async move {
                             let tx = client.transaction().begin().await.ok().expect("transaction");
                             let (first, second) = Join::new(
-                                tx.unchecked().command("SELECT 1"),
-                                tx.unchecked().command("SELECT 1"),
+                                tx.query().command("SELECT 1"),
+                                tx.query().command("SELECT 1"),
                             ).await;
                             assert!(first.is_ok() && second.is_ok());
                             assert!(tx.commit().await.is_ok());
@@ -283,13 +284,9 @@ fn transaction_status_rejects_stale_guard() {
                                         Ok(Ok(()))
                                     ));
                                     assert!(matches!(
-                                        runtime.block_on(fibers::TEST.poll_once(
-                                            client.unchecked().command(if unmanaged_begin {
-                                                "BEGIN"
-                                            } else {
-                                                "SELECT 1"
-                                            })
-                                        )),
+                                        runtime.block_on(fibers::TEST.poll_once(client.command(
+                                            if unmanaged_begin { "BEGIN" } else { "SELECT 1" }
+                                        ))),
                                         Ok(None)
                                     ));
                                     let started = runtime
@@ -306,7 +303,7 @@ fn transaction_status_rejects_stale_guard() {
                                     } else {
                                         let tx = started.ok().expect("pipelined transaction");
                                         assert!(matches!(
-                                            runtime.block_on(tx.unchecked().command("ROLLBACK")),
+                                            runtime.block_on(tx.query().command("ROLLBACK")),
                                             Ok(Err(reply::Error::Driver(
                                                 cartel_pg::Error::Protocol(
                                                     cartel_pg::protocol::Reason::TransactionLease
@@ -314,18 +311,18 @@ fn transaction_status_rejects_stale_guard() {
                                             )))
                                         ));
                                         assert!(matches!(
-                                            runtime.block_on(tx.unchecked().command("SELECT 1")),
+                                            runtime.block_on(tx.query().command("SELECT 1")),
                                             Ok(Err(reply::Error::Pinned(_)))
                                         ));
                                         Some(tx)
                                     };
                                     assert!(matches!(
-                                        runtime.block_on(client.unchecked().command("SELECT 1")),
+                                        runtime.block_on(client.command("SELECT 1")),
                                         Ok(Ok(()))
                                     ));
                                     drop(stale);
                                     assert!(matches!(
-                                        runtime.block_on(client.unchecked().command("SELECT 1")),
+                                        runtime.block_on(client.command("SELECT 1")),
                                         Ok(Ok(()))
                                     ));
                                 })
@@ -394,7 +391,7 @@ fn finalizer_preserves_status_error() {
                                         ));
                                     }
                                     assert!(matches!(
-                                        runtime.block_on(client.unchecked().command("SELECT 1")),
+                                        runtime.block_on(client.command("SELECT 1")),
                                         Ok(Ok(()))
                                     ));
                                 })
@@ -463,7 +460,7 @@ fn finalizer_keeps_error() {
                                         .is_none()
                                 );
                                 let marker = runtime
-                                    .block_on(client.notify().next())
+                                    .block_on(client.next())
                                     .expect("notification driver")
                                     .ok()
                                     .expect("finalizer error marker");
@@ -501,7 +498,7 @@ fn finalizer_keeps_error() {
                                     ("23505", "finish rejected")
                                 );
                                 assert!(matches!(
-                                    runtime.block_on(client.unchecked().command("SELECT 1")),
+                                    runtime.block_on(client.command("SELECT 1")),
                                     Ok(Ok(()))
                                 ));
                                 let fields = error
@@ -570,7 +567,7 @@ fn completed_query_deadline_keeps_next_transaction() {
                                 Ok(Ok(()))
                             ));
                             let mut old =
-                                pin!(Task::new(client.unchecked().command("SELECT 1")));
+                                pin!(Task::new(client.command("SELECT 1")));
                             assert!(
                                 runtime
                                     .block_on(fibers::TEST.poll_once(old.as_mut()))
@@ -595,7 +592,7 @@ fn completed_query_deadline_keeps_next_transaction() {
                                 "the completed old query must not close the next transaction"
                             );
                             assert!(matches!(
-                                runtime.block_on(client.unchecked().command("SELECT 1")),
+                                runtime.block_on(client.command("SELECT 1")),
                                 Ok(Ok(()))
                             ));
                         })
@@ -663,7 +660,7 @@ fn retains_next_owner() {
                                             .expect("next transaction after ReadyForQuery")
                                     };
                                     let result = runtime
-                                        .block_on(next.unchecked().command("SELECT 1"))
+                                        .block_on(next.query().command("SELECT 1"))
                                         .expect("query driver");
                                     assert!(
                                         result.is_ok(),
@@ -816,7 +813,7 @@ fn transaction_frees_slot() {
                                         assert!(
                                             matches!(
                                                 runtime.block_on(fibers::TEST.poll_once(
-                                                    client.unchecked().command("SELECT 1"),
+                                                    client.command("SELECT 1"),
                                                 )),
                                                 Ok(None)
                                             ),
@@ -833,7 +830,7 @@ fn transaction_frees_slot() {
                                         fibers::TEST
                                             .try_run(&mut runtime, startup::request(&mut io, false))
                                             .expect("detached request");
-                                        let mut waiting = pin!(Task::new(client.unchecked().command("SELECT 2")));
+                                        let mut waiting = pin!(Task::new(client.command("SELECT 2")));
                                         assert!(matches!(
                                             runtime.block_on(fibers::TEST.poll_once(waiting.as_mut())),
                                             Ok(None)
@@ -853,7 +850,7 @@ fn transaction_frees_slot() {
                                             .expect("new peer admission driver");
                                         assert!(result.is_ok(), "new peer must wake and admit the waiting query");
                                         client.status().set_policy(PickPolicy::LeastInflight);
-                                        let mut held = pin!(Task::new(client.unchecked().command("SELECT 3")));
+                                        let mut held = pin!(Task::new(client.command("SELECT 3")));
                                         assert!(matches!(
                                             runtime.block_on(fibers::TEST.poll_once(held.as_mut())),
                                             Ok(None)
@@ -872,10 +869,10 @@ fn transaction_frees_slot() {
                                             "server must send detached response"
                                         );
                                         assert!(matches!(fibers::TEST.try_run(&mut runtime, io.write_all(fence)), Ok(Ok(()))));
-                                        assert!(matches!(runtime.block_on(client.notify().next()), Ok(Ok(_))));
+                                        assert!(matches!(runtime.block_on(client.next()), Ok(Ok(_))));
                                         assert!(matches!(fibers::TEST.try_run(&mut runtime, second.write_all(transaction::DETACHED_RESPONSES[0])), Ok(Ok(()))));
                                         assert!(matches!(fibers::TEST.try_run(&mut runtime, second.write_all(fence)), Ok(Ok(()))));
-                                        assert!(matches!(runtime.block_on(client.notify().next()), Ok(Ok(_))));
+                                        assert!(matches!(runtime.block_on(client.next()), Ok(Ok(_))));
                                         let peer = &mut io;
                                         let exchange = dope_fiber::fiber!('_ => async move {
                                             startup::request(peer, false).await;
@@ -901,7 +898,7 @@ fn transaction_frees_slot() {
                                         let (result, ()) = fibers::TEST
                                             .try_run(
                                                 &mut runtime,
-                                                Join::new(client.unchecked().command("SELECT 1"), exchange),
+                                                Join::new(client.command("SELECT 1"), exchange),
                                             )
                                             .expect("reused SELECT driver");
                                         assert!(

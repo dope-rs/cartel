@@ -55,19 +55,19 @@ fn notification_waiters_finish_each_wake_round() {
                         let client = runtime.root_client();
                         assert!(matches!(fibers::TEST.try_run(&mut runtime, client.status().wait_ready()), Ok(Ok(()))));
                         let polls = [Cell::new(0), Cell::new(0), Cell::new(0)];
-                        let first = Counted::new(client.notify().next(), &polls[0]);
-                        let second = Counted::new(client.notify().next(), &polls[1]);
-                        let third = Counted::new(client.notify().next(), &polls[2]);
+                        let first = Counted::new(client.next(), &polls[0]);
+                        let second = Counted::new(client.next(), &polls[1]);
+                        let third = Counted::new(client.next(), &polls[2]);
                         let observed = &polls;
                         let notify = dope_fiber::fiber!('_ => async move {
-                            assert!(client.unchecked().command(notice::COMMAND).await.is_ok());
+                            assert!(client.command(notice::COMMAND).await.is_ok());
                             Sleep::new(timer, Duration::from_millis(20)).expect("settle timer").await;
                             let before = observed.each_ref().map(Cell::get);
                             Sleep::new(timer, Duration::from_millis(20)).expect("observe timer").await;
                             for (polls, before) in observed.iter().zip(before) {
                                 assert!(polls.get() <= before + 2, "empty notification waiter kept polling");
                             }
-                            assert!(client.unchecked().command(notice::COMMAND).await.is_ok());
+                            assert!(client.command(notice::COMMAND).await.is_ok());
                         });
                         let ((first, second), (third, ())) = fibers::TEST.try_run(
                             &mut runtime, Join::new(Join::new(first, second), Join::new(third, notify)),

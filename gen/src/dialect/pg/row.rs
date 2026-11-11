@@ -35,21 +35,6 @@ impl Row<'_> {
                 ),
             ));
         }
-        let mut named = false;
-        for attr in &input.attrs {
-            if attr.path().is_ident("row") {
-                attr.parse_nested_meta(|meta| {
-                    if !meta.path.is_ident("view") {
-                        return Err(meta.error("expected view"));
-                    }
-                    if named {
-                        return Err(meta.error("duplicate view"));
-                    }
-                    named = true;
-                    Ok(())
-                })?;
-            }
-        }
         let name = &input.ident;
         let fields = fields.named.pairs().map(|pair| pair.into_value());
         let shape = fields
@@ -65,66 +50,49 @@ impl Row<'_> {
             let read = field.ty.row_read()?;
             owned.push(quote::quote! { #name: #read, });
         }
-        let (view, decode, project) = if named {
-            let row = quote::format_ident!("{name}View");
-            let mut reserved = backend::Names::default();
-            reserved.visit_derive_input(input);
-            let lease = reserved.fresh("__cartel_lease_");
-            let vis = &input.vis;
-            let mut decls = Vec::new();
-            for field in fields.clone() {
-                let name = &field.ident;
-                let vis = &field.vis;
-                let ty = &field.ty;
-                decls.push(quote::quote! {
-                    #vis #name: <#ty as ::cartel_pg::schema::Row>::View<'row>
-                });
-            }
-            let names = fields.map(|field| &field.ident);
-            let pattern = names
-                .clone()
-                .rev()
-                .fold(quote::quote! { () }, |tail, name| {
-                    quote::quote! { (#name, #tail) }
-                });
-            (
-                quote::quote! { #row<'row> },
-                quote::quote! {
-                    let fields = <<Self as ::cartel_pg::schema::Project>::Fields as ::cartel_pg::schema::Row>::decode(row)?;
-                    ::core::result::Result::Ok(<Self as ::cartel_pg::schema::Project>::project(fields))
-                },
-                quote::quote! {
-                    #[derive(Clone, Copy)]
-                    #vis struct #row<'row> {
-                        #(#decls,)*
-                        #lease: ::core::marker::PhantomData<&'row ()>,
-                    }
-
-                    impl ::cartel_pg::schema::Project for #name {
-                        type Fields = #shape;
-
-                        fn project<'row>(fields: <Self::Fields as ::cartel_pg::schema::Row>::View<'row>) -> Self::View<'row> {
-                            let #pattern = fields;
-                            #row { #(#names,)* #lease: ::core::marker::PhantomData }
-                        }
-                    }
-                },
-            )
-        } else {
-            (
-                quote::quote! { <#shape as ::cartel_pg::schema::Row>::View<'row> },
-                quote::quote! { <#shape as ::cartel_pg::schema::Row>::decode(row) },
-                quote::quote! {},
-            )
-        };
+        let row = quote::format_ident!("{name}View");
+        let mut reserved = backend::Names::default();
+        reserved.visit_derive_input(input);
+        let lease = reserved.fresh("__cartel_lease_");
+        let vis = &input.vis;
+        let mut decls = Vec::new();
+        for field in fields.clone() {
+            let name = &field.ident;
+            let vis = &field.vis;
+            let ty = &field.ty;
+            decls.push(quote::quote! {
+                #vis #name: <#ty as ::cartel_pg::schema::Row>::View<'row>
+            });
+        }
+        let names = fields.map(|field| &field.ident);
+        let pattern = names
+            .clone()
+            .rev()
+            .fold(quote::quote! { () }, |tail, name| {
+                quote::quote! { (#name, #tail) }
+            });
         Ok(quote::quote! {
-            #project
+            #[derive(Clone, Copy)]
+            #vis struct #row<'row> {
+                #(#decls,)*
+                #lease: ::core::marker::PhantomData<&'row ()>,
+            }
+
+            impl ::cartel_pg::schema::Project for #name {
+                type Fields = #shape;
+
+                fn project<'row>(fields: <Self::Fields as ::cartel_pg::schema::Row>::View<'row>) -> Self::View<'row> {
+                    let #pattern = fields;
+                    #row { #(#names,)* #lease: ::core::marker::PhantomData }
+                }
+            }
 
             impl ::cartel_pg::schema::Row for #name {
-                type View<'row> = #view;
+                type View<'row> = #row<'row>;
 
                 fn decode<'row>(row: &mut ::cartel_pg::protocol::value::decode::RowReader<'row>) -> ::core::result::Result<Self::View<'row>, ::cartel_pg::Error> {
-                    #decode
+                    let fields = <<Self as ::cartel_pg::schema::Project>::Fields as ::cartel_pg::schema::Row>::decode(row)?;
+                    ::core::result::Result::Ok(<Self as ::cartel_pg::schema::Project>::project(fields))
                 }
 
                 fn decode_owned(row: &mut ::cartel_pg::protocol::value::decode::RowReader<'_>) -> ::core::result::Result<Self, ::cartel_pg::Error> {

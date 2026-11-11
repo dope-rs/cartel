@@ -4,7 +4,7 @@ use crate::{api, protocol, reply, reply::Error, schema};
 use api::tx::control;
 use api::{results, sql, tx};
 use dope_fiber::abi::Fiber;
-use results::{Storage, group, source};
+use results::{group, source};
 use schema::result;
 use std::ops::Deref;
 
@@ -15,54 +15,62 @@ use copy::Transfer;
 use sealed::Sealed;
 
 /// One exact runtime-issued client, with its storage details carried by its type.
-pub trait Client<'d, const ID: u8 = 0>: Sealed + results::Storage + Copy {
-    type Schema: schema::QuerySet + 'd;
-    type Query: Query<'d, ID, Schema = Self::Schema, Results = Self> + Copy;
-    type CopyChunk: AsRef<[u8]> + Deref<Target = [u8]>;
+pub trait Client<'d, const ID: u8 = 0>: Notify<'d, ID> {
     type Transaction: Transaction<
             'd,
             ID,
             Schema = Self::Schema,
             Payload = Self::Payload,
             Diagnostics = Self::Diagnostics,
-            CopyChunk = Self::CopyChunk,
+            CopyChunk = Self::Chunk,
         >;
 
-    fn query(self) -> Self::Query;
-    fn unchecked(self) -> impl Unchecked<'d, ID>;
-    fn copy(self) -> impl Transfer<'d, ID, Chunk = Self::CopyChunk>;
-    fn notify(
-        self,
-    ) -> impl Notify<
-        'd,
-        ID,
-        Schema = Self::Schema,
-        Payload = Self::Payload,
-        Diagnostics = Self::Diagnostics,
-    >;
     fn transaction(self) -> impl Begin<'d, ID, Guard = Self::Transaction>;
     fn status(self) -> impl Status<'d, ID>;
 }
 
+pub trait IntoQuery<'d, const ID: u8 = 0>: Sized {
+    type Query;
+
+    fn into_query(self) -> Self::Query;
+}
+
+impl<'a, 'd, T: Connection<'d, ID>, const ID: u8> IntoQuery<'d, ID> for &'a T {
+    type Query = T::Query<'a>;
+
+    fn into_query(self) -> Self::Query {
+        self.query()
+    }
+}
+
 /// A query view whose result owners retain the admitted storage and route.
-pub trait Query<'d, const ID: u8 = 0>: Sealed + Sized {
-    type Acquired: Query<'d, ID, Schema = Self::Schema, Results = Self::Results>
-        + Unchecked<'d, ID>
-        + Transfer<'d, ID>;
+pub trait Query<'d, const ID: u8 = 0>:
+    Sealed + IntoQuery<'d, ID, Query = Self> + Unchecked<'d, ID> + Transfer<'d, ID>
+{
+    type Acquired: Query<
+            'd,
+            ID,
+            Schema = Self::Schema,
+            Payload = Self::Payload,
+            Batch = Self::Batch,
+            Diagnostics = Self::Diagnostics,
+        >;
 
     fn acquire(self) -> impl Fiber<'d, Output = Result<Self::Acquired, Error<'d, ID>>>
     where
         Self: Copy;
     type Schema: schema::QuerySet + 'd;
-    type Results: results::Storage;
-    type Stream<Q>: Stream<'d, Q, ID, Payload = <Self::Results as Storage>::Payload>
+    type Payload: source::Payload;
+    type Batch: source::Batch;
+    type Diagnostics: group::Diagnostics;
+    type Stream<Q>: Stream<'d, Q, ID, Payload = Self::Payload>
     where
         Q: schema::TypedQuery<Result = result::Rows>;
 
     fn run_one<Q>(
         self,
         params: Q::Params<'_>,
-    ) -> impl Fiber<'d, Output = Result<results::StoredRow<Self::Results, Q>, Error<'d, ID>>>
+    ) -> impl Fiber<'d, Output = Result<results::Row<Self::Payload, Q>, Error<'d, ID>>>
     + use<'d, Self, Q, ID>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
@@ -77,13 +85,7 @@ pub trait Query<'d, const ID: u8 = 0>: Sealed + Sized {
         params: [Q::Params<'_>; N],
     ) -> impl Fiber<
         'd,
-        Output = results::GroupResult<
-            'd,
-            results::StoredRow<Self::Results, Q>,
-            <Self::Results as Storage>::Diagnostics,
-            N,
-            ID,
-        >,
+        Output = results::GroupResult<'d, results::Row<Self::Payload, Q>, Self::Diagnostics, N, ID>,
     > + use<'d, Self, Q, ID, N>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
@@ -93,7 +95,7 @@ pub trait Query<'d, const ID: u8 = 0>: Sealed + Sized {
     fn run_first<Q>(
         self,
         params: Q::Params<'_>,
-    ) -> impl Fiber<'d, Output = results::FirstResult<'d, Self::Results, Q, ID>> + use<'d, Self, Q, ID>
+    ) -> impl Fiber<'d, Output = results::FirstResult<'d, Self::Payload, Q, ID>> + use<'d, Self, Q, ID>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
         Self::Schema: schema::HasGroup<Q::Group>,
@@ -102,7 +104,7 @@ pub trait Query<'d, const ID: u8 = 0>: Sealed + Sized {
     fn run_scalar<Q>(
         self,
         params: Q::Params<'_>,
-    ) -> impl Fiber<'d, Output = results::FirstResult<'d, Self::Results, Q, ID, true>>
+    ) -> impl Fiber<'d, Output = results::FirstResult<'d, Self::Payload, Q, ID, true>>
     + use<'d, Self, Q, ID>
     where
         Q: schema::TypedQuery<Result = result::Rows<true>>,
@@ -112,7 +114,7 @@ pub trait Query<'d, const ID: u8 = 0>: Sealed + Sized {
     fn run_all<Q>(
         self,
         params: Q::Params<'_>,
-    ) -> impl Fiber<'d, Output = Result<results::StoredCollection<Self::Results, Q>, Error<'d, ID>>>
+    ) -> impl Fiber<'d, Output = Result<results::Collection<Self::Batch, Q>, Error<'d, ID>>>
     + use<'d, Self, Q, ID>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
@@ -128,7 +130,7 @@ pub trait Query<'d, const ID: u8 = 0>: Sealed + Sized {
         Self::Schema: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup;
 
-    fn run_stream<Q>(self, params: Q::Params<'_>) -> Self::Stream<Q>
+    fn run_stream<Q>(self, params: Q::Params<'_>) -> <Self as Query<'d, ID>>::Stream<Q>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
         Self::Schema: schema::HasGroup<Q::Group>,
@@ -164,20 +166,27 @@ pub trait Begin<'d, const ID: u8 = 0>: Sealed + Sized {
     fn begin(self) -> impl Fiber<'d, Output = Result<Self::Guard, Error<'d, ID>>>;
 }
 
-/// Each query borrows its transaction; completed single rows retain their own owner.
-pub trait Transaction<'d, const ID: u8 = 0>: Sealed + Sized {
+pub trait Connection<'d, const ID: u8 = 0>: Sealed {
     type Schema: schema::QuerySet + 'd;
     type Payload: source::Payload;
     type Diagnostics: group::Diagnostics;
     type CopyChunk: AsRef<[u8]> + Deref<Target = [u8]>;
-    type Query<'tx>: Query<
+    type Query<'query>: Notify<
             'd,
             ID,
             Schema = Self::Schema,
-            Results: results::Storage<Payload = Self::Payload, Diagnostics = Self::Diagnostics>,
-        > + Copy
+            Payload = Self::Payload,
+            Diagnostics = Self::Diagnostics,
+            Chunk = Self::CopyChunk,
+        >
     where
-        Self: 'tx;
+        Self: 'query;
+
+    fn query(&self) -> Self::Query<'_>;
+}
+
+/// Each query borrows its transaction; completed single rows retain their own owner.
+pub trait Transaction<'d, const ID: u8 = 0>: Connection<'d, ID> + Sized {
     type Savepoint<'tx>: Savepoint<
             'd,
             ID,
@@ -189,9 +198,6 @@ pub trait Transaction<'d, const ID: u8 = 0>: Sealed + Sized {
     where
         Self: 'tx;
 
-    fn query(&self) -> Self::Query<'_>;
-    fn unchecked(&self) -> impl Unchecked<'d, ID> + '_;
-    fn copy(&self) -> impl Transfer<'d, ID, Chunk = Self::CopyChunk> + '_;
     fn savepoint<'tx>(
         &'tx mut self,
         name: crate::Identifier,
@@ -207,19 +213,7 @@ pub trait Transaction<'d, const ID: u8 = 0>: Sealed + Sized {
 }
 
 /// A savepoint and every nested operation retain their exact parent lease.
-pub trait Savepoint<'d, const ID: u8 = 0>: Sealed + Sized {
-    type Schema: schema::QuerySet + 'd;
-    type Payload: source::Payload;
-    type Diagnostics: group::Diagnostics;
-    type CopyChunk: AsRef<[u8]> + Deref<Target = [u8]>;
-    type Query<'save>: Query<
-            'd,
-            ID,
-            Schema = Self::Schema,
-            Results: results::Storage<Payload = Self::Payload, Diagnostics = Self::Diagnostics>,
-        > + Copy
-    where
-        Self: 'save;
+pub trait Savepoint<'d, const ID: u8 = 0>: Connection<'d, ID> + Sized {
     type Savepoint<'parent>: Savepoint<
             'd,
             ID,
@@ -232,9 +226,6 @@ pub trait Savepoint<'d, const ID: u8 = 0>: Sealed + Sized {
         Self: 'parent;
 
     fn name(&self) -> &str;
-    fn query(&self) -> Self::Query<'_>;
-    fn unchecked(&self) -> impl Unchecked<'d, ID> + '_;
-    fn copy(&self) -> impl Transfer<'d, ID, Chunk = Self::CopyChunk> + '_;
     fn cancel(self);
     fn release(self) -> impl Fiber<'d, Output = Result<(), Error<'d, ID>>>;
     fn rollback(self) -> impl Fiber<'d, Output = Result<(), Error<'d, ID>>>;
@@ -245,10 +236,7 @@ pub trait Savepoint<'d, const ID: u8 = 0>: Sealed + Sized {
 }
 
 /// Notifications and listener admission on one exact client or listener view.
-pub trait Notify<'d, const ID: u8 = 0>: Sealed + Copy {
-    type Schema: schema::QuerySet + 'd;
-    type Payload: source::Payload;
-    type Diagnostics: group::Diagnostics;
+pub trait Notify<'d, const ID: u8 = 0>: Query<'d, ID> + Copy {
     type Listener: Listener<
             'd,
             ID,
@@ -266,31 +254,8 @@ pub trait Notify<'d, const ID: u8 = 0>: Sealed + Copy {
 }
 
 /// A listener whose operation views keep its connection lease borrowed.
-pub trait Listener<'d, const ID: u8 = 0>: Sealed + Sized {
-    type Schema: schema::QuerySet + 'd;
-    type Payload: source::Payload;
-    type Diagnostics: group::Diagnostics;
-    type Query<'listen>: Query<
-            'd,
-            ID,
-            Schema = Self::Schema,
-            Results: results::Storage<Payload = Self::Payload, Diagnostics = Self::Diagnostics>,
-        > + Copy
-    where
-        Self: 'listen;
-
+pub trait Listener<'d, const ID: u8 = 0>: Connection<'d, ID> + Sized {
     fn channel(&self) -> &str;
-    fn query(&self) -> Self::Query<'_>;
-    fn unchecked(&self) -> impl Unchecked<'d, ID> + '_;
-    fn notify(
-        &self,
-    ) -> impl Notify<
-        'd,
-        ID,
-        Schema = Self::Schema,
-        Payload = Self::Payload,
-        Diagnostics = Self::Diagnostics,
-    > + '_;
     fn unlisten(self) -> impl Fiber<'d, Output = Result<(), reply::Error<'d, ID>>>;
 }
 

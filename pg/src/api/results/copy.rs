@@ -320,7 +320,7 @@ where
 }
 
 fn send<'d, B: ?Sized, I: schema::QuerySet, const ID: u8>(
-    client: api::Client<'_, '_, '_, '_, '_, '_, 'd, B, I, ID>,
+    client: api::Context<'_, '_, '_, '_, '_, '_, 'd, B, I, ID>,
     target: conn::Id<'d, KeyTag<ID>>,
     data: &[u8],
     region: &mut region::Token<region::Identity<'d>>,
@@ -338,7 +338,7 @@ fn send<'d, B: ?Sized, I: schema::QuerySet, const ID: u8>(
 }
 
 fn finish<'d, B: ?Sized, I: schema::QuerySet, const ID: u8>(
-    client: api::Client<'_, '_, '_, '_, '_, '_, 'd, B, I, ID>,
+    client: api::Context<'_, '_, '_, '_, '_, '_, 'd, B, I, ID>,
     target: conn::Id<'d, KeyTag<ID>>,
     region: &mut region::Token<region::Identity<'d>>,
 ) -> Result<(), Error<'d, ID>> {

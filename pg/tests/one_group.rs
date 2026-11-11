@@ -1,3 +1,4 @@
+use cartel_pg::api::traits::Connection as _;
 use cartel_pg::api::traits::{
     Begin as _, Client as _, Notify as _, Query as _, Status as _, Stream as _, Transaction as _,
 };
@@ -61,9 +62,9 @@ fn deadline_keeps_results() {
                 stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
                     let client = runtime.root_client();
                     runtime.block_on(client.status().wait_ready()).expect("ready driver").ok().expect("ready PostgreSQL");
-                    let mut group = pin!(Task::new(client.query().run_group::<TextQuery, 3>([(); 3])));
+                    let mut group = pin!(Task::new(client.run_group::<TextQuery, 3>([(); 3])));
                     assert!(runtime.block_on(fibers::TEST.poll_once(group.as_mut())).expect("admission driver").is_none());
-                    let marker = runtime.block_on(client.notify().next()).expect("notification driver").ok().expect("Sync marker");
+                    let marker = runtime.block_on(client.next()).expect("notification driver").ok().expect("Sync marker");
                     assert_eq!(marker.payload(), "settled");
                     fibers::TEST.try_pause(&mut runtime, Duration::from_millis(50)).expect("group deadline driver");
                     let failure = runtime.block_on(group.as_mut()).expect("group driver").err().expect("expired group");
@@ -174,9 +175,9 @@ fn rows_outlive_group() {
                                                 io
                                             }))
                                             .expect("startup driver");
-                                        let mut stream = client.query().run_stream::<TextQuery>(());
+                                        let mut stream = client.run_stream::<TextQuery>(());
                                         let mut group = pin!(Task::new(
-                                            client.query().run_group::<TextQuery, 2>([(); 2])
+                                            client.run_group::<TextQuery, 2>([(); 2])
                                         ));
                                         let (rows, mut io) = fibers::TEST
                                             .try_run(&mut runtime, dope_fiber::fiber!('_ => async move {
@@ -188,7 +189,7 @@ fn rows_outlive_group() {
                                                 assert!(fibers::TEST.poll_once(group.as_mut()).await.is_none());
                                                 startup::request(&mut io, false).await;
                                                 assert!(io.write_all(group::ROWS_COMPLETED).await.is_ok());
-                                                let marker = client.notify().next().await.ok().expect("completion marker");
+                                                let marker = client.next().await.ok().expect("completion marker");
                                                 assert_eq!(marker.channel(), "group");
                                                 assert!(fibers::TEST.poll_once(group.as_mut()).await.is_none());
                                                 assert!(io.write_all(startup::IDLE).await.is_ok());
@@ -203,7 +204,7 @@ fn rows_outlive_group() {
                                         });
                                         let (next, ()) = fibers::TEST
                                             .try_run(&mut runtime, Join::new(
-                                                client.query().run_group::<TextQuery, 1>([()]),
+                                                client.run_group::<TextQuery, 1>([()]),
                                                 exchange,
                                             ))
                                             .expect("next group driver");
@@ -312,7 +313,7 @@ fn sync_keeps_commands() {
                 stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
                     let client = runtime.root_client();
                     runtime.block_on(client.status().wait_ready()).expect("ready driver").ok().expect("ready PostgreSQL");
-                    let failure = runtime.block_on(client.query().run_group::<TextQuery, 2>([(); 2])).expect("group driver").err().expect("late Sync failure");
+                    let failure = runtime.block_on(client.run_group::<TextQuery, 2>([(); 2])).expect("group driver").err().expect("late Sync failure");
                     assert_eq!(failure.sync(), Sync::Complete);
                     assert!(matches!(failure.outcomes(), [Outcome::Completed(first), Outcome::Completed(second)] if first.decode().expect("first row").lease == 3 && second.decode().expect("second row").lease == 7));
                     let detail = failure.diagnostics().iter().next().expect("Sync diagnostic");
@@ -368,9 +369,7 @@ fn classify_error_scope() {
                                             .ok()
                                             .expect("ready PostgreSQL");
                                         let failure = runtime
-                                            .block_on(
-                                                client.query().run_group::<TextQuery, 2>([(); 2]),
-                                            )
+                                            .block_on(client.run_group::<TextQuery, 2>([(); 2]))
                                             .expect("group driver")
                                             .err()
                                             .expect("server failure");
@@ -459,7 +458,7 @@ fn capacity_keeps_error() {
                                         .ok()
                                         .expect("ready PostgreSQL");
                                     let failure = runtime
-                                        .block_on(client.query().run_group::<TextQuery, 2>([(); 2]))
+                                        .block_on(client.run_group::<TextQuery, 2>([(); 2]))
                                         .expect("group driver")
                                         .err()
                                         .expect("diagnostic capacity failure");

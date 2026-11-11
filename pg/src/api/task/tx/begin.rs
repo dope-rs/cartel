@@ -27,7 +27,7 @@ pub(in crate::api) struct Begin<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I
 where
     I: schema::QuerySet + 'd,
 {
-    client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     reply: Response<'app, 'g, 'r, 's, 'b, 'c, 'd, api::ExtractUnit<ID>>,
     state: State<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     #[pin]
@@ -40,7 +40,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     Begin<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     pub(in crate::api) fn new(
-        client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+        client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         begin: request::Begin,
     ) -> Self {
         let reply = Response::new();
@@ -75,7 +75,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
 
     fn poll_admit(
         state: &mut State<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-        client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+        client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         mut ctx: pin::Pin<&mut context::Context<'_, 'd>>,
         waiter: pin::Pin<&wait::Waiter<'app, 'd>>,
         reply: &mut Response<'app, 'g, 'r, 's, 'b, 'c, 'd, api::ExtractUnit<ID>>,

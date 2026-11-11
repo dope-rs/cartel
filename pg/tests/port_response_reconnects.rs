@@ -1,3 +1,4 @@
+use cartel_pg::api::traits::Connection as _;
 use cartel_pg::api::traits::{
     Begin as _, Client as _, Notify as _, Query as _, Status as _, Transaction as _, Unchecked as _,
 };
@@ -93,7 +94,7 @@ fn failed_reconnect_preserves_healthy_connection() {
                             }))) if errno.is_refused()
                         ));
                         assert!(matches!(
-                            runtime.block_on(client.unchecked().command("SELECT 1")),
+                            runtime.block_on(client.command("SELECT 1")),
                             Ok(Ok(()))
                         ));
                         fibers::TEST
@@ -110,7 +111,7 @@ fn failed_reconnect_preserves_healthy_connection() {
                             )
                             .expect("all connections closed");
                         assert!(matches!(
-                            runtime.block_on(client.unchecked().command("SELECT 1")),
+                            runtime.block_on(client.command("SELECT 1")),
                             Ok(Err(reply::Error::Open(reply::Open::Transport {
                                 cause: ConnectFault::Transport(event::ConnectError::Connect(errno)),
                                 ..
@@ -162,7 +163,7 @@ fn stalled_partial_reconnects_idle_connection() {
                             let client = runtime.root_client();
                             for _ in 0..2 {
                                 assert!(matches!(
-                                    runtime.block_on(client.unchecked().command("SELECT 1")),
+                                    runtime.block_on(client.command("SELECT 1")),
                                     Ok(Ok(()))
                                 ));
                             }
@@ -216,8 +217,8 @@ fn unsolicited_partial_cannot_bind_next_request() {
                                         runtime.block_on(client.status().wait_ready()),
                                         Ok(Ok(()))
                                     ));
-                                    let mut first = pin!(Task::new(client.unchecked().command("SELECT 1")));
-                                    let mut second = pin!(Task::new(client.unchecked().command("SELECT 1")));
+                                    let mut first = pin!(Task::new(client.command("SELECT 1")));
+                                    let mut second = pin!(Task::new(client.command("SELECT 1")));
                                     runtime.block_on(PollFn::admitted(|admit| {
                                         let (first, context) = admit.poll(first.as_mut());
                                         assert!(first.is_pending());
@@ -355,7 +356,7 @@ fn asynchronous_partial_resumes_pinned_request() {
                                             .try_pause(&mut runtime, Duration::from_millis(20))
                                             .expect("process asynchronous prefix");
                                         let mut command =
-                                            pin!(Task::new(tx.unchecked().command("SELECT 1")));
+                                            pin!(Task::new(tx.query().command("SELECT 1")));
                                         assert!(matches!(
                                             runtime
                                                 .block_on(fibers::TEST.poll_once(command.as_mut())),
@@ -384,7 +385,7 @@ fn asynchronous_partial_resumes_pinned_request() {
                                         ));
                                     }
                                     let notice = runtime
-                                        .block_on(client.notify().next())
+                                        .block_on(client.next())
                                         .expect("notification driver")
                                         .ok()
                                         .expect("asynchronous notification");
@@ -447,8 +448,7 @@ fn detached_partial_preserves_pipelined_request() {
                                 ));
                                 assert!(matches!(
                                     runtime.block_on(
-                                        fibers::TEST
-                                            .poll_once(client.unchecked().command("SELECT 1"))
+                                        fibers::TEST.poll_once(client.command("SELECT 1"))
                                     ),
                                     Ok(None)
                                 ));
@@ -456,7 +456,7 @@ fn detached_partial_preserves_pipelined_request() {
                                     .try_pause(&mut runtime, Duration::from_millis(20))
                                     .expect("process detached partial response");
                                 assert!(matches!(
-                                    runtime.block_on(client.unchecked().command("SELECT 2")),
+                                    runtime.block_on(client.command("SELECT 2")),
                                     Ok(Ok(()))
                                 ));
                             })
@@ -584,7 +584,7 @@ fn pending_ready_settles() {
                                         .ok()
                                         .expect("replacement connection");
                                     runtime
-                                        .block_on(client.unchecked().command("SELECT 1"))
+                                        .block_on(client.command("SELECT 1"))
                                         .expect("replacement command driver")
                                         .ok()
                                         .expect("replacement command");
@@ -623,89 +623,90 @@ fn late_error_keeps_batch() {
         |server| {
             let addr = server.addr();
             let config = Queries::try_cancel().expect("pipeline config");
-            let ((), events) =
-                {
-                    let prepared = topology::try_new::<_, Env>(
-                        port::Port::<Queries>::plan(
-                            Queries::try_config().expect("database config"),
-                            config,
-                        ),
-                        addr,
-                        Duration::from_millis(1),
-                        Duration::from_millis(1_024),
-                    )
-                    .expect("topology fixture completed");
-                    let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                    let mut report = Completion::new();
-                    let scoped =
-                        prepared.with_local(
-                            |worker| {
-                                worker.lend(|node, stage| {
-                                    node.install(stage, |host, stage| {
-                                        stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                            let client: api::Client<'_, '_, '_, '_, '_, '_, '_, _, _> =
-                                runtime.root_client();
-                            assert!(
-                                matches!(
-                                    runtime.block_on(client.status().wait_ready()),
-                                    Ok(Ok(()))
-                                ),
-                                "PostgreSQL connection ready"
-                            );
-                            let mut first = pin!(Task::new(client.unchecked().command("SELECT 1")));
-                            assert!(
-                                matches!(
-                                    runtime.block_on(fibers::TEST.poll_once(first.as_mut())),
-                                    Ok(None)
-                                ),
-                                "first command admitted"
-                            );
-                            let marker = runtime
-                                .block_on(client.notify().next())
-                                .expect("notification runtime")
-                                .ok()
-                                .expect("CommandComplete marker");
-                            assert_eq!(marker.channel(), "settlement");
-                            assert!(
-                                matches!(
-                                    runtime.block_on(fibers::TEST.poll_once(first.as_mut())),
-                                    Ok(None)
-                                ),
-                                "CommandComplete remains pending before ReadyForQuery"
-                            );
-                            let (first, second) = runtime
-                                .block_on(Join::new(
-                                    first.as_mut(),
-                                    client.unchecked().command("SELECT 2"),
-                                ))
-                                .expect("pipeline runtime");
-                            assert!(
-                                matches!(
-                                    first,
-                                    Err(reply::Error::Server(error))
-                                        if error.fields().code().as_str() == "23505"
-                                            && error.fields().message() == "late sync"
-                                ),
-                                "the first command retains its late Sync error"
-                            );
-                            assert!(matches!(second, Ok(())), "second batch completes");
-                        })
-                                    })
+            let ((), events) = {
+                let prepared = topology::try_new::<_, Env>(
+                    port::Port::<Queries>::plan(
+                        Queries::try_config().expect("database config"),
+                        config,
+                    ),
+                    addr,
+                    Duration::from_millis(1),
+                    Duration::from_millis(1_024),
+                )
+                .expect("topology fixture completed");
+                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
+                let mut report = Completion::new();
+                let scoped = prepared.with_local(
+                    |worker| {
+                        worker.lend(|node, stage| {
+                            node.install(stage, |host, stage| {
+                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
+                                    let client: api::Client<
+                                        api::Context<'_, '_, '_, '_, '_, '_, '_, _, _>,
+                                    > = runtime.root_client();
+                                    assert!(
+                                        matches!(
+                                            runtime.block_on(client.status().wait_ready()),
+                                            Ok(Ok(()))
+                                        ),
+                                        "PostgreSQL connection ready"
+                                    );
+                                    let mut first = pin!(Task::new(client.command("SELECT 1")));
+                                    assert!(
+                                        matches!(
+                                            runtime
+                                                .block_on(fibers::TEST.poll_once(first.as_mut())),
+                                            Ok(None)
+                                        ),
+                                        "first command admitted"
+                                    );
+                                    let marker = runtime
+                                        .block_on(client.next())
+                                        .expect("notification runtime")
+                                        .ok()
+                                        .expect("CommandComplete marker");
+                                    assert_eq!(marker.channel(), "settlement");
+                                    assert!(
+                                        matches!(
+                                            runtime
+                                                .block_on(fibers::TEST.poll_once(first.as_mut())),
+                                            Ok(None)
+                                        ),
+                                        "CommandComplete remains pending before ReadyForQuery"
+                                    );
+                                    let (first, second) = runtime
+                                        .block_on(Join::new(
+                                            first.as_mut(),
+                                            client.command("SELECT 2"),
+                                        ))
+                                        .expect("pipeline runtime");
+                                    assert!(
+                                        matches!(
+                                            first,
+                                            Err(reply::Error::Server(error))
+                                                if error.fields().code().as_str() == "23505"
+                                                    && error.fields().message() == "late sync"
+                                        ),
+                                        "the first command retains its late Sync error"
+                                    );
+                                    assert!(matches!(second, Ok(())), "second batch completes");
                                 })
-                            },
-                            recovery::Policy::new(|event| reports.push(event), common::recover),
-                            |outcome| {
-                                assert!(
-                                    outcome.is_ok(),
-                                    "{:?}",
-                                    outcome.as_ref().err().map(|error| error.cause())
-                                );
-                                outcome.ok().expect("application entry")
-                            },
+                            })
+                        })
+                    },
+                    recovery::Policy::new(|event| reports.push(event), common::recover),
+                    |outcome| {
+                        assert!(
+                            outcome.is_ok(),
+                            "{:?}",
+                            outcome.as_ref().err().map(|error| error.cause())
                         );
-                    let result = scoped.expect("application installation completed");
-                    (result.expect("application session completed"), reports)
-                };
+                        outcome.ok().expect("application entry")
+                    },
+                );
+                let result = scoped.expect("application installation completed");
+                (result.expect("application session completed"), reports)
+            };
             assert!(
                 events.events().expect("native reclamation").is_empty(),
                 "unexpected events PostgreSQL operations: {events:?}"
@@ -768,14 +769,14 @@ fn response_reconnects() {
                             worker.lend(|node, stage| {
                                 node.install(stage, |host, stage| {
                                     stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                        let client: api::Client<'_, '_, '_, '_, '_, '_, '_, _, _> =
+                                        let client: api::Client<api::Context<'_, '_, '_, '_, '_, '_, '_, _, _>> =
                                             runtime.root_client();
                                         assert!(
                                             matches!(runtime.block_on(client.status().wait_ready()), Ok(Ok(()))),
                                             "PostgreSQL connection ready"
                                         );
                                         let mut first = pin!(held.then(|| {
-                                            Task::new(client.unchecked().command("SELECT 1"))
+                                            Task::new(client.command("SELECT 1"))
                                         }));
                                         if let Some(first) = first.as_mut().as_pin_mut() {
                                             assert!(
@@ -785,7 +786,7 @@ fn response_reconnects() {
                                         }
                                         if idle || held {
                                             let notice = fibers::TEST
-                                                .try_run(&mut runtime, client.notify().next())
+                                                .try_run(&mut runtime, client.next())
                                                 .expect("replacement notification driver")
                                                 .ok()
                                                 .expect("replacement notification");
@@ -796,7 +797,7 @@ fn response_reconnects() {
                                         } else {
                                             assert!(
                                                 matches!(
-                                                    runtime.block_on(client.unchecked().command("SELECT 1")),
+                                                    runtime.block_on(client.command("SELECT 1")),
                                                     Ok(Err(reply::Error::Driver(cartel_pg::Error::RequestTimeout(timeout))))
                                                         if timeout.phase() == cartel_pg::RequestPhase::Response
                                                 ),
@@ -808,7 +809,7 @@ fn response_reconnects() {
                                             );
                                         }
                                         assert!(
-                                            matches!(runtime.block_on(client.unchecked().command("SELECT 1")), Ok(Ok(()))),
+                                            matches!(runtime.block_on(client.command("SELECT 1")), Ok(Ok(()))),
                                             "replacement command"
                                         );
                                         if let Some(first) = first.as_mut().as_pin_mut() {

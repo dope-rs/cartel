@@ -3,8 +3,9 @@ use crate::{
     common::external::own::Convert as _, common::external::user::Lookup,
     common::external::user::Write,
 };
+use cartel_pg::api::traits::Connection as _;
 use cartel_pg::api::traits::{
-    Begin as _, Client as _, Savepoint as _, Status as _, Transaction as _, Unchecked as _,
+    Begin as _, Client as _, Status as _, Transaction as _, Unchecked as _,
 };
 use cartel_pg::api::tx::control::error::Kind;
 use cartel_pg::port;
@@ -45,8 +46,7 @@ fn quarantines_transaction() {
                     .expect("tx begins");
                 assert!(
                     matches!(
-                        rt.runtime
-                            .block_on(Write::rename(tx.query(), 1, "outer".into()))?,
+                        rt.runtime.block_on(Write::rename(&tx, 1, "outer".into()))?,
                         Ok(())
                     ),
                     "outer update succeeds"
@@ -62,7 +62,7 @@ fn quarantines_transaction() {
                     assert!(
                         matches!(
                             rt.runtime
-                                .block_on(Write::rename(point.query(), 1, "inner".into()))?,
+                                .block_on(Write::rename(&point, 1, "inner".into()))?,
                             Ok(())
                         ),
                         "inner update succeeds"
@@ -71,7 +71,7 @@ fn quarantines_transaction() {
                 tx.cancel();
                 ::core::assert_eq!(
                     rt.runtime
-                        .block_on(Lookup::by_id(client.query(), 1))?
+                        .block_on(Lookup::by_id(client, 1))?
                         .try_own()
                         .ok()
                         .expect("successful typed query")
@@ -159,7 +159,7 @@ fn bounded_cancel_slots() {
                                         } else {
                                             assert!(token.pid() != 0);
                                         }
-                                        let query = tx.unchecked().command("SELECT pg_sleep(30)");
+                                        let query = tx.query().command("SELECT pg_sleep(30)");
                                         let pid = token.pid();
                                         let request = &token;
                                         let cancel = dope_fiber::fiber!('_ => async move {

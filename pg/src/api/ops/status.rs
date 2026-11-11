@@ -5,14 +5,14 @@ use std::task;
 use traits::sealed::Sealed;
 
 pub struct Status<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0>(
-    pub(in crate::api) api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    pub(in crate::api) api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
 )
 where
     I: schema::QuerySet + 'd;
 
 #[pin_project::pin_project]
 struct Wait<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8> {
-    client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     #[pin]
     waiter: wait::Waiter<'app, 'd>,
 }

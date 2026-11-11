@@ -1,7 +1,8 @@
 use crate::common::external::runtime::Plan;
 use crate::common::external::runtime::fixtures::try_suffix;
 use cartel_pg::Identifier;
-use cartel_pg::api::traits::{Client as _, Listener as _, Notify as _, Unchecked as _};
+use cartel_pg::api::traits::Connection as _;
+use cartel_pg::api::traits::{Listener as _, Notify as _, Unchecked as _};
 use common::env::{self, Env};
 use common::{external::runtime::check, recover};
 use dope_fiber::BlockOn as _;
@@ -25,7 +26,7 @@ fn listen_unlisten_api() {
 
                 let suffix = try_suffix().expect("fixture suffix");
                 let channel = ::std::format!("cartel_test_\"{suffix}");
-                let guard = rt.runtime.block_on(client.notify().listen(
+                let guard = rt.runtime.block_on(client.listen(
                     Identifier::try_from(&mut channel.clone()).expect("channel identifier"),
                 ))?;
                 let guard = guard.ok().expect("LISTEN succeeds");
@@ -57,19 +58,18 @@ fn listen_cancel() {
             rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
                 ::core::assert!(
                     fibers::TEST
-                        .poll_once(client.notify().listen(Identifier::try_from(&mut channel.clone()).expect("channel identifier")))
+                        .poll_once(client.listen(Identifier::try_from(&mut channel.clone()).expect("channel identifier")))
                         .await
                         .is_none()
                 );
                 let sql = ::std::format!("NOTIFY \"{}\"", channel.replace('"', "\"\""));
                 ::core::assert!(client
-                    .unchecked()
                     .command(&sql)
                     .await
                     .is_ok(), "NOTIFY succeeds");
                 ::core::assert!(
                     fibers::TEST
-                        .poll_once(client.notify().next())
+                        .poll_once(client.next())
                         .await
                         .is_none()
                 );
@@ -94,7 +94,6 @@ fn unlisten_cancel() {
                 );
                 rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
                 let guard = client
-                    .notify()
                     .listen(Identifier::try_from(&mut channel.clone()).expect("channel identifier"))
                     .await;
                 let guard = guard.ok().expect("LISTEN succeeds");
@@ -102,13 +101,12 @@ fn unlisten_cancel() {
 
                 let sql = ::std::format!("NOTIFY \"{}\"", channel.replace('"', "\"\""));
                 ::core::assert!(client
-                    .unchecked()
                     .command(&sql)
                     .await
                     .is_ok(), "NOTIFY succeeds");
                 ::core::assert!(
                     fibers::TEST
-                        .poll_once(client.notify().next())
+                        .poll_once(client.next())
                         .await
                         .is_none()
                 );
@@ -137,7 +135,6 @@ fn listen_notify_delivery() {
                 let payload = "hello world";
                 rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
             let guard = client
-                .notify()
                 .listen(Identifier::try_from(&mut channel.clone()).expect("channel identifier"))
                 .await;
             let guard = guard.ok().expect("LISTEN succeeds");
@@ -145,11 +142,10 @@ fn listen_notify_delivery() {
             let escaped = payload.replace('\'', "''");
             let sql = ::std::format!("NOTIFY \"{}\", '{}'", channel.replace('"', "\"\""), escaped);
             ::core::assert!(notifier
-                .unchecked()
                 .command(&sql)
                 .await
                 .is_ok(), "NOTIFY succeeds");
-            let n = guard.notify().next().await;
+            let n = guard.query().next().await;
             let n = n.ok().expect("notification arrives");
             ::core::assert_eq!(n.channel(), channel);
             ::core::assert_eq!(n.payload(), payload);

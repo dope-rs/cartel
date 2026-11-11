@@ -99,8 +99,9 @@ fn bind_failures_recover() {
                 worker.lend(|node, stage| {
                     node.install(stage, |host, stage| {
                         stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                            let client: api::Client<'_, '_, '_, '_, '_, '_, '_, _, Bind> =
-                                runtime.root_client();
+                            let client: api::Client<
+                                api::Context<'_, '_, '_, '_, '_, '_, '_, _, Bind>,
+                            > = runtime.root_client();
                             let ready = runtime
                                 .block_on(client.status().wait_ready())
                                 .expect("ready driver");
@@ -117,7 +118,7 @@ fn bind_failures_recover() {
                             .map(|case| {
                                 let errors = [Cell::new(None), Cell::new(None)];
                                 let result = runtime
-                                    .block_on(client.query().run_no_rows::<Bind>((case, &errors)))
+                                    .block_on(client.run_no_rows::<Bind>((case, &errors)))
                                     .expect("bind driver");
                                 (result, errors.map(Cell::into_inner))
                             });

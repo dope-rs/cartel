@@ -213,7 +213,7 @@ fn request_errors() {
                                             "PostgreSQL connection ready for {expected:?}"
                                         );
                                         let error = runtime
-                                            .block_on(client.unchecked().command("SELECT 1"))
+                                            .block_on(client.command("SELECT 1"))
                                             .expect("runtime")
                                             .expect_err("query must be rejected");
                                         Tracker::count(|| {
@@ -336,7 +336,7 @@ fn connection_errors_preserve_pending_diagnostics() {
                                             .expect("ready driver")
                                             .ok()
                                             .expect("ready PostgreSQL");
-                                        let mut rows = client.query().run_stream::<TextQuery>(());
+                                        let mut rows = client.run_stream::<TextQuery>(());
                                         if buffered {
                                             let row = runtime
                                                 .block_on(rows.next_row())

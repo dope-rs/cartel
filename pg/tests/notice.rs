@@ -70,8 +70,9 @@ fn retains_fields_and_pid() {
                         worker.lend(|node, stage| {
                             node.install(stage, |host, stage| {
                                 stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let client: api::Client<'_, '_, '_, '_, '_, '_, '_, _, _> =
-                                        runtime.root_client();
+                                    let client: api::Client<
+                                        api::Context<'_, '_, '_, '_, '_, '_, '_, _, _>,
+                                    > = runtime.root_client();
 
                                     assert!(
                                         matches!(
@@ -86,17 +87,15 @@ fn retains_fields_and_pid() {
                                     {
                                         if dropped != 0 {
                                             assert!(matches!(
-                                                runtime.block_on(
-                                                    client.unchecked().command(notice::COMMAND)
-                                                ),
+                                                runtime.block_on(client.command(notice::COMMAND)),
                                                 Ok(Ok(()))
                                             ));
                                         }
-                                        assert_eq!(client.notify().dropped(), dropped);
+                                        assert_eq!(client.dropped(), dropped);
                                         for index in range {
                                             let (pid, channel, payload) = cases[index];
                                             let notice = runtime
-                                        .block_on(client.notify().next())
+                                        .block_on(client.next())
                                         .expect("notification runtime")
                                         .ok()
                                         .expect(
@@ -108,35 +107,32 @@ fn retains_fields_and_pid() {
                                             );
                                         }
                                     }
-                                    let dropped = client.notify().dropped();
+                                    let dropped = client.dropped();
                                     let mut held = Vec::new();
                                     for _ in 0..attempts {
                                         assert!(matches!(
-                                            runtime.block_on(
-                                                client.unchecked().command(notice::COMMAND)
-                                            ),
+                                            runtime.block_on(client.command(notice::COMMAND)),
                                             Ok(Ok(()))
                                         ));
-                                        if client.notify().dropped() != dropped {
+                                        if client.dropped() != dropped {
                                             break;
                                         }
                                         held.push(
                                             runtime
-                                                .block_on(client.notify().next())
+                                                .block_on(client.next())
                                                 .expect("notification runtime")
                                                 .ok()
                                                 .expect("retained notification"),
                                         );
                                     }
-                                    assert_eq!(client.notify().dropped(), dropped + 1);
+                                    assert_eq!(client.dropped(), dropped + 1);
                                     drop(held);
                                     assert!(matches!(
-                                        runtime
-                                            .block_on(client.unchecked().command(notice::COMMAND)),
+                                        runtime.block_on(client.command(notice::COMMAND)),
                                         Ok(Ok(()))
                                     ));
                                     let notice = runtime
-                                        .block_on(client.notify().next())
+                                        .block_on(client.next())
                                         .expect("notification runtime")
                                         .ok()
                                         .expect("released notification budget");

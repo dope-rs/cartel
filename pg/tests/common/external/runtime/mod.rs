@@ -106,22 +106,24 @@ type Host<'q, 'h, 'p, 's, 'dg, 'dr, 'ds, 'b, 'c, 'd, I> = app::Host<
 >;
 
 type Handle<'app, 's, 'dg, 'dr, 'ds, 'b, 'c, 'd, I> = api::Client<
-    'app,
-    'dg,
-    'dr,
-    'ds,
-    'b,
-    'c,
-    'd,
-    bindings::Bound<
-        's,
+    api::Context<
+        'app,
+        'dg,
+        'dr,
+        'ds,
+        'b,
+        'c,
         'd,
-        port::Port<'s, 'dg, 'dr, 'ds, 'b, 'c, 'd, I>,
-        logic::Session,
-        KeyTag<0>,
-        { u32::MAX as usize },
+        bindings::Bound<
+            's,
+            'd,
+            port::Port<'s, 'dg, 'dr, 'ds, 'b, 'c, 'd, I>,
+            logic::Session,
+            KeyTag<0>,
+            { u32::MAX as usize },
+        >,
+        I,
     >,
-    I,
 >;
 
 pub struct Harness<'app, 'life, 'q, 'h, 'p, 's, 'dg, 'dr, 'ds, 'b, 'c, 'd, I: schema::QuerySet + 'd>
@@ -153,7 +155,7 @@ impl<'app, 'life, 'q, 'h, 'p, 's, 'dg, 'dr, 'ds, 'b, 'c, 'd, I: schema::QuerySet
             let prior = &body;
             let sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema);
             self.runtime.block_on(dope_fiber::fiber!('_ => async move {
-                let result = client.unchecked().command(&sql).await;
+                let result = client.command(&sql).await;
                 let verdict = check(Check::Reply {
                     sql: Some(&sql),
                     prior: Some(prior),
@@ -231,7 +233,7 @@ where
         let result = worker.lend(|node, stage| {
             node.install(stage, |host, stage| {
                 stage.with_quiesce(self.finish, host, GUARD, |mut runtime| {
-                    let client: api::Client<'_, '_, '_, '_, '_, '_, 'd, _, I> =
+                    let client: api::Client<api::Context<'_, '_, '_, '_, '_, '_, 'd, _, I>> =
                         runtime.root_client();
                     slot.insert(
                         Harness {
@@ -421,7 +423,7 @@ impl<I: schema::QuerySet, B: schema::QuerySet> Plan<'_, I, B> {
                 let create = format!("CREATE SCHEMA {}", rt.schema);
                 rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
                     for sql in iter::once(create.as_str()).chain(ddl.iter().chain(rows).copied()) {
-                        let result = client.unchecked().command(sql).await;
+                        let result = client.command(sql).await;
                         let verdict = check(Check::Reply {
                             sql: Some(sql),
                             prior: None,

@@ -93,7 +93,7 @@ pub(super) struct Core<
     P: lease::Policy,
 {
     admission: State<
-        api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+        api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         R,
         api::Pending<'d, (S, X::Context), M>,
         lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>,
@@ -117,7 +117,7 @@ where
     M: Copy + Into<crate::port::requests::Boundary>,
 {
     pub(super) fn new(
-        client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+        client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         target: R,
         context: X::Context,
         next: Result<api::Pending<'d, S, M>, crate::Error>,
@@ -138,7 +138,7 @@ where
         seal: impl Copy
         + Fn(
             S,
-            api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+            api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
             conn::Id<'d, KeyTag<ID>>,
         ) -> lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>,
     ) -> Poll<Result<&mut Response<'app, 'g, 'r, 's, 'b, 'c, 'd, X>, Error<'d, ID>>>
@@ -243,7 +243,7 @@ where
         seal: impl Copy
         + Fn(
             S,
-            api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+            api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
             conn::Id<'d, KeyTag<ID>>,
         ) -> lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>,
         finish: impl FnOnce(&mut Self, Result<T, Error<'d, ID>>) -> Result<U, Error<'d, ID>>,

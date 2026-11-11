@@ -1,6 +1,6 @@
 use crate::common::external::Db;
 use cartel_pg::{
-    api::traits::{Client, Unchecked as _},
+    api::traits::Client,
     reply,
 };
 use dope_fiber::abi;
@@ -132,7 +132,7 @@ pub trait Seed<'d> {
 
 impl<'d, C: Client<'d, Schema = Db>> Seed<'d> for C {
     fn seed_types(self) -> impl abi::Fiber<'d, Output = Result<(), reply::Error<'d>>> {
-        self.unchecked().command(
+        self.command(
             "INSERT INTO cartel_pg_types
             (id, v_i16, v_i32, v_i64, v_f32, v_f64, v_bool, v_string, v_bytes,
              v_uuid, v_ts, v_date, v_ltree,

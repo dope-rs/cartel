@@ -22,7 +22,7 @@ pub fn pg_derive_table(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
     }
 }
 
-#[proc_macro_derive(PgRow, attributes(row))]
+#[proc_macro_derive(PgRow)]
 pub fn pg_derive_row(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = syn::parse_macro_input!(input as syn::DeriveInput);
     match row::Row(&input).emit() {

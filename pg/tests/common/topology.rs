@@ -105,15 +105,26 @@ where
                         worker.lend(|node, stage| {
                             node.install(stage, |host, stage| {
                                 stage.with_quiesce(&mut report, host, GUARD, |mut app| {
-                                    let client: Client<'_, '_, '_, '_, '_, '_, '_, _, Database> =
-                                        app.root_client();
+                                    let client: Client<
+                                        cartel_pg::api::Context<
+                                            '_,
+                                            '_,
+                                            '_,
+                                            '_,
+                                            '_,
+                                            '_,
+                                            '_,
+                                            _,
+                                            Database,
+                                        >,
+                                    > = app.root_client();
                                     app.block_on(client.status().wait_ready())
                                         .expect("driver ready")
                                         .ok()
                                         .expect("PostgreSQL ready");
                                     let row = app
                                         .block_on(traits::Query::run_one::<Q>(
-                                            client.query(),
+                                            client,
                                             Default::default(),
                                         ))
                                         .expect("driver query");

@@ -24,15 +24,15 @@ fn full_text_search() {
             |rt| {
                 let client = rt.client();
                 let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
-                    let r = Doc::fts_match(client.query(), "quick".into())
+                    let r = Doc::fts_match(client, "quick".into())
                         .await
                         .try_own()?;
                     ::core::assert_eq!(r, ::std::vec![1, 2]);
-                    let r = Doc::fts_raw(client.query(), "rust & cartel".into())
+                    let r = Doc::fts_raw(client, "rust & cartel".into())
                         .await
                         .try_own()?;
                     ::core::assert_eq!(r, ::std::vec![2]);
-                    let r = Doc::ts_rank_q(client.query(), "quick".into(), "quick".into())
+                    let r = Doc::ts_rank_q(client, "quick".into(), "quick".into())
                         .await
                         .try_own()?;
                     ::core::assert_eq!(r.len(), 2);
@@ -61,12 +61,10 @@ fn array_ops() {
                 let client = rt.client();
                 let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
                     client
-                        .unchecked()
                         .command("DELETE FROM cartel_pg_types")
                         .await
                         .map_err(own::Error::Query)?;
                     client
-                        .unchecked()
                         .command(
                             "INSERT INTO cartel_pg_types
                 (id, v_i16, v_i32, v_i64, v_f32, v_f64, v_bool, v_string, v_bytes,
@@ -90,53 +88,53 @@ fn array_ops() {
                         .map_err(own::Error::Query)?;
 
                     let rhs: &[i32] = &[2, 3];
-                    let r = AllTypes::ints_contain(client.query(), rhs)
+                    let r = AllTypes::ints_contain(client, rhs)
                         .await
                         .try_own()?;
                     ::core::assert_eq!(r, ::std::vec![10, 11]);
 
                     let rhs: &[i32] = &[2, 99];
-                    let r = AllTypes::ints_contain(client.query(), rhs)
+                    let r = AllTypes::ints_contain(client, rhs)
                         .await
                         .try_own()?;
                     ::core::assert!(r.is_empty());
 
                     let rhs: &[i32] = &[3, 4];
-                    let r = AllTypes::ints_overlap(client.query(), rhs)
+                    let r = AllTypes::ints_overlap(client, rhs)
                         .await
                         .try_own()?;
                     ::core::assert_eq!(r, ::std::vec![10, 11]);
 
                     let rhs: &[i32] = &[99, 100];
-                    let r = AllTypes::ints_overlap(client.query(), rhs)
+                    let r = AllTypes::ints_overlap(client, rhs)
                         .await
                         .try_own()?;
                     ::core::assert!(r.is_empty());
 
                     let rhs: &[&str] = &["sql"];
-                    let r = AllTypes::strs_contain(client.query(), rhs)
+                    let r = AllTypes::strs_contain(client, rhs)
                         .await
                         .try_own()?;
                     ::core::assert_eq!(r, ::std::vec![10, 11]);
 
                     let rhs: &[&str] = &["rust", "missing"];
-                    let r = AllTypes::strs_contain(client.query(), rhs)
+                    let r = AllTypes::strs_contain(client, rhs)
                         .await
                         .try_own()?;
                     ::core::assert!(r.is_empty());
 
                     let rhs: &[&str] = &["cake", "missing"];
-                    let r = AllTypes::strs_overlap(client.query(), rhs)
+                    let r = AllTypes::strs_overlap(client, rhs)
                         .await
                         .try_own()?;
                     ::core::assert_eq!(r, ::std::vec![12]);
 
-                    let r = AllTypes::ints_len(client.query())
+                    let r = AllTypes::ints_len(client)
                         .await
                         .try_own()?;
                     ::core::assert_eq!(r, ::std::vec![(10, 3), (11, 3), (12, 3)]);
 
-                    let r = AllTypes::strs_len(client.query())
+                    let r = AllTypes::strs_len(client)
                         .await
                         .try_own()?;
                     ::core::assert_eq!(r, ::std::vec![(10, 2), (11, 2), (12, 1)]);
@@ -163,13 +161,13 @@ fn ltree_ops() {
                 let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
                     let path = cartel_pg::Ltree::try_from(&mut String::from("top.a"))
                         .expect("ltree storage must allocate");
-                    let r = LtreeNode::descendants(client.query(), path)
+                    let r = LtreeNode::descendants(client, path)
                         .await
                         .try_own()?;
                     ::core::assert_eq!(r, ::std::vec![2, 3]);
                     let path = cartel_pg::Ltree::try_from(&mut String::from("top.a.b"))
                         .expect("ltree storage must allocate");
-                    let r = LtreeNode::ancestors(client.query(), path)
+                    let r = LtreeNode::ancestors(client, path)
                         .await
                         .try_own()?;
                     ::core::assert_eq!(r, ::std::vec![1, 2, 3]);
@@ -195,11 +193,11 @@ fn array_sizes() {
                 let client = rt.client();
                 let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
                     let ids = [1i32, 2, 3];
-                    let c = Aggregate::array_int4(client.query(), &ids)
+                    let c = Aggregate::array_int4(client, &ids)
                         .await
                         .try_own()?;
                     ::core::assert_eq!(c, 5);
-                    let c = Aggregate::cardinality(client.query(), &ids)
+                    let c = Aggregate::cardinality(client, &ids)
                         .await
                         .try_own()?;
                     ::core::assert_eq!(c, 5);
@@ -231,13 +229,13 @@ fn row_lock_clauses() {
                         .map_err(own::Error::Query)?;
                     let rows = rt
                         .runtime
-                        .block_on(Order::locked(tx.query()))
+                        .block_on(Order::locked(&tx))
                         .expect("runtime drive")
                         .try_own()?;
                     ::core::assert_eq!(rows, ::std::vec![1, 2]);
                     let rows = rt
                         .runtime
-                        .block_on(Order::share_lock(tx.query()))
+                        .block_on(Order::share_lock(&tx))
                         .expect("runtime drive")
                         .try_own()?;
                     ::core::assert_eq!(rows, ::std::vec![1, 2]);
@@ -269,14 +267,14 @@ fn insert_each_bulk() {
                     let ids = [500i64, 501, 502];
                     let buckets = [10i32, 11, 12];
                     let values = [100i64, 200, 300];
-                    WidgetSlim::insert_bulk(client.query(), &ids, &buckets, &values)
+                    WidgetSlim::insert_bulk(client, &ids, &buckets, &values)
                         .await
                         .try_own()?;
-                    let n = WidgetSlim::count_500(client.query())
+                    let n = WidgetSlim::count_500(client)
                         .await
                         .try_own()?;
                     ::core::assert_eq!(n, 3);
-                    let rows = WidgetSlim::rows_500(client.query())
+                    let rows = WidgetSlim::rows_500(client)
                         .await
                         .map_err(own::Error::Query)?
                         .validate()
@@ -317,44 +315,44 @@ fn bulk_update_filter_each() {
                         .map_err(own::Error::Query)?;
                     let ids = [1i32, 3, 5];
                     let numbers = [111i32, 333, 555];
-                    Score::bulk_update(tx.query(), &ids, &numbers)
+                    Score::bulk_update(&tx, &ids, &numbers)
                         .await
                         .try_own()?;
-                    let score = Score::by_id(tx.query(), 1)
+                    let score = Score::by_id(&tx, 1)
                         .await
                         .map_err(own::Error::Query)?;
                     let score = score.decode().map_err(own::Error::Decode)?;
                     ::core::assert_eq!((score.id, score.randomnumber), (1, 111));
                     ::core::assert_eq!(
-                        Score::by_id(tx.query(), 1)
+                        Score::by_id(&tx, 1)
                             .await
                             .try_own()?
                             .randomnumber,
                         111
                     );
                     ::core::assert_eq!(
-                        Score::by_id(tx.query(), 2)
+                        Score::by_id(&tx, 2)
                             .await
                             .try_own()?
                             .randomnumber,
                         200
                     );
                     ::core::assert_eq!(
-                        Score::by_id(tx.query(), 3)
+                        Score::by_id(&tx, 3)
                             .await
                             .try_own()?
                             .randomnumber,
                         333
                     );
                     ::core::assert_eq!(
-                        Score::by_id(tx.query(), 4)
+                        Score::by_id(&tx, 4)
                             .await
                             .try_own()?
                             .randomnumber,
                         400
                     );
                     ::core::assert_eq!(
-                        Score::by_id(tx.query(), 5)
+                        Score::by_id(&tx, 5)
                             .await
                             .try_own()?
                             .randomnumber,
@@ -364,7 +362,7 @@ fn bulk_update_filter_each() {
                         .await
                         .map_err(own::Error::Query)?;
                     ::core::assert_eq!(
-                        Score::by_id(client.query(), 3)
+                        Score::by_id(client, 3)
                             .await
                             .try_own()?
                             .randomnumber,
@@ -391,7 +389,7 @@ fn raw_typed_query() {
             |rt| {
                 let client = rt.client();
                 let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
-                    let v = Lookup::id_literal(client.query(), 1)
+                    let v = Lookup::id_literal(client, 1)
                         .await
                         .try_own()?;
                     ::core::assert_eq!(v, 1);

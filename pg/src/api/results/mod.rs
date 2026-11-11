@@ -23,19 +23,8 @@ use group::{Diagnostics, Outcome, Position, Sync};
 
 use source::Payload as _;
 
-/// The exact retained owners returned by one query capability.
-pub trait Storage {
-    type Payload: source::Payload;
-    type Batch: source::Batch;
-    type Diagnostics: group::Diagnostics;
-}
-
-pub(in crate::api) type StoredRow<S, Q, const SCALAR: bool = false> =
-    Row<<S as Storage>::Payload, Q, SCALAR>;
-pub(in crate::api) type StoredCollection<S, Q> = Collection<<S as Storage>::Batch, Q>;
-
-pub(in crate::api) type FirstResult<'d, S, Q, const ID: u8, const SCALAR: bool = false> =
-    Result<Option<StoredRow<S, Q, SCALAR>>, Error<'d, ID>>;
+pub(in crate::api) type FirstResult<'d, P, Q, const ID: u8, const SCALAR: bool = false> =
+    Result<Option<Row<P, Q, SCALAR>>, Error<'d, ID>>;
 
 pub(in crate::api) type GroupResult<'d, T, D, const N: usize, const ID: u8> =
     Result<[T; N], GroupFailure<'d, T, D, N, ID>>;
@@ -298,7 +287,7 @@ pub struct Next<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 =
 where
     I: schema::QuerySet + 'd,
 {
-    pub(super) client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    pub(super) client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     #[pin]
     pub(super) waiter: wait::Waiter<'app, 'd>,
 }

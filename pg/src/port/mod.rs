@@ -100,7 +100,7 @@ impl<
     for Port<'e, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
 {
     type Client<'app, B: ?Sized + 'app>
-        = api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+        = api::Client<api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>>
     where
         'life: 'app,
         'd: 'app;
@@ -113,7 +113,7 @@ impl<
         'life: 'app,
         'd: 'app,
     {
-        api::Client { port: self, bound }
+        api::Client::from_parts(api::Context { port: self, bound }, api::Pooled)
     }
 }
 

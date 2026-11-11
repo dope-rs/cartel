@@ -1,9 +1,5 @@
-use crate::reply::group::Ledger;
 use crate::{api, port, port::replies, reply::Error, schema};
-use api::results::copy;
-use api::traits::{copy::Transfer, sealed::Sealed};
-use api::{ops, request, results, task, traits, tx};
-use cartel_core::reply::Batch;
+use api::{ops, request, task, traits, tx};
 use cartel_core::reply::recv;
 use dope::runtime::client;
 use dope::{core::driver::route::KeyTag, manifold::client::conn};
@@ -11,7 +7,7 @@ use dope_fiber::abi;
 use std::marker::PhantomData;
 use task::lease::{self, Policy, Target};
 
-pub struct Client<
+pub struct Context<
     'app,
     'g,
     'r,
@@ -28,12 +24,12 @@ pub struct Client<
 }
 
 impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Copy
-    for Client<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
+    for Context<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
 {
 }
 
 impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Clone
-    for Client<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
+    for Context<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
 {
     fn clone(&self) -> Self {
         *self
@@ -41,7 +37,7 @@ impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Clone
 }
 
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+    Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     pub(super) fn abort<T: Target<'d, ID>>(self, target: T, error: crate::Error) {
         if let Some(conn) = target.current(&self.port.shared.transaction()) {
@@ -51,65 +47,27 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         }
     }
 
-    pub(crate) fn reborrow<'short>(&'short self) -> Client<'short, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+    pub(crate) fn reborrow<'short>(
+        &'short self,
+    ) -> Context<'short, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
     where
         'app: 'short,
     {
-        Client {
+        Context {
             port: self.port,
             bound: self.bound.borrow(),
         }
     }
 }
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Sealed
-    for Client<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-}
-
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd, B: ?Sized, I: schema::QuerySet, const ID: u8> results::Storage
-    for Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
-{
-    type Payload = replies::Payload<'b, 'c, 'd>;
-    type Batch = Batch<'app, 'b, 'c, 'd, replies::Row<'d>>;
-    type Diagnostics = Ledger<'r, 's>;
-}
-
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    traits::Client<'d, ID> for Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+    traits::Client<'d, ID> for ops::Query<Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>>
 {
-    type Schema = I;
-    type Query = ops::Query<Self>;
-    type CopyChunk = copy::Chunk<'b, 'c, 'd>;
     type Transaction = tx::Guard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>;
-
-    fn query(self) -> Self::Query {
-        ops::Query::from_parts(self, api::Pooled)
-    }
-
-    fn unchecked(self) -> impl traits::Unchecked<'d, ID> {
-        self.query()
-    }
-
-    fn copy(self) -> impl Transfer<'d, ID, Chunk = Self::CopyChunk> {
-        self.query()
-    }
-
-    fn notify(
-        self,
-    ) -> impl traits::Notify<
-        'd,
-        ID,
-        Schema = Self::Schema,
-        Payload = Self::Payload,
-        Diagnostics = Self::Diagnostics,
-    > {
-        self.query()
-    }
 
     fn transaction(self) -> impl traits::Begin<'d, ID, Guard = Self::Transaction> {
         tx::Builder {
-            client: self,
+            client: self.client,
             isolation: tx::Isolation::Default,
             access_mode: tx::AccessMode::Default,
             deferral: tx::Deferral::Default,
@@ -118,19 +76,19 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 
     fn status(self) -> impl traits::Status<'d, ID> {
-        ops::Status(self)
+        ops::Status(self.client)
     }
 }
 
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R, S>
-    ops::Query<Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
+    ops::Query<Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
 where
     R: Copy + Into<Option<api::Target<'d, ID>>>,
 {
     pub(in crate::api) fn into_parts(
         self,
     ) -> (
-        Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+        Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         R,
         impl FnOnce(&o3::buffer::pool::Pool) -> Option<o3::buffer::pool::Span>,
         impl FnOnce(cartel_core::deadline::Source<'d>) -> S::Clock,

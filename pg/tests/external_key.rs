@@ -3,7 +3,6 @@ use crate::{
     common::external::own, common::external::own::Convert as _, common::external::row::Item,
     common::external::row::Widget,
 };
-use cartel_pg::api::traits::Client as _;
 use common::env::{self, Env};
 use common::{external::runtime::check, recover};
 use dope_fiber::BlockOn as _;
@@ -23,19 +22,19 @@ fn composite_and_names() {
             |rt| {
                 let client = rt.client();
                 let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
-                    Item::add(client.query(), 1, 2, "hi".into())
+                    Item::add(client, 1, 2, "hi".into())
                         .await
                         .try_own()?;
-                    Item::add(client.query(), 1, 3, "ho".into())
+                    Item::add(client, 1, 3, "ho".into())
                         .await
                         .try_own()?;
-                    let item = Item::by_key(client.query(), 1, 2)
+                    let item = Item::by_key(client, 1, 2)
                         .await
                         .try_own()?
                         .expect("inserted pair key exists");
                     ::core::assert_eq!(item.payload, "hi");
                     ::core::assert!(
-                        Item::by_key(client.query(), 2, 2)
+                        Item::by_key(client, 2, 2)
                             .await
                             .try_own()?
                             .is_none()

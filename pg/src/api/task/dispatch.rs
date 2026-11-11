@@ -28,7 +28,7 @@ impl<
     H,
 >
     State<
-        api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+        api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         R,
         api::Pending<'d, S, M>,
         lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>,
@@ -51,7 +51,7 @@ impl<
         ready: impl FnOnce(&'this mut H) -> O,
         mut prepare: impl FnMut(
             &'this mut Self,
-            api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+            api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
             NonZero<usize>,
             requests::ReplyContext<'_, 'app, 'd, ID>,
         ) -> Result<

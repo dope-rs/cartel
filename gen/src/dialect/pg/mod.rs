@@ -67,6 +67,10 @@ impl PgBackend {
         let driver = names.lifetime("__cartel_driver_");
         let loan = names.lifetime("__cartel_pool_");
         let input = names.lifetime("__cartel_input_");
+        let executor = quote::quote! {
+            <#caller as ::cartel_pg::api::traits::IntoQuery<#driver, #route_id>>::Query
+        };
+        let query_trait = quote::quote! { ::cartel_pg::api::traits::Query<#driver, #route_id> };
         let client = names.fresh("__cartel_client_");
         let pool = names.fresh("__cartel_pool_");
         let args = names.fresh("__cartel_arguments_");
@@ -129,22 +133,22 @@ impl PgBackend {
         let (row, value, run) = match &plan.dispatch {
             emit::Kind::One(ty) => (
                 Some(ty),
-                quote::quote! { ::cartel_pg::api::results::Row<<#caller::Results as ::cartel_pg::api::results::Storage>::Payload, #query> },
+                quote::quote! { ::cartel_pg::api::results::Row<<#executor as #query_trait>::Payload, #query> },
                 quote::format_ident!("run_one"),
             ),
             emit::Kind::First(ty) => (
                 Some(ty),
-                quote::quote! { ::core::option::Option<::cartel_pg::api::results::Row<<#caller::Results as ::cartel_pg::api::results::Storage>::Payload, #query>> },
+                quote::quote! { ::core::option::Option<::cartel_pg::api::results::Row<<#executor as #query_trait>::Payload, #query>> },
                 quote::format_ident!("run_first"),
             ),
             emit::Kind::Aggregate(ty) => (
                 Some(ty),
-                quote::quote! { ::core::option::Option<::cartel_pg::api::results::Row<<#caller::Results as ::cartel_pg::api::results::Storage>::Payload, #query, true>> },
+                quote::quote! { ::core::option::Option<::cartel_pg::api::results::Row<<#executor as #query_trait>::Payload, #query, true>> },
                 quote::format_ident!("run_scalar"),
             ),
             emit::Kind::All(ty) => (
                 Some(ty),
-                quote::quote! { ::cartel_pg::api::results::Collection<<#caller::Results as ::cartel_pg::api::results::Storage>::Batch, #query> },
+                quote::quote! { ::cartel_pg::api::results::Collection<<#executor as #query_trait>::Batch, #query> },
                 quote::format_ident!("run_all"),
             ),
             emit::Kind::Stream(ty) => (
@@ -162,14 +166,16 @@ impl PgBackend {
             ::core::result::Result<#value, ::cartel_pg::reply::Error<#driver, #route_id>>
         };
         let ret = if matches!(plan.dispatch, emit::Kind::Stream(_)) {
-            quote::quote! { #caller::Stream<#query> }
+            quote::quote! { <#executor as #query_trait>::Stream<#query> }
         } else {
             quote::quote! {
                 impl ::cartel_pg::Fiber<#driver, Output = #response> + use<#driver, #caller, #route_id>
             }
         };
         let call = quote::quote! {
-            ::cartel_pg::api::traits::Query::#run::<#query>(#client, #values)
+            ::cartel_pg::api::traits::Query::#run::<#query>(
+                ::cartel_pg::api::traits::IntoQuery::into_query(#client), #values
+            )
         };
         let (row_ty, shape, codes) = match row {
             Some(ty) => {
@@ -256,18 +262,19 @@ impl PgBackend {
                             ::cartel_pg::api::results::GroupFailure<
                                 #driver,
                                 #value,
-                                <#caller::Results as ::cartel_pg::api::results::Storage>::Diagnostics,
+                                <#executor as #query_trait>::Diagnostics,
                                 #count,
                                 #route_id,
                             >,
                         >,
                     > + use<#driver, #caller, #route_id, #count>
                     where
-                        #caller: ::cartel_pg::api::traits::Query<#driver, #route_id>,
-                        #caller::Schema: ::cartel_pg::schema::HasGroup<Self>,
+                        #caller: ::cartel_pg::api::traits::IntoQuery<#driver, #route_id>,
+                        #executor: #query_trait,
+                    <#executor as #query_trait>::Schema: ::cartel_pg::schema::HasGroup<Self>,
                     {
                         ::cartel_pg::api::traits::Query::run_group::<#query, #count>(
-                            #client,
+                            ::cartel_pg::api::traits::IntoQuery::into_query(#client),
                             #values,
                         )
                     }
@@ -291,13 +298,14 @@ impl PgBackend {
                     #count,
                 >
                 where
-                    #caller: ::cartel_pg::api::traits::Query<#driver, #route_id> + ::core::marker::Copy,
-                    #caller::Schema: ::cartel_pg::schema::HasGroup<Self>,
+                    #caller: ::cartel_pg::api::traits::IntoQuery<#driver, #route_id> + ::core::marker::Copy,
+                    #executor: #query_trait,
+                    <#executor as #query_trait>::Schema: ::cartel_pg::schema::HasGroup<Self>,
                 {
                     ::cartel_pg::dope_fiber::task::batch::Join::from_map(
                         #pool,
                         #args,
-                        |#argument| ::cartel_pg::api::traits::Query::#run::<#query>(#client, #item),
+                        |#argument| ::cartel_pg::api::traits::Query::#run::<#query>(::cartel_pg::api::traits::IntoQuery::into_query(#client), #item),
                     )
                 }
             }
@@ -342,8 +350,9 @@ impl PgBackend {
                     #( #decls, )*
                 ) -> #ret
                 where
-                    #caller: ::cartel_pg::api::traits::Query<#driver, #route_id>,
-                    #caller::Schema: ::cartel_pg::schema::HasGroup<Self>,
+                    #caller: ::cartel_pg::api::traits::IntoQuery<#driver, #route_id>,
+                    #executor: #query_trait,
+                    <#executor as #query_trait>::Schema: ::cartel_pg::schema::HasGroup<Self>,
                 {
                     #call
                 }

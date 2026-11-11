@@ -4,6 +4,7 @@ use crate::{
     common::external::reports::Aggregate, common::external::user::Lookup,
     common::external::user::Write,
 };
+use cartel_pg::api::traits::Connection as _;
 use cartel_pg::api::traits::{
     Begin as _, Client as _, Savepoint as _, Transaction as _, Unchecked as _,
 };
@@ -36,7 +37,7 @@ fn cancels_close() {
                     .map_err(own::Error::Query)?;
                 save.cancel();
                 ::core::assert_eq!(
-                    Lookup::by_id(client.query(), 1)
+                    Lookup::by_id(client, 1)
                         .await
                         .try_own()?
                         .name,
@@ -69,11 +70,11 @@ fn drop_rolls_back() {
                             .begin()
                             .await
                             .map_err(own::Error::Query)?;
-                        Write::rename(tx.query(), 1, "drop-rollback".into())
+                        Write::rename(&tx, 1, "drop-rollback".into())
                             .await
                             .try_own()?;
                     }
-                    let u = Lookup::by_id(client.query(), 1)
+                    let u = Lookup::by_id(client, 1)
                         .await
                         .try_own()?;
                     ::core::assert_eq!(u.name, "alice");
@@ -110,7 +111,7 @@ fn isolation() {
                             .map_err(own::Error::Query)?;
                         ::core::assert_eq!(
                             rt.runtime
-                                .block_on(Lookup::by_id(tx.query(), 1))
+                                .block_on(Lookup::by_id(&tx, 1))
                                 .expect("runtime drive")
                                 .try_own()?
                                 .id,
@@ -135,7 +136,7 @@ fn isolation() {
                         .map_err(own::Error::Query)?;
                     ::core::assert_eq!(
                         rt.runtime
-                            .block_on(Aggregate::count_all(tx.query()))
+                            .block_on(Aggregate::count_all(&tx))
                             .expect("runtime drive")
                             .try_own()?,
                         5
@@ -174,7 +175,7 @@ fn timeout() {
                 .await
                 .map_err(own::Error::Query)?;
             ::core::assert_eq!(
-                Aggregate::count_all(tx.query())
+                Aggregate::count_all(&tx)
                     .await
                     .try_own()?,
                 5
@@ -205,7 +206,7 @@ fn savepoint_end() {
                     .begin()
                     .await
                     .map_err(own::Error::Query)?;
-                Write::rename(tx.query(), 1, "lvl-0".into())
+                Write::rename(&tx, 1, "lvl-0".into())
                     .await
                     .try_own()?;
 
@@ -213,12 +214,12 @@ fn savepoint_end() {
                     .savepoint(Identifier::try_from(&mut String::from("a\"quoted")).expect("identifier storage"))
                     .await
                     .map_err(own::Error::Query)?;
-                Write::rename(sp.query(), 1, "lvl-1".into())
+                Write::rename(&sp, 1, "lvl-1".into())
                     .await
                     .try_own()?;
                 sp.release().await.map_err(own::Error::Query)?;
                 ::core::assert_eq!(
-                    Lookup::by_id(tx.query(), 1)
+                    Lookup::by_id(&tx, 1)
                         .await
                         .try_own()?
                         .name,
@@ -229,11 +230,11 @@ fn savepoint_end() {
                     .savepoint(Identifier::try_from(&mut String::from("b\"quoted")).expect("identifier storage"))
                     .await
                     .map_err(own::Error::Query)?;
-                Write::rename(sp2.query(), 1, "lvl-2".into())
+                Write::rename(&sp2, 1, "lvl-2".into())
                     .await
                     .try_own()?;
                 ::core::assert_eq!(
-                    Lookup::by_id(sp2.query(), 1)
+                    Lookup::by_id(&sp2, 1)
                         .await
                         .try_own()?
                         .name,
@@ -241,7 +242,7 @@ fn savepoint_end() {
                 );
                 sp2.rollback().await.map_err(own::Error::Query)?;
                 ::core::assert_eq!(
-                    Lookup::by_id(tx.query(), 1)
+                    Lookup::by_id(&tx, 1)
                         .await
                         .try_own()?
                         .name,
@@ -252,19 +253,19 @@ fn savepoint_end() {
                     .savepoint(Identifier::try_from(&mut String::from("aa")).expect("identifier storage"))
                     .await
                     .map_err(own::Error::Query)?;
-                Write::rename(sp_a.query(), 1, "lvl-3a".into())
+                Write::rename(&sp_a, 1, "lvl-3a".into())
                     .await
                     .try_own()?;
                 let sp_b = sp_a
                     .savepoint(Identifier::try_from(&mut String::from("bb\"quoted")).expect("identifier storage"))
                     .await
                     .map_err(own::Error::Query)?;
-                Write::rename(sp_b.query(), 1, "lvl-3b".into())
+                Write::rename(&sp_b, 1, "lvl-3b".into())
                     .await
                     .try_own()?;
                 sp_b.rollback().await.map_err(own::Error::Query)?;
                 ::core::assert_eq!(
-                    Lookup::by_id(sp_a.query(), 1)
+                    Lookup::by_id(&sp_a, 1)
                         .await
                         .try_own()?
                         .name,
@@ -274,7 +275,7 @@ fn savepoint_end() {
 
                 tx.commit().await.map_err(own::Error::Query)?;
                 ::core::assert_eq!(
-                    Lookup::by_id(client.query(), 1)
+                    Lookup::by_id(client, 1)
                         .await
                         .try_own()?
                         .name,
@@ -307,8 +308,7 @@ fn releases_server() {
                     .map_err(own::Error::Query)?;
                 save.rollback().await.map_err(own::Error::Query)?;
 
-                let error = tx
-                    .unchecked()
+                let error = tx.query()
                     .command("RELEASE SAVEPOINT \"released_after_rollback\"")
                     .await;
                 ::core::assert_eq!(

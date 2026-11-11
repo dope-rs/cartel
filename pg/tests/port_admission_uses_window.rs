@@ -1,4 +1,4 @@
-use cartel_pg::api::traits::{Client as _, Query as _, Unchecked as _};
+use cartel_pg::api::traits::{Query as _, Unchecked as _};
 use dope::core::driver::life::recovery;
 use std::{
     net::{SocketAddr, TcpListener},
@@ -60,7 +60,7 @@ fn full_request_pool_allows_startup() {
                         node.install(stage, |host, stage| {
                             stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
                                 let client = runtime.root_client();
-                                let query = client.unchecked().command("SELECT 1");
+                                let query = client.command("SELECT 1");
                                 let result = fibers::TEST
                                     .try_run(&mut runtime, query)
                                     .expect("admission driver");
@@ -126,10 +126,10 @@ fn admission_uses_window() {
                         node.install(stage, |host, stage| {
 
                             stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                let client: api::Client<'_, '_, '_, '_, '_, '_, '_, _, _> = runtime.root_client();
+                                let client: api::Client<api::Context<'_, '_, '_, '_, '_, '_, '_, _, _>> = runtime.root_client();
 
-                let mut held = Some(client.unchecked().command("SELECT 1"));
-                let mut waiting = pin!(client.query().acquire());
+                let mut held = Some(client.command("SELECT 1"));
+                let mut waiting = pin!(client.acquire());
                 let acquired = runtime.block_on(poll_fn(|context| {
                     // SAFETY: waiting stays pinned; Ready ends polling authority.
                     let poll = unsafe { Live::new(waiting.as_mut()) }.poll(context);

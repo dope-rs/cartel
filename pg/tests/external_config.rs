@@ -1,4 +1,4 @@
-use cartel_pg::{api, api::Client, port, port::config, protocol::logic};
+use cartel_pg::{api, api::Context, port, port::config, protocol::logic};
 use dope::{
     core::{
         driver::route::{KeyTag, table::conn},
@@ -21,7 +21,7 @@ fn views_keep_owner_layout() {
         use std::alloc::Layout;
 
         let client = Layout::new::<
-            Client<'static, 'static, 'static, 'static, 'static, 'static, 'static, B, Queries, ID>,
+            Context<'static, 'static, 'static, 'static, 'static, 'static, 'static, B, Queries, ID>,
         >();
         assert_eq!(client, Layout::new::<&'static ()>());
         assert_eq!(
@@ -43,7 +43,7 @@ fn views_keep_owner_layout() {
         );
         let query = Layout::new::<
             ops::Query<
-                Client<
+                Context<
                     'static,
                     'static,
                     'static,

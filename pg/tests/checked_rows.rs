@@ -79,7 +79,7 @@ fn collects_multiple_rows() {
                         worker.lend(|node, stage| {
                             node.install(stage, |host, stage| {
                                 stage.with_quiesce(&mut report, host, GUARD, |mut app| {
-                                    let client: Client<'_, '_, '_, '_, '_, '_, '_, _, Database> =
+                                    let client: Client<cartel_pg::api::Context<'_, '_, '_, '_, '_, '_, '_, _, Database>> =
                                         app.root_client();
                                     app.block_on(client.status().wait_ready())
                                         .expect("driver ready")
@@ -87,7 +87,7 @@ fn collects_multiple_rows() {
                                         .expect("PostgreSQL ready");
                                     let rows = app
                                         .block_on(traits::Query::run_all::<MixedQuery>(
-                                            client.query(),
+                                            client,
                                             (),
                                         ))
                                         .expect("driver query");
@@ -134,7 +134,7 @@ fn collects_multiple_rows() {
                                     ] {
                                         let row = app
                                             .block_on(traits::Query::run_scalar::<ArrayQuery<true>>(
-                                                client.query(),
+                                                client,
                                                 (),
                                             ))
                                             .expect("driver scalar")
@@ -222,17 +222,25 @@ fn owned_batch_failure() {
                         worker.lend(|node, stage| {
                             node.install(stage, |host, stage| {
                                 stage.with_quiesce(&mut report, host, GUARD, |mut app| {
-                                    let client: Client<'_, '_, '_, '_, '_, '_, '_, _, Database> =
-                                        app.root_client();
+                                    let client: Client<
+                                        cartel_pg::api::Context<
+                                            '_,
+                                            '_,
+                                            '_,
+                                            '_,
+                                            '_,
+                                            '_,
+                                            '_,
+                                            _,
+                                            Database,
+                                        >,
+                                    > = app.root_client();
                                     app.block_on(client.status().wait_ready())
                                         .expect("driver ready")
                                         .ok()
                                         .expect("PostgreSQL ready");
                                     let rows = app
-                                        .block_on(traits::Query::run_all::<TextQuery>(
-                                            client.query(),
-                                            (),
-                                        ))
+                                        .block_on(traits::Query::run_all::<TextQuery>(client, ()))
                                         .expect("driver query");
                                     let rows = rows.ok().expect("query rows");
                                     let (result, counts) = Tracker::measure(|| rows.into_owned());

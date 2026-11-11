@@ -11,7 +11,7 @@ use std::{
 
 use cartel_pg::{
     PgRow, PgTable,
-    api::traits::{self, Client as _, Stream as _},
+    api::traits::{self, Stream as _},
     dsl::query::{self, ops::Fetch as _},
     pg_instance,
     port::{self, config},
@@ -112,7 +112,7 @@ impl Input {
                     node.install(stage, |host, stage| {
                         stage.with_app(done, host, |mut app| {
                             let client = app.root_client();
-                            Setting::read(client.query(), &mut app)
+                            Setting::read(client, &mut app)
                         })
                     })
                 })

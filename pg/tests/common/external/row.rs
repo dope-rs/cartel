@@ -34,7 +34,6 @@ pub struct Tag {
 }
 
 #[derive(PgTable, PgRow, PartialEq)]
-#[row(view)]
 #[table_name("cartel_pg_widgets")]
 pub struct Widget {
     pub id: i64,
@@ -119,7 +118,6 @@ pub struct LtreeNode {
 }
 
 #[derive(PgTable, PgRow, PartialEq)]
-#[row(view)]
 #[table(batch)]
 #[table_name("cartel_pg_widgets")]
 pub struct WidgetSlim {
@@ -129,7 +127,6 @@ pub struct WidgetSlim {
 }
 
 #[derive(PgTable, PgRow, PartialEq)]
-#[row(view)]
 #[table_name("cartel_pg_scores")]
 pub struct Score {
     pub id: i32,

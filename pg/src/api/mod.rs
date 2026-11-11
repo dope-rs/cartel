@@ -83,10 +83,12 @@ pub(crate) mod task;
 pub mod traits;
 pub mod tx;
 
-pub use client::Client;
+#[doc(hidden)]
+pub use client::Context;
+pub use ops::Query as Client;
 
 fn check_open<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet, const ID: u8>(
-    client: Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    client: Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
 ) -> Result<(), reply::Error<'d, ID>> {
     client.port.shared.failure().map_or(Ok(()), Err)
 }

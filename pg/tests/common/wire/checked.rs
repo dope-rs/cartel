@@ -8,14 +8,12 @@ use std::cell::Cell;
 use std::iter;
 
 #[derive(PgRow)]
-#[row(view)]
 pub struct TextRow {
     pub lease: i64,
     pub name: String,
 }
 
 #[derive(PgRow)]
-#[row(view)]
 pub struct MixedRow {
     pub low: i64,
     pub middle: i32,

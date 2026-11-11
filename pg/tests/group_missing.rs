@@ -55,12 +55,12 @@ fn missing_keeps_rows() {
                                     .ok()
                                     .expect("ready PostgreSQL");
                                 let failure = runtime
-                                    .block_on(client.query().run_group::<TextQuery, 3>([(); 3]))
+                                    .block_on(client.run_group::<TextQuery, 3>([(); 3]))
                                     .expect("group driver")
                                     .err()
                                     .expect("missing row");
                                 let [next] = runtime
-                                    .block_on(client.query().run_group::<TextQuery, 1>([()]))
+                                    .block_on(client.run_group::<TextQuery, 1>([()]))
                                     .expect("next group driver")
                                     .unwrap_or_else(|failure| {
                                         panic!("next group: {:?}", failure.cause().map(common::port::Reply::from))

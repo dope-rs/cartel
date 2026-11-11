@@ -5,8 +5,8 @@ use std::marker;
 
 use api::tx::control;
 use api::{request, results, task, traits};
+use cartel_core::reply::Batch;
 use reply::group;
-use results::Storage;
 use results::copy::{Chunk, Sink, Stream};
 use task::lease;
 use traits::{copy, sealed::Sealed};
@@ -35,14 +35,22 @@ impl<C, R> Query<C, R> {
 
 impl<C, R, S> Sealed for Query<C, R, S> {}
 
+impl<'d, C, R, S, const ID: u8> traits::IntoQuery<'d, ID> for Query<C, R, S> {
+    type Query = Self;
+
+    fn into_query(self) -> Self {
+        self
+    }
+}
+
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R, S>
-    traits::Query<'d, ID> for Query<api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
+    traits::Query<'d, ID> for Query<api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
 where
     R: Copy + Into<Option<api::Target<'d, ID>>>,
     S: request::Input<'d>,
 {
     type Acquired =
-        Query<api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, request::Acquired<'d>>;
+        Query<api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, request::Acquired<'d>>;
 
     fn acquire(self) -> impl abi::Fiber<'d, Output = Result<Self::Acquired, Error<'d, ID>>>
     where
@@ -93,7 +101,9 @@ where
     }
 
     type Schema = I;
-    type Results = api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>;
+    type Payload = replies::Payload<'b, 'c, 'd>;
+    type Batch = Batch<'app, 'b, 'c, 'd, replies::Row<'d>>;
+    type Diagnostics = group::Ledger<'r, 's>;
     type Stream<Q>
         = results::RunStream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R>
     where
@@ -102,10 +112,8 @@ where
     fn run_one<Q>(
         self,
         params: Q::Params<'_>,
-    ) -> impl abi::Fiber<
-        'd,
-        Output = Result<results::Row<<Self::Results as Storage>::Payload, Q>, Error<'d, ID>>,
-    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
+    ) -> impl abi::Fiber<'d, Output = Result<results::Row<Self::Payload, Q>, Error<'d, ID>>>
+    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
         I: schema::HasGroup<Q::Group>,
@@ -119,13 +127,7 @@ where
         params: [Q::Params<'_>; N],
     ) -> impl abi::Fiber<
         'd,
-        Output = results::GroupResult<
-            'd,
-            results::Row<<Self::Results as Storage>::Payload, Q>,
-            <Self::Results as Storage>::Diagnostics,
-            N,
-            ID,
-        >,
+        Output = results::GroupResult<'d, results::Row<Self::Payload, Q>, Self::Diagnostics, N, ID>,
     > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, N, R, S>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
@@ -140,13 +142,8 @@ where
     fn run_first<Q>(
         self,
         params: Q::Params<'_>,
-    ) -> impl abi::Fiber<
-        'd,
-        Output = Result<
-            Option<results::Row<<Self::Results as Storage>::Payload, Q>>,
-            Error<'d, ID>,
-        >,
-    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
+    ) -> impl abi::Fiber<'d, Output = Result<Option<results::Row<Self::Payload, Q>>, Error<'d, ID>>>
+    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
         I: schema::HasGroup<Q::Group>,
@@ -160,10 +157,7 @@ where
         params: Q::Params<'_>,
     ) -> impl abi::Fiber<
         'd,
-        Output = Result<
-            Option<results::Row<<Self::Results as Storage>::Payload, Q, true>>,
-            Error<'d, ID>,
-        >,
+        Output = Result<Option<results::Row<Self::Payload, Q, true>>, Error<'d, ID>>,
     > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
     where
         Q: schema::TypedQuery<Result = result::Rows<true>>,
@@ -176,10 +170,8 @@ where
     fn run_all<Q>(
         self,
         params: Q::Params<'_>,
-    ) -> impl abi::Fiber<
-        'd,
-        Output = Result<results::Collection<<Self::Results as Storage>::Batch, Q>, Error<'d, ID>>,
-    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
+    ) -> impl abi::Fiber<'d, Output = Result<results::Collection<Self::Batch, Q>, Error<'d, ID>>>
+    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
         I: schema::HasGroup<Q::Group>,
@@ -224,7 +216,7 @@ where
 }
 
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R, S>
-    traits::Unchecked<'d, ID> for Query<api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
+    traits::Unchecked<'d, ID> for Query<api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
 where
     R: Copy + Into<Option<api::Target<'d, ID>>>,
     S: request::Input<'d>,
@@ -239,7 +231,7 @@ where
 }
 
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R, S>
-    copy::Transfer<'d, ID> for Query<api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
+    copy::Transfer<'d, ID> for Query<api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
 where
     R: Copy + Into<Option<api::Target<'d, ID>>>,
     S: request::Input<'d>,
@@ -278,13 +270,10 @@ where
 }
 
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R>
-    traits::Notify<'d, ID> for Query<api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R>
+    traits::Notify<'d, ID> for Query<api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R>
 where
     R: Copy + Into<Option<api::Target<'d, ID>>>,
 {
-    type Schema = I;
-    type Payload = replies::Payload<'b, 'c, 'd>;
-    type Diagnostics = group::Ledger<'r, 's>;
     type Listener = control::ListenGuard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>;
 
     fn dropped(self) -> u64 {

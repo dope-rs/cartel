@@ -9,7 +9,7 @@ use api::{
     ops, request,
     results::copy::Chunk,
     sql,
-    traits::{self, copy::Transfer, sealed},
+    traits::{self, sealed},
 };
 use dope_fiber::abi;
 use finish::{End, Finish};
@@ -47,7 +47,7 @@ pub struct Builder<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u
 where
     I: schema::QuerySet + 'd,
 {
-    pub(super) client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    pub(super) client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     pub(super) isolation: Isolation,
     pub(super) access_mode: AccessMode,
     pub(super) deferral: Deferral,
@@ -134,16 +134,28 @@ impl<B: ?Sized, I: schema::QuerySet, const ID: u8> sealed::Sealed
 }
 
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    traits::Transaction<'d, ID> for Guard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+    traits::Connection<'d, ID> for Guard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     type Schema = I;
     type Payload = replies::Payload<'b, 'c, 'd>;
     type Diagnostics = Ledger<'r, 's>;
     type CopyChunk = Chunk<'b, 'c, 'd>;
     type Query<'tx>
-        = ops::Query<api::Client<'tx, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, api::Target<'d, ID>>
+        = ops::Query<api::Context<'tx, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, api::Target<'d, ID>>
     where
         Self: 'tx;
+
+    fn query(&self) -> Self::Query<'_> {
+        ops::Query::from_parts(
+            self.lease.reborrow(),
+            api::Target::from_tx(self.lease.target()),
+        )
+    }
+}
+
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+    traits::Transaction<'d, ID> for Guard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+{
     type Savepoint<'tx>
         = control::Savepoint<'tx, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
     where
@@ -183,21 +195,6 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
 
     fn cancel(self) {
         drop(self.lease);
-    }
-
-    fn query(&self) -> Self::Query<'_> {
-        ops::Query::from_parts(
-            self.lease.reborrow(),
-            api::Target::from_tx(self.lease.target()),
-        )
-    }
-
-    fn unchecked(&self) -> impl traits::Unchecked<'d, ID> + '_ {
-        self.query()
-    }
-
-    fn copy(&self) -> impl Transfer<'d, ID, Chunk = Self::CopyChunk> + '_ {
-        self.query()
     }
 
     fn savepoint<'tx>(

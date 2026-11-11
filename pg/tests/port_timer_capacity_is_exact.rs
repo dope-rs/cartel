@@ -63,8 +63,9 @@ fn timer_capacity_is_exact() {
                     node.install(stage, |host, stage| {
                         let timer = stage.driver().driver_ref().timer();
                         stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                            let client: api::Client<'_, '_, '_, '_, '_, '_, '_, _, _> =
-                                runtime.root_client();
+                            let client: api::Client<
+                                api::Context<'_, '_, '_, '_, '_, '_, '_, _, _>,
+                            > = runtime.root_client();
 
                             let mut alarms = Vec::new();
                             let failure = loop {
@@ -75,14 +76,14 @@ fn timer_capacity_is_exact() {
                             };
                             assert!(matches!(failure, Exhausted::Slots));
                             let invalid = runtime
-                                .block_on(client.unchecked().command("SELECT\0"))
+                                .block_on(client.command("SELECT\0"))
                                 .expect("invalid query driver");
                             let group = runtime
-                                .block_on(client.query().run_group::<TextQuery, 1>([()]))
+                                .block_on(client.run_group::<TextQuery, 1>([()]))
                                 .expect("disabled group driver")
                                 .err()
                                 .expect("group diagnostics disabled");
-                            let pending = client.unchecked().command("SELECT 1");
+                            let pending = client.command("SELECT 1");
                             let begin = runtime
                                 .block_on(client.transaction().begin())
                                 .expect("begin driver");
@@ -102,7 +103,7 @@ fn timer_capacity_is_exact() {
                                 Err(reply::Error::Driver(cartel_pg::Error::RequestCapacity))
                             ));
                             assert!(matches!(
-                                runtime.block_on(client.unchecked().command("SELECT 1")),
+                                runtime.block_on(client.command("SELECT 1")),
                                 Ok(Err(reply::Error::Driver(cartel_pg::Error::Deadline(
                                     Exhausted::Slots
                                 ))))
@@ -156,15 +157,7 @@ fn typed_queries_free_timer() {
                                 let timer = stage.driver().driver_ref().timer();
                                 stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
                                     let client: api::Client<
-                                        '_,
-                                        '_,
-                                        '_,
-                                        '_,
-                                        '_,
-                                        '_,
-                                        '_,
-                                        _,
-                                        Database,
+                                        api::Context<'_, '_, '_, '_, '_, '_, '_, _, Database>,
                                     > = runtime.root_client();
                                     runtime
                                         .block_on(client.status().wait_ready())
@@ -178,7 +171,7 @@ fn typed_queries_free_timer() {
                                     drop(alarms.pop().expect("last available timer"));
 
                                     let acquired = runtime
-                                        .block_on(client.query().acquire())
+                                        .block_on(client.acquire())
                                         .expect("frame drive")
                                         .ok()
                                         .expect("request frame");
@@ -214,7 +207,7 @@ fn typed_queries_free_timer() {
                                         ));
                                     }
 
-                                    let mut one = pin!(client.query().run_one::<TextQuery>(()));
+                                    let mut one = pin!(client.run_one::<TextQuery>(()));
                                     assert!(matches!(timer.try_alarm(), Err(Exhausted::Slots)));
                                     let row = runtime
                                         .block_on(poll_fn(|context| {
@@ -235,7 +228,7 @@ fn typed_queries_free_timer() {
                                     drop(row);
                                     drop(alarm);
 
-                                    let mut first = pin!(client.query().run_first::<TextQuery>(()));
+                                    let mut first = pin!(client.run_first::<TextQuery>(()));
                                     let mut all = pin!(None);
                                     assert!(matches!(timer.try_alarm(), Err(Exhausted::Slots)));
                                     runtime
@@ -265,8 +258,7 @@ fn typed_queries_free_timer() {
                                             drop(row);
                                             drop(alarm);
 
-                                            all.as_mut()
-                                                .set(Some(client.query().run_all::<TextQuery>(())));
+                                            all.as_mut().set(Some(client.run_all::<TextQuery>(())));
                                             assert!(matches!(
                                                 timer.try_alarm(),
                                                 Err(Exhausted::Slots)
@@ -289,7 +281,7 @@ fn typed_queries_free_timer() {
                                         }))
                                         .expect("driver query");
                                     runtime
-                                        .block_on(client.notify().next())
+                                        .block_on(client.next())
                                         .expect("notification driver")
                                         .ok()
                                         .expect("next request reached peer");
@@ -314,7 +306,7 @@ fn typed_queries_free_timer() {
                                     drop(rows);
                                     drop(alarm);
                                     let failure = runtime
-                                        .block_on(client.query().run_first::<TextQuery>(()))
+                                        .block_on(client.run_first::<TextQuery>(()))
                                         .expect("late failure driver")
                                         .err()
                                         .expect("late Sync failure");

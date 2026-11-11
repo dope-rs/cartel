@@ -82,7 +82,7 @@ struct Owner<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, P, const ID: u
 where
     I: schema::QuerySet + 'd,
 {
-    client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     policy: marker::PhantomData<(T, P)>,
 }
 
@@ -95,7 +95,7 @@ where
 {
     pub(in crate::api) fn admit(
         (): (),
-        client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+        client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         target: T,
     ) -> Self {
         Self::new(client, target)
@@ -107,7 +107,7 @@ where
     }
 
     pub(in crate::api) fn new(
-        client: api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+        client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         target: T,
     ) -> Self {
         Self {
@@ -121,13 +121,13 @@ where
         }
     }
 
-    pub(in crate::api) fn client(&self) -> api::Client<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID> {
+    pub(in crate::api) fn client(&self) -> api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID> {
         self.inner.sink().client
     }
 
     pub(in crate::api) fn reborrow<'short>(
         &'short self,
-    ) -> api::Client<'short, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+    ) -> api::Context<'short, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
     where
         'app: 'short,
     {

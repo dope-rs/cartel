@@ -120,7 +120,7 @@ fn round_robin_and_shared_admission_progress() {
                         worker.lend(|node, stage| {
                             node.install(stage, |host, stage| {
                                 stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let client: api::Client<'_, '_, '_, '_, '_, '_, '_, _, _> =
+                                    let client: api::Client<api::Context<'_, '_, '_, '_, '_, '_, '_, _, _>> =
                                         runtime.root_client();
 
                                     assert!(
@@ -137,11 +137,11 @@ fn round_robin_and_shared_admission_progress() {
                                     let queries = batch::Join::from_map(&mut pool, [0, 1, 2, 3], |index| {
                                         dope_fiber::fiber!('_ => async move {
                                             let sql = ["SELECT 0", "SELECT 1", "SELECT 2", "SELECT 3"][index];
-                                            assert!(client.unchecked().command(sql).await.is_ok());
+                                            assert!(client.command(sql).await.is_ok());
                                             if index == 2 {
                                                 let (waiting, marker) = abi::Join::new(
-                                                    client.unchecked().command("SELECT 4"),
-                                                    client.unchecked().command("SELECT 5"),
+                                                    client.command("SELECT 4"),
+                                                    client.command("SELECT 5"),
                                                 ).await;
                                                 assert!(waiting.is_ok() && marker.is_ok());
                                             }

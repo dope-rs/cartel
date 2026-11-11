@@ -9,10 +9,7 @@ use std::{num::NonZero, pin::pin, task::Poll, thread, time::Duration};
 use crate::common::external::runtime::{Plan, Session};
 use crate::common::{port::Queries, postgres::accept::Listener as _};
 use cartel_pg::{
-    api::traits::{
-        self,
-        copy::{Sink as _, Stream as _, Transfer as _},
-    },
+    api::traits::copy::{Sink as _, Stream as _, Transfer as _},
     reply,
 };
 use o3::base::time::Positive;
@@ -37,7 +34,7 @@ fn copy_out_done_ends_data() {
                 .try_run(
                     |rt| {
                         let client = rt.client();
-                        let mut copy = client.copy().copy_out("COPY items TO STDOUT");
+                        let mut copy = client.copy_out("COPY items TO STDOUT");
                         let next = rt.runtime.block_on(copy.next_chunk())?;
                         match extra {
                             None => assert!(matches!(next, Ok(None))),
@@ -85,7 +82,7 @@ fn finish_with_full_request_pool() {
                 drop(alarms.pop().expect("last available timer"));
                 let acquired = rt
                     .runtime
-                    .block_on(client.query().acquire())?
+                    .block_on(client.acquire())?
                     .ok()
                     .expect("request frame");
                 let mut copy = acquired.copy_stream("COPY items FROM STDIN");
@@ -105,17 +102,15 @@ fn finish_with_full_request_pool() {
                 drop(alarms);
                 let notice = rt
                     .runtime
-                    .block_on(client.notify().next())?
+                    .block_on(client.next())?
                     .ok()
                     .expect("COPY admission marker");
                 assert_eq!((notice.channel(), notice.payload()), ("copy", "ready"));
                 drop(notice);
                 // Session admits sixteen request frames per connection.
-                let held =
-                    std::array::from_fn::<_, 16, _>(|_| client.unchecked().command("SELECT 1"));
+                let held = std::array::from_fn::<_, 16, _>(|_| client.command("SELECT 1"));
                 assert!(matches!(
-                    rt.runtime
-                        .block_on(client.unchecked().command("SELECT 1"))?,
+                    rt.runtime.block_on(client.command("SELECT 1"))?,
                     Err(reply::Error::Driver(cartel_pg::Error::RequestCapacity))
                 ));
                 {
@@ -166,15 +161,14 @@ fn rejected_copy_recovers() {
                     let client = rt.client();
                     assert!(rt.runtime.block_on(client.status().wait_ready())?.is_ok());
                     for finish in [false, true] {
-                        let mut copy =
-                            traits::Client::copy(client).copy_stream("COPY missing FROM STDIN");
+                        let mut copy = client.copy_stream("COPY missing FROM STDIN");
                         assert!(
                             rt.runtime.block_on(copy.write(&[]))?.is_ok(),
                             "initial COPY admission"
                         );
                         let marker = rt
                             .runtime
-                            .block_on(client.notify().next())?
+                            .block_on(client.next())?
                             .ok()
                             .expect("server rejection marker");
                         assert_eq!(marker.channel(), "copy");
@@ -194,9 +188,7 @@ fn rejected_copy_recovers() {
                         );
                         drop(rejected);
                         assert!(
-                            rt.runtime
-                                .block_on(client.unchecked().command("SELECT 1"))?
-                                .is_ok(),
+                            rt.runtime.block_on(client.command("SELECT 1"))?.is_ok(),
                             "a rejected COPY recovers through a replacement connection",
                         );
                     }
@@ -226,7 +218,6 @@ fn copy_in_binary() {
                 let client = rt.client();
                 let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
                     client
-                        .unchecked()
                         .command("DELETE FROM cartel_pg_copy")
                         .await
                         .try_own()?;
@@ -245,12 +236,11 @@ fn copy_in_binary() {
                     buf.extend_from_slice(&(-1i16).to_be_bytes());
 
                     client
-                        .copy()
                         .copy_in("COPY cartel_pg_copy (id, label) FROM STDIN BINARY", &buf)
                         .await
                         .map_err(own::Error::Query)?;
 
-                    let n = Copy::count_all(client.query())
+                    let n = Copy::count_all(client)
                         .await
                         .try_own()?;
                     ::core::assert_eq!(n, 3);
@@ -275,9 +265,7 @@ fn copy_out_deadline() {
             Positive::from_millis::<100>(),
             |rt| {
                 let client = rt.client();
-                let mut stream = client
-                    .copy()
-                    .copy_out("COPY cartel_pg_users TO STDOUT BINARY");
+                let mut stream = client.copy_out("COPY cartel_pg_users TO STDOUT BINARY");
                 let first = rt.runtime.block_on(stream.next_chunk())?;
                 ::core::assert!(matches!(first, Ok(Some(_))), "first chunk must arrive");
                 thread::sleep(Duration::from_millis(150));
@@ -308,9 +296,8 @@ fn copy_in_deadline() {
             Positive::from_millis::<100>(),
             |rt| {
                 let client = rt.client();
-                let mut copy = client
-                    .copy()
-                    .copy_stream("COPY cartel_pg_copy (id, label) FROM STDIN BINARY");
+                let mut copy =
+                    client.copy_stream("COPY cartel_pg_copy (id, label) FROM STDIN BINARY");
                 let mut header = Vec::new();
                 header.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
                 header.extend_from_slice(&0i32.to_be_bytes());
@@ -347,12 +334,10 @@ fn stream_chunks_at_limit() {
                 let client = rt.client();
                 let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
                     client
-                        .unchecked()
                         .command("DELETE FROM cartel_pg_copy")
                         .await
                         .map_err(own::Error::Query)?;
                     let mut guard = client
-                        .copy()
                         .copy_stream("COPY cartel_pg_copy (id, label) FROM STDIN BINARY");
                     let mut header = Vec::new();
                     header.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
@@ -396,11 +381,10 @@ fn cancel_reconnects() {
                 let client = rt.client();
                 let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
                     client
-                        .copy()
                         .copy_stream("COPY cartel_pg_copy (id, label) FROM STDIN BINARY")
                         .cancel();
                     ::core::assert_eq!(
-                        Lookup::by_id(client.query(), 1)
+                        Lookup::by_id(client, 1)
                             .await
                             .try_own()?
                             .name,
@@ -408,7 +392,6 @@ fn cancel_reconnects() {
                     );
 
                     let mut guard = client
-                        .copy()
                         .copy_stream("COPY cartel_pg_copy (id, label) FROM STDIN BINARY");
                     let mut header = Vec::new();
                     header.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
@@ -418,7 +401,7 @@ fn cancel_reconnects() {
                     guard.cancel();
 
                     ::core::assert_eq!(
-                        Lookup::by_id(client.query(), 1)
+                        Lookup::by_id(client, 1)
                             .await
                             .try_own()?
                             .name,

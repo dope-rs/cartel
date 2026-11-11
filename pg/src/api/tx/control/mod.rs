@@ -6,7 +6,7 @@ use api::task::lease::{Lease, Recover};
 use api::{
     ops, request,
     results::copy::Chunk,
-    traits::{self, copy::Transfer, sealed},
+    traits::{self, sealed},
 };
 use dope::core::driver::{route::KeyTag, schedule::ready};
 use dope::manifold::client::conn;
@@ -148,24 +148,16 @@ impl<B: ?Sized, I: schema::QuerySet, const ID: u8> sealed::Sealed
 }
 
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    traits::Savepoint<'d, ID> for Savepoint<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+    traits::Connection<'d, ID> for Savepoint<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     type Schema = I;
     type Payload = replies::Payload<'b, 'c, 'd>;
     type Diagnostics = Ledger<'r, 's>;
     type CopyChunk = Chunk<'b, 'c, 'd>;
     type Query<'save>
-        = ops::Query<api::Client<'save, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, api::Target<'d, ID>>
+        = ops::Query<api::Context<'save, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, api::Target<'d, ID>>
     where
         Self: 'save;
-    type Savepoint<'parent>
-        = Savepoint<'parent, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
-    where
-        Self: 'parent;
-
-    fn name(&self) -> &str {
-        &self.name
-    }
 
     fn query(&self) -> Self::Query<'_> {
         ops::Query::from_parts(
@@ -173,13 +165,18 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             api::Target::from_tx(self.lease.target()),
         )
     }
+}
 
-    fn unchecked(&self) -> impl traits::Unchecked<'d, ID> + '_ {
-        self.query()
-    }
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+    traits::Savepoint<'d, ID> for Savepoint<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+{
+    type Savepoint<'parent>
+        = Savepoint<'parent, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+    where
+        Self: 'parent;
 
-    fn copy(&self) -> impl Transfer<'d, ID, Chunk = Self::CopyChunk> + '_ {
-        self.query()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn cancel(self) {
@@ -259,38 +256,27 @@ impl<B: ?Sized, I: schema::QuerySet, const ID: u8> sealed::Sealed
 }
 
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
-    traits::Listener<'d, ID> for ListenGuard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+    traits::Connection<'d, ID> for ListenGuard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     type Schema = I;
     type Payload = replies::Payload<'b, 'c, 'd>;
     type Diagnostics = Ledger<'r, 's>;
+    type CopyChunk = Chunk<'b, 'c, 'd>;
     type Query<'listen>
-        = ops::Query<api::Client<'listen, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, api::Target<'d, ID>>
+        = ops::Query<api::Context<'listen, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, api::Target<'d, ID>>
     where
         Self: 'listen;
-
-    fn channel(&self) -> &str {
-        &self.channel
-    }
 
     fn query(&self) -> Self::Query<'_> {
         ops::Query::from_parts(self.lease.reborrow(), self.lease.target())
     }
+}
 
-    fn unchecked(&self) -> impl traits::Unchecked<'d, ID> + '_ {
-        self.query()
-    }
-
-    fn notify(
-        &self,
-    ) -> impl traits::Notify<
-        'd,
-        ID,
-        Schema = Self::Schema,
-        Payload = Self::Payload,
-        Diagnostics = Self::Diagnostics,
-    > + '_ {
-        self.query()
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+    traits::Listener<'d, ID> for ListenGuard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+{
+    fn channel(&self) -> &str {
+        &self.channel
     }
 
     fn unlisten(self) -> impl abi::Fiber<'d, Output = Result<(), reply::Error<'d, ID>>> {

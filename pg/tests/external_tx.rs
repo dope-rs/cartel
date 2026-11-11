@@ -40,7 +40,7 @@ fn groups_survive_finish() {
                 let client = rt.client();
                 let rows = rt
                     .runtime
-                    .block_on(Lookup::by_id_group(client.query(), [1, 2]))?
+                    .block_on(Lookup::by_id_group(client, [1, 2]))?
                     .ok()
                     .expect("group rows");
                 let tx = rt
@@ -50,7 +50,7 @@ fn groups_survive_finish() {
                     .expect("transaction");
                 let outcome = rt
                     .runtime
-                    .block_on(Write::add_one_group(tx.query(), User::conflicting()))?;
+                    .block_on(Write::add_one_group(&tx, User::conflicting()))?;
                 let error = rt
                     .runtime
                     .block_on(tx.finish(outcome))?
@@ -73,7 +73,7 @@ fn groups_survive_finish() {
                 assert!(matches!(
                     failure.outcomes(),
                     [Outcome::Completed(row), Outcome::Server, Outcome::Skipped]
-                        if row.decode().expect("completed insert").1.0 == "group-first"
+                        if row.decode().expect("completed insert").name == "group-first"
                 ));
                 assert_eq!(
                     failure
@@ -83,11 +83,11 @@ fn groups_survive_finish() {
                         .as_str(),
                     "23505"
                 );
-                assert_eq!(rows[0].decode().expect("retained first row").1.0, "alice");
-                assert_eq!(rows[1].decode().expect("retained second row").1.0, "bob");
+                assert_eq!(rows[0].decode().expect("retained first row").name, "alice");
+                assert_eq!(rows[1].decode().expect("retained second row").name, "bob");
                 assert!(
                     rt.runtime
-                        .block_on(Lookup::maybe_by_id(client.query(), 101))?
+                        .block_on(Lookup::maybe_by_id(client, 101))?
                         .ok()
                         .expect("rolled back lookup")
                         .is_none()
@@ -112,10 +112,10 @@ fn commit_reports_rollback() {
                 let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
                     let tx = client.transaction().begin().await.map_err(own::Error::Query)?;
                     let pid = tx.cancel_token().expect("backend key").pid();
-                    Write::add(tx.query(), 101, "rolled-back".into(), 30, 1.0, true)
+                    Write::add(&tx, 101, "rolled-back".into(), 30, 1.0, true)
                         .await
                         .try_own()?;
-                    let error = Write::add(tx.query(), 1, "duplicate".into(), 30, 1.0, true).await;
+                    let error = Write::add(&tx, 1, "duplicate".into(), 30, 1.0, true).await;
                     ::core::assert_eq!(
                         error.as_ref().err().and_then(|error| error.as_server())
                             .map(|error| error.fields().code().as_str()),
@@ -126,7 +126,7 @@ fn commit_reports_rollback() {
                         Err(reply::Error::Driver(cartel_pg::Error::CommitRolledBack))
                     ));
                     ::core::assert!(
-                        Lookup::maybe_by_id(client.query(), 101).await.try_own()?.is_none()
+                        Lookup::maybe_by_id(client, 101).await.try_own()?.is_none()
                     );
                     let next = client.transaction().begin().await.map_err(own::Error::Query)?;
                     ::core::assert_eq!(next.cancel_token().expect("backend key").pid(), pid);
@@ -160,10 +160,10 @@ fn explicit_end() {
                         .begin()
                         .await
                         .map_err(own::Error::Query)?;
-                    Write::rename(tx.query(), 1, "explicit-saved".into())
+                    Write::rename(&tx, 1, "explicit-saved".into())
                         .await
                         .try_own()?;
-                    let saved = Lookup::by_id(tx.query(), 1)
+                    let saved = Lookup::by_id(&tx, 1)
                         .await
                         .try_own()?;
                     let name = cartel_pg::api::traits::Transaction::finish(
@@ -175,7 +175,7 @@ fn explicit_end() {
                     .expect("successful transaction finish preserves its value");
                     ::core::assert_eq!(name, "explicit-saved");
                     ::core::assert_eq!(
-                        Lookup::by_id(client.query(), 1)
+                        Lookup::by_id(client, 1)
                             .await
                             .try_own()?
                             .name,
@@ -187,7 +187,7 @@ fn explicit_end() {
                         .begin()
                         .await
                         .map_err(own::Error::Query)?;
-                    Write::rename(tx.query(), 1, "explicit-rolled-back".into())
+                    Write::rename(&tx, 1, "explicit-rolled-back".into())
                         .await
                         .try_own()?;
                     let operation = String::from("operation failed");
@@ -196,7 +196,7 @@ fn explicit_end() {
                         Err(FinishError::Operation(error)) if error == operation
                     ));
                     ::core::assert_eq!(
-                        Lookup::by_id(client.query(), 1)
+                        Lookup::by_id(client, 1)
                             .await
                             .try_own()?
                             .name,
@@ -229,11 +229,11 @@ fn ends() {
                             .begin()
                             .await
                             .map_err(own::Error::Query)?;
-                        Write::rename(tx.query(), 1, "tx-renamed".into())
+                        Write::rename(&tx, 1, "tx-renamed".into())
                             .await
                             .try_own()?;
                         ::core::assert_eq!(
-                            Lookup::by_id(tx.query(), 1)
+                            Lookup::by_id(&tx, 1)
                                 .await
                                 .try_own()?
                                 .name,
@@ -242,7 +242,7 @@ fn ends() {
                         tx.rollback().await.map_err(own::Error::Query)?;
                     }
                     ::core::assert_eq!(
-                        Lookup::by_id(client.query(), 1)
+                        Lookup::by_id(client, 1)
                             .await
                             .try_own()?
                             .name,
@@ -255,13 +255,13 @@ fn ends() {
                             .begin()
                             .await
                             .map_err(own::Error::Query)?;
-                        Write::rename(tx.query(), 1, "tx-saved".into())
+                        Write::rename(&tx, 1, "tx-saved".into())
                             .await
                             .try_own()?;
                         tx.commit().await.map_err(own::Error::Query)?;
                     }
                     ::core::assert_eq!(
-                        Lookup::by_id(client.query(), 1)
+                        Lookup::by_id(client, 1)
                             .await
                             .try_own()?
                             .name,
@@ -293,10 +293,10 @@ fn routes_pin() {
                         .begin()
                         .await
                         .map_err(own::Error::Query)?;
-                    Write::rename(tx.query(), 1, "tx-only".into())
+                    Write::rename(&tx, 1, "tx-only".into())
                         .await
                         .try_own()?;
-                    let outside = Write::rename(client.query(), 1, "outside".into()).await;
+                    let outside = Write::rename(client, 1, "outside".into()).await;
                     ::core::assert!(outside.as_ref().is_err_and(|error| ::core::matches!(
                         error,
                         reply::Error::Driver(cartel_pg::Error::Backpressure { .. })
@@ -304,11 +304,11 @@ fn routes_pin() {
                     tx.rollback()
                         .await
                         .try_own()?;
-                    Write::rename(client.query(), 1, "outside".into())
+                    Write::rename(client, 1, "outside".into())
                         .await
                         .try_own()?;
                     ::core::assert_eq!(
-                        Lookup::by_id(client.query(), 1)
+                        Lookup::by_id(client, 1)
                             .await
                             .try_own()?
                             .name,
@@ -342,7 +342,7 @@ fn cancels_tx() {
                             .is_none()
                     );
                     ::core::assert_eq!(
-                        Lookup::by_id(client.query(), 1)
+                        Lookup::by_id(client, 1)
                             .await
                             .try_own()?
                             .name,
@@ -354,12 +354,12 @@ fn cancels_tx() {
                         .begin()
                         .await
                         .map_err(own::Error::Query)?;
-                    Write::rename(tx.query(), 1, "cancelled-finalizer".into())
+                    Write::rename(&tx, 1, "cancelled-finalizer".into())
                         .await
                         .try_own()?;
                     drop(tx.finish::<(), Infallible>(Ok(())));
                     ::core::assert_eq!(
-                        Lookup::by_id(client.query(), 1)
+                        Lookup::by_id(client, 1)
                             .await
                             .try_own()?
                             .name,
@@ -397,7 +397,7 @@ fn cancels_open() {
                         .is_none()
                 );
                 ::core::assert_eq!(
-                    Lookup::by_id(client.query(), 1)
+                    Lookup::by_id(client, 1)
                         .await
                         .try_own()?
                         .name,

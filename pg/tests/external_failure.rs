@@ -32,7 +32,7 @@ fn deferred_commit_fails() {
             "connection ready: {:?}",
             ready.as_ref().err().map(cartel_pg::reply::Error::kind),
         );
-        let created = rt.runtime.block_on(client.unchecked().command(
+        let created = rt.runtime.block_on(client.command(
             "CREATE TEMP TABLE cartel_pg_deferred (id integer UNIQUE DEFERRABLE INITIALLY DEFERRED)",
         ))?;
         assert!(
@@ -41,7 +41,7 @@ fn deferred_commit_fails() {
             created.as_ref().err().map(cartel_pg::reply::Error::kind),
         );
 
-        let conflict = rt.runtime.block_on(client.unchecked().command(
+        let conflict = rt.runtime.block_on(client.command(
             "INSERT INTO cartel_pg_deferred VALUES (1), (1)",
         ))?;
         assert_eq!(
@@ -56,7 +56,7 @@ fn deferred_commit_fails() {
         );
         drop(conflict);
 
-        let reused = rt.runtime.block_on(client.unchecked().command(
+        let reused = rt.runtime.block_on(client.command(
             "INSERT INTO cartel_pg_deferred VALUES (1)",
         ))?;
         assert!(
