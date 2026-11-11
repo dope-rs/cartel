@@ -71,6 +71,7 @@ impl<'a> Wire<'a> {
         ))
     }
 
+    #[inline]
     pub fn try_text(self) -> Result<Text<'a>, TextError> {
         match str::from_utf8(self.as_slice()) {
             Ok(text) => Ok(Text(text)),

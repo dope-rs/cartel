@@ -1,16 +1,11 @@
 use crate::protocol::value::decode;
 use crate::schema::{array, desc};
 use o3::base::marker::ThreadBound;
+
 fn own<T>(value: &str, make: fn(crate::TextStorage) -> T) -> Result<T, crate::Error> {
     Ok(make((crate::Error::try_string(value)?, ThreadBound::NEW)))
 }
 
-fn own_text<T>(
-    value: Option<&str>,
-    make: fn(crate::TextStorage) -> T,
-) -> Result<Option<T>, crate::Error> {
-    value.map(|value| own(value, make)).transpose()
-}
 pub trait Row: desc::Validate + Sized {
     type View<'row>;
 
@@ -88,414 +83,332 @@ impl<A: Row, B: Row, C: Row, D: Row> Row for (A, B, C, D) {
     }
 }
 
-impl Row for bool {
-    type View<'row> = Self;
+#[doc(hidden)]
+pub trait Field: sealed::Sealed + Sized {
+    type View<'row>;
+    const TARGET: desc::Target;
+    const FORMAT: u16 = 1;
+    const DYNAMIC_TYPES: u8 = 0;
 
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader.scalar().read_bool()
-    }
-
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.scalar().read_bool()
-    }
+    fn read<'row>(column: decode::Column<'row>) -> Result<Self::View<'row>, crate::Error>;
+    fn into_owned<'row>(value: Self::View<'row>) -> Result<Self, crate::Error>;
 }
 
-impl Row for i16 {
-    type View<'row> = Self;
+pub(crate) use sealed::Nullable;
 
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader.scalar().read_i16()
-    }
+mod sealed {
+    pub trait Sealed {}
+    pub(crate) trait Nullable {}
 
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.scalar().read_i16()
-    }
+    impl<T: Nullable> Sealed for T {}
+    impl Sealed for Vec<i32> {}
+    impl Sealed for Vec<i64> {}
+    impl Sealed for Vec<String> {}
+
+    impl Nullable for bool {}
+    impl Nullable for i16 {}
+    impl Nullable for i32 {}
+    impl Nullable for i64 {}
+    impl Nullable for f32 {}
+    impl Nullable for f64 {}
+    impl Nullable for String {}
+    impl Nullable for crate::Text {}
+    impl Nullable for crate::Jsonb {}
+    impl Nullable for crate::Ltree {}
+    impl Nullable for Vec<u8> {}
+    impl Nullable for crate::Uuid {}
+    impl Nullable for crate::Timestamp {}
+    impl Nullable for crate::Date {}
 }
 
-impl Row for i32 {
-    type View<'row> = Self;
+impl<T: Field> Row for T {
+    type View<'row> = T::View<'row>;
 
     #[inline]
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader.read_i32()
-    }
-
-    #[inline]
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.read_i32()
-    }
-}
-
-impl Row for i64 {
-    type View<'row> = Self;
-
-    #[inline]
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader.scalar().read_i64()
-    }
-
-    #[inline]
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.scalar().read_i64()
-    }
-}
-
-impl Row for f32 {
-    type View<'row> = Self;
-
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader.scalar().read_f32()
-    }
-
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.scalar().read_f32()
-    }
-}
-
-impl Row for f64 {
-    type View<'row> = Self;
-
-    #[inline]
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader.scalar().read_f64()
+    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<T::View<'row>, crate::Error> {
+        T::read(reader.require()?)
     }
 
     #[inline]
     fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.scalar().read_f64()
+        T::into_owned(T::read(reader.require()?)?)
     }
 }
 
-impl Row for String {
-    type View<'row> = &'row str;
+impl<T: Field + Nullable> Row for Option<T> {
+    type View<'row> = Option<T::View<'row>>;
 
     #[inline]
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<&'row str, crate::Error> {
-        reader.data().read_text()
-    }
-
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        crate::Error::try_string(reader.data().read_text()?)
-    }
-}
-
-impl Row for Option<String> {
-    type View<'row> = Option<&'row str>;
-
     fn decode<'row>(
         reader: &mut decode::RowReader<'row>,
     ) -> Result<Self::View<'row>, crate::Error> {
-        reader.optional().read_text()
+        match reader.take_column()? {
+            decode::Field::Data(column) => T::read(column).map(Some),
+            decode::Field::Null { .. } => Ok(None),
+        }
     }
 
+    #[inline]
     fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader
-            .optional()
-            .read_text()?
-            .map(crate::Error::try_string)
-            .transpose()
+        Self::decode(reader)?.map(T::into_owned).transpose()
     }
 }
 
-impl Row for crate::Text {
+impl Field for bool {
+    type View<'row> = Self;
+    const TARGET: desc::Target = desc::Target::Exact(desc::BOOL);
+
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<Self, crate::Error> {
+        column.read_bool()
+    }
+
+    #[inline]
+    fn into_owned<'row>(value: Self) -> Result<Self, crate::Error> {
+        Ok(value)
+    }
+}
+
+impl Field for i16 {
+    type View<'row> = Self;
+    const TARGET: desc::Target = desc::Target::Exact(desc::INT2);
+
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<Self, crate::Error> {
+        Ok(Self::from_be_bytes(column.fixed()?))
+    }
+
+    #[inline]
+    fn into_owned<'row>(value: Self) -> Result<Self, crate::Error> {
+        Ok(value)
+    }
+}
+
+impl Field for i32 {
+    type View<'row> = Self;
+    const TARGET: desc::Target = desc::Target::Exact(desc::INT4);
+
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<Self, crate::Error> {
+        Ok(Self::from_be_bytes(column.fixed()?))
+    }
+
+    #[inline]
+    fn into_owned<'row>(value: Self) -> Result<Self, crate::Error> {
+        Ok(value)
+    }
+}
+
+impl Field for i64 {
+    type View<'row> = Self;
+    const TARGET: desc::Target = desc::Target::Exact(desc::INT8);
+
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<Self, crate::Error> {
+        Ok(Self::from_be_bytes(column.fixed()?))
+    }
+
+    #[inline]
+    fn into_owned<'row>(value: Self) -> Result<Self, crate::Error> {
+        Ok(value)
+    }
+}
+
+impl Field for f32 {
+    type View<'row> = Self;
+    const TARGET: desc::Target = desc::Target::Exact(desc::FLOAT4);
+
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<Self, crate::Error> {
+        Ok(Self::from_be_bytes(column.fixed()?))
+    }
+
+    #[inline]
+    fn into_owned<'row>(value: Self) -> Result<Self, crate::Error> {
+        Ok(value)
+    }
+}
+
+impl Field for f64 {
+    type View<'row> = Self;
+    const TARGET: desc::Target = desc::Target::Exact(desc::FLOAT8);
+
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<Self, crate::Error> {
+        Ok(Self::from_be_bytes(column.fixed()?))
+    }
+
+    #[inline]
+    fn into_owned<'row>(value: Self) -> Result<Self, crate::Error> {
+        Ok(value)
+    }
+}
+
+impl Field for String {
     type View<'row> = &'row str;
+    const TARGET: desc::Target = desc::Target::String;
 
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<&'row str, crate::Error> {
-        reader.data().read_text()
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<&'row str, crate::Error> {
+        column.text()
     }
 
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        own(reader.data().read_text()?, Self)
+    #[inline]
+    fn into_owned<'row>(value: &'row str) -> Result<Self, crate::Error> {
+        crate::Error::try_string(value)
     }
 }
 
-impl Row for crate::Jsonb {
+impl Field for crate::Text {
     type View<'row> = &'row str;
+    const TARGET: desc::Target = desc::Target::String;
 
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<&'row str, crate::Error> {
-        reader.data().read_json()
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<&'row str, crate::Error> {
+        column.text()
     }
 
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        own(reader.data().read_json()?, Self)
+    #[inline]
+    fn into_owned<'row>(value: &'row str) -> Result<Self, crate::Error> {
+        own(value, Self)
     }
 }
 
-impl Row for crate::Ltree {
+impl Field for crate::Jsonb {
     type View<'row> = &'row str;
+    const TARGET: desc::Target = desc::Target::Exact(desc::JSONB);
 
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<&'row str, crate::Error> {
-        reader.data().read_text()
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<&'row str, crate::Error> {
+        column.json()
     }
 
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        own(reader.data().read_text()?, Self)
-    }
-}
-
-impl Row for Option<crate::Text> {
-    type View<'row> = Option<&'row str>;
-
-    fn decode<'row>(
-        reader: &mut decode::RowReader<'row>,
-    ) -> Result<Self::View<'row>, crate::Error> {
-        reader.optional().read_text()
-    }
-
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        own_text(reader.optional().read_text()?, crate::Text)
+    #[inline]
+    fn into_owned<'row>(value: &'row str) -> Result<Self, crate::Error> {
+        own(value, Self)
     }
 }
 
-impl Row for Option<crate::Jsonb> {
-    type View<'row> = Option<&'row str>;
+impl Field for crate::Ltree {
+    type View<'row> = &'row str;
+    const TARGET: desc::Target = desc::Target::Ltree;
+    const FORMAT: u16 = 0;
+    const DYNAMIC_TYPES: u8 = desc::DYNAMIC_LTREE;
 
-    fn decode<'row>(
-        reader: &mut decode::RowReader<'row>,
-    ) -> Result<Self::View<'row>, crate::Error> {
-        reader.optional().read_json()
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<&'row str, crate::Error> {
+        column.text()
     }
 
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        own_text(reader.optional().read_json()?, crate::Jsonb)
-    }
-}
-
-impl Row for Option<crate::Ltree> {
-    type View<'row> = Option<&'row str>;
-
-    fn decode<'row>(
-        reader: &mut decode::RowReader<'row>,
-    ) -> Result<Self::View<'row>, crate::Error> {
-        reader.optional().read_text()
-    }
-
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        own_text(reader.optional().read_text()?, crate::Ltree)
+    #[inline]
+    fn into_owned<'row>(value: &'row str) -> Result<Self, crate::Error> {
+        own(value, Self)
     }
 }
 
-impl Row for Vec<u8> {
+impl Field for Vec<u8> {
     type View<'row> = &'row [u8];
+    const TARGET: desc::Target = desc::Target::Exact(desc::BYTEA);
 
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<&'row [u8], crate::Error> {
-        reader.data().read_bytes()
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<&'row [u8], crate::Error> {
+        Ok(column.bytes())
     }
 
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        crate::Error::try_copy(reader.data().read_bytes()?)
-    }
-}
-
-impl Row for Option<Vec<u8>> {
-    type View<'row> = Option<&'row [u8]>;
-
-    fn decode<'row>(
-        reader: &mut decode::RowReader<'row>,
-    ) -> Result<Self::View<'row>, crate::Error> {
-        reader.optional().read_bytes()
-    }
-
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader
-            .optional()
-            .read_bytes()?
-            .map(crate::Error::try_copy)
-            .transpose()
+    #[inline]
+    fn into_owned<'row>(value: &'row [u8]) -> Result<Self, crate::Error> {
+        crate::Error::try_copy(value)
     }
 }
 
-impl Row for crate::Uuid {
+impl Field for crate::Uuid {
     type View<'row> = Self;
+    const TARGET: desc::Target = desc::Target::Exact(desc::UUID);
 
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader.scalar().read_fixed::<16>().map(Self::from_bytes)
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<Self, crate::Error> {
+        Ok(Self::from_bytes(column.fixed()?))
     }
 
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.scalar().read_fixed::<16>().map(Self::from_bytes)
+    #[inline]
+    fn into_owned<'row>(value: Self) -> Result<Self, crate::Error> {
+        Ok(value)
     }
 }
 
-impl Row for crate::Timestamp {
+impl Field for crate::Timestamp {
     type View<'row> = Self;
+    const TARGET: desc::Target = desc::Target::Exact(desc::TIMESTAMP);
 
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader.scalar().read_i64().map(Self)
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<Self, crate::Error> {
+        Ok(Self(i64::from_be_bytes(column.fixed()?)))
     }
 
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.scalar().read_i64().map(Self)
+    #[inline]
+    fn into_owned<'row>(value: Self) -> Result<Self, crate::Error> {
+        Ok(value)
     }
 }
 
-impl Row for crate::Date {
+impl Field for crate::Date {
     type View<'row> = Self;
+    const TARGET: desc::Target = desc::Target::Exact(desc::DATE);
 
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader.read_i32().map(Self)
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<Self, crate::Error> {
+        Ok(Self(i32::from_be_bytes(column.fixed()?)))
     }
 
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.read_i32().map(Self)
-    }
-}
-
-impl Row for Option<bool> {
-    type View<'row> = Self;
-
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader.optional().read_bool()
-    }
-
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.optional().read_bool()
+    #[inline]
+    fn into_owned<'row>(value: Self) -> Result<Self, crate::Error> {
+        Ok(value)
     }
 }
 
-impl Row for Option<i16> {
-    type View<'row> = Self;
-
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader.optional().read_i16()
-    }
-
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.optional().read_i16()
-    }
-}
-
-impl Row for Option<i32> {
-    type View<'row> = Self;
-
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader.optional().read_i32()
-    }
-
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.optional().read_i32()
-    }
-}
-
-impl Row for Option<i64> {
-    type View<'row> = Self;
-
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader.optional().read_i64()
-    }
-
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.optional().read_i64()
-    }
-}
-
-impl Row for Option<f32> {
-    type View<'row> = Self;
-
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader.optional().read_f32()
-    }
-
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.optional().read_f32()
-    }
-}
-
-impl Row for Option<f64> {
-    type View<'row> = Self;
-
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader.optional().read_f64()
-    }
-
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.optional().read_f64()
-    }
-}
-
-impl Row for Option<crate::Uuid> {
-    type View<'row> = Self;
-
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader
-            .optional()
-            .read_uuid()
-            .map(|value| value.map(crate::Uuid::from_bytes))
-    }
-
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        Self::decode(reader)
-    }
-}
-
-impl Row for Option<crate::Timestamp> {
-    type View<'row> = Self;
-
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader
-            .optional()
-            .read_i64()
-            .map(|value| value.map(crate::Timestamp))
-    }
-
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        Self::decode(reader)
-    }
-}
-
-impl Row for Option<crate::Date> {
-    type View<'row> = Self;
-
-    fn decode<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self, crate::Error> {
-        reader
-            .optional()
-            .read_i32()
-            .map(|value| value.map(crate::Date))
-    }
-
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        Self::decode(reader)
-    }
-}
-
-impl Row for Vec<i32> {
+impl Field for Vec<i32> {
     type View<'row> = array::Array<'row, i32>;
+    const TARGET: desc::Target = desc::Target::Exact(desc::INT4_ARRAY);
 
-    fn decode<'row>(
-        reader: &mut decode::RowReader<'row>,
-    ) -> Result<Self::View<'row>, crate::Error> {
-        reader.arrays().read_i32()
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<array::Array<'row, i32>, crate::Error> {
+        column.array(decode::ArrayElement::Exact(desc::INT4))
     }
 
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.arrays().read_i32()?.try_collect()
+    #[inline]
+    fn into_owned<'row>(value: array::Array<'row, i32>) -> Result<Self, crate::Error> {
+        value.try_collect()
     }
 }
 
-impl Row for Vec<i64> {
+impl Field for Vec<i64> {
     type View<'row> = array::Array<'row, i64>;
+    const TARGET: desc::Target = desc::Target::Exact(desc::INT8_ARRAY);
 
-    fn decode<'row>(
-        reader: &mut decode::RowReader<'row>,
-    ) -> Result<Self::View<'row>, crate::Error> {
-        reader.arrays().read_i64()
+    #[inline]
+    fn read<'row>(column: decode::Column<'row>) -> Result<array::Array<'row, i64>, crate::Error> {
+        column.array(decode::ArrayElement::Exact(desc::INT8))
     }
 
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.arrays().read_i64()?.try_collect()
+    #[inline]
+    fn into_owned<'row>(value: array::Array<'row, i64>) -> Result<Self, crate::Error> {
+        value.try_collect()
     }
 }
 
-impl Row for Vec<String> {
+impl Field for Vec<String> {
     type View<'row> = array::Array<'row, &'row str>;
+    const TARGET: desc::Target = desc::Target::StringArray;
 
-    fn decode<'row>(
-        reader: &mut decode::RowReader<'row>,
-    ) -> Result<Self::View<'row>, crate::Error> {
-        reader.arrays().read_text()
+    #[inline]
+    fn read<'row>(
+        column: decode::Column<'row>,
+    ) -> Result<array::Array<'row, &'row str>, crate::Error> {
+        column.array(decode::ArrayElement::String)
     }
 
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        reader.arrays().read_text()?.try_collect()
+    #[inline]
+    fn into_owned<'row>(value: array::Array<'row, &'row str>) -> Result<Self, crate::Error> {
+        value.try_collect()
     }
 }

@@ -2,7 +2,7 @@ use crate::{
     protocol::{Length, Reason, Wire},
     schema::array,
 };
-use std::{convert::identity, ops};
+use std::ops;
 
 pub mod checked;
 
@@ -11,20 +11,13 @@ pub struct RowReader<'a> {
     columns: ops::Range<u16>,
 }
 
-pub struct Scalar<'a, 'b>(&'a mut RowReader<'b>);
-
-pub struct Data<'a, 'b>(&'a mut RowReader<'b>);
-
-pub struct Optional<'a, 'b>(&'a mut RowReader<'b>);
-
-pub struct Arrays<'a, 'b>(&'a mut RowReader<'b>);
-
-struct Column<'a> {
+#[doc(hidden)]
+pub struct Column<'a> {
     buf: Wire<'a>,
     index: u16,
 }
 
-enum Field<'a> {
+pub(crate) enum Field<'a> {
     Data(Column<'a>),
     Null { column: u16 },
 }
@@ -88,7 +81,7 @@ impl<'a> RowReader<'a> {
     }
 
     #[inline]
-    fn take_column(&mut self) -> Result<Field<'a>, crate::Error> {
+    pub(crate) fn take_column(&mut self) -> Result<Field<'a>, crate::Error> {
         let mut columns = self.columns.clone();
         let index = columns
             .next()
@@ -126,32 +119,11 @@ impl<'a> RowReader<'a> {
     }
 
     #[inline]
-    fn require(&mut self) -> Result<Column<'a>, crate::Error> {
+    pub(crate) fn require(&mut self) -> Result<Column<'a>, crate::Error> {
         match self.take_column()? {
             Field::Data(column) => Ok(column),
             Field::Null { column } => Err(crate::Error::Protocol(Reason::ColumnNull { column })),
         }
-    }
-
-    #[inline]
-    pub fn read_i32(&mut self) -> Result<i32, crate::Error> {
-        Ok(i32::from_be_bytes(self.require()?.fixed()?))
-    }
-
-    pub fn scalar(&mut self) -> Scalar<'_, 'a> {
-        Scalar(self)
-    }
-
-    pub fn data(&mut self) -> Data<'_, 'a> {
-        Data(self)
-    }
-
-    pub fn optional(&mut self) -> Optional<'_, 'a> {
-        Optional(self)
-    }
-
-    pub fn arrays(&mut self) -> Arrays<'_, 'a> {
-        Arrays(self)
     }
 }
 
@@ -162,7 +134,7 @@ impl Column<'_> {
             .map_err(|_| crate::Error::Protocol(Reason::RequiredLength { required: N }))
     }
 
-    fn fixed<const N: usize>(&self) -> Result<[u8; N], crate::Error> {
+    pub(crate) fn fixed<const N: usize>(&self) -> Result<[u8; N], crate::Error> {
         match self.buf.as_slice().try_into() {
             Ok(bytes) => Ok(bytes),
             Err(_) => Err(crate::Error::Protocol(Reason::ColumnWidth {
@@ -173,7 +145,8 @@ impl Column<'_> {
         }
     }
 
-    fn read_bool(&self) -> Result<bool, crate::Error> {
+    #[inline]
+    pub(crate) fn read_bool(&self) -> Result<bool, crate::Error> {
         match self.fixed::<1>()? {
             [0] => Ok(false),
             [1] => Ok(true),
@@ -197,119 +170,8 @@ impl Column<'_> {
     }
 }
 
-impl Scalar<'_, '_> {
-    pub fn read_fixed<const N: usize>(&mut self) -> Result<[u8; N], crate::Error> {
-        self.0.require()?.fixed()
-    }
-
-    pub fn read_bool(&mut self) -> Result<bool, crate::Error> {
-        self.0.require()?.read_bool()
-    }
-
-    pub fn read_i16(&mut self) -> Result<i16, crate::Error> {
-        Ok(i16::from_be_bytes(self.read_fixed()?))
-    }
-
-    #[inline]
-    pub fn read_i64(&mut self) -> Result<i64, crate::Error> {
-        Ok(i64::from_be_bytes(self.read_fixed()?))
-    }
-
-    pub fn read_f32(&mut self) -> Result<f32, crate::Error> {
-        Ok(f32::from_be_bytes(self.read_fixed()?))
-    }
-
-    #[inline]
-    pub fn read_f64(&mut self) -> Result<f64, crate::Error> {
-        Ok(f64::from_be_bytes(self.read_fixed()?))
-    }
-}
-
-impl<'b> Data<'_, 'b> {
-    pub fn read_bytes(&mut self) -> Result<&'b [u8], crate::Error> {
-        Ok(self.0.require()?.buf.as_slice())
-    }
-
-    pub fn read_text(&mut self) -> Result<&'b str, crate::Error> {
-        let column = self.0.require()?;
-        text(column.index, column.buf)
-    }
-
-    pub fn read_json(&mut self) -> Result<&'b str, crate::Error> {
-        let column = self.0.require()?;
-        json(column.index, column.buf)
-    }
-}
-
-impl<'b> Optional<'_, 'b> {
-    fn fixed<const N: usize, T>(
-        &mut self,
-        decode: impl FnOnce([u8; N]) -> T,
-    ) -> Result<Option<T>, crate::Error> {
-        let column = match self.0.take_column()? {
-            Field::Data(column) => column,
-            Field::Null { .. } => return Ok(None),
-        };
-        Ok(Some(decode(column.fixed()?)))
-    }
-
-    pub fn read_bool(&mut self) -> Result<Option<bool>, crate::Error> {
-        let column = match self.0.take_column()? {
-            Field::Data(column) => column,
-            Field::Null { .. } => return Ok(None),
-        };
-        Ok(Some(column.read_bool()?))
-    }
-
-    pub fn read_i64(&mut self) -> Result<Option<i64>, crate::Error> {
-        self.fixed::<8, _>(i64::from_be_bytes)
-    }
-
-    pub fn read_i32(&mut self) -> Result<Option<i32>, crate::Error> {
-        self.fixed::<4, _>(i32::from_be_bytes)
-    }
-
-    pub fn read_text(&mut self) -> Result<Option<&'b str>, crate::Error> {
-        let column = match self.0.take_column()? {
-            Field::Data(column) => column,
-            Field::Null { .. } => return Ok(None),
-        };
-        text(column.index, column.buf).map(Some)
-    }
-
-    pub fn read_json(&mut self) -> Result<Option<&'b str>, crate::Error> {
-        let column = match self.0.take_column()? {
-            Field::Data(column) => column,
-            Field::Null { .. } => return Ok(None),
-        };
-        json(column.index, column.buf).map(Some)
-    }
-
-    pub fn read_bytes(&mut self) -> Result<Option<&'b [u8]>, crate::Error> {
-        match self.0.take_column()? {
-            Field::Data(column) => Ok(Some(column.buf.as_slice())),
-            Field::Null { .. } => Ok(None),
-        }
-    }
-
-    pub fn read_i16(&mut self) -> Result<Option<i16>, crate::Error> {
-        self.fixed::<2, _>(i16::from_be_bytes)
-    }
-
-    pub fn read_f32(&mut self) -> Result<Option<f32>, crate::Error> {
-        self.fixed::<4, _>(f32::from_be_bytes)
-    }
-
-    pub fn read_f64(&mut self) -> Result<Option<f64>, crate::Error> {
-        self.fixed::<8, _>(f64::from_be_bytes)
-    }
-
-    pub fn read_uuid(&mut self) -> Result<Option<[u8; 16]>, crate::Error> {
-        self.fixed::<16, _>(identity)
-    }
-}
-
 impl Column<'_> {
+    #[inline]
     fn array_header(&mut self, want: ArrayElement) -> Result<usize, crate::Error> {
         let [a, b, c, d, e, f, g, h, i, j, k, l] = self.take_fixed::<12>()?;
         let ndim = i32::from_be_bytes([a, b, c, d]);
@@ -367,68 +229,60 @@ impl Column<'_> {
 }
 
 #[derive(Clone, Copy)]
-enum ArrayElement {
+pub(crate) enum ArrayElement {
     Exact(u32),
     String,
 }
 
-impl<'b> Arrays<'_, 'b> {
-    pub fn read_i64(&mut self) -> Result<array::Array<'b, i64>, crate::Error> {
-        let mut column = self.0.require()?;
-        let len = column.array_header(ArrayElement::Exact(20))?;
-        Ok(array::Array::new(column.buf, len))
+impl<'row> Column<'row> {
+    pub(crate) fn array<T: array::Element<'row>>(
+        mut self,
+        want: ArrayElement,
+    ) -> Result<array::Array<'row, T>, crate::Error> {
+        let len = self.array_header(want)?;
+        Ok(array::Array::new(self.buf, len))
     }
 
-    pub fn read_i32(&mut self) -> Result<array::Array<'b, i32>, crate::Error> {
-        let mut column = self.0.require()?;
-        let len = column.array_header(ArrayElement::Exact(23))?;
-        Ok(array::Array::new(column.buf, len))
+    pub(crate) fn bytes(self) -> &'row [u8] {
+        self.buf.as_slice()
     }
 
-    pub fn read_text(&mut self) -> Result<array::Array<'b, &'b str>, crate::Error> {
-        let mut column = self.0.require()?;
-        let len = column.array_header(ArrayElement::String)?;
-        Ok(array::Array::new(column.buf, len))
+    #[inline]
+    pub(crate) fn text(self) -> Result<&'row str, crate::Error> {
+        match self.buf.try_text() {
+            Ok(value) => Ok(value.as_str()),
+            Err(error) => Err(crate::Error::Protocol(Reason::TextUtf8 {
+                column: self.index,
+                valid: error.valid,
+                error: error.error,
+            })),
+        }
     }
-}
 
-fn text(column: u16, bytes: Wire<'_>) -> Result<&str, crate::Error> {
-    match bytes.try_text() {
-        Ok(value) => Ok(value.as_str()),
-        Err(error) => Err(crate::Error::Protocol(Reason::TextUtf8 {
-            column,
-            valid: error.valid,
-            error: error.error,
-        })),
-    }
-}
-
-fn json(column: u16, bytes: Wire<'_>) -> Result<&str, crate::Error> {
-    let Some((version, value)) = bytes.split_first() else {
-        return Err(crate::Error::Protocol(Reason::JsonTruncated {
-            column,
-            actual: Length::from_u32(0),
-        }));
-    };
-    if version != 0x01 {
-        return Err(crate::Error::Protocol(Reason::JsonVersion {
-            column,
-            actual: version,
-        }));
-    }
-    match value.try_text() {
-        Ok(value) => Ok(value.as_str()),
-        Err(error) => Err(crate::Error::Protocol(Reason::JsonUtf8 {
-            column,
-            valid: error.valid,
-            error: error.error,
-        })),
+    #[inline]
+    pub(crate) fn json(self) -> Result<&'row str, crate::Error> {
+        let Some((version, value)) = self.buf.split_first() else {
+            return Err(crate::Error::Protocol(Reason::JsonTruncated {
+                column: self.index,
+                actual: Length::from_u32(0),
+            }));
+        };
+        if version != 0x01 {
+            return Err(crate::Error::Protocol(Reason::JsonVersion {
+                column: self.index,
+                actual: version,
+            }));
+        }
+        match value.try_text() {
+            Ok(value) => Ok(value.as_str()),
+            Err(error) => Err(crate::Error::Protocol(Reason::JsonUtf8 {
+                column: self.index,
+                valid: error.valid,
+                error: error.error,
+            })),
+        }
     }
 }
 
 const _: () = assert!(std::mem::size_of::<RowReader<'_>>() == 3 * std::mem::size_of::<usize>());
 const _: () = assert!(std::mem::size_of::<Column<'_>>() == 3 * std::mem::size_of::<usize>());
-const _: () = assert!(std::mem::size_of::<Scalar<'_, '_>>() == std::mem::size_of::<usize>());
-const _: () = assert!(std::mem::size_of::<Data<'_, '_>>() == std::mem::size_of::<usize>());
-const _: () = assert!(std::mem::size_of::<Optional<'_, '_>>() == std::mem::size_of::<usize>());
-const _: () = assert!(std::mem::size_of::<Arrays<'_, '_>>() == std::mem::size_of::<usize>());

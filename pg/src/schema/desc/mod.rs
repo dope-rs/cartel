@@ -7,7 +7,7 @@ mod registry;
 
 #[doc(hidden)]
 pub use formats::Formats;
-use oids::*;
+pub(super) use oids::*;
 #[doc(hidden)]
 pub use registry::Registry;
 pub(crate) const DYNAMIC_LTREE: u8 = 1;
@@ -20,7 +20,8 @@ pub struct Input<'a> {
 
 const _: () = assert!(mem::size_of::<Input<'_>>() <= 5 * mem::size_of::<usize>());
 
-enum Target {
+#[doc(hidden)]
+pub enum Target {
     Exact(u32),
     String,
     StringArray,
@@ -231,195 +232,21 @@ impl<A: Validate, B: Validate, C: Validate, D: Validate> Validate for (A, B, C, 
     }
 }
 
-impl Validate for bool {
+impl<T: schema::Field> Validate for T {
+    const DYNAMIC_TYPES: u8 = T::DYNAMIC_TYPES;
+    const FORMAT: u16 = T::FORMAT;
+
     fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(BOOL))
+        types.match_type(T::TARGET)
     }
 }
 
-impl Validate for i16 {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(INT2))
-    }
-}
-
-impl Validate for i32 {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(INT4))
-    }
-}
-
-impl Validate for i64 {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(INT8))
-    }
-}
-
-impl Validate for f32 {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(FLOAT4))
-    }
-}
-
-impl Validate for f64 {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(FLOAT8))
-    }
-}
-
-impl Validate for Vec<u8> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(BYTEA))
-    }
-}
-
-impl Validate for crate::Uuid {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(UUID))
-    }
-}
-
-impl Validate for crate::Timestamp {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(TIMESTAMP))
-    }
-}
-
-impl Validate for crate::Date {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(DATE))
-    }
-}
-
-impl Validate for crate::Jsonb {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(JSONB))
-    }
-}
-
-impl Validate for Vec<i32> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(INT4_ARRAY))
-    }
-}
-
-impl Validate for Vec<i64> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(INT8_ARRAY))
-    }
-}
-
-impl Validate for String {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::String)
-    }
-}
-
-impl Validate for crate::Text {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::String)
-    }
-}
-
-impl Validate for Vec<String> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::StringArray)
-    }
-}
-
-impl Validate for crate::Ltree {
-    const DYNAMIC_TYPES: u8 = DYNAMIC_LTREE;
-    const FORMAT: u16 = 0;
+impl<T: schema::Field + schema::row::Nullable> Validate for Option<T> {
+    const DYNAMIC_TYPES: u8 = T::DYNAMIC_TYPES;
+    const FORMAT: u16 = T::FORMAT;
 
     fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Ltree)
-    }
-}
-
-impl Validate for Option<bool> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(BOOL))
-    }
-}
-
-impl Validate for Option<i16> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(INT2))
-    }
-}
-
-impl Validate for Option<i32> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(INT4))
-    }
-}
-
-impl Validate for Option<i64> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(INT8))
-    }
-}
-
-impl Validate for Option<f32> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(FLOAT4))
-    }
-}
-
-impl Validate for Option<f64> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(FLOAT8))
-    }
-}
-
-impl Validate for Option<String> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::String)
-    }
-}
-
-impl Validate for Option<crate::Text> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::String)
-    }
-}
-
-impl Validate for Option<crate::Jsonb> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(JSONB))
-    }
-}
-
-impl Validate for Option<crate::Ltree> {
-    const DYNAMIC_TYPES: u8 = DYNAMIC_LTREE;
-    const FORMAT: u16 = 0;
-
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Ltree)
-    }
-}
-
-impl Validate for Option<Vec<u8>> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(BYTEA))
-    }
-}
-
-impl Validate for Option<crate::Uuid> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(UUID))
-    }
-}
-
-impl Validate for Option<crate::Timestamp> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(TIMESTAMP))
-    }
-}
-
-impl Validate for Option<crate::Date> {
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        types.match_type(Target::Exact(DATE))
+        T::validate(types)
     }
 }
 

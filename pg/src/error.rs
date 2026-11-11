@@ -191,12 +191,14 @@ pub enum Error {
 }
 
 impl Error {
+    #[inline]
     pub(crate) fn try_copy(bytes: &[u8]) -> Result<Vec<u8>, Self> {
         let owned: Box<[u8]> =
             alloc::BoxSliceExt::try_copy(bytes).map_err(|error| Self::Allocation(error.into()))?;
         Ok(owned.into_vec())
     }
 
+    #[inline]
     pub(crate) fn try_string(value: &str) -> Result<String, Self> {
         alloc::StrExt::try_to_owned(value).map_err(|error| Self::Allocation(error.into()))
     }
