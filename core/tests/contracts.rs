@@ -7,18 +7,13 @@ use cartel_core::{
     queue, reply,
     reply::{layout, recv, recv::attach::Attach as _, usage},
 };
-use common::Pending;
+use common::{Pending, frame};
 use dope::{
     core::driver::{life::recovery, settings},
     net::link::egress,
 };
 use dope_test::scope::Driver;
-use o3::{
-    base::cell::region,
-    buffer::pool,
-    depot::queue::pool::fair,
-    mem::credit::fair::{Axis, Cause},
-};
+use o3::{base::cell::region, buffer::pool, depot::queue::pool::fair};
 
 #[test]
 fn decimal_suffix() {
@@ -85,34 +80,27 @@ fn restores_input_credit() {
             let success = arena.try_with(
                 replies,
                 token,
-                7,
                 (),
                 11,
                 |token, lane, tag, item| match first.try_ordered(token, lane, tag) {
-                    Ok(depth) => Ok((depth, item)),
+                    Ok(depth) => Ok((frame(&[11; 7]), (item, depth.get()))),
                     Err(cause) => Err((cause, item)),
                 },
-                |item, depth| (item, depth.get()),
             );
-            assert!(success == Ok(1));
+            assert!(success == Ok((11, 1)));
             assert_eq!(requests.weight(token), 7);
-            assert_eq!(requests.pop_front(token), Some(11));
+            assert_eq!(
+                requests.pop_front(token).map(egress::NonEmpty::into_inner),
+                Some([11; 7].as_slice())
+            );
             assert_eq!(requests.weight(token), 0);
 
             let mut second = recv::Response::<_, Pending>::new();
             let built = cell::Cell::new(false);
-            let full = arena.try_publish(
-                replies,
-                token,
-                19,
-                &mut second,
-                (),
-                23,
-                |item| {
-                    built.set(true);
-                    (item, ())
-                },
-            );
+            let full = arena.try_publish(replies, token, &mut second, (), 23, |item| {
+                built.set(true);
+                (frame(&[23; 19]), item)
+            });
             assert!(
                 matches!(full, Err((queue::Failure::Reply(recv::attach::Error::Full {
             len,
@@ -125,28 +113,23 @@ fn restores_input_credit() {
             assert_eq!(replies.depth(token).get(), 1);
 
             assert!(
-                requests.try_push(token, 29, 3).is_ok(),
+                requests.try_push(token, frame(&[29; 3])).is_ok(),
                 "queue must preserve the admitted value"
             );
-            let full = arena.try_publish(
-                replies,
-                token,
-                31,
-                &mut second,
-                (),
-                37,
-                |item| {
-                    built.set(true);
-                    (item, ())
-                },
-            );
+            let full = arena.try_publish(replies, token, &mut second, (), 37, |item| {
+                built.set(true);
+                (frame(&[37; 31]), item)
+            });
             assert!(matches!(
                 full,
                 Err((queue::Failure::Queue(queue::Rejection::Capacity(_)), 37))
             ));
             assert!(!built.get());
             assert_eq!(requests.weight(token), 3);
-            assert_eq!(requests.pop_front(token), Some(29));
+            assert_eq!(
+                requests.pop_front(token).map(egress::NonEmpty::into_inner),
+                Some([29; 3].as_slice())
+            );
             assert_eq!(requests.weight(token), 0);
             assert_eq!(replies.depth(token).get(), 1);
         });
@@ -198,7 +181,7 @@ fn queue_domain() {
             let mut response = recv::Response::<_, Pending>::new();
             assert!(
                 requests
-                    .try_publish(reply, &mut token, (), &mut response, (), 7, |item| (item, ()))
+                    .try_publish(reply, &mut token, &mut response, (), 7, |item| (item, ()))
                     .is_ok()
             );
             assert!(first.is_empty(&token));
@@ -220,15 +203,15 @@ fn lane_weights() {
         .expect("both configured lanes must exist");
 
         assert!(
-            left.try_push(&mut token, 1, 10).is_ok(),
+            left.try_push(&mut token, frame(&[1; 10])).is_ok(),
             "queue must preserve the admitted value"
         );
         assert!(
-            left.try_push(&mut token, 2, 20).is_ok(),
+            left.try_push(&mut token, frame(&[2; 20])).is_ok(),
             "queue must preserve the admitted value"
         );
         assert!(
-            right.try_push(&mut token, 5, 50).is_ok(),
+            right.try_push(&mut token, frame(&[5; 50])).is_ok(),
             "queue must preserve the admitted value"
         );
         assert_eq!(left.weight(&token), 30);
@@ -250,7 +233,7 @@ fn clear_budget() {
                 let arena = queue::Arena::try_unweighted(plan, token).expect("queue storage");
                 let lane = arena.lane(0).expect("queue lane");
                 for value in 0..budget + extra {
-                    lane.try_push(token, value, ()).expect("queue entry");
+                    lane.try_push(token, value).expect("queue entry");
                 }
                 let mut released = 0;
                 assert!(lane.clear(work, token, |_| released += 1) == expected);
@@ -319,38 +302,4 @@ fn deadline_expires_at_clock_limit() {
                 .expect("driver lifecycle");
         },
     );
-}
-
-#[test]
-fn guards_restore_credit() {
-    region::Token::scope(|mut token| {
-        let config = (fair::Plan::new(2, 2)).expect("two slots must fit two lanes");
-        let arena = (queue::Arena::try_new(config, &token)).expect("the queue must allocate");
-        let lane = (arena.lane(1)).expect("the configured lane must exist");
-
-        assert!(
-            lane.try_push(&mut token, 11, usize::MAX).is_ok(),
-            "queue must preserve the admitted value"
-        );
-        assert!(
-            lane.try_push(&mut token, 12, 1)
-                == Err(queue::Rejected {
-                    value: 12,
-                    cause: queue::Rejection::Weight {
-                        lane: 1,
-                        cause: Cause::Overflow {
-                            axis: Axis::at::<0>(),
-                            held: usize::MAX,
-                            requested: 1,
-                        },
-                    },
-                })
-        );
-        assert_eq!(lane.pop_front(&mut token), Some(11));
-        assert!(
-            lane.try_push(&mut token, 12, 9).is_ok(),
-            "queue must preserve the admitted value"
-        );
-        assert_eq!(lane.pop_front(&mut token), Some(12));
-    });
 }

@@ -115,7 +115,6 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             let context =
                 requests::ReplyContext::reserved(&hold, boundary, ctx.as_mut().region_token());
             match client.port.request().try_reply(
-                frame.geometry().wire().widen(),
                 (frame, hold),
                 reply,
                 context,

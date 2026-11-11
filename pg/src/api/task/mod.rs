@@ -150,10 +150,9 @@ where
             cx,
             waiter,
             |reply| reply,
-            |this, client, weight, context| {
+            |this, client, context| {
                 client.port.request().try_with(
                     context,
-                    weight,
                     this,
                     |region, lane, tag, this| {
                         Response::<X>::try_with(region, lane, tag, this, |this| match mem::replace(

@@ -16,10 +16,7 @@ use o3::{
     alloc,
     base::cell::region,
     depot::{self, queue::pool::fair},
-    mem::{
-        credit::fair::{Axis, Cause},
-        quota,
-    },
+    mem::{credit::fair::Cause, quota},
 };
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -31,7 +28,6 @@ pub enum Drain {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Rejection {
     Capacity(Cause<usize>),
-    Weight { lane: usize, cause: Cause<usize> },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -53,25 +49,27 @@ impl From<Rejection> for Failure {
 }
 
 mod sealed {
-    pub trait Weight {}
-    impl Weight for usize {}
-    impl Weight for () {}
+    pub trait Weight<T> {}
+    impl<T> Weight<dope::net::link::egress::NonEmpty<T>> for usize {}
+    impl<T> Weight<T> for () {}
 }
 
-/// The supported per-entry charges: usize weights or no weight accounting.
-pub trait Weight: sealed::Weight + Copy {
-    fn try_add(self, other: Self) -> Result<Self, Cause<usize>>;
+/// Immutable wire lengths or no weight accounting.
+pub trait Weight<T>: sealed::Weight<T> + Copy {
+    fn of(value: &T) -> Self;
+    fn add(self, other: Self) -> Self;
     fn wrapping_sub(self, other: Self) -> Self;
 }
 
-impl Weight for usize {
+impl<T> Weight<egress::NonEmpty<T>> for usize {
     #[inline]
-    fn try_add(self, other: Self) -> Result<Self, Cause<usize>> {
-        self.checked_add(other).ok_or(Cause::Overflow {
-            axis: Axis::at::<0>(),
-            held: self,
-            requested: other,
-        })
+    fn of(value: &egress::NonEmpty<T>) -> Self {
+        value.geometry().wire().into_nonzero().get() as usize
+    }
+
+    #[inline]
+    fn add(self, other: Self) -> Self {
+        self.wrapping_add(other)
     }
 
     #[inline]
@@ -80,29 +78,25 @@ impl Weight for usize {
     }
 }
 
-impl Weight for () {
+impl<T> Weight<T> for () {
     #[inline]
-    fn try_add(self, _: Self) -> Result<Self, Cause<usize>> {
-        Ok(())
-    }
+    fn of(_: &T) -> Self {}
+
+    #[inline]
+    fn add(self, _: Self) -> Self {}
 
     #[inline]
     fn wrapping_sub(self, _: Self) -> Self {}
 }
 
-struct Entry<T, W> {
-    value: T,
-    weight: W,
-}
-
 /// Region-owned fixed storage shared fairly by a fixed number of FIFO lanes.
-pub struct Arena<'d, T, W: Weight = usize> {
-    items: fair::Lanes<'d, Entry<T, W>, W>,
+pub struct Arena<'d, T, W = usize> {
+    items: fair::Lanes<'d, T, W>,
 }
 
 /// A request arena admitted to one exact reply lane domain.
 #[repr(transparent)]
-pub struct Scoped<'b, 'd, T, W: Weight = usize> {
+pub struct Scoped<'b, 'd, T, W = usize> {
     arena: Arena<'d, T, W>,
     domain: marker::PhantomData<fn(&'b ()) -> &'b ()>,
 }
@@ -115,20 +109,13 @@ pub struct Mismatch {
 }
 
 /// A zero-cost typed view of one [`Arena`] lane.
-pub struct Lane<'a, 'd, T, W: Weight = usize> {
-    binding: fair::Binding<'a, 'd, Entry<T, W>, W>,
+pub struct Lane<'a, 'd, T, W = usize> {
+    binding: fair::Binding<'a, 'd, T, W>,
 }
 
-/// Ownership of a detached lane head until its charge is released.
-#[must_use]
-struct Front<'lane, 'd, T, W> {
-    permit: fair::Permit<'lane, 'd, Entry<T, W>, W>,
-    weight: W,
-}
+impl<T, W: Weight<T>> Copy for Lane<'_, '_, T, W> {}
 
-impl<T, W: Weight> Copy for Lane<'_, '_, T, W> {}
-
-impl<T, W: Weight> Clone for Lane<'_, '_, T, W> {
+impl<T, W: Weight<T>> Clone for Lane<'_, '_, T, W> {
     fn clone(&self) -> Self {
         *self
     }
@@ -138,7 +125,10 @@ impl<'d, T: Unpin> Arena<'d, T> {
     pub fn try_new(
         config: fair::Plan,
         token: &region::Token<region::Identity<'d>>,
-    ) -> Result<Self, alloc::Error> {
+    ) -> Result<Self, alloc::Error>
+    where
+        usize: Weight<T>,
+    {
         Ok(Self {
             items: fair::Lanes::try_new(config, token)?,
         })
@@ -155,7 +145,7 @@ impl<'d, T: Unpin> Arena<'d, T> {
     }
 }
 
-impl<'d, T: Unpin, W: Weight> Arena<'d, T, W> {
+impl<'d, T: Unpin, W: Weight<T>> Arena<'d, T, W> {
     pub fn lane(&self, lane: usize) -> Option<Lane<'_, 'd, T, W>> {
         Some(Lane {
             binding: self.items.bind(lane)?,
@@ -182,7 +172,7 @@ impl<'d, T: Unpin, W: Weight> Arena<'d, T, W> {
     }
 }
 
-impl<'b, 'd, T: Unpin, W: Weight> Scoped<'b, 'd, T, W> {
+impl<'b, 'd, T: Unpin, W: Weight<T>> Scoped<'b, 'd, T, W> {
     pub fn lane<ID: Identity>(&self, position: layout::Position<'b, 'd, ID>) -> Lane<'_, 'd, T, W> {
         let index = position.connection().index().into_usize();
         // SAFETY: Position retains a checked index in the exact invariant domain
@@ -211,7 +201,6 @@ impl<'b, 'd, T: Unpin, W: Weight> Scoped<'b, 'd, T, W> {
         &self,
         replies: reply::Lane<'s, 'b, 'c, 'd, D, E, K>,
         token: &mut region::Token<region::Identity<'d>>,
-        weight: W,
         reply: &mut impl attach::Attach<'s, 'b, 'c, 'd, D, E, K>,
         tag: K,
         input: I,
@@ -220,23 +209,20 @@ impl<'b, 'd, T: Unpin, W: Weight> Scoped<'b, 'd, T, W> {
         self.try_with(
             replies,
             token,
-            weight,
             tag,
             input,
             |token, replies, tag, input| match reply.try_tagged(token, replies, tag) {
-                Ok(()) => Ok(((), input)),
+                Ok(()) => Ok(build(input)),
                 Err(cause) => Err((cause, input)),
             },
-            |input, ()| build(input),
         )
     }
 
     /// Retains owned preparation input until reply admission succeeds.
-    pub fn try_with<'s, 'c, D: Footprint, E, K, I, J, P, R>(
+    pub fn try_with<'s, 'c, D: Footprint, E, K, I, R>(
         &self,
         replies: reply::Lane<'s, 'b, 'c, 'd, D, E, K>,
         token: &mut region::Token<region::Identity<'d>>,
-        weight: W,
         tag: K,
         input: I,
         prepare: impl FnOnce(
@@ -244,18 +230,15 @@ impl<'b, 'd, T: Unpin, W: Weight> Scoped<'b, 'd, T, W> {
             reply::Lane<'s, 'b, 'c, 'd, D, E, K>,
             K,
             I,
-        ) -> Result<(P, J), (attach::Error, I)>,
-        build: impl FnOnce(J, P) -> (T, R),
+        ) -> Result<(T, R), (attach::Error, I)>,
     ) -> Result<R, (Failure, I)> {
         self.lane_for(replies).try_with(
             token,
-            weight,
             input,
             |token, input| {
                 prepare(token, replies, tag, input)
                     .map_err(|(cause, input)| (Failure::Reply(cause), input))
             },
-            build,
         )
     }
 }
@@ -266,7 +249,7 @@ impl<'d, T: Unpin> Lane<'_, 'd, T> {
     }
 }
 
-impl<'lane, 'd, T: Unpin, W: Weight> Lane<'lane, 'd, T, W> {
+impl<'lane, 'd, T: Unpin, W: Weight<T>> Lane<'lane, 'd, T, W> {
     pub const fn index(self) -> usize {
         self.binding.index()
     }
@@ -283,70 +266,43 @@ impl<'lane, 'd, T: Unpin, W: Weight> Lane<'lane, 'd, T, W> {
         self,
         token: &mut region::Token<region::Identity<'d>>,
         item: T,
-        weight: W,
     ) -> Result<(), Rejected<T>> {
-        self.try_with(
-            token,
-            weight,
-            item,
-            |_, item| Ok(((), item)),
-            |item, ()| (item, ()),
-        )
-        .map_err(|(cause, value)| Rejected { value, cause })
+        self.try_with(token, item, |_, item| Ok((item, ())))
+            .map_err(|(cause, value)| Rejected { value, cause })
     }
 
-    pub fn try_with<I, J, P, R, E: From<Rejection>>(
+    pub fn try_with<I, R, E: From<Rejection>>(
         self,
         token: &mut region::Token<region::Identity<'d>>,
-        weight: W,
         input: I,
-        prepare: impl FnOnce(&mut region::Token<region::Identity<'d>>, I) -> Result<(P, J), (E, I)>,
-        build: impl FnOnce(J, P) -> (T, R),
+        prepare: impl FnOnce(&mut region::Token<region::Identity<'d>>, I) -> Result<(T, R), (E, I)>,
     ) -> Result<R, (E, I)> {
-        let front = match self.try_reserve(token, weight) {
-            Ok(front) => front,
-            Err(cause) => return Err((E::from(cause), input)),
+        let permit = match self.binding.reserve() {
+            Ok(permit) => permit,
+            Err(cause) => return Err((E::from(Rejection::Capacity(cause)), input)),
         };
-        let (proof, input) = match prepare(token, input) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                front.release(token);
-                return Err(error);
-            }
-        };
-        let (item, output) = build(input, proof);
-        front.publish(token, item);
+        let (item, output) = prepare(token, input)?;
+        // Fair entitlements bound the sum by u32::MAX * i32::MAX on the
+        // supported o3 layouts; unpublished reservations carry no wire weight.
+        let held = permit.state_mut(token);
+        *held = held.add(W::of(&item));
+        permit.push_back(token, item);
         Ok(output)
     }
 
-    fn try_reserve(
-        self,
+    fn release(
+        permit: fair::Permit<'lane, 'd, T, W>,
         token: &mut region::Token<region::Identity<'d>>,
         weight: W,
-    ) -> Result<Front<'lane, 'd, T, W>, Rejection> {
-        let held = *self.binding.view(token).state().value();
-        let total = held.try_add(weight).map_err(|cause| Rejection::Weight {
-            lane: self.index(),
-            cause,
-        })?;
-        let permit = self.binding.reserve().map_err(Rejection::Capacity)?;
-        *permit.state_mut(token) = total;
-        Ok(Front { permit, weight })
+    ) {
+        let held = permit.state_mut(token);
+        *held = held.wrapping_sub(weight);
     }
 
     pub fn pop_front(self, token: &mut region::Token<region::Identity<'d>>) -> Option<T> {
-        let (item, front) = self.take_front(token)?;
-        front.release(token);
+        let (item, permit) = self.binding.take_front(token)?;
+        Self::release(permit, token, W::of(&item));
         Some(item)
-    }
-
-    fn take_front(
-        self,
-        token: &mut region::Token<region::Identity<'d>>,
-    ) -> Option<(T, Front<'lane, 'd, T, W>)> {
-        let (entry, permit) = self.binding.take_front(token)?;
-        let Entry { value, weight } = entry;
-        Some((value, Front { permit, weight }))
     }
 
     pub fn clear(
@@ -366,7 +322,7 @@ impl<'lane, 'd, T: Unpin, W: Weight> Lane<'lane, 'd, T, W> {
     }
 }
 
-impl<'lane, 'd, T: Unpin + data::raw::Payload<'d>, W: Weight>
+impl<'lane, 'd, T: Unpin + data::raw::Payload<'d>, W: Weight<egress::NonEmpty<T>>>
     Lane<'lane, 'd, egress::NonEmpty<T>, W>
 {
     /// Moves source heads through owned exact final-link admission.
@@ -374,12 +330,11 @@ impl<'lane, 'd, T: Unpin + data::raw::Payload<'d>, W: Weight>
         mut self,
         requests: &mut request::Requests<'_, '_, '_, 'd, T, KeyTag<ID>>,
     ) -> Result<(), exact::Failure> {
-        while let Some(((entry, permit), work)) = requests.claim(&mut self.binding) {
-            let Entry { value, weight } = entry;
-            let front = Front { permit, weight };
+        while let Some(((value, permit), work)) = requests.claim(&mut self.binding) {
+            let weight = W::of(&value);
             let (value, result) = match work.admit(value) {
                 request::Admission::Ready(ready) => {
-                    ready.push_with(|token| front.release(token));
+                    ready.push_with(|token| Self::release(permit, token, weight));
                     continue;
                 }
                 request::Admission::Saturated(value) => (value, Ok(())),
@@ -388,40 +343,10 @@ impl<'lane, 'd, T: Unpin + data::raw::Payload<'d>, W: Weight>
                     (value, Err(cause))
                 }
             };
-            front.restore(requests.region(), value);
+            permit.push_front(requests.region(), value);
             return result;
         }
         Ok(())
-    }
-}
-
-impl<'d, T: Unpin, W: Weight> Front<'_, 'd, T, W> {
-    fn publish(self, token: &mut region::Token<region::Identity<'d>>, value: T) {
-        self.permit.push_back(
-            token,
-            Entry {
-                value,
-                weight: self.weight,
-            },
-        );
-    }
-
-    fn restore(self, token: &mut region::Token<region::Identity<'d>>, value: T) {
-        self.permit.push_front(
-            token,
-            Entry {
-                value,
-                weight: self.weight,
-            },
-        );
-    }
-
-    /// Checked admission adds each charge once. Entries and detached guards
-    /// stay in this permit's lane; consuming this guard refunds its charge.
-    /// A forgotten guard can only leave excess held weight.
-    fn release(self, token: &mut region::Token<region::Identity<'d>>) {
-        let held = self.permit.state_mut(token);
-        *held = held.wrapping_sub(self.weight);
     }
 }
 
@@ -429,10 +354,7 @@ const _: () = {
     const WORD: usize = size_of::<usize>();
 
     assert!(usize::BITS >= u32::BITS);
-    assert!(size_of::<Entry<usize, usize>>() == 2 * WORD);
-    assert!(size_of::<Entry<usize, ()>>() == WORD);
     assert!(size_of::<Arena<'static, u64>>() == 5 * WORD);
     assert!(size_of::<Scoped<'static, 'static, u64>>() == size_of::<Arena<'static, u64>>());
     assert!(size_of::<Lane<'static, 'static, u64>>() == 2 * WORD);
-    assert!(size_of::<Front<'static, 'static, u64, usize>>() == 3 * WORD);
 };

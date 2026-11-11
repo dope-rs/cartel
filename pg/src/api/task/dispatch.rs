@@ -1,4 +1,4 @@
-use std::{mem, num::NonZero, pin::Pin, task::Poll};
+use std::{mem, pin::Pin, task::Poll};
 
 use cartel_core::deadline;
 use dope::core::driver::schedule::clock::{self, timer};
@@ -52,7 +52,6 @@ impl<
         mut prepare: impl FnMut(
             &'this mut Self,
             api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-            NonZero<usize>,
             requests::ReplyContext<'_, 'app, 'd, ID>,
         ) -> Result<
             O,
@@ -86,7 +85,6 @@ impl<
                     .maintain(cx.as_ref().work(), cx.as_mut().region_token());
                 let unpinned = target.is_none();
                 let boundary = request.boundary.into();
-                let weight = request.frame.geometry().wire().widen();
                 let mut this = this;
                 let error = 'failed: {
                     if let Err(error) = api::check_open(client) {
@@ -112,7 +110,6 @@ impl<
                                 let (error, source, next) = match prepare(
                                     this,
                                     client,
-                                    weight,
                                     source.context(boundary, cx.as_mut().region_token()),
                                 ) {
                                     Ok(output) => {

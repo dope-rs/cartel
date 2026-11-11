@@ -202,10 +202,9 @@ where
                     cx.as_mut(),
                     this.waiter.as_ref(),
                     |_| (),
-                    |admit, client, weight, context| {
+                    |admit, client, context| {
                         client.port.request().try_with(
                             context,
-                            weight,
                             admit,
                             |token, lane, tag, admit| {
                                 let State::Connecting { request, .. } = &*admit else {

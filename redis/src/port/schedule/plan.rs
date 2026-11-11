@@ -51,7 +51,7 @@ impl<'app, 's, 'b, 'c, 'd, const ID: u8> schedule::Schedule<'s, 'app, 'b, 'c, 'd
             }
             match self
                 .queue
-                .try_publish(reps, region, (), reply, (), frame, |frame| {
+                .try_publish(reps, region, reply, (), frame, |frame| {
                     conn.unlink::<0>(token);
                     (frame.into_frame(), token)
                 }) {
@@ -89,7 +89,7 @@ impl<'app, 's, 'b, 'c, 'd, const ID: u8> schedule::Schedule<'s, 'app, 'b, 'c, 'd
         let reps = self.lane(conn.position());
         match self
             .queue
-            .try_publish(reps, region, (), reply, (), frame, |frame| {
+            .try_publish(reps, region, reply, (), frame, |frame| {
                 (frame.into_frame(), token)
             }) {
             Ok(done) => {

@@ -1,4 +1,4 @@
-use std::{mem, num::NonZero};
+use std::mem;
 
 use cartel_core::{frame, queue, reply};
 use dope::{
@@ -107,7 +107,6 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
     pub(crate) fn try_with<'a, J, K, R>(
         &self,
         context: ReplyContext<'_, 'a, 'd, ID>,
-        weight: NonZero<usize>,
         input: J,
         prepare: impl FnOnce(
             &mut region::Token<region::Identity<'d>>,
@@ -137,14 +136,13 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         let result = self.port.request_queue.try_with(
             replies,
             region,
-            weight.get(),
             replies::Tag::new(batch, boundary),
             (source, input),
-            |region, lane, tag, (source, input)| match prepare(region, lane, tag, input) {
-                Ok((depth, output)) => Ok((depth, (source, output))),
-                Err((cause, input)) => Err((cause, (source, input))),
-            },
-            |(source, input), depth| {
+            |region, lane, tag, (source, input)| {
+                let (depth, input) = match prepare(region, lane, tag, input) {
+                    Ok(prepared) => prepared,
+                    Err((cause, input)) => return Err((cause, (source, input))),
+                };
                 let (bytes, done) = build(input, token);
                 if !permit.commit() {
                     self.port.shared.wake_ready();
@@ -152,7 +150,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
                 if let Source::Shared(listed) = source {
                     listed.reprioritize(depth.get() + conn.barriers());
                 }
-                (bytes, done)
+                Ok((bytes, done))
             },
         );
         match result {
@@ -204,7 +202,6 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
 
     pub(crate) fn try_reply<'a, J, R>(
         &self,
-        weight: NonZero<usize>,
         input: J,
         reply: &mut impl attach::Attach<
             'life,
@@ -220,7 +217,6 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
     ) -> Result<R, (Rejection, Source<'a, 'd, ID>, J)> {
         self.try_with(
             context,
-            weight,
             input,
             |token, lane, tag, input| match reply.try_ordered(token, lane, tag) {
                 Ok(depth) => Ok((depth, input)),
@@ -242,9 +238,8 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         let ready = conn.ready(token)?;
         let requests = self.request_lane(token);
         let queued = requests.weight(region);
-        let weight = bytes.geometry().wire().widen().get();
         requests
-            .try_push(region, bytes, weight)
+            .try_push(region, bytes)
             .map_err(|queue::Rejected { cause, .. }| error::Error::RequestQueue {
                 queued,
                 cause,
@@ -300,13 +295,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         let requests = self.request_lane(token);
         let queued = requests.weight(region);
         let unchanged = requests
-            .try_with(
-                region,
-                encode::COPY_DONE_SYNC.len(),
-                bytes,
-                |_, bytes| Ok(((), bytes)),
-                |bytes, ()| (bytes, sync.commit()),
-            )
+            .try_with(region, bytes, |_, bytes| Ok((bytes, sync.commit())))
             .map_err(|(cause, _)| error::Error::RequestQueue { queued, cause })?;
         if !unchanged {
             self.port.shared.wake_ready();
