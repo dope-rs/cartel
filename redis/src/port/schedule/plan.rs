@@ -1,4 +1,4 @@
-use cartel_core::{handoff, reply};
+use cartel_core::{queue, reply};
 use dope::{core::driver::route, manifold::client::conn::Id};
 use o3::base::cell::region;
 use reply::recv::attach;
@@ -49,25 +49,20 @@ impl<'app, 's, 'b, 'c, 'd, const ID: u8> schedule::Schedule<'s, 'app, 'b, 'c, 'd
                     )));
                 }
             }
-            match handoff::Lane::new(&self.queue, reps).try_publish(
-                region,
-                (),
-                reply,
-                (),
-                frame,
-                |frame| {
+            match self
+                .queue
+                .try_publish(reps, region, (), reply, (), frame, |frame| {
                     conn.unlink::<0>(token);
                     (frame.into_frame(), token)
-                },
-            ) {
+                }) {
                 Ok(done) => {
                     conn.wake();
                     return Ok(done);
                 }
-                Err((handoff::Failure::Reply(cause), _)) => {
+                Err((queue::Failure::Reply(cause), _)) => {
                     return Err(Reject::Failed(Error::Reply(cause)));
                 }
-                Err((handoff::Failure::Queue(cause), retained)) => {
+                Err((queue::Failure::Queue(cause), retained)) => {
                     frame = retained;
                     blocked = Block::Queue(cause);
                 }
@@ -92,23 +87,20 @@ impl<'app, 's, 'b, 'c, 'd, const ID: u8> schedule::Schedule<'s, 'app, 'b, 'c, 'd
             return Err(Reject::Failed(Error::Unavailable));
         };
         let reps = self.lane(conn.position());
-        match handoff::Lane::new(&self.queue, reps).try_publish(
-            region,
-            (),
-            reply,
-            (),
-            frame,
-            |frame| (frame.into_frame(), token),
-        ) {
+        match self
+            .queue
+            .try_publish(reps, region, (), reply, (), frame, |frame| {
+                (frame.into_frame(), token)
+            }) {
             Ok(done) => {
                 conn.wake();
                 Ok(done)
             }
-            Err((handoff::Failure::Queue(cause), frame)) => Err(Reject::Blocked {
+            Err((queue::Failure::Queue(cause), frame)) => Err(Reject::Blocked {
                 cause: Block::Queue(cause),
                 frame,
             }),
-            Err((handoff::Failure::Reply(cause), _)) => Err(Reject::Failed(Error::Reply(cause))),
+            Err((queue::Failure::Reply(cause), _)) => Err(Reject::Failed(Error::Reply(cause))),
         }
     }
 }

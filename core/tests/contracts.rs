@@ -4,7 +4,7 @@ use std::{cell, convert::Infallible};
 
 use cartel_core::{
     frame::{Buffer, Sensitivity},
-    handoff, queue, reply,
+    queue, reply,
     reply::{layout, recv, recv::attach::Attach as _, usage},
 };
 use common::Pending;
@@ -82,7 +82,8 @@ fn restores_input_credit() {
             let requests = arena.lane_for(replies);
             let token = &mut token;
             let mut first = recv::Response::<_, Pending>::new();
-            let success = handoff::Lane::new(&arena, replies).try_with(
+            let success = arena.try_with(
+                replies,
                 token,
                 7,
                 (),
@@ -100,7 +101,8 @@ fn restores_input_credit() {
 
             let mut second = recv::Response::<_, Pending>::new();
             let built = cell::Cell::new(false);
-            let full = handoff::Lane::new(&arena, replies).try_publish(
+            let full = arena.try_publish(
+                replies,
                 token,
                 19,
                 &mut second,
@@ -112,7 +114,7 @@ fn restores_input_credit() {
                 },
             );
             assert!(
-                matches!(full, Err((handoff::Failure::Reply(recv::attach::Error::Full {
+                matches!(full, Err((queue::Failure::Reply(recv::attach::Error::Full {
             len,
             capacity,
         }), 23)) if len.get() == 1 && capacity.get() == 1)
@@ -126,7 +128,8 @@ fn restores_input_credit() {
                 requests.try_push(token, 29, 3).is_ok(),
                 "queue must preserve the admitted value"
             );
-            let full = handoff::Lane::new(&arena, replies).try_publish(
+            let full = arena.try_publish(
+                replies,
                 token,
                 31,
                 &mut second,
@@ -139,7 +142,7 @@ fn restores_input_credit() {
             );
             assert!(matches!(
                 full,
-                Err((handoff::Failure::Queue(queue::Rejection::Capacity(_)), 37))
+                Err((queue::Failure::Queue(queue::Rejection::Capacity(_)), 37))
             ));
             assert!(!built.get());
             assert_eq!(requests.weight(token), 3);
@@ -194,8 +197,8 @@ fn queue_domain() {
             let second = requests.lane_for(reply);
             let mut response = recv::Response::<_, Pending>::new();
             assert!(
-                handoff::Lane::new(&requests, reply)
-                    .try_publish(&mut token, (), &mut response, (), 7, |item| (item, ()))
+                requests
+                    .try_publish(reply, &mut token, (), &mut response, (), 7, |item| (item, ()))
                     .is_ok()
             );
             assert!(first.is_empty(&token));

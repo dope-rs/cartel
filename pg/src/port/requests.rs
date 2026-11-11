@@ -1,6 +1,6 @@
 use std::{mem, num::NonZero};
 
-use cartel_core::{frame, handoff, queue, reply};
+use cartel_core::{frame, queue, reply};
 use dope::{
     core::driver::{route::KeyTag, schedule::app},
     manifold::client::{app::request, close, conn},
@@ -134,7 +134,8 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         let replies = self.port.lane(token.lane());
         let conn = permit.slot();
         let batch = permit.batch();
-        let result = handoff::Lane::new(&self.port.request_queue, replies).try_with(
+        let result = self.port.request_queue.try_with(
+            replies,
             region,
             weight.get(),
             replies::Tag::new(batch, boundary),
@@ -159,7 +160,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
                 conn.wake();
                 Ok(done)
             }
-            Err((handoff::Failure::Reply(cause), (source, input))) => {
+            Err((queue::Failure::Reply(cause), (source, input))) => {
                 let cause = match cause {
                     attach::Error::Full { len, capacity } => {
                         Rejection::Pressure(Pressure::Full { len, capacity })
@@ -182,7 +183,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
                 };
                 Err((cause, source, input))
             }
-            Err((handoff::Failure::Queue(cause), (source, input))) => {
+            Err((queue::Failure::Queue(cause), (source, input))) => {
                 let queued = self.port.request_queue.lane_for(replies).weight(region);
                 let cause = match cause {
                     queue::Rejection::Capacity(fair::Cause::Exhausted {

@@ -11,7 +11,7 @@ use dope::{
     net::link::egress::{self, data, reserve::exact},
 };
 
-use crate::reply::{self, layout, usage::Footprint};
+use crate::reply::{self, layout, recv::attach, usage::Footprint};
 use o3::{
     alloc,
     base::cell::region,
@@ -38,6 +38,18 @@ pub enum Rejection {
 pub struct Rejected<T> {
     pub value: T,
     pub cause: Rejection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Failure {
+    Reply(attach::Error),
+    Queue(Rejection),
+}
+
+impl From<Rejection> for Failure {
+    fn from(cause: Rejection) -> Self {
+        Self::Queue(cause)
+    }
 }
 
 mod sealed {
@@ -192,6 +204,59 @@ impl<'b, 'd, T: Unpin, W: Weight> Scoped<'b, 'd, T, W> {
         Lane {
             binding: fair::Binding::from_source(proof),
         }
+    }
+
+    /// Reserves both sides before consuming input or publishing the request.
+    pub fn try_publish<'s, 'c, D: Footprint, E, K, I, R>(
+        &self,
+        replies: reply::Lane<'s, 'b, 'c, 'd, D, E, K>,
+        token: &mut region::Token<region::Identity<'d>>,
+        weight: W,
+        reply: &mut impl attach::Attach<'s, 'b, 'c, 'd, D, E, K>,
+        tag: K,
+        input: I,
+        build: impl FnOnce(I) -> (T, R),
+    ) -> Result<R, (Failure, I)> {
+        self.try_with(
+            replies,
+            token,
+            weight,
+            tag,
+            input,
+            |token, replies, tag, input| match reply.try_tagged(token, replies, tag) {
+                Ok(()) => Ok(((), input)),
+                Err(cause) => Err((cause, input)),
+            },
+            |input, ()| build(input),
+        )
+    }
+
+    /// Retains owned preparation input until reply admission succeeds.
+    pub fn try_with<'s, 'c, D: Footprint, E, K, I, J, P, R>(
+        &self,
+        replies: reply::Lane<'s, 'b, 'c, 'd, D, E, K>,
+        token: &mut region::Token<region::Identity<'d>>,
+        weight: W,
+        tag: K,
+        input: I,
+        prepare: impl FnOnce(
+            &mut region::Token<region::Identity<'d>>,
+            reply::Lane<'s, 'b, 'c, 'd, D, E, K>,
+            K,
+            I,
+        ) -> Result<(P, J), (attach::Error, I)>,
+        build: impl FnOnce(J, P) -> (T, R),
+    ) -> Result<R, (Failure, I)> {
+        self.lane_for(replies).try_with(
+            token,
+            weight,
+            input,
+            |token, input| {
+                prepare(token, replies, tag, input)
+                    .map_err(|(cause, input)| (Failure::Reply(cause), input))
+            },
+            build,
+        )
     }
 }
 
