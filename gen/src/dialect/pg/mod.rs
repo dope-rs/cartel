@@ -95,26 +95,21 @@ impl PgBackend {
         let mut text = false;
         for &(fn_idx, _) in caps {
             let (_, ty) = &params[fn_idx];
-            let bind = ty.bind()?;
-            let oid = bind.oid;
-            oids.push(quote::quote! { #oid });
-            fmts.push(bind.format);
-            if bind.format == 0 {
-                text = true;
-            }
+            let meta = ty.param()?;
+            oids.push(
+                quote::quote! { <#meta as ::cartel_pg::protocol::value::encode::Param>::OID },
+            );
+            fmts.push(
+                quote::quote! { <#meta as ::cartel_pg::protocol::value::encode::Param>::FORMAT },
+            );
+            text |= ty.format() == 0;
             let idx = syn::Index::from(fn_idx);
-            let target = match bind.target {
-                types::Target::Scalar => quote::format_ident!("scalar"),
-                types::Target::Data => quote::format_ident!("data"),
-                types::Target::Array => quote::format_ident!("array"),
+            let arg = if matches!(ty, syn::Type::Reference(_)) {
+                quote::quote! { #args.#idx }
+            } else {
+                quote::quote! { &#args.#idx }
             };
-            let method = bind.method;
-            let arg = match bind.arg {
-                types::Arg::Move => quote::quote! { #args.#idx },
-                types::Arg::Borrow => quote::quote! { #args.#idx.as_ref() },
-                types::Arg::UuidBytes => quote::quote! { #args.#idx.into_bytes() },
-            };
-            calls.push(quote::quote! { #writer.#target().#method(#arg)?; });
+            calls.push(quote::quote! { #writer.param(#arg)?; });
         }
 
         let decl = if text {

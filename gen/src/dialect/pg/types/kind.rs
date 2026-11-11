@@ -1,4 +1,3 @@
-use crate::dialect::pg::types;
 use crate::dialect::pg::types::tag::Tag;
 
 pub(super) struct Kind<'a> {
@@ -103,55 +102,35 @@ impl<'a> Kind<'a> {
         }
     }
 
-    pub(super) fn bind(self) -> syn::Result<types::Bind> {
+    pub(super) fn param(self) -> syn::Result<&'a syn::Type> {
         match self.tag {
-            Tag::Bool => Ok(types::Bind::scalar(16, "write_bool")),
-            Tag::I16 => Ok(types::Bind::scalar(21, "write_i16")),
-            Tag::I32 => Ok(types::Bind::scalar(23, "write_i32")),
-            Tag::I64 => Ok(types::Bind::scalar(20, "write_i64")),
-            Tag::F32 => Ok(types::Bind::scalar(700, "write_f32")),
-            Tag::F64 => Ok(types::Bind::scalar(701, "write_f64")),
-            Tag::String | Tag::Text => Ok(types::Bind::data(25, "write_text").borrow()),
-            Tag::Jsonb => Ok(types::Bind::data(3802, "write_jsonb").borrow()),
-            Tag::Uuid => Ok(types::Bind::data(2950, "write_uuid").arg(types::Arg::UuidBytes)),
-            Tag::Timestamp => Ok(types::Bind::data(1114, "write_time")),
-            Tag::Date => Ok(types::Bind::data(1082, "write_date")),
-            Tag::Ltree => Ok(types::Bind::data(25, "write_ltree").borrow().text()),
-            Tag::VecU8 => Ok(types::Bind::data(17, "write_bytes").borrow()),
-            Tag::RefStr => Ok(types::Bind::data(25, "write_text")),
-            Tag::SliceU8 => Ok(types::Bind::data(17, "write_bytes")),
-            Tag::SliceI16 => Ok(types::Bind::array(1005, "write_i16")),
-            Tag::SliceI32 => Ok(types::Bind::array(1007, "write_i32")),
-            Tag::SliceI64 => Ok(types::Bind::array(1016, "write_i64")),
-            Tag::SliceF32 => Ok(types::Bind::array(1021, "write_f32")),
-            Tag::SliceF64 => Ok(types::Bind::array(1022, "write_f64")),
-            Tag::SliceBool => Ok(types::Bind::array(1000, "write_bool")),
-            Tag::SliceStr => Ok(types::Bind::array(1009, "write_text")),
-            Tag::U8
-            | Tag::U32
-            | Tag::Str
-            | Tag::VecI32
-            | Tag::VecI64
-            | Tag::VecString
-            | Tag::VecOther
-            | Tag::OptBool
-            | Tag::OptI16
-            | Tag::OptI32
-            | Tag::OptI64
-            | Tag::OptF32
-            | Tag::OptF64
-            | Tag::OptString
-            | Tag::OptText
-            | Tag::OptJsonb
-            | Tag::OptUuid
-            | Tag::OptTimestamp
-            | Tag::OptDate
-            | Tag::OptLtree
-            | Tag::OptBytes
-            | Tag::OptOther
-            | Tag::RefOther
-            | Tag::Named
-            | Tag::Unsupported => Err(syn::Error::new_spanned(
+            Tag::Bool
+            | Tag::I16
+            | Tag::I32
+            | Tag::I64
+            | Tag::F32
+            | Tag::F64
+            | Tag::String
+            | Tag::Text
+            | Tag::Jsonb
+            | Tag::Uuid
+            | Tag::Timestamp
+            | Tag::Date
+            | Tag::Ltree
+            | Tag::VecU8
+            | Tag::RefStr
+            | Tag::SliceU8
+            | Tag::SliceI16
+            | Tag::SliceI32
+            | Tag::SliceI64
+            | Tag::SliceF32
+            | Tag::SliceF64
+            | Tag::SliceBool
+            | Tag::SliceStr => Ok(match self.syntax {
+                syn::Type::Reference(value) => &value.elem,
+                value => value,
+            }),
+            _ => Err(syn::Error::new_spanned(
                 self.cause,
                 "#[query] cannot bind this parameter type",
             )),

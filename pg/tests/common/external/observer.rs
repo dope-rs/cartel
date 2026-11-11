@@ -24,7 +24,7 @@ impl schema::TypedQuery for Observer {
     const N_RESULT_COLS: u16 = 1;
 
     fn encode(pid: i32, writer: &mut BindWriter<'_, '_>) -> Result<(), encode::Error> {
-        writer.scalar().write_i32(pid)
+        writer.param(&pid)
     }
 }
 

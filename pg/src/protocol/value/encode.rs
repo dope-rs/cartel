@@ -1,4 +1,7 @@
-use crate::protocol::encode;
+use crate::{
+    protocol::encode,
+    schema::{desc, sealed},
+};
 use o3::buffer::write::Sink as _;
 
 fn wire_length(value: usize) -> Result<i32, encode::Error> {
@@ -24,26 +27,9 @@ fn write_with_len(out: &mut encode::Writer<'_>, payload: &[u8]) -> Result<(), en
     out.write_slices([&wire_length(payload.len())?.to_be_bytes(), payload])
 }
 
-fn write_array(
-    values: &mut BindWriter<'_, '_>,
-    oid: u32,
-    element: u32,
-    len: usize,
-    write: impl FnOnce(&mut encode::Writer<'_>) -> Result<(), encode::Error>,
-) -> Result<(), encode::Error> {
-    values.write(oid, 1, |out| {
-        let count = count32(len)?;
-        out.patch::<false, _>(|out| {
-            out.write_slices([
-                &1i32.to_be_bytes(),
-                &0i32.to_be_bytes(),
-                &element.to_be_bytes(),
-                &count.to_be_bytes(),
-                &1i32.to_be_bytes(),
-            ])?;
-            write(out)
-        })
-    })
+fn jsonb_payload(out: &mut encode::Writer<'_>, value: &str) -> Result<(), encode::Error> {
+    let len = value.len() + 1;
+    out.write_slices([&wire_length(len)?.to_be_bytes(), &[0x01], value.as_bytes()])
 }
 
 /// Encoding retains the exact parameter domains admitted for its query type.
@@ -74,16 +60,20 @@ impl<'a, 'out> BindWriter<'a, 'out> {
         Ok(())
     }
 
-    pub fn scalar(&mut self) -> Scalar<'_, 'a, 'out> {
-        Scalar(self)
+    pub fn param<P: Param + ?Sized>(&mut self, value: &P) -> Result<(), encode::Error> {
+        self.write(P::OID, P::FORMAT, |out| value.payload(out))
     }
 
-    pub fn data(&mut self) -> Data<'_, 'a, 'out> {
-        Data(self)
+    pub fn write_jsonb(&mut self, value: &str) -> Result<(), encode::Error> {
+        self.write(crate::Jsonb::OID, crate::Jsonb::FORMAT, |out| {
+            jsonb_payload(out, value)
+        })
     }
 
-    pub fn array(&mut self) -> Array<'_, 'a, 'out> {
-        Array(self)
+    pub fn write_ltree(&mut self, value: &str) -> Result<(), encode::Error> {
+        self.write(crate::Ltree::OID, crate::Ltree::FORMAT, |out| {
+            write_with_len(out, value.as_bytes())
+        })
     }
 
     pub(crate) fn finish(self) -> Result<(), encode::Error> {
@@ -155,164 +145,225 @@ impl<'a, 'out> BindWriter<'a, 'out> {
     }
 }
 
-#[repr(transparent)]
-pub struct Scalar<'a, 'values, 'out>(&'a mut BindWriter<'values, 'out>);
+/// One supported parameter's static wire type and length-prefixed payload.
+#[doc(hidden)]
+pub trait Param: sealed::Sealed {
+    const OID: u32;
+    const FORMAT: u16 = 1;
 
-impl Scalar<'_, '_, '_> {
-    #[inline]
-    pub fn write_bool(&mut self, value: bool) -> Result<(), encode::Error> {
-        self.0
-            .write(16, 1, |out| write_with_len(out, &[value as u8]))
-    }
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error>;
+}
 
-    #[inline]
-    pub fn write_i16(&mut self, value: i16) -> Result<(), encode::Error> {
-        self.0
-            .write(21, 1, |out| write_with_len(out, &value.to_be_bytes()))
-    }
+impl sealed::Sealed for str {}
+impl sealed::Sealed for [u8] {}
+impl sealed::Sealed for &str {}
+impl<T: Element> sealed::Sealed for [T] {}
 
-    #[inline]
-    pub fn write_i32(&mut self, value: i32) -> Result<(), encode::Error> {
-        self.0
-            .write(23, 1, |out| write_with_len(out, &value.to_be_bytes()))
-    }
+impl Param for bool {
+    const OID: u32 = desc::BOOL;
 
     #[inline]
-    pub fn write_i64(&mut self, value: i64) -> Result<(), encode::Error> {
-        self.0
-            .write(20, 1, |out| write_with_len(out, &value.to_be_bytes()))
-    }
-
-    #[inline]
-    pub fn write_f32(&mut self, value: f32) -> Result<(), encode::Error> {
-        self.0
-            .write(700, 1, |out| write_with_len(out, &value.to_be_bytes()))
-    }
-
-    #[inline]
-    pub fn write_f64(&mut self, value: f64) -> Result<(), encode::Error> {
-        self.0
-            .write(701, 1, |out| write_with_len(out, &value.to_be_bytes()))
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        write_with_len(out, &[*self as u8])
     }
 }
 
-#[repr(transparent)]
-pub struct Data<'a, 'values, 'out>(&'a mut BindWriter<'values, 'out>);
-
-impl Data<'_, '_, '_> {
-    #[inline]
-    pub fn write_text(&mut self, value: &str) -> Result<(), encode::Error> {
-        self.0
-            .write(25, 1, |out| write_with_len(out, value.as_bytes()))
-    }
+impl Param for i16 {
+    const OID: u32 = desc::INT2;
 
     #[inline]
-    pub fn write_ltree(&mut self, value: &str) -> Result<(), encode::Error> {
-        self.0
-            .write(25, 0, |out| write_with_len(out, value.as_bytes()))
-    }
-
-    pub fn write_jsonb(&mut self, value: &str) -> Result<(), encode::Error> {
-        self.0.write(3802, 1, |out| {
-            let len = value.len() + 1;
-            out.write_slices([&wire_length(len)?.to_be_bytes(), &[0x01], value.as_bytes()])
-        })
-    }
-
-    #[inline]
-    pub fn write_bytes(&mut self, value: &[u8]) -> Result<(), encode::Error> {
-        self.0.write(17, 1, |out| write_with_len(out, value))
-    }
-
-    #[inline]
-    pub fn write_uuid(&mut self, value: [u8; 16]) -> Result<(), encode::Error> {
-        self.0.write(2950, 1, |out| write_with_len(out, &value))
-    }
-
-    #[inline]
-    pub fn write_time(&mut self, value: crate::Timestamp) -> Result<(), encode::Error> {
-        self.0
-            .write(1114, 1, |out| write_with_len(out, &value.0.to_be_bytes()))
-    }
-
-    #[inline]
-    pub fn write_date(&mut self, value: crate::Date) -> Result<(), encode::Error> {
-        self.0
-            .write(1082, 1, |out| write_with_len(out, &value.0.to_be_bytes()))
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        write_with_len(out, &self.to_be_bytes())
     }
 }
 
-#[repr(transparent)]
-pub struct Array<'a, 'values, 'out>(&'a mut BindWriter<'values, 'out>);
+impl Param for i32 {
+    const OID: u32 = desc::INT4;
 
-impl Array<'_, '_, '_> {
-    pub fn write_i64(&mut self, items: &[i64]) -> Result<(), encode::Error> {
-        write_array(self.0, 1016, 20, items.len(), |out| {
-            for value in items {
-                write_with_len(out, &value.to_be_bytes())?;
-            }
-            Ok(())
-        })
+    #[inline]
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        write_with_len(out, &self.to_be_bytes())
     }
+}
 
-    pub fn write_i32(&mut self, items: &[i32]) -> Result<(), encode::Error> {
-        write_array(self.0, 1007, 23, items.len(), |out| {
-            for value in items {
-                write_with_len(out, &value.to_be_bytes())?;
-            }
-            Ok(())
-        })
+impl Param for i64 {
+    const OID: u32 = desc::INT8;
+
+    #[inline]
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        write_with_len(out, &self.to_be_bytes())
     }
+}
 
-    pub fn write_text(&mut self, items: &[&str]) -> Result<(), encode::Error> {
-        write_array(self.0, 1009, 25, items.len(), |out| {
-            for value in items {
-                write_with_len(out, value.as_bytes())?;
-            }
-            Ok(())
-        })
+impl Param for f32 {
+    const OID: u32 = desc::FLOAT4;
+
+    #[inline]
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        write_with_len(out, &self.to_be_bytes())
     }
+}
 
-    pub fn write_i16(&mut self, items: &[i16]) -> Result<(), encode::Error> {
-        write_array(self.0, 1005, 21, items.len(), |out| {
-            for value in items {
-                write_with_len(out, &value.to_be_bytes())?;
-            }
-            Ok(())
-        })
+impl Param for f64 {
+    const OID: u32 = desc::FLOAT8;
+
+    #[inline]
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        write_with_len(out, &self.to_be_bytes())
     }
+}
 
-    pub fn write_f32(&mut self, items: &[f32]) -> Result<(), encode::Error> {
-        write_array(self.0, 1021, 700, items.len(), |out| {
-            for value in items {
-                write_with_len(out, &value.to_be_bytes())?;
-            }
-            Ok(())
-        })
+impl Param for str {
+    const OID: u32 = desc::TEXT;
+
+    #[inline]
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        write_with_len(out, self.as_bytes())
     }
+}
 
-    pub fn write_f64(&mut self, items: &[f64]) -> Result<(), encode::Error> {
-        write_array(self.0, 1022, 701, items.len(), |out| {
-            for value in items {
-                write_with_len(out, &value.to_be_bytes())?;
-            }
-            Ok(())
-        })
+impl Param for [u8] {
+    const OID: u32 = desc::BYTEA;
+
+    #[inline]
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        write_with_len(out, self)
     }
+}
 
-    pub fn write_bool(&mut self, items: &[bool]) -> Result<(), encode::Error> {
-        write_array(self.0, 1000, 16, items.len(), |out| {
-            for value in items {
-                write_with_len(out, &[*value as u8])?;
+impl Param for String {
+    const OID: u32 = desc::TEXT;
+
+    #[inline]
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        self.as_str().payload(out)
+    }
+}
+
+impl Param for crate::Text {
+    const OID: u32 = desc::TEXT;
+
+    #[inline]
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        self.as_ref().payload(out)
+    }
+}
+
+impl Param for crate::Jsonb {
+    const OID: u32 = desc::JSONB;
+
+    #[inline]
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        jsonb_payload(out, self.as_ref())
+    }
+}
+
+impl Param for crate::Ltree {
+    const OID: u32 = desc::TEXT;
+    const FORMAT: u16 = 0;
+
+    #[inline]
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        self.as_ref().payload(out)
+    }
+}
+
+impl Param for Vec<u8> {
+    const OID: u32 = desc::BYTEA;
+
+    #[inline]
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        self.as_slice().payload(out)
+    }
+}
+
+impl Param for crate::Uuid {
+    const OID: u32 = desc::UUID;
+
+    #[inline]
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        write_with_len(out, self.as_bytes())
+    }
+}
+
+impl Param for crate::Timestamp {
+    const OID: u32 = desc::TIMESTAMP;
+
+    #[inline]
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        write_with_len(out, &self.0.to_be_bytes())
+    }
+}
+
+impl Param for crate::Date {
+    const OID: u32 = desc::DATE;
+
+    #[inline]
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        write_with_len(out, &self.0.to_be_bytes())
+    }
+}
+
+impl Param for &str {
+    const OID: u32 = desc::TEXT;
+
+    #[inline]
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        (*self).payload(out)
+    }
+}
+
+trait Element: Param {
+    const ARRAY_OID: u32;
+}
+
+impl Element for bool {
+    const ARRAY_OID: u32 = 1000;
+}
+
+impl Element for i16 {
+    const ARRAY_OID: u32 = 1005;
+}
+
+impl Element for i32 {
+    const ARRAY_OID: u32 = desc::INT4_ARRAY;
+}
+
+impl Element for i64 {
+    const ARRAY_OID: u32 = desc::INT8_ARRAY;
+}
+
+impl Element for f32 {
+    const ARRAY_OID: u32 = 1021;
+}
+
+impl Element for f64 {
+    const ARRAY_OID: u32 = 1022;
+}
+
+impl Element for &str {
+    const ARRAY_OID: u32 = desc::TEXT_ARRAY;
+}
+
+impl<T: Element> Param for [T] {
+    const OID: u32 = T::ARRAY_OID;
+
+    fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+        let count = count32(self.len())?;
+        out.patch::<false, _>(|out| {
+            out.write_slices([
+                &1i32.to_be_bytes(),
+                &0i32.to_be_bytes(),
+                &T::OID.to_be_bytes(),
+                &count.to_be_bytes(),
+                &1i32.to_be_bytes(),
+            ])?;
+            for value in self {
+                value.payload(out)?;
             }
             Ok(())
         })
     }
 }
 
-const _: () = {
-    assert!(size_of::<BindWriter<'_, '_>>() == 6 * size_of::<usize>());
-    assert!(size_of::<Scalar<'_, '_, '_>>() == size_of::<&mut BindWriter<'_, '_>>());
-    assert!(size_of::<Data<'_, '_, '_>>() == size_of::<&mut BindWriter<'_, '_>>());
-    assert!(size_of::<Array<'_, '_, '_>>() == size_of::<&mut BindWriter<'_, '_>>());
-};
+const _: () = assert!(size_of::<BindWriter<'_, '_>>() == 6 * size_of::<usize>());

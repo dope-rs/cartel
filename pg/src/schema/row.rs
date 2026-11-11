@@ -96,7 +96,7 @@ pub trait Field: sealed::Sealed + Sized {
 
 pub(crate) use sealed::Nullable;
 
-mod sealed {
+pub(crate) mod sealed {
     pub trait Sealed {}
     pub(crate) trait Nullable {}
 

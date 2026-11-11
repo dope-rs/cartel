@@ -18,6 +18,7 @@ mod wire;
 pub use prepare::Prepare;
 pub(crate) use prepare::catalog::{Catalog, Cursor};
 pub use project::Project;
+pub(crate) use row::sealed;
 pub use row::{Field, Row};
 #[doc(hidden)]
 pub use wire::Wire;

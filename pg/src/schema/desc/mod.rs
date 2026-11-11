@@ -7,7 +7,7 @@ mod registry;
 
 #[doc(hidden)]
 pub use formats::Formats;
-pub(super) use oids::*;
+pub(crate) use oids::*;
 #[doc(hidden)]
 pub use registry::Registry;
 pub(crate) const DYNAMIC_LTREE: u8 = 1;

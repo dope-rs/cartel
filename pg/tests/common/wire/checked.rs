@@ -402,17 +402,17 @@ impl schema::TypedQuery for Bind {
         (case, observed): Self::Params<'_>,
         w: &mut BindWriter<'_, '_>,
     ) -> Result<(), encode::Error> {
-        w.scalar().write_i32(7)?;
+        w.param(&7i32)?;
         if !matches!(case, BindCase::MissingArray) {
-            observed[0].set(w.data().write_text(OVERSIZED).err());
+            observed[0].set(w.param(OVERSIZED).err());
             if matches!(case, BindCase::MissingText) {
                 return Ok(());
             }
         }
-        w.data().write_text("ok")?;
-        observed[1].set(w.array().write_text(&["kept", OVERSIZED]).err());
+        w.param("ok")?;
+        observed[1].set(w.param(["kept", OVERSIZED].as_slice()).err());
         if matches!(case, BindCase::Retry) {
-            w.array().write_text(&["x"])?;
+            w.param(["x"].as_slice())?;
         }
         Ok(())
     }

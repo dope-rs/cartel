@@ -64,7 +64,8 @@ fn write_search_path(out: &mut Writer<'_>, schema: &str) -> Result<(), Error> {
 }
 
 #[repr(transparent)]
-pub(crate) struct Writer<'a>(write::Spare<'a>);
+#[doc(hidden)]
+pub struct Writer<'a>(write::Spare<'a>);
 
 impl write::Sink for Writer<'_> {
     type Error = Error;

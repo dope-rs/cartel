@@ -2,7 +2,7 @@ mod kind;
 mod tag;
 
 pub(super) trait TypeExt {
-    fn bind(&self) -> syn::Result<Bind>;
+    fn param(&self) -> syn::Result<&syn::Type>;
     fn row_read(&self) -> syn::Result<proc_macro2::TokenStream>;
     fn format(&self) -> u16;
     fn slice_type(&self) -> Option<proc_macro2::TokenStream>;
@@ -10,8 +10,8 @@ pub(super) trait TypeExt {
 }
 
 impl TypeExt for syn::Type {
-    fn bind(&self) -> syn::Result<Bind> {
-        kind::Kind::new(self).bind()
+    fn param(&self) -> syn::Result<&syn::Type> {
+        kind::Kind::new(self).param()
     }
 
     fn row_read(&self) -> syn::Result<proc_macro2::TokenStream> {
@@ -92,65 +92,4 @@ fn format_parts(syntax: &syn::Type, parts: &mut Vec<proc_macro2::TokenStream>) {
         .formats(syntax)
         .unwrap_or_else(|| quote::quote! { &[1u16] });
     parts.push(quote::quote! { (#columns, #formats) });
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum Arg {
-    Move,
-    Borrow,
-    UuidBytes,
-}
-
-#[derive(Clone, Copy)]
-pub(super) enum Target {
-    Scalar,
-    Data,
-    Array,
-}
-
-pub(super) struct Bind {
-    pub(super) oid: u32,
-    pub(super) target: Target,
-    pub(super) method: syn::Ident,
-    pub(super) arg: Arg,
-    pub(super) format: u16,
-}
-
-impl Bind {
-    fn new(oid: u32, target: Target, method: &str) -> Self {
-        Self {
-            oid,
-            target,
-            method: quote::format_ident!("{method}"),
-            arg: Arg::Move,
-            format: 1,
-        }
-    }
-
-    fn scalar(oid: u32, method: &str) -> Self {
-        Self::new(oid, Target::Scalar, method)
-    }
-
-    fn data(oid: u32, method: &str) -> Self {
-        Self::new(oid, Target::Data, method)
-    }
-
-    fn array(oid: u32, method: &str) -> Self {
-        Self::new(oid, Target::Array, method)
-    }
-
-    fn borrow(mut self) -> Self {
-        self.arg = Arg::Borrow;
-        self
-    }
-
-    fn arg(mut self, arg: Arg) -> Self {
-        self.arg = arg;
-        self
-    }
-
-    fn text(mut self) -> Self {
-        self.format = 0;
-        self
-    }
 }
