@@ -1,4 +1,4 @@
-use crate::reply::Error;
+use crate::{api::task::State, reply::Error};
 use crate::{
     api::{self, Response, request},
     port::requests,
@@ -9,17 +9,8 @@ use dope::core::driver::schedule::clock::timer;
 use dope_fiber::{abi, context, wait};
 use std::{mem, pin, task};
 
-enum State<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8>
-where
-    I: schema::QuerySet + 'd,
-{
-    Pending {
-        lease: super::Held<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-    },
-    Waiting(api::Pending<'d>),
-    Failed(crate::Error),
-    Done,
-}
+type Admission<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, const ID: u8> =
+    State<(), (), api::Pending<'d>, super::Held<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, ()>;
 
 #[pin_project::pin_project]
 /// Transaction-begin task retaining its exact admission state.
@@ -29,7 +20,7 @@ where
 {
     client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     reply: Response<'app, 'g, 'r, 's, 'b, 'c, 'd, api::ExtractUnit<ID>>,
-    state: State<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    state: Admission<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     #[pin]
     deadline: Result<deadline::Guard<'d>, timer::Exhausted>,
     #[pin]
@@ -44,14 +35,15 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         begin: request::Begin,
     ) -> Self {
         let reply = Response::new();
-        let state = match api::Pending::raw(
-            client.port,
-            request::Request::begin(begin),
-            o3::buffer::pool::Pool::acquire,
-        ) {
-            Ok(request) => State::Waiting(request),
-            Err(error) => State::Failed(error),
-        };
+        let state = State::new(
+            (),
+            (),
+            api::Pending::raw(
+                client.port,
+                request::Request::begin(begin),
+                o3::buffer::pool::Pool::acquire,
+            ),
+        );
         Self {
             client,
             reply,
@@ -61,20 +53,8 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         }
     }
 
-    fn fail(
-        state: &mut State<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-        error: crate::Error,
-    ) -> Error<'d, ID> {
-        match mem::replace(state, State::Done) {
-            State::Failed(error) => return error.into(),
-            State::Pending { lease } => lease.abort(error),
-            _ => {}
-        }
-        error.into()
-    }
-
     fn poll_admit(
-        state: &mut State<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+        state: &mut Admission<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         mut ctx: pin::Pin<&mut context::Context<'_, 'd>>,
         waiter: pin::Pin<&wait::Waiter<'app, 'd>>,
@@ -122,7 +102,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             ) {
                 Ok(lease) => {
                     waiter.unregister();
-                    *state = State::Pending { lease };
+                    *state = State::Admitted(lease, ());
                     return task::Poll::Ready(Ok(()));
                 }
                 Err((error, source, (returned, hold))) => {
@@ -166,11 +146,15 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                 .try_register(waiter, ctx.as_ref())
                 .map_err(Error::Wait)?;
         }
-        *state = State::Waiting(api::Pending {
-            frame,
-            boundary,
-            state: (),
-        });
+        *state = State::Connecting {
+            client: (),
+            target: (),
+            request: api::Pending {
+                frame,
+                boundary,
+                state: (),
+            },
+        };
         task::Poll::Pending
     }
 }
@@ -189,32 +173,31 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             Ok(guard) => pin::Pin::new(guard),
             Err(error) => {
                 Attach::detach(this.reply);
-                let error = Self::fail(this.state, crate::Error::Deadline(*error));
+                let error = this
+                    .state
+                    .cancel(crate::Error::Deadline(*error), super::Held::abort);
                 waiter.unregister();
                 return task::Poll::Ready(Err(error));
             }
         };
         loop {
             if guard.as_mut().poll_expired(ctx.as_mut()).is_ready() {
-                let time = deadline::Elapsed::new(match &*this.state {
-                    State::Pending { .. } => deadline::RequestPhase::Response,
-                    State::Waiting(_) | State::Failed(_) | State::Done => {
-                        deadline::RequestPhase::Admission
-                    }
-                });
+                let time = deadline::Elapsed::new(this.state.phase());
                 Attach::detach(this.reply);
-                let error = Self::fail(this.state, crate::Error::RequestTimeout(time));
+                let error = this
+                    .state
+                    .cancel(crate::Error::RequestTimeout(time), super::Held::abort);
                 waiter.unregister();
                 return task::Poll::Ready(Err(error));
             }
-            if matches!(this.state, State::Pending { .. }) {
+            if matches!(this.state, State::Admitted(..)) {
                 let task::Poll::Ready(next) =
                     pin::Pin::new(&mut *this.reply).poll_reply(ctx.as_mut())
                 else {
                     return task::Poll::Pending;
                 };
                 return match mem::replace(this.state, State::Done) {
-                    State::Pending { lease } => {
+                    State::Admitted(lease, ()) => {
                         guard.as_mut().complete();
                         task::Poll::Ready(match next {
                             Ok(()) => {
@@ -239,14 +222,14 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                 };
             }
             match mem::replace(this.state, State::Done) {
-                State::Waiting(req) => {
+                State::Connecting { request, .. } => {
                     match Self::poll_admit(
                         this.state,
                         client,
                         ctx.as_mut(),
                         waiter,
                         this.reply,
-                        req,
+                        request,
                     ) {
                         task::Poll::Ready(Ok(())) => {}
                         task::Poll::Ready(Err(error)) => {
@@ -256,7 +239,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                         task::Poll::Pending => return task::Poll::Pending,
                     }
                 }
-                State::Pending { .. } => unreachable!("pending"),
+                State::Admitted(..) => unreachable!("pending"),
                 State::Failed(error) => {
                     guard.as_mut().complete();
                     return task::Poll::Ready(Err(error.into()));

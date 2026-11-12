@@ -35,15 +35,6 @@ impl<
         H,
     >
 {
-    pub(super) fn cancel(&mut self, error: crate::Error) -> Error<'d, ID> {
-        match mem::replace(self, State::Done) {
-            State::Failed(error) => return error.into(),
-            State::Admitted(lease, _) => lease.abort(error),
-            _ => {}
-        }
-        error.into()
-    }
-
     pub(super) fn poll_with<'this, 'target, O>(
         &'this mut self,
         mut cx: Pin<&mut context::Context<'_, 'd>>,
@@ -77,7 +68,9 @@ impl<
                     } => (*client, (*target).into(), request),
                     State::Admitted(..) => unreachable!("admitted"),
                     State::Failed(_) | State::Done => {
-                        return Poll::Ready(Err(this.cancel(crate::Error::Closed)));
+                        return Poll::Ready(Err(
+                            this.cancel(crate::Error::Closed, lease::Lease::abort)
+                        ));
                     }
                 };
                 client

@@ -67,6 +67,19 @@ impl<C, R, Q, L, H> State<C, R, Q, L, H> {
             _ => None,
         }
     }
+
+    fn cancel<'d, const ID: u8>(
+        &mut self,
+        error: crate::Error,
+        abort: impl FnOnce(L, crate::Error),
+    ) -> Error<'d, ID> {
+        match mem::replace(self, Self::Done) {
+            Self::Failed(error) => return error.into(),
+            Self::Admitted(lease, _) => abort(lease, error),
+            _ => {}
+        }
+        error.into()
+    }
 }
 
 pub(super) struct Core<
@@ -213,7 +226,7 @@ where
         if let State::Admitted(_, reply) = &mut self.admission {
             reply.detach();
         }
-        self.admission.cancel(error)
+        self.admission.cancel(error, lease::Lease::abort)
     }
 }
 

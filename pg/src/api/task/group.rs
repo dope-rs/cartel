@@ -298,7 +298,7 @@ where
         };
         this.sync.detach();
         let cause = match stop {
-            Stop::Deadline(error) => Some(this.admission.cancel(error)),
+            Stop::Deadline(error) => Some(this.admission.cancel(error, lease::Lease::abort)),
             stop => {
                 this.admission.take();
                 if let Ok(guard) = this.deadline.get_mut() {
