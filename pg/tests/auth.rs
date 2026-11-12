@@ -78,11 +78,7 @@ fn authenticates_peers() {
                             })
                         },
                         recovery::Policy::new(|event| reports.push(event), common::recover),
-                        |outcome| {
-                            outcome
-                                .map_err(|error| format!("{:?}", error.cause()))
-                                .expect("application entry")
-                        },
+                        |outcome| outcome.map_err(common::entry_error).expect("application entry"),
                     );
 
                     let result = scoped.expect("application installation completed");

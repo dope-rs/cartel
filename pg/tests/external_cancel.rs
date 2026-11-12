@@ -214,11 +214,7 @@ fn bounded_cancel_slots() {
                     })
                 },
                 recovery::Policy::new(|event| reports.push(event), recover),
-                |outcome| {
-                    outcome
-                        .map_err(|error| format!("{:?}", error.cause()))
-                        .expect("application entry")
-                },
+                |outcome| outcome.map_err(common::entry_error).expect("application entry"),
             )
             .expect("main install")
             .expect("observer install")

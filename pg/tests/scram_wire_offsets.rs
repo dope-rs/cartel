@@ -54,11 +54,7 @@ fn rejects_wire() {
                             })
                         },
                         recovery::Policy::new(|event| reports.push(event), common::recover),
-                        |outcome| {
-                            outcome
-                                .map_err(|error| format!("{:?}", error.cause()))
-                                .expect("SCRAM scope")
-                        },
+                        |outcome| outcome.map_err(common::entry_error).expect("SCRAM scope"),
                     )
                     .expect("SCRAM installation")
                     .expect("SCRAM session");

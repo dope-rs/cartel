@@ -15,3 +15,9 @@ pub fn recover(
 ) -> std::convert::Infallible {
     panic!("{:?}", failure.cause())
 }
+
+pub fn entry_error<O, T>(
+    error: dope::runtime::topology::EnterError<'_, std::convert::Infallible, O, T>,
+) -> String {
+    format!("{:?}", error.cause())
+}

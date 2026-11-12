@@ -162,7 +162,7 @@ fn least_inflight_selects() {
                             recovery::Policy::new(|event| reports.push(event), common::recover),
                             |outcome| {
                                 outcome
-                                    .map_err(|error| format!("{:?}", error.cause()))
+                                    .map_err(common::entry_error)
                                     .expect("application entry")
                             },
                         );

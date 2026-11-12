@@ -96,11 +96,7 @@ fn startup_closes_live() {
                         })
                     },
                     recovery::Policy::new(|event| reports.push(event), common::recover),
-                    |outcome| {
-                        outcome
-                            .map_err(|error| format!("{:?}", error.cause()))
-                            .expect("startup scope")
-                    },
+                    |outcome| outcome.map_err(common::entry_error).expect("startup scope"),
                 )
                 .expect("startup installation")
                 .expect("startup session");
@@ -147,11 +143,7 @@ fn catalog_mismatch() {
                     })
                 },
                 recovery::Policy::new(|event| reports.push(event), common::recover),
-                |outcome| {
-                    outcome
-                        .map_err(|error| format!("{:?}", error.cause()))
-                        .expect("startup scope")
-                },
+                |outcome| outcome.map_err(common::entry_error).expect("startup scope"),
             )
             .expect("startup installation");
         assert!(
@@ -218,11 +210,7 @@ fn request_errors() {
                             })
                         },
                         recovery::Policy::new(|event| reports.push(event), common::recover),
-                        |outcome| {
-                            outcome
-                                .map_err(|error| format!("{:?}", error.cause()))
-                                .expect("reply scope")
-                        },
+                        |outcome| outcome.map_err(common::entry_error).expect("reply scope"),
                     )
                     .expect("application installation completed")
                     .ok()

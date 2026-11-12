@@ -514,11 +514,7 @@ fn finalizer_keeps_error() {
                             })
                         },
                         recovery::Policy::new(|event| reports.push(event), common::recover),
-                        |outcome| {
-                            outcome
-                                .map_err(|error| format!("{:?}", error.cause()))
-                                .expect("application entry")
-                        },
+                        |outcome| outcome.map_err(common::entry_error).expect("application entry"),
                     )
                     .expect("finalizer installation")
                     .expect("finalizer session");
@@ -676,11 +672,7 @@ fn retains_next_owner() {
                         })
                     },
                     recovery::Policy::new(|event| reports.push(event), common::recover),
-                    |outcome| {
-                        outcome
-                            .map_err(|error| format!("{:?}", error.cause()))
-                            .expect("application entry")
-                    },
+                    |outcome| outcome.map_err(common::entry_error).expect("application entry"),
                 )
                 .expect("finalizer installation")
                 .expect("finalizer session");
@@ -908,11 +900,7 @@ fn transaction_frees_slot() {
                 })
             },
             recovery::Policy::new(|event| reports.push(event), common::recover),
-            |outcome| {
-                outcome
-                    .map_err(|error| format!("{:?}", error.cause()))
-                    .expect("application entry")
-            },
+            |outcome| outcome.map_err(common::entry_error).expect("application entry"),
         )
         .expect("application installation completed")
         .expect("application session completed");

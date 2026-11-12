@@ -62,9 +62,32 @@ fn missing_keeps_rows() {
                                 let [next] = runtime
                                     .block_on(client.run_group::<TextQuery, 1>([()]))
                                     .expect("next group driver")
-                                    .unwrap_or_else(|failure| {
-                                        panic!("next group: {:?}", failure.cause().map(common::port::Reply::from))
-                                    });
+                                    .map_err(|failure| {
+                                        let [outcome] = failure.outcomes();
+                                        let outcome = match outcome {
+                                            Outcome::Completed(_) => Outcome::Completed(()),
+                                            Outcome::Failed(error) => {
+                                                Outcome::Failed(error.kind())
+                                            }
+                                            Outcome::Interrupted(error) => {
+                                                Outcome::Interrupted(error.kind())
+                                            }
+                                            Outcome::Server => Outcome::Server,
+                                            Outcome::Skipped => Outcome::Skipped,
+                                            Outcome::Unobserved => Outcome::Unobserved,
+                                        };
+                                        format!(
+                                            "{:?}",
+                                            (
+                                                outcome,
+                                                failure.sync(),
+                                                failure.cause().map(common::port::Reply::from),
+                                                failure.sync_error().map(common::port::Reply::from),
+                                                failure.diagnostics().iter().collect::<Vec<_>>(),
+                                            )
+                                        )
+                                    })
+                                    .expect("next group");
                                 assert_eq!(next.decode().expect("next row").lease, 11);
                                 assert_eq!(failure.sync(), Sync::Complete);
                                 assert!(failure.diagnostics().is_empty());

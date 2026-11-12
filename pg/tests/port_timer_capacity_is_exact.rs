@@ -113,11 +113,7 @@ fn timer_capacity_is_exact() {
                 })
             },
             recovery::Policy::new(|event| reports.push(event), common::recover),
-            |outcome| {
-                outcome
-                    .map_err(|error| format!("{:?}", error.cause()))
-                    .expect("application entry")
-            },
+            |outcome| outcome.map_err(common::entry_error).expect("application entry"),
         );
 
         let result = scoped.expect("application installation completed");
@@ -317,11 +313,7 @@ fn typed_queries_free_timer() {
                         })
                     },
                     recovery::Policy::new(|event| reports.push(event), common::recover),
-                    |outcome| {
-                        outcome
-                            .map_err(|error| format!("{:?}", error.cause()))
-                            .expect("application entry")
-                    },
+                    |outcome| outcome.map_err(common::entry_error).expect("application entry"),
                 )
                 .expect("scoped PostgreSQL")
                 .expect("application scope");
