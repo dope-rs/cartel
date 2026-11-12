@@ -63,12 +63,9 @@ fn groups_survive_finish() {
                         rollback: error, ..
                     } => Err(error),
                 };
-                assert!(
-                    failure.is_ok(),
-                    "transaction completion error: {:?}",
-                    failure.as_ref().err().map(common::port::Reply::from)
-                );
-                let failure = failure.ok().expect("rolled back group failure");
+                let failure = failure
+                    .map_err(|error| format!("{:?}", common::port::Reply::from(&error)))
+                    .expect("rolled back group failure");
                 assert_eq!(failure.sync(), Sync::Complete);
                 assert!(matches!(
                     failure.outcomes(),

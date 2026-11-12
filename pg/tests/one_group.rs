@@ -265,8 +265,9 @@ fn errors_survive_finish() {
                         FinishError::Operation(failure) => Ok(failure),
                         FinishError::Commit(error) | FinishError::Rollback { rollback: error, .. } => Err(error),
                     };
-                    assert!(failure.is_ok(), "transaction completion error: {:?}", failure.as_ref().err().map(Reply::from));
-                    let failure = failure.ok().expect("rolled back group failure");
+                    let failure = failure
+                        .map_err(|error| format!("{:?}", Reply::from(&error)))
+                        .expect("rolled back group failure");
                     assert_eq!(failure.sync(), Sync::Complete);
                     assert!(matches!(failure.outcomes(), [Outcome::Completed(row), Outcome::Server, Outcome::Skipped] if row.decode().expect("retained row").name == "retained"));
                     let details: Vec<_> = failure.diagnostics().iter().map(|entry| (entry.position, entry.fields.code().as_str(), entry.fields.message())).collect();

@@ -91,12 +91,9 @@ fn collects_multiple_rows() {
                                             (),
                                         ))
                                         .expect("driver query");
-                                    assert!(
-                                        rows.is_ok(),
-                                        "{:?}",
-                                        rows.as_ref().err().map(Reply::from)
-                                    );
-                                    let rows = rows.ok().expect("query rows");
+                                    let rows = rows
+                                        .map_err(|error| format!("{:?}", Reply::from(&error)))
+                                        .expect("query rows");
                                     let (rows, count) = Tracker::count(|| rows.validate());
                                     let retained = rows.expect("validated rows");
                                     let mut rows = retained.iter();
@@ -138,7 +135,8 @@ fn collects_multiple_rows() {
                                                 (),
                                             ))
                                             .expect("driver scalar")
-                                            .unwrap_or_else(|error| panic!("{:?}", Reply::from(&error)))
+                                            .map_err(|error| format!("{:?}", Reply::from(&error)))
+                                            .expect("scalar query")
                                             .expect("scalar row");
                                         match expected {
                                             Ok(expected) => {

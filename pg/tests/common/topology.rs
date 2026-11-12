@@ -127,13 +127,10 @@ where
                                             client,
                                             Default::default(),
                                         ))
-                                        .expect("driver query");
-                                    assert!(
-                                        row.is_ok(),
-                                        "{:?}",
-                                        row.as_ref().err().map(Reply::from)
-                                    );
-                                    check(row.ok().expect("query row"))
+                                        .expect("driver query")
+                                        .map_err(|error| format!("{:?}", Reply::from(&error)))
+                                        .expect("query row");
+                                    check(row)
                                 })
                             })
                         })

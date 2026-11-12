@@ -73,9 +73,10 @@ fn exercise(case: Scored) {
     .expect("spawn Redis peer");
 }
 
-fn check_valid<S: source::Scored, E>(result: Result<S, E>) {
-    assert!(result.is_ok(), "valid scored reply");
-    let values = result.ok().expect("valid scored reply");
+fn check_valid<S: source::Scored, E: source::Error>(result: Result<S, E>) {
+    let values = result
+        .map_err(|error| format!("{:?}", error.diagnostic()))
+        .expect("valid scored reply");
     let mut iter = values.iter();
     assert_eq!(iter.size_hint(), (2, Some(2)));
     assert_eq!(iter.next(), Some((&b"alice"[..], 42.5)));
@@ -87,12 +88,17 @@ fn check_valid<S: source::Scored, E>(result: Result<S, E>) {
     assert_eq!(iter.next(), None);
     assert_eq!(iter.size_hint(), (0, Some(0)));
     drop(iter);
-    let text = values.try_text().ok().expect("valid member text");
+    let text = values
+        .try_text()
+        .map_err(|error| (error.index, error.error))
+        .expect("valid member text");
     assert!(text.iter().eq([("alice", 42.5), ("bob", -7.0)]));
 }
 
-fn check_text<S: source::Scored, E>(result: Result<S, E>) {
-    let values = result.ok().expect("valid binary scored reply");
+fn check_text<S: source::Scored, E: source::Error>(result: Result<S, E>) {
+    let values = result
+        .map_err(|error| format!("{:?}", error.diagnostic()))
+        .expect("valid binary scored reply");
     let before = values.iter().nth(1).expect("second member").0.as_ptr();
     let failed = values.try_text().err().expect("invalid member text");
     assert_eq!(failed.index, 1);
