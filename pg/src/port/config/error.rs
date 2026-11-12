@@ -77,6 +77,7 @@ pub enum Error {
     Memory(memory::Error),
     ResidentFixed(limits::Error),
     ResidentDiagnostic(limits::Error),
+    RetentionHeadroom(limits::Error),
     GroupSlots(capacity::Error),
     GroupRecordsOverflow {
         groups: NonZero<usize>,

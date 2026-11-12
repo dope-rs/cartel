@@ -191,6 +191,7 @@ impl<A: Validate, B: Validate> Validate for (A, B) {
         B::validate(types)
     }
 
+    #[inline(always)]
     fn formats(values: &mut Formats<'_>) -> Result<(), encode::Error> {
         A::formats(values)?;
         B::formats(values)
@@ -206,6 +207,7 @@ impl<A: Validate, B: Validate, C: Validate> Validate for (A, B, C) {
         C::validate(types)
     }
 
+    #[inline(always)]
     fn formats(values: &mut Formats<'_>) -> Result<(), encode::Error> {
         A::formats(values)?;
         B::formats(values)?;
@@ -224,6 +226,7 @@ impl<A: Validate, B: Validate, C: Validate, D: Validate> Validate for (A, B, C, 
         D::validate(types)
     }
 
+    #[inline(always)]
     fn formats(values: &mut Formats<'_>) -> Result<(), encode::Error> {
         A::formats(values)?;
         B::formats(values)?;

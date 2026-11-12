@@ -11,7 +11,10 @@ use dope::{
         },
         service::bindings,
     },
-    net::link::{egress, pool::change::opening},
+    net::{
+        link::{egress, pool::change::opening},
+        wire,
+    },
 };
 use driver::schedule::{self, app::Work, clock};
 use o3::{
@@ -133,7 +136,9 @@ impl<
         CONNECTOR_CONNECTION_LIMIT,
     > for Session
 {
-    fn flush() -> Option<
+    fn flush<'w, W: wire::Spec + 'w>(
+        _: &W::Connection<'w, KeyTag<ID>>,
+    ) -> Option<
         impl for<'a, 'x, 'y, 'z> Call<(
             &'a mut Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
             &'x mut Context<'y, 'z, 'life, 'd, I, ID>,

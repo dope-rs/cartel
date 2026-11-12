@@ -296,6 +296,7 @@ pub(crate) enum ErrorRoute<'input, 'd, R: buffer::Cursor> {
 
 pub(crate) struct RowPlan<'input, 'd, R: buffer::Cursor> {
     payload: hold::scope::Deferred<'input, 'd, R>,
+    headroom: usize,
 }
 
 pub(crate) enum Pending<'d> {
@@ -304,9 +305,10 @@ pub(crate) enum Pending<'d> {
 }
 
 impl<'input, 'd, R: buffer::Cursor> RowPlan<'input, 'd, R> {
-    pub(crate) fn row(payload: frame::Payload<'input, 'd, R>) -> Self {
+    pub(crate) fn row(payload: frame::Payload<'input, 'd, R>, headroom: usize) -> Self {
         Self {
             payload: payload.into_inner(),
+            headroom,
         }
     }
 
@@ -325,13 +327,30 @@ impl<'d, R: buffer::Cursor + hold::raw::Retain<'d>> usage::Build<Row<'d>> for Ro
         usage::Bytes::new(self.payload.as_slice().len())
     }
 
+    #[inline(always)]
     fn try_build(self) -> Result<Row<'d>, (Self, Self::Error)> {
-        let payload = self.payload.bind(cartel_core::memory::RETENTION);
+        let budget = self.payload.budget();
+        let mut payload = self.payload.bind(hold::Policy::share());
+        let len = payload.len();
+        let resident = payload.ceiling();
+        if let hold::Choice::Copy = cartel_core::memory::RETENTION.choose(len, || resident) {
+            // Exact PG staging gives Local owners len + header bytes. Keep
+            // those within the existing 2 * len allowance; other owners must
+            // fit extra headroom without spending ordinary retention credits.
+            if len >= port::config::FRAME_HEADER_BYTES
+                && resident <= self.headroom.saturating_sub(budget.resident())
+                && let Ok(owner) = payload.try_retain()
+            {
+                return Ok(Row(owner));
+            }
+            payload = payload.defer().bind(hold::Policy::compact());
+        }
         match payload.try_retain() {
             Ok(owner) => Ok(Row(owner)),
             Err(error) => Err((
                 Self {
                     payload: payload.defer(),
+                    headroom: self.headroom,
                 },
                 error,
             )),

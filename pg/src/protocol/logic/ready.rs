@@ -222,7 +222,10 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 | Completion::Commit,
             ) => {}
         }
-        match selected.try_build(replies::RowPlan::row(data)) {
+        match selected.try_build(replies::RowPlan::row(
+            data,
+            self.port.shared.config.retention_headroom(),
+        )) {
             Ok(()) => Ok(None),
             Err(usage::PushError::Backpressure { builder: build, .. }) => {
                 match build.into_pending() {

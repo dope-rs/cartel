@@ -22,7 +22,7 @@ use reply::{layout, usage};
 
 use crate::{port::replies::groups, protocol::runtime::ready::plan};
 
-const FRAME_HEADER_BYTES: usize = 5;
+pub(crate) const FRAME_HEADER_BYTES: usize = 5;
 pub const DEFAULT_OPERATION_WINDOW: Positive = Positive::from_secs::<30>();
 
 #[derive(Clone)]
@@ -45,6 +45,7 @@ pub(super) struct Runtime {
     control_pool: pool::Layout,
     request_queue: fair::Plan,
     response_arena: layout::Layout,
+    retention_headroom: usize,
     ready: plan::Plan,
     notifications: NonZero<u32>,
     groups: Option<groups::Layout>,
@@ -228,7 +229,16 @@ impl Config {
                 notifications: notices.get() as usize,
             })?;
         let owners = capacity::Count::try_from(owners).map_err(Error::Owners)?;
-        let ingress = retained.ingress(owners);
+        let retention_headroom = if payload < FRAME_HEADER_BYTES {
+            0
+        } else {
+            retained.admitted().bytes()
+        };
+        let mut ingress = retained.ingress(owners);
+        ingress.retained = ingress
+            .retained
+            .try_add(retention_headroom)
+            .map_err(Error::RetentionHeadroom)?;
         let resident = ingress.try_resident(conns, wire).map_err(Error::Memory)?;
         let base = request
             .checked_add(cancel)
@@ -267,6 +277,7 @@ impl Config {
                 control_pool: control,
                 request_queue: queue,
                 response_arena: arena,
+                retention_headroom,
                 ready,
                 notifications: notices,
                 groups: None,
@@ -349,6 +360,10 @@ impl Config {
 
     pub(crate) const fn notice_limit(&self) -> NonZero<u32> {
         self.runtime.notifications
+    }
+
+    pub(crate) const fn retention_headroom(&self) -> usize {
+        self.runtime.retention_headroom
     }
 
     /// Maximum connector sockets reserved by this port: one session and one

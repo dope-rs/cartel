@@ -237,7 +237,6 @@ impl<'storage, 'g> codec::Stateful for Codec<'storage, 'g> {
         F: FnOnce(Result<Self::Outcome<'d>, Self::Error>, &mut Self::State<'d>) -> T::Accepted,
     {
         codec::Input::commit(storage, budget, limit, |input| {
-            let need = input.need_more(None);
             let parsed = match state.scan(&input, self.frame, self.values) {
                 parser::Scan::Source(error) => {
                     state.reset();
@@ -248,7 +247,7 @@ impl<'storage, 'g> codec::Stateful for Codec<'storage, 'g> {
                 }
                 parser::Scan::Blocked => return Ok(codec::Parse::Blocked),
                 parser::Scan::Pending => {
-                    return Ok(match need {
+                    return Ok(match input.need_more(None) {
                         Some(need) => codec::Parse::More(need),
                         None => codec::Parse::CapacityExhausted,
                     });

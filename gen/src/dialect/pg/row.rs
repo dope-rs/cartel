@@ -108,6 +108,7 @@ impl Row<'_> {
                     <#shape as ::cartel_pg::schema::desc::Validate>::validate(types)
                 }
 
+                #[inline(always)]
                 fn formats(values: &mut ::cartel_pg::schema::desc::Formats<'_>) -> ::core::result::Result<(), ::cartel_pg::protocol::encode::Error> {
                     <#shape as ::cartel_pg::schema::desc::Validate>::formats(values)
                 }

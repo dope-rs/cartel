@@ -15,7 +15,10 @@ use dope::{
         },
         service::bindings::endpoint::State,
     },
-    net::link::{egress, pool::change::opening},
+    net::{
+        link::{egress, pool::change::opening},
+        wire,
+    },
 };
 use driver::schedule::{Progress, app::Work, clock};
 use o3::{
@@ -155,7 +158,9 @@ where
         Sent::<_>::Ready(|owner: &mut State<P, _, _, _>| owner.root().port().activity.wake_send())
     }
 
-    fn flush() -> Option<
+    fn flush<'w, W: wire::Spec + 'w>(
+        _: &W::Connection<'w, route::KeyTag<ID>>,
+    ) -> Option<
         impl for<'a, 'x, 'y, 'z> Call<(
             &'a mut Owner<'r, 's, 'd, P, ID>,
             &'x mut turns::Context<'y, 'z, 'd, Self::ConnState, Self::Send, route::KeyTag<ID>>,

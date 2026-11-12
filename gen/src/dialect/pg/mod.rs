@@ -327,6 +327,7 @@ impl PgBackend {
                 #decl
                 #codes
 
+                #[inline(always)]
                 fn encode(
                     #args: Self::Params<'_>,
                     #writer: &mut ::cartel_pg::protocol::value::encode::BindWriter<'_, '_>,

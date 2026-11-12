@@ -63,7 +63,10 @@ fn collects_multiple_rows() {
         |server| {
             let login = cartel_pg::Config::new("user".into(), "password".into(), "database".into())
                 .expect("database credentials");
-            let config = Database::config().expect("bounded PostgreSQL config");
+            let mut caps = Database::config().expect("bounded PostgreSQL config").capacities();
+            caps.responses.items = 2;
+            caps.responses.bytes = 65536;
+            let config = port::config::Config::new(caps).expect("two retained rows");
             let ready = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
                 port::Port::<Database>::plan(login, config),
                 server.addr(),
@@ -85,12 +88,13 @@ fn collects_multiple_rows() {
                                         .expect("driver ready")
                                         .ok()
                                         .expect("PostgreSQL ready");
-                                    let rows = app
+                                    let (rows, allocations) = Tracker::count(|| app
                                         .block_on(traits::Query::run_all::<MixedQuery>(
                                             client,
                                             (),
                                         ))
-                                        .expect("driver query");
+                                        .expect("driver query"));
+                                    assert_eq!(allocations, 0);
                                     let rows = rows
                                         .map_err(|error| format!("{:?}", Reply::from(&error)))
                                         .expect("query rows");

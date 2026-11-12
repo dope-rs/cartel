@@ -368,14 +368,23 @@ fn validates_capacities() {
     ::core::assert_eq!(config.memory_bound().response_bytes, 4096);
     ::core::assert_eq!(config.memory_bound().ingress.active, 2048);
     ::core::assert_eq!(config.memory_bound().ingress.owners.get(), 17);
-    ::core::assert_eq!(config.memory_bound().resident_bytes.bytes(), 28_672);
+    ::core::assert_eq!(config.memory_bound().resident_bytes.bytes(), 41_984);
     ::core::assert_eq!(config.memory_bound().notification_bytes, 2048);
     ::core::assert_eq!(config.memory_bound().diagnostic_bytes, 1024);
     let ready = 2 * 136 + 2 * 20 + 5 * 4 + 4 + 8 + 8;
     ::core::assert_eq!(
         config.memory_bound().total_bytes.bytes(),
-        28_672 + 10240 + 32 + ready + 1024
+        41_984 + 10240 + 32 + ready + 1024
     );
+    let empty = config::Config::new(config::Capacities {
+        responses: config::Response {
+            frame_bytes: 5,
+            ..valid.responses
+        },
+        ..valid
+    })
+    .expect("empty response payload");
+    assert_eq!(empty.memory_bound().ingress.retained.bytes(), 10_250);
     let window = Positive::from_millis::<17>();
     assert!(
         config::Config::with_window(valid, window).is_ok(),
