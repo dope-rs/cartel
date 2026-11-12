@@ -11,13 +11,13 @@ repository = "https://github.com/dope-rs/cartel"
 authors = ["inq <gofiri@gmail.com>"]
 
 [workspace.dependencies]
-dope-test = "0.69.0"
-dope = "0.69.0"
-dope-core = "0.69.0"
-dope-fiber = "0.69.0"
-dope-manifold = "0.69.0"
-dope-runtime = "0.69.0"
-o3 = "0.52.4"
+dope-test = "0.70.0"
+dope = "0.70.0"
+dope-core = "0.70.0"
+dope-fiber = "0.70.0"
+dope-manifold = "0.70.0"
+dope-runtime = "0.70.0"
+o3 = "0.54.0"
 pin-project = "1"
 ryu = "1"
 cartel-core = { path = "core", version = "0.40.0" }

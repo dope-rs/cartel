@@ -130,7 +130,7 @@ impl Input {
                     Err(fail(format_args!("PostgreSQL query drive: {cause:?}")))
                 }
                 Ok(Ok(Err(error))) => {
-                    let code = fail(format_args!("PostgreSQL session: {:?}", error.kind()));
+                    let code = fail(format_args!("PostgreSQL session: {:?}", error.cause()));
                     if code == ExitCode::from(2) {
                         return Err(code);
                     }

@@ -97,7 +97,7 @@ fn main() -> ExitCode {
             Ok(Ok(Ok(Ok(code)))) => code,
             Ok(Ok(Ok(Err(cause)))) => fail(format_args!("Redis probe: {cause:?}")),
             Ok(Ok(Err(error))) => {
-                let code = fail(format_args!("Redis session: {:?}", error.kind()));
+                let code = fail(format_args!("Redis session: {:?}", error.cause()));
                 if code == ExitCode::from(2) {
                     return code;
                 }
