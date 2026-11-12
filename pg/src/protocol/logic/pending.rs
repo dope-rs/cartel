@@ -44,10 +44,11 @@ impl<'d> Pending<'d> {
             KeyTag<ID>,
         >,
     ) -> response::Settlement<Self> {
-        let Some(mut queue) = port.responses(ctx.conn_id, ctx.region()) else {
+        let Some(entry) = ctx.state.entry() else {
             Turn::new(port, ctx).fail(crate::Error::Protocol(Reason::RowUnknown));
             return response::Settlement::Ready;
         };
+        let mut queue = replies::Lane::new(port, ctx.conn_id, entry, ctx.region());
         match pending {
             replies::Pending::Row(row) => match queue.try_push(row) {
                 Ok(()) => response::Settlement::Ready,

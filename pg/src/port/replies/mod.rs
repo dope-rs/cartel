@@ -428,12 +428,20 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, const ID: u8> Lane<'life, 'g, 'r, 's,
         region: &'life mut region::Token<region::Identity<'d>>,
     ) -> Option<Self> {
         let entry = port.shared.connection_entry(conn)?;
-        let lane = port.lane(conn.lane());
-        Some(Self {
+        Some(Self::new(port, conn, entry, region))
+    }
+
+    pub(crate) fn new<I: schema::QuerySet>(
+        port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
+        conn: conn::Id<'d, KeyTag<ID>>,
+        entry: ready::Entry<'life, 'd, ID>,
+        region: &'life mut region::Token<region::Identity<'d>>,
+    ) -> Self {
+        Self {
             entry,
-            lane,
+            lane: port.lane(conn.lane()),
             region,
-        })
+        }
     }
 
     pub(crate) fn set_receiving(&mut self, receiving: bool) {

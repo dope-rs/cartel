@@ -7,7 +7,7 @@ use crate::{
         Reason, frame,
         logic::{self, payloads, state, turn::Turn},
         messages,
-        runtime::tx::poll,
+        runtime::{ready::Entry, tx::poll},
     },
     reply, schema,
 };
@@ -20,6 +20,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         &mut self,
         typ: u8,
         data: frame::Payload<'input, 'd, R>,
+        entry: Entry<'life, 'd, ID>,
     ) -> Result<Option<logic::Pending<'d>>, crate::Error>
     where
         'd: 'input,
@@ -36,7 +37,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         }
         let copy = matches!(
             self.state.phase,
-            state::Phase::CopyInActive | state::Phase::CopyOutActive
+            state::Phase::CopyInActive(_) | state::Phase::CopyOutActive(_)
         );
         match typ {
             messages::Be::ROW_DESCRIPTION | messages::Be::PARAMETER_DESCRIPTION => {
@@ -60,11 +61,11 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 Ok(None)
             }
             messages::Be::COPY_DONE => {
-                if !matches!(self.state.phase, state::Phase::CopyOutActive) {
+                if !matches!(self.state.phase, state::Phase::CopyOutActive(_)) {
                     return Err(crate::Error::UnexpectedReadyMessage(typ));
                 }
                 payloads::empty(typ, data.wire())?;
-                self.state.phase = state::Phase::Ready;
+                self.state.phase = state::Phase::Ready(entry);
                 Ok(None)
             }
             messages::Be::COPY_IN_RESPONSE => {
@@ -72,7 +73,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                     return Err(crate::Error::UnexpectedReadyMessage(typ));
                 }
                 payloads::copy_format(data.wire())?;
-                self.state.phase = state::Phase::CopyInActive;
+                self.state.phase = state::Phase::CopyInActive(entry);
                 Ok(None)
             }
             messages::Be::COPY_OUT_RESPONSE => {
@@ -80,7 +81,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                     return Err(crate::Error::UnexpectedReadyMessage(typ));
                 }
                 payloads::copy_format(data.wire())?;
-                self.state.phase = state::Phase::CopyOutActive;
+                self.state.phase = state::Phase::CopyOutActive(entry);
                 Ok(None)
             }
             messages::Be::COMMAND_COMPLETE | messages::Be::EMPTY_QUERY_RESPONSE => {
@@ -89,10 +90,8 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 } else {
                     payloads::empty(typ, data.wire())?;
                 }
-                let mut queue = self
-                    .port
-                    .responses(self.conn, self.region)
-                    .ok_or(crate::Error::Protocol(Reason::CommandUnknown))?;
+                let mut queue =
+                    crate::port::replies::Lane::new(self.port, self.conn, entry, self.region);
                 let end = queue.front(self.state.batch)?.0;
                 let Some(end) = end else {
                     return Err(crate::Error::Protocol(Reason::CommandEmpty));
@@ -121,21 +120,21 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                     }
                 }
                 if copy {
-                    self.state.phase = state::Phase::Ready;
+                    self.state.phase = state::Phase::Ready(entry);
                 }
                 Ok(None)
             }
             messages::Be::COPY_DATA => {
-                if !matches!(self.state.phase, state::Phase::CopyOutActive) {
+                if !matches!(self.state.phase, state::Phase::CopyOutActive(_)) {
                     return Err(crate::Error::UnexpectedReadyMessage(typ));
                 }
-                self.push(data)
+                self.push(data, entry)
             }
             messages::Be::DATA_ROW => {
                 if copy {
                     return Err(crate::Error::UnexpectedReadyMessage(typ));
                 }
-                self.push(data)
+                self.push(data, entry)
             }
             messages::Be::NOTIFICATION_RESPONSE => {
                 payloads::notification(data, &self.port.shared.notifications, self.region)?;
@@ -147,10 +146,12 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                     poll::Status::Transaction => {
                         match self.port.shared.transaction().current(self.conn) {
                             access::Current::Reserved(_) => {
-                                let mut queue = self
-                                    .port
-                                    .responses(self.conn, self.region)
-                                    .ok_or(crate::Error::Protocol(Reason::ReadyUnknown))?;
+                                let mut queue = crate::port::replies::Lane::new(
+                                    self.port,
+                                    self.conn,
+                                    entry,
+                                    self.region,
+                                );
                                 if !matches!(
                                     queue.front(self.state.batch)?.0,
                                     Some(Completion::Begin)
@@ -181,7 +182,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                     }
                 }
                 if copy {
-                    self.state.phase = state::Phase::Ready;
+                    self.state.phase = state::Phase::Ready(entry);
                 }
                 Ok(Some(logic::Pending::ready(status)))
             }
@@ -192,16 +193,14 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
     fn push<'input, R: buffer::Cursor + hold::raw::Retain<'d>>(
         &mut self,
         data: frame::Payload<'input, 'd, R>,
+        entry: Entry<'life, 'd, ID>,
     ) -> Result<Option<logic::Pending<'d>>, crate::Error>
     where
         'd: 'input,
     {
         use crate::port::replies;
 
-        let mut queue = self
-            .port
-            .responses(self.conn, self.region)
-            .ok_or(crate::Error::Protocol(Reason::RowUnknown))?;
+        let mut queue = replies::Lane::new(self.port, self.conn, entry, self.region);
         let (end, selected) = queue.front(self.state.batch)?;
         match end {
             None => {
@@ -257,6 +256,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
     pub(super) fn reply_error<'input, R: buffer::Cursor + hold::raw::Retain<'d>>(
         &mut self,
         plan: reply::Plan<'input, 'd, R>,
+        entry: Entry<'life, 'd, ID>,
     ) -> Result<Option<logic::Pending<'d>>, crate::Error>
     where
         'd: 'input,
@@ -265,14 +265,11 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
 
         if matches!(
             self.state.phase,
-            state::Phase::CopyInActive | state::Phase::CopyOutActive
+            state::Phase::CopyInActive(_) | state::Phase::CopyOutActive(_)
         ) {
-            self.state.phase = state::Phase::Ready;
+            self.state.phase = state::Phase::Ready(entry);
         }
-        let mut queue = self
-            .port
-            .responses(self.conn, self.region)
-            .ok_or(crate::Error::Protocol(Reason::ResponseUnknown))?;
+        let mut queue = replies::Lane::new(self.port, self.conn, entry, self.region);
         let (end, mut selected) = queue.front(self.state.batch)?;
         let plan = match end {
             None => plan,

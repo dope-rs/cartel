@@ -8,6 +8,7 @@ use o3::depot::index::bitmap::entry;
 use o3::depot::{index::bitmap, queue::links};
 use std::num::NonZero;
 
+#[derive(Clone, Copy)]
 pub(crate) struct Entry<'a, 'd, const ID: u8> {
     pub(super) core: &'a Shared<'d, ID>,
     pub(super) index: NonZero<u32>,

@@ -310,6 +310,9 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         if let Some(wake) = state.cancel(region) {
             owner.root().connection().wake(wake);
         }
+        if state.entry().is_some() {
+            state.phase = state::Phase::Failed;
+        }
         owner.root().connection().deactivate(link);
     }
     fn quarantine(

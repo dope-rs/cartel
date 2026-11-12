@@ -202,7 +202,7 @@ impl<'d, const ID: u8> Shared<'d, ID> {
     pub(crate) fn try_ready(
         &self,
         id: conn::Id<'d, route::KeyTag<ID>>,
-    ) -> Result<(), protocol::Reason> {
+    ) -> Result<storage::Entry<'_, 'd, ID>, protocol::Reason> {
         let entry = self
             .entry(id.index().into_usize())
             .ok_or(protocol::Reason::PrepareReady)?;
@@ -214,7 +214,7 @@ impl<'d, const ID: u8> Shared<'d, ID> {
             .live
             .set(unsafe { bounded::raw::u32(self.index.live.get().get() + 1) });
         self.wake_ready();
-        Ok(())
+        Ok(entry)
     }
 
     pub(crate) fn finalize(&self, id: access::Transaction<'d, ID>) -> access::Finalization<'d, ID> {

@@ -33,10 +33,11 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         status: poll::Status,
         work: &mut A,
     ) -> Result<Progress, crate::Error> {
-        let mut lane = self
-            .port
-            .responses(self.conn, self.region)
+        let entry = self
+            .state
+            .entry()
             .ok_or(crate::Error::Protocol(protocol::Reason::ReadyUnknown))?;
+        let mut lane = replies::Lane::new(self.port, self.conn, entry, self.region);
         let depth = loop {
             let (action, selected) = lane.inspect(self.state.batch, |end, front| {
                 if matches!(self.state.progress, state::Progress::Complete) {

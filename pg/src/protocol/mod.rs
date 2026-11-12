@@ -164,7 +164,6 @@ pub enum Reason {
     },
     CommandData,
     CommandEmpty,
-    CommandUnknown,
     CommitTag,
     GroupReply,
     DiagnosticMessage,

@@ -106,20 +106,17 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             state::Phase::Sasl { scram } => {
                 Self::drive_scram(self.port, &self.sink, self.region, scram)?
             }
-            phase @ (state::Phase::Ready
-            | state::Phase::CopyInActive
-            | state::Phase::CopyOutActive) => {
-                let mut lane = self
-                    .port
-                    .responses(self.conn, self.region)
-                    .ok_or(crate::Error::Protocol(Reason::ResponseUnknown))?;
+            state::Phase::Ready(entry)
+            | state::Phase::CopyInActive(entry)
+            | state::Phase::CopyOutActive(entry) => {
+                let mut lane = replies::Lane::new(self.port, self.conn, *entry, self.region);
                 let receiving = match input {
                     Input::Empty => false,
                     Input::Partial => lane.front(self.state.batch)?.0.is_none(),
                     Input::Yield | Input::Blocked => true,
                 };
                 lane.set_receiving(receiving);
-                if matches!(phase, state::Phase::Ready) {
+                if matches!(self.state.phase, state::Phase::Ready(_)) {
                     let result = lane.try_flush(self.port, |region| {
                         let frame = egress::NonEmpty::try_new(Frame::from(encode::SYNC.as_slice()))
                             .map_err(crate::Error::RequestLoad)?;
@@ -136,6 +133,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             | state::Phase::StartupSent
             | state::Phase::AwaitingReady
             | state::Phase::Preparing { .. }
+            | state::Phase::Retiring(_)
             | state::Phase::Failed => {}
         }
         Ok(())
@@ -174,10 +172,12 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             state::Phase::Preparing { remaining: prep } => {
                 self.prepare(typ, data.wire(), prep).map(|()| None)
             }
-            state::Phase::Ready | state::Phase::CopyInActive | state::Phase::CopyOutActive => {
-                self.ready(typ, data)
+            state::Phase::Ready(entry)
+            | state::Phase::CopyInActive(entry)
+            | state::Phase::CopyOutActive(entry) => self.ready(typ, data, entry),
+            state::Phase::NeedsStartup | state::Phase::Retiring(_) | state::Phase::Failed => {
+                Ok(None)
             }
-            state::Phase::NeedsStartup | state::Phase::Failed => Ok(None),
         };
         match result {
             Ok(next) => next.map_or(Delivery::Committed, Delivery::Prepared),
@@ -211,10 +211,12 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 self.fail_server(class, server);
                 return None;
             }
-            state::Phase::Ready | state::Phase::CopyInActive | state::Phase::CopyOutActive => {
-                self.reply_error(plan)
+            state::Phase::Ready(entry)
+            | state::Phase::CopyInActive(entry)
+            | state::Phase::CopyOutActive(entry) => self.reply_error(plan, entry),
+            state::Phase::NeedsStartup | state::Phase::Retiring(_) | state::Phase::Failed => {
+                Ok(None)
             }
-            state::Phase::NeedsStartup | state::Phase::Failed => Ok(None),
         };
         match result {
             Ok(next) => next,
@@ -418,11 +420,12 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 if depth != order::Depth::ZERO {
                     return Err(crate::Error::Protocol(Reason::PrepareRetained));
                 }
-                self.port
+                let entry = self
+                    .port
                     .connection()
                     .try_ready(self.conn)
                     .map_err(crate::Error::Protocol)?;
-                self.state.phase = state::Phase::Ready;
+                self.state.phase = state::Phase::Ready(entry);
                 return Ok(());
             }
             (_, messages::Be::READY_FOR_QUERY) => {

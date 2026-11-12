@@ -8,7 +8,7 @@ use std::num;
 
 use crate::{
     port::replies,
-    protocol::scram,
+    protocol::{runtime::ready, scram},
     schema::{self, desc},
 };
 
@@ -98,7 +98,22 @@ impl<I: schema::QuerySet> Prepare<I> {
 const _: () = assert!(std::mem::size_of::<Progress>() == std::mem::size_of::<bool>());
 const _: () = assert!(std::mem::align_of::<Progress>() == std::mem::align_of::<bool>());
 
-impl<'d, I, const ID: u8> State<'_, 'd, I, ID> {
+impl<'a, 'd, I, const ID: u8> State<'a, 'd, I, ID> {
+    pub(super) fn entry(&self) -> Option<ready::Entry<'a, 'd, ID>> {
+        match self.phase {
+            Phase::Ready(entry)
+            | Phase::CopyInActive(entry)
+            | Phase::CopyOutActive(entry)
+            | Phase::Retiring(entry) => Some(entry),
+            Phase::NeedsStartup
+            | Phase::StartupSent
+            | Phase::Sasl { .. }
+            | Phase::AwaitingReady
+            | Phase::Preparing { .. }
+            | Phase::Failed => None,
+        }
+    }
+
     pub(super) fn cancel(
         &self,
         token: &mut region::Token<region::Identity<'d>>,
@@ -109,9 +124,10 @@ impl<'d, I, const ID: u8> State<'_, 'd, I, ID> {
             | Phase::StartupSent
             | Phase::AwaitingReady
             | Phase::Preparing { .. }
-            | Phase::Ready
-            | Phase::CopyInActive
-            | Phase::CopyOutActive
+            | Phase::Ready(_)
+            | Phase::CopyInActive(_)
+            | Phase::CopyOutActive(_)
+            | Phase::Retiring(_)
             | Phase::Failed => None,
         }
     }
@@ -123,9 +139,10 @@ impl<'d, I, const ID: u8> State<'_, 'd, I, ID> {
             | Phase::AwaitingReady
             | Phase::Preparing { .. } => app::Inbound::Awaiting(idle),
             Phase::NeedsStartup
-            | Phase::Ready
-            | Phase::CopyInActive
-            | Phase::CopyOutActive
+            | Phase::Ready(_)
+            | Phase::CopyInActive(_)
+            | Phase::CopyOutActive(_)
+            | Phase::Retiring(_)
             | Phase::Failed => match load {
                 Some(0) => app::Inbound::Quiescent,
                 None | Some(1..) => app::Inbound::Awaiting(idle),
@@ -140,9 +157,10 @@ pub(super) enum Phase<'a, 'd, I, const ID: u8> {
     Sasl { scram: scram::Scram<'a, 'd, ID> },
     AwaitingReady,
     Preparing { remaining: Prepare<I> },
-    Ready,
-    CopyInActive,
-    CopyOutActive,
+    Ready(ready::Entry<'a, 'd, ID>),
+    CopyInActive(ready::Entry<'a, 'd, ID>),
+    CopyOutActive(ready::Entry<'a, 'd, ID>),
+    Retiring(ready::Entry<'a, 'd, ID>),
     Failed,
 }
 

@@ -73,12 +73,12 @@ impl<'p, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8>
     pub(crate) fn try_ready(
         &self,
         token: conn::Id<'d, KeyTag<ID>>,
-    ) -> Result<(), protocol::Reason> {
-        self.port.shared.try_ready(token)?;
+    ) -> Result<protocol::runtime::ready::Entry<'p, 'd, ID>, protocol::Reason> {
+        let entry = self.port.shared.try_ready(token)?;
         if self.port.shared.count() == self.port.capacity() {
             self.port.shared.signals.clear_open();
         }
-        Ok(())
+        Ok(entry)
     }
 
     pub(crate) fn deactivate(

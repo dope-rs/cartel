@@ -172,9 +172,10 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             ) => Disposition::Permanent,
             (
                 state::Phase::NeedsStartup
-                | state::Phase::Ready
-                | state::Phase::CopyInActive
-                | state::Phase::CopyOutActive
+                | state::Phase::Ready(_)
+                | state::Phase::CopyInActive(_)
+                | state::Phase::CopyOutActive(_)
+                | state::Phase::Retiring(_)
                 | state::Phase::Failed,
                 reply::Class::Permanent,
             )
@@ -184,14 +185,18 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 | state::Phase::Sasl { .. }
                 | state::Phase::AwaitingReady
                 | state::Phase::Preparing { .. }
-                | state::Phase::Ready
-                | state::Phase::CopyInActive
-                | state::Phase::CopyOutActive
+                | state::Phase::Ready(_)
+                | state::Phase::CopyInActive(_)
+                | state::Phase::CopyOutActive(_)
+                | state::Phase::Retiring(_)
                 | state::Phase::Failed,
                 reply::Class::Transient,
             ) => Disposition::Reconnect,
         };
-        self.state.phase = state::Phase::Failed;
+        self.state.phase = self
+            .state
+            .entry()
+            .map_or(state::Phase::Failed, state::Phase::Retiring);
         self.state.progress = state::Progress::Running;
         let shared = &self.port.shared;
         match mode {
