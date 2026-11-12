@@ -76,8 +76,9 @@ fn deadline_keeps_results() {
             })
         }), recovery::Policy::new(|event| reports.push(event), common::recover),
 |outcome| {
-    assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err().map(|error| error.cause()));
-    outcome.ok().expect("application entry")
+    outcome
+        .map_err(|error| format!("{:?}", error.cause()))
+        .expect("application entry")
 }).expect("group installation").expect("group session");
         assert!(reports.events().expect("native reclamation").is_empty());
         server
@@ -222,12 +223,9 @@ fn rows_outlive_group() {
             },
             recovery::Policy::new(|event| reports.push(event), common::recover),
             |outcome| {
-                assert!(
-                    outcome.is_ok(),
-                    "{:?}",
-                    outcome.as_ref().err().map(|error| error.cause())
-                );
-                outcome.ok().expect("application entry")
+                outcome
+                    .map_err(|error| format!("{:?}", error.cause()))
+                    .expect("application entry")
             },
         )
         .expect("group installation")
@@ -277,8 +275,9 @@ fn errors_survive_finish() {
             })
         }), recovery::Policy::new(|event| reports.push(event), common::recover),
 |outcome| {
-    assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err().map(|error| error.cause()));
-    outcome.ok().expect("application entry")
+    outcome
+        .map_err(|error| format!("{:?}", error.cause()))
+        .expect("application entry")
 }).expect("group installation").expect("group session");
         assert!(reports.events().expect("native reclamation").is_empty());
         server
@@ -322,8 +321,9 @@ fn sync_keeps_commands() {
             })
         }), recovery::Policy::new(|event| reports.push(event), common::recover),
 |outcome| {
-    assert!(outcome.is_ok(), "{:?}", outcome.as_ref().err().map(|error| error.cause()));
-    outcome.ok().expect("application entry")
+    outcome
+        .map_err(|error| format!("{:?}", error.cause()))
+        .expect("application entry")
 }).expect("group installation").expect("group session");
         assert!(reports.events().expect("native reclamation").is_empty());
         server
@@ -399,12 +399,9 @@ fn classify_error_scope() {
                         },
                         recovery::Policy::new(|event| reports.push(event), common::recover),
                         |outcome| {
-                            assert!(
-                                outcome.is_ok(),
-                                "{:?}",
-                                outcome.as_ref().err().map(|error| error.cause())
-                            );
-                            outcome.ok().expect("application entry")
+                            outcome
+                                .map_err(|error| format!("{:?}", error.cause()))
+                                .expect("application entry")
                         },
                     )
                     .expect("group installation")
@@ -488,12 +485,9 @@ fn capacity_keeps_error() {
                     },
                     recovery::Policy::new(|event| reports.push(event), common::recover),
                     |outcome| {
-                        assert!(
-                            outcome.is_ok(),
-                            "{:?}",
-                            outcome.as_ref().err().map(|error| error.cause())
-                        );
-                        outcome.ok().expect("application entry")
+                        outcome
+                            .map_err(|error| format!("{:?}", error.cause()))
+                            .expect("application entry")
                     },
                 )
                 .expect("group installation")

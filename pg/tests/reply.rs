@@ -97,12 +97,9 @@ fn startup_closes_live() {
                     },
                     recovery::Policy::new(|event| reports.push(event), common::recover),
                     |outcome| {
-                        assert!(
-                            outcome.is_ok(),
-                            "{:?}",
-                            outcome.as_ref().err().map(|error| error.cause())
-                        );
-                        outcome.ok().expect("startup scope")
+                        outcome
+                            .map_err(|error| format!("{:?}", error.cause()))
+                            .expect("startup scope")
                     },
                 )
                 .expect("startup installation")
@@ -151,12 +148,9 @@ fn catalog_mismatch() {
                 },
                 recovery::Policy::new(|event| reports.push(event), common::recover),
                 |outcome| {
-                    assert!(
-                        outcome.is_ok(),
-                        "{:?}",
-                        outcome.as_ref().err().map(|error| error.cause())
-                    );
-                    outcome.ok().expect("startup scope")
+                    outcome
+                        .map_err(|error| format!("{:?}", error.cause()))
+                        .expect("startup scope")
                 },
             )
             .expect("startup installation");
@@ -225,12 +219,9 @@ fn request_errors() {
                         },
                         recovery::Policy::new(|event| reports.push(event), common::recover),
                         |outcome| {
-                            assert!(
-                                outcome.is_ok(),
-                                "{:?}",
-                                outcome.as_ref().err().map(|error| error.cause())
-                            );
-                            outcome.ok().expect("reply scope")
+                            outcome
+                                .map_err(|error| format!("{:?}", error.cause()))
+                                .expect("reply scope")
                         },
                     )
                     .expect("application installation completed")

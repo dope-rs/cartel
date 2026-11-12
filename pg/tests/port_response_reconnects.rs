@@ -594,12 +594,9 @@ fn pending_ready_settles() {
                     },
                     recovery::Policy::new(|event| reports.push(event), common::recover),
                     |outcome| {
-                        assert!(
-                            outcome.is_ok(),
-                            "{:?}",
-                            outcome.as_ref().err().map(|error| error.cause())
-                        );
-                        outcome.ok().expect("application entry")
+                        outcome
+                            .map_err(|error| format!("{:?}", error.cause()))
+                            .expect("application entry")
                     },
                 )
                 .expect("installation")
@@ -696,12 +693,9 @@ fn late_error_keeps_batch() {
                     },
                     recovery::Policy::new(|event| reports.push(event), common::recover),
                     |outcome| {
-                        assert!(
-                            outcome.is_ok(),
-                            "{:?}",
-                            outcome.as_ref().err().map(|error| error.cause())
-                        );
-                        outcome.ok().expect("application entry")
+                        outcome
+                            .map_err(|error| format!("{:?}", error.cause()))
+                            .expect("application entry")
                     },
                 );
                 let result = scoped.expect("application installation completed");
@@ -829,12 +823,9 @@ fn response_reconnects() {
                         },
                         recovery::Policy::new(|event| reports.push(event), common::recover),
                         |outcome| {
-                            assert!(
-                                outcome.is_ok(),
-                                "{:?}",
-                                outcome.as_ref().err().map(|error| error.cause())
-                            );
-                            outcome.ok().expect("application entry")
+                            outcome
+                                .map_err(|error| format!("{:?}", error.cause()))
+                                .expect("application entry")
                         },
                     );
                     let result = scoped.expect("application installation completed");

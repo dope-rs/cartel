@@ -86,12 +86,9 @@ fn cancel_reuses_slot() {
                 },
                 recovery::Policy::new(|event| reports.push(event), common::recover),
                 |outcome| {
-                    assert!(
-                        outcome.is_ok(),
-                        "{:?}",
-                        outcome.as_ref().err().map(|error| error.cause())
-                    );
-                    outcome.ok().expect("application entry")
+                    outcome
+                        .map_err(|error| format!("{:?}", error.cause()))
+                        .expect("application entry")
                 },
             );
 
