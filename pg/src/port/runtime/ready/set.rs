@@ -128,27 +128,21 @@ impl<'d, const ID: u8> Shared<'d, ID> {
 
     pub(crate) fn select(
         &self,
-        target: &Option<api::Target<'d, ID>>,
+        target: &api::Target<'d, ID>,
     ) -> Result<Option<Source<'_, 'd, ID>>, api::Target<'d, ID>> {
-        let source = if let Some(target) = *target {
-            let token = target.connection();
-            let generation = target.transaction().map(|tx| tx.generation);
-            let entry = self.entry(token.index().into_usize()).ok_or(target)?;
-            let slot = entry.slot();
-            let ready = slot.select(token, generation).ok_or(target)?;
-            if slot.is_receiving() {
-                return Ok(None);
-            }
-            if generation.is_some() {
-                Source::Exclusive(ready)
-            } else {
-                let Some(listed) = entry.listed() else {
-                    return Ok(None);
-                };
-                Source::Shared(listed)
-            }
+        let target = *target;
+        let token = target.connection();
+        let generation = target.transaction().map(|tx| tx.generation);
+        let entry = self.entry(token.index().into_usize()).ok_or(target)?;
+        let slot = entry.slot();
+        let ready = slot.select(token, generation).ok_or(target)?;
+        if slot.is_receiving() {
+            return Ok(None);
+        }
+        let source = if generation.is_some() {
+            Source::Exclusive(ready)
         } else {
-            let Some(listed) = self.pick() else {
+            let Some(listed) = entry.listed() else {
                 return Ok(None);
             };
             Source::Shared(listed)

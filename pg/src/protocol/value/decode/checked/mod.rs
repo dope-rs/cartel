@@ -1,8 +1,4 @@
-use crate::{
-    protocol::{Wire, value::decode},
-    schema,
-};
-use std::marker;
+use crate::protocol::{Wire, value::decode};
 
 mod cursor;
 mod sealed;
@@ -10,41 +6,25 @@ pub use cursor::Cursor;
 pub(crate) use sealed::Sealed;
 
 /// The closed field descriptions supported by retained, validated projection.
-pub trait Fields: schema::Row + Sealed {
+pub trait Fields: Sealed {
     fn read<'row>(cursor: &mut Cursor<'row>) -> Self::View<'row>;
 }
 
-/// A complete immutable row validated against this exact field description.
-pub(crate) struct Row<'row, T: Fields> {
-    bytes: &'row [u8],
-    fields: marker::PhantomData<T>,
+pub(crate) fn validate<T: Fields>(bytes: Wire<'_>, columns: u16) -> Result<(), crate::Error> {
+    let mut reader = decode::RowReader::new(bytes, columns)?;
+    <T as Sealed>::validate(&mut reader)?;
+    reader.finish()
 }
 
-impl<'row, T: Fields> Row<'row, T> {
-    pub(crate) fn validate(bytes: Wire<'row>, columns: u16) -> Result<(), crate::Error> {
-        let mut reader = decode::RowReader::new(bytes, columns)?;
-        T::decode(&mut reader)?;
-        reader.finish()
-    }
-
-    /// # Safety
-    /// The immutable retained owner validated these same bytes as T.
-    pub(crate) unsafe fn new(bytes: &'row [u8]) -> Self {
-        Self {
-            bytes,
-            fields: marker::PhantomData,
-        }
-    }
-
-    pub(crate) fn read(self) -> T::View<'row> {
-        // SAFETY: validation consumed the complete two-byte row header.
-        let bytes = unsafe { self.bytes.get_unchecked(2..) };
-        T::read(&mut Cursor { bytes })
-    }
+/// # Safety
+/// The immutable retained owner validated these same bytes as T.
+pub(crate) unsafe fn read<T: Fields>(bytes: &[u8]) -> T::View<'_> {
+    // SAFETY: validation consumed the complete two-byte row header.
+    let bytes = unsafe { bytes.get_unchecked(2..) };
+    T::read(&mut Cursor { bytes })
 }
 
 const _: () = {
-    assert!(size_of::<Row<'static, (i64, (String, ()))>>() == size_of::<&[u8]>());
     assert!(size_of::<Cursor<'static>>() == size_of::<&[u8]>());
 };
 

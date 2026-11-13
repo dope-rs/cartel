@@ -84,9 +84,12 @@ impl<
                         break 'failed error;
                     }
                     let ready = &client.port.shared;
-                    let mut selected = match ready.select(&target) {
-                        Ok(source) => source,
-                        Err(target) => break 'failed Error::Pinned(target),
+                    let mut selected = match target.as_ref() {
+                        Some(target) => match ready.select(target) {
+                            Ok(source) => source,
+                            Err(target) => break 'failed Error::Pinned(target),
+                        },
+                        None => ready.pick().map(requests::Source::Shared),
                     };
                     let mut candidates = None;
                     let mut pressure = None;

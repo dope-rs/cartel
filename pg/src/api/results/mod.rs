@@ -108,7 +108,7 @@ where
         Q::Row: schema::Project,
         <Q::Row as schema::Project>::Fields: checked::Fields,
     {
-        checked::Row::<<Q::Row as schema::Project>::Fields>::validate(
+        checked::validate::<<Q::Row as schema::Project>::Fields>(
             self.payload.wire(),
             Q::N_RESULT_COLS,
         )?;
@@ -125,9 +125,8 @@ where
     pub fn view<'row>(&'row self) -> <Q::Row as schema::Row>::View<'row> {
         // SAFETY: this owner keeps the exact validated immutable payload retained.
         let fields = unsafe {
-            checked::Row::<<Q::Row as schema::Project>::Fields>::new(self.0.payload.as_slice())
-        }
-        .read();
+            checked::read::<<Q::Row as schema::Project>::Fields>(self.0.payload.as_slice())
+        };
         <Q::Row as schema::Project>::project(fields)
     }
 
@@ -171,10 +170,7 @@ where
         <Q::Row as schema::Project>::Fields: checked::Fields,
     {
         for row in self.batch.iter() {
-            checked::Row::<<Q::Row as schema::Project>::Fields>::validate(
-                row.wire(),
-                Q::N_RESULT_COLS,
-            )?;
+            checked::validate::<<Q::Row as schema::Project>::Fields>(row.wire(), Q::N_RESULT_COLS)?;
         }
         Ok(Validated(self))
     }
@@ -219,8 +215,7 @@ where
         let row = self.rows.next()?;
         // SAFETY: the iterator borrows only the validated owner's immutable batch.
         let fields =
-            unsafe { checked::Row::<<Q::Row as schema::Project>::Fields>::new(row.as_slice()) }
-                .read();
+            unsafe { checked::read::<<Q::Row as schema::Project>::Fields>(row.as_slice()) };
         Some(<Q::Row as schema::Project>::project(fields))
     }
 }
