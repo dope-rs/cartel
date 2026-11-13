@@ -58,8 +58,13 @@ impl<'connection, P> Bound<'_, 'connection, P> {
     pub(crate) fn columns<const CURRENT: bool>(
         &self,
         expected: usize,
+        declared: usize,
     ) -> result::Result<(), crate::Error> {
-        let actual = self.statement.columns::<CURRENT>();
+        let actual = if !CURRENT && declared != usize::MAX {
+            declared
+        } else {
+            self.statement.columns::<CURRENT>()
+        };
         if actual != expected {
             return Err(crate::Error::ColumnCount { expected, actual });
         }

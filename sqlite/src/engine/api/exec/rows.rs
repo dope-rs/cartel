@@ -101,7 +101,7 @@ impl<
                     Ok(active) => active,
                     Err(error) => return vacant.complete(Err(error)),
                 };
-                if let Err(error) = active.columns::<false>(R::N_COLS) {
+                if let Err(error) = active.columns::<false>(R::N_COLS, Q::COLUMNS) {
                     return vacant.complete(active.finish(Err(error)));
                 }
                 let config = active.config();
@@ -151,7 +151,7 @@ fn poll_rows<'d, R: row::raw::Decode, P, M: exec::Policy<R>>(
         let bytes = match *byte_capacity {
             Some(bytes) => bytes,
             None => {
-                if let Err(error) = active.columns::<true>(R::N_COLS) {
+                if let Err(error) = active.columns::<true>(R::N_COLS, usize::MAX) {
                     break Err(error);
                 }
                 let bytes = active.config().row_bytes();

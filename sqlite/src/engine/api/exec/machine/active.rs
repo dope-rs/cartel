@@ -41,8 +41,9 @@ impl<'query, 'connection, 'd, P, A: Access> Active<'query, 'connection, 'd, P, A
     pub(in crate::engine::api::exec) fn columns<const CURRENT: bool>(
         &self,
         expected: usize,
+        declared: usize,
     ) -> result::Result<(), crate::Error> {
-        self.bound.columns::<CURRENT>(expected)
+        self.bound.columns::<CURRENT>(expected, declared)
     }
 
     pub(in crate::engine::api::exec) fn read<R: row::raw::Decode, M: exec::Policy<R>>(
