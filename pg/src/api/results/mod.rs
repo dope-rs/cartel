@@ -23,6 +23,16 @@ use group::{Diagnostics, Outcome, Position, Sync};
 
 use source::Payload as _;
 
+#[inline(always)]
+fn read<'row, Q: schema::TypedQuery>(
+    bytes: crate::protocol::Wire<'row>,
+) -> Result<<Q::Row as schema::Row>::View<'row>, crate::Error> {
+    let mut reader = decode::RowReader::new(bytes, Q::N_RESULT_COLS)?;
+    let row = <Q::Row as schema::Row>::decode(&mut reader)?;
+    reader.finish()?;
+    Ok(row)
+}
+
 pub(in crate::api) type FirstResult<'d, P, Q, const ID: u8, const SCALAR: bool = false> =
     Result<Option<Row<P, Q, SCALAR>>, Error<'d, ID>>;
 
@@ -72,10 +82,7 @@ where
     }
 
     pub fn decode(&self) -> Result<<Q::Row as schema::Row>::View<'_>, crate::Error> {
-        let mut reader = decode::RowReader::new(self.payload.wire(), Q::N_RESULT_COLS)?;
-        let row = <Q::Row as schema::Row>::decode(&mut reader)?;
-        reader.finish()?;
-        Ok(row)
+        read::<Q>(self.payload.wire())
     }
 
     pub fn into_owned(self) -> Result<Q::Row, crate::Error> {
@@ -148,6 +155,16 @@ impl<B: source::Batch, Q> Collection<B, Q>
 where
     Q: schema::TypedQuery,
 {
+    pub fn iter<'rows>(
+        &'rows self,
+    ) -> impl Iterator<Item = Result<<Q::Row as schema::Row>::View<'rows>, crate::Error>> {
+        self.batch.iter().map(|row| read::<Q>(row.wire()))
+    }
+
+    pub fn len(&self) -> reply::Length {
+        self.batch.len()
+    }
+
     pub(in crate::api) fn from_result<E>(batch: Result<B, E>) -> Result<Self, E> {
         Ok(Self {
             batch: batch?,
@@ -190,7 +207,7 @@ where
     }
 
     pub fn len(&self) -> reply::Length {
-        self.0.batch.len()
+        self.0.len()
     }
 
     pub fn payload_len(&self) -> usage::Bytes {

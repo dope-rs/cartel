@@ -30,6 +30,7 @@ impl Row for () {
 impl<A: Row, B: Row> Row for (A, B) {
     type View<'row> = (A::View<'row>, B::View<'row>);
 
+    #[inline(always)]
     fn decode<'row>(
         reader: &mut decode::RowReader<'row>,
     ) -> Result<Self::View<'row>, crate::Error> {

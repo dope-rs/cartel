@@ -90,6 +90,7 @@ impl Row<'_> {
             impl ::cartel_pg::schema::Row for #name {
                 type View<'row> = #row<'row>;
 
+                #[inline(always)]
                 fn decode<'row>(row: &mut ::cartel_pg::protocol::value::decode::RowReader<'row>) -> ::core::result::Result<Self::View<'row>, ::cartel_pg::Error> {
                     let fields = <<Self as ::cartel_pg::schema::Project>::Fields as ::cartel_pg::schema::Row>::decode(row)?;
                     ::core::result::Result::Ok(<Self as ::cartel_pg::schema::Project>::project(fields))

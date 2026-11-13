@@ -98,6 +98,25 @@ fn collects_multiple_rows() {
                                     let rows = rows
                                         .map_err(|error| format!("{:?}", Reply::from(&error)))
                                         .expect("query rows");
+                                    let (projected, allocations) = Tracker::count(|| {
+                                        let mut values = Vec::new();
+                                        let initial = values
+                                            .try_reserve_exact(rows.len().get())
+                                            .map(|()| values);
+                                        rows.iter().try_fold(initial, |state, row| {
+                                            let row = row?;
+                                            Ok::<_, cartel_pg::Error>(state.map(|mut values| {
+                                                values.push((row.low, row.tags));
+                                                values
+                                            }))
+                                        })
+                                    });
+                                    let projected = projected
+                                        .expect("decoded rows")
+                                        .expect("reserved views");
+                                    assert_eq!(allocations, 1);
+                                    assert_eq!(projected, [(3, "[]"), (7, "{}")]);
+                                    drop(projected);
                                     let (rows, count) = Tracker::count(|| rows.validate());
                                     let retained = rows.expect("validated rows");
                                     let mut rows = retained.iter();
@@ -238,6 +257,17 @@ fn owned_batch_failure() {
                                         .block_on(traits::Query::run_all::<TextQuery>(client, ()))
                                         .expect("driver query");
                                     let rows = rows.ok().expect("query rows");
+                                    let failure =
+                                        rows.iter().try_fold(Ok::<_, u8>(()), |state, row| {
+                                            row?;
+                                            Ok::<_, cartel_pg::Error>(state.and(Err(7)))
+                                        });
+                                    assert!(matches!(
+                                        failure,
+                                        Err(cartel_pg::Error::Protocol(Reason::RowTrailing {
+                                            actual
+                                        })) if actual.get() == 1
+                                    ));
                                     let (result, counts) = Tracker::measure(|| rows.into_owned());
                                     assert!(matches!(
                                         result,
