@@ -225,7 +225,11 @@ impl<'d> Pending<'d> {
         }
         let frame = port.request().encode(frame(&port.requests), |frame| {
             schema::QueryMeta::validate::<Q>()?.write(frame, params)?;
-            if X::SYNC { frame.sync() } else { Ok(()) }
+            if matches!(X::BOUNDARY, requests::Boundary::Open) {
+                Ok(())
+            } else {
+                frame.sync()
+            }
         })?;
         Ok(Pending {
             frame,

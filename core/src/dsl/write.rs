@@ -44,6 +44,10 @@ impl<T> Conflict<T> {
 }
 
 impl<T> Update<T> {
+    pub fn required(self) -> Self {
+        self
+    }
+
     pub fn return_one(self) -> T {
         self.0.infer(())
     }

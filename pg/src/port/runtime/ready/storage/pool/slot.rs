@@ -60,12 +60,18 @@ impl Sync {
         match (self, edge) {
             (
                 Self::Synced,
-                requests::Boundary::Close | requests::Boundary::Begin | requests::Boundary::Commit,
+                requests::Boundary::Close
+                | requests::Boundary::Required
+                | requests::Boundary::Begin
+                | requests::Boundary::Commit,
             )
             | (Self::Synced, requests::Boundary::Group)
             | (
                 Self::Automatic(_),
-                requests::Boundary::Close | requests::Boundary::Begin | requests::Boundary::Commit,
+                requests::Boundary::Close
+                | requests::Boundary::Required
+                | requests::Boundary::Begin
+                | requests::Boundary::Commit,
             ) => Ok(Self::Synced),
             (Self::Automatic(depth) | Self::Explicit(depth), requests::Boundary::Group) => {
                 Err(crate::Error::GroupOpen { depth })
@@ -84,7 +90,10 @@ impl Sync {
             }
             (
                 Self::Explicit(depth),
-                requests::Boundary::Close | requests::Boundary::Begin | requests::Boundary::Commit,
+                requests::Boundary::Close
+                | requests::Boundary::Required
+                | requests::Boundary::Begin
+                | requests::Boundary::Commit,
             ) => Err(crate::Error::RequestCloseDuringCopy { depth }),
             (Self::Explicit(depth), requests::Boundary::Open) => {
                 Err(crate::Error::RequestOpenDuringCopy { depth })

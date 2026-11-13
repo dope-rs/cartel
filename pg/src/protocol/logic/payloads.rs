@@ -44,6 +44,29 @@ pub(super) fn command(tag: u8, bytes: Wire<'_>) -> Result<(), crate::Error> {
     }
 }
 
+pub(super) fn update(bytes: Wire<'_>) -> Result<bool, crate::Error> {
+    let result = bytes
+        .as_slice()
+        .strip_prefix(b"UPDATE ")
+        .and_then(|body| body.strip_suffix(&[0]))
+        .filter(|digits| !digits.is_empty())
+        .and_then(|digits| {
+            let mut found = 0;
+            for digit in digits {
+                let digit = digit.wrapping_sub(b'0');
+                if digit > 9 {
+                    return None;
+                }
+                found |= digit;
+            }
+            Some(found != 0)
+        });
+    result.ok_or(crate::Error::Protocol(Reason::ControlPayload {
+        tag: messages::Be::COMMAND_COMPLETE,
+        actual: bytes.length(),
+    }))
+}
+
 pub(super) fn copy_format(bytes: Wire<'_>) -> Result<(), crate::Error> {
     let [overall, count0, count1, formats @ ..] = bytes.as_slice() else {
         return Err(copy_error(bytes));

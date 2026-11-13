@@ -26,7 +26,7 @@ pub(in crate::plan) fn build<'a>(
     prefix: proc_macro2::TokenStream,
     output: Output<'a>,
 ) -> emit::Plan<'a> {
-    if !matches!(output.dispatch, emit::Kind::NoRows) {
+    if !matches!(output.dispatch, emit::Kind::NoRows(_)) {
         sql.push(state.dialect.kw("RETURNING_KW"));
         let columns = match state.dialect.kind {
             backend::Kind::Pg => {
@@ -52,6 +52,13 @@ pub(in crate::plan) fn validate<'a>(
     ret: shape::Returning,
     table: &syn::Path,
 ) -> syn::Result<Output<'a>> {
+    let required = matches!(ret, shape::Returning::Required);
+    if required && !(matches!(op, Op::Update) && matches!(state.dialect.kind, backend::Kind::Pg)) {
+        return Err(syn::Error::new(
+            table.span(),
+            "`.required()` requires a PostgreSQL UPDATE",
+        ));
+    }
     let rt = &state.dialect.rt_crate;
     let (op, command) = match op {
         Op::Insert => ("INSERT", "Insert"),
@@ -73,7 +80,7 @@ pub(in crate::plan) fn validate<'a>(
             Output {
                 output: Cow::Owned(syn::parse_quote!(-> #rt::dsl::write::#command<#table>)),
                 cols: quote::quote! { 0u16 },
-                dispatch: emit::Kind::NoRows,
+                dispatch: emit::Kind::NoRows(required),
             }
         }
         Some(kind) => {

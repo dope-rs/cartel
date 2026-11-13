@@ -85,15 +85,21 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 Ok(None)
             }
             messages::Be::COMMAND_COMPLETE | messages::Be::EMPTY_QUERY_RESPONSE => {
-                if typ == messages::Be::COMMAND_COMPLETE {
-                    payloads::command(typ, data.wire())?;
-                } else {
-                    payloads::empty(typ, data.wire())?;
-                }
                 let mut queue =
                     crate::port::replies::Lane::new(self.port, self.conn, entry, self.region);
-                let end = queue.front(self.state.batch)?.0;
-                let Some(end) = end else {
+                let end = queue.front(self.state.batch).map(|front| front.0);
+                let found = if typ == messages::Be::COMMAND_COMPLETE {
+                    if matches!(end, Ok(Some(Completion::Required))) {
+                        payloads::update(data.wire())?
+                    } else {
+                        payloads::command(typ, data.wire())?;
+                        true
+                    }
+                } else {
+                    payloads::empty(typ, data.wire())?;
+                    true
+                };
+                let Some(end) = end? else {
                     return Err(crate::Error::Protocol(Reason::CommandEmpty));
                 };
                 match end {
@@ -104,6 +110,16 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                     }
                     Completion::Ready | Completion::Begin => {
                         self.state.progress = state::Progress::Complete;
+                    }
+                    Completion::Required => {
+                        if typ == messages::Be::EMPTY_QUERY_RESPONSE {
+                            return Err(crate::Error::UnexpectedReadyMessage(typ));
+                        }
+                        self.state.progress = if found {
+                            state::Progress::Complete
+                        } else {
+                            state::Progress::Missing
+                        };
                     }
                     Completion::Commit => match data.wire().as_slice() {
                         b"COMMIT\0" => self.state.progress = state::Progress::Complete,
@@ -218,6 +234,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 | Completion::Group
                 | Completion::Last
                 | Completion::Ready
+                | Completion::Required
                 | Completion::Begin
                 | Completion::Commit,
             ) => {}

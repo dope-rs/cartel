@@ -51,6 +51,7 @@ pub(crate) struct Tag<'g, 'r, 's, 'b, 'c, 'd> {
 pub(crate) enum Kind<G, S = G> {
     Command,
     Ready,
+    Required,
     Begin,
     Commit,
     Group(u32, G),
@@ -63,6 +64,7 @@ impl<G, S> Kind<G, S> {
         match self {
             Self::Command => Completion::Command,
             Self::Ready => Completion::Ready,
+            Self::Required => Completion::Required,
             Self::Begin => Completion::Begin,
             Self::Commit => Completion::Commit,
             Self::Group(_, _) => Completion::Group,
@@ -80,6 +82,7 @@ pub(crate) enum Completion {
     /// The final command closes command progress, while its Sync stays ordered.
     Last,
     Ready,
+    Required,
     Begin,
     Commit,
     /// A group barrier owns no command and completes only at ReadyForQuery.
@@ -93,6 +96,7 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Tag<'g, 'r, 's, 'b, 'c, 'd> {
             kind: match boundary {
                 Boundary::Open => Kind::Command,
                 Boundary::Close | Boundary::Group | Boundary::External => Kind::Ready,
+                Boundary::Required => Kind::Required,
                 Boundary::Begin => Kind::Begin,
                 Boundary::Commit => Kind::Commit,
             },
@@ -110,7 +114,7 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Tag<'g, 'r, 's, 'b, 'c, 'd> {
     ) -> Result<ErrorRoute<'input, 'd, R>, crate::Error> {
         let end = self.as_ref();
         let (group, command) = match end {
-            Kind::Command | Kind::Ready | Kind::Begin | Kind::Commit => {
+            Kind::Command | Kind::Ready | Kind::Required | Kind::Begin | Kind::Commit => {
                 return Ok(ErrorRoute::Single(plan));
             }
             Kind::Group(index, owner) | Kind::Last(index, owner) => {
@@ -182,6 +186,7 @@ mod raw {
             match &self.kind {
                 Kind::Command => Kind::Command,
                 Kind::Ready => Kind::Ready,
+                Kind::Required => Kind::Required,
                 Kind::Begin => Kind::Begin,
                 Kind::Commit => Kind::Commit,
                 // SAFETY: only try_group_by constructs these command tags. Its

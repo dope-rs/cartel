@@ -82,7 +82,7 @@ impl Query {
         if self.returning != shape::Returning::None {
             return Err(syn::Error::new(
                 span,
-                "duplicate `.returning_*()` — only one is allowed per mutation",
+                "only one mutation outcome is allowed",
             ));
         }
         self.returning = ret;

@@ -26,6 +26,7 @@ pub(crate) enum Rejection {
 #[repr(u8)]
 pub(crate) enum Boundary {
     Close,
+    Required,
     Begin,
     Commit,
     Group,

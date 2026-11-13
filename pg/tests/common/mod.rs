@@ -5,6 +5,7 @@ pub mod env;
 pub mod external;
 pub mod port;
 pub mod postgres;
+pub mod required;
 pub mod topology;
 pub mod transaction;
 pub mod types;
@@ -13,7 +14,7 @@ pub mod wire;
 pub fn recover(
     failure: dope::core::driver::life::recovery::Recovery<'_, '_>,
 ) -> std::convert::Infallible {
-    panic!("{:?}", failure.cause())
+    failure.abort()
 }
 
 pub fn entry_error<O, T>(

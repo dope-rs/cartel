@@ -8,7 +8,7 @@ pub(crate) enum Kind<'a> {
     Aggregate(&'a syn::Type),
     All(&'a syn::Type),
     Stream(&'a syn::Type),
-    NoRows,
+    NoRows(bool),
 }
 
 impl<'a> Kind<'a> {

@@ -23,6 +23,7 @@ enum Action {
     Retire,
     FailGroup,
     FailOne,
+    Missing,
 }
 
 impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
@@ -43,11 +44,27 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 if matches!(self.state.progress, state::Progress::Complete) {
                     if !matches!(
                         end,
-                        Some(Kind::Ready | Kind::Begin | Kind::Commit | Kind::Sync(_))
+                        Some(
+                            Kind::Ready
+                                | Kind::Required
+                                | Kind::Begin
+                                | Kind::Commit
+                                | Kind::Sync(_)
+                        )
                     ) {
                         return Err(crate::Error::Protocol(protocol::Reason::ReadyUnknown));
                     }
                     return Ok(work.admit(|| Action::Complete));
+                }
+                if matches!(self.state.progress, state::Progress::Missing) {
+                    if !matches!(end, Some(Kind::Required)) {
+                        return Err(crate::Error::Protocol(protocol::Reason::ReadyUnknown));
+                    }
+                    return match front {
+                        Front::Open | Front::Denied => Ok(work.admit(|| Action::Missing)),
+                        Front::Detached => Ok(work.admit(|| Action::Complete)),
+                        Front::Empty => Err(crate::Error::Protocol(protocol::Reason::ReadyUnknown)),
+                    };
                 }
                 let Some(end) = end else {
                     return Ok(work::Capacity::Available(Action::Done));
@@ -71,13 +88,16 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                         }
                         Kind::Command
                         | Kind::Ready
+                        | Kind::Required
                         | Kind::Begin
                         | Kind::Commit
                         | Kind::Sync(_) => {
                             return Err(crate::Error::Protocol(protocol::Reason::GroupReply));
                         }
                     },
-                    state::Progress::Running | state::Progress::Complete => {
+                    state::Progress::Running
+                    | state::Progress::Complete
+                    | state::Progress::Missing => {
                         return Err(crate::Error::Protocol(protocol::Reason::ReadyUnknown));
                     }
                 };
@@ -95,6 +115,11 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             match action? {
                 work::Capacity::Available(Action::Done) => break lane.depth(),
                 work::Capacity::Available(Action::Complete) => break selected.complete(),
+                work::Capacity::Available(Action::Missing) => {
+                    break selected
+                        .fail_one(replies::Failure::from_error(crate::Error::NotFound))
+                        .unwrap_or_else(|| unreachable!("reply"));
+                }
                 work::Capacity::Available(Action::Retire) => {
                     let depth = selected.complete();
                     lane.reindex(depth);

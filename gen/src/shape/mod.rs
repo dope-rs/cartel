@@ -271,6 +271,7 @@ impl AggregateFn {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Returning {
     None,
+    Required,
     One,
     First,
     All,
@@ -279,6 +280,7 @@ pub(super) enum Returning {
 impl Returning {
     pub(super) fn from_method(name: &str) -> Option<Self> {
         Some(match name {
+            "required" => Self::Required,
             "returning_one" => Self::One,
             "returning_first" => Self::First,
             "returning_all" => Self::All,
@@ -291,7 +293,7 @@ impl Returning {
             Self::One => Some(Terminator::One),
             Self::First => Some(Terminator::First),
             Self::All => Some(Terminator::All),
-            Self::None => None,
+            Self::None | Self::Required => None,
         }
     }
 }

@@ -197,6 +197,19 @@ where
         self.typed::<Q, api::ExtractUnit<ID>, _>(params, ())
     }
 
+    fn run_required<Q>(
+        self,
+        params: Q::Params<'_>,
+    ) -> impl abi::Fiber<'d, Output = Result<(), Error<'d, ID>>>
+    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
+    where
+        Q: schema::TypedQuery<Row = (), Result = result::Command>,
+        I: schema::HasGroup<Q::Group>,
+        Q::Group: schema::QueryGroup,
+    {
+        self.typed::<Q, api::ExtractUnit<ID, true>, _>(params, ())
+    }
+
     fn run_stream<Q>(self, params: Q::Params<'_>) -> <Self as traits::Query<'d, ID>>::Stream<Q>
     where
         Q: schema::TypedQuery<Result = result::Rows>,

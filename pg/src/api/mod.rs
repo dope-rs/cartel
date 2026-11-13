@@ -119,11 +119,11 @@ impl<'app, 'b: 'app, 'c: 'b, 'd: 'c, const ID: u8>
     }
 }
 
-pub struct ExtractUnit<const ID: u8 = 0>;
+pub struct ExtractUnit<const ID: u8 = 0, const REQUIRED: bool = false>;
 
-impl<'app, 'b, 'c, 'd, const ID: u8>
+impl<'app, 'b, 'c, 'd, const ID: u8, const REQUIRED: bool>
     recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>
-    for ExtractUnit<ID>
+    for ExtractUnit<ID, REQUIRED>
 {
     type Output = Result<(), reply::Error<'d, ID>>;
     const ACCEPTANCE: recv::Acceptance = recv::Acceptance::Unit;
@@ -201,20 +201,26 @@ where
 }
 
 pub(in crate::api) trait Sync {
-    const SYNC: bool = true;
+    const BOUNDARY: crate::port::requests::Boundary = crate::port::requests::Boundary::Close;
 }
 
 impl<const ID: u8> Sync for ExtractAll<ID> {}
-impl<const ID: u8> Sync for ExtractUnit<ID> {}
+impl<const ID: u8, const REQUIRED: bool> Sync for ExtractUnit<ID, REQUIRED> {
+    const BOUNDARY: crate::port::requests::Boundary = if REQUIRED {
+        crate::port::requests::Boundary::Required
+    } else {
+        crate::port::requests::Boundary::Close
+    };
+}
 impl<M, const ID: u8> Sync for ExtractFirst<M, ID> {}
 
 impl<const ID: u8> Sync for ExtractOne<ID> {
-    const SYNC: bool = false;
+    const BOUNDARY: crate::port::requests::Boundary = crate::port::requests::Boundary::Open;
 }
 
 impl<X: Sync> From<marker::PhantomData<X>> for crate::port::requests::Boundary {
     fn from(_: marker::PhantomData<X>) -> Self {
-        if X::SYNC { Self::Close } else { Self::Open }
+        X::BOUNDARY
     }
 }
 

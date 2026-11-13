@@ -130,6 +130,16 @@ pub trait Query<'d, const ID: u8 = 0>:
         Self::Schema: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup;
 
+    /// Completes an UPDATE without rows; zero affected rows returns `NotFound`.
+    fn run_required<Q>(
+        self,
+        params: Q::Params<'_>,
+    ) -> impl Fiber<'d, Output = Result<(), Error<'d, ID>>> + use<'d, Self, Q, ID>
+    where
+        Q: schema::TypedQuery<Row = (), Result = result::Command>,
+        Self::Schema: schema::HasGroup<Q::Group>,
+        Q::Group: schema::QueryGroup;
+
     fn run_stream<Q>(self, params: Q::Params<'_>) -> <Self as Query<'d, ID>>::Stream<Q>
     where
         Q: schema::TypedQuery<Result = result::Rows>,

@@ -66,7 +66,7 @@ impl Query {
         let run_tys = params.iter().map(|(_, ty)| ty);
         let n_params = captures.len();
         let n_cols = match &plan.dispatch {
-            emit::Kind::NoRows => quote::quote! { 0usize },
+            emit::Kind::NoRows(_) => quote::quote! { 0usize },
             emit::Kind::One(t)
             | emit::Kind::First(t)
             | emit::Kind::Aggregate(t)
@@ -86,7 +86,7 @@ impl Query {
         let sql = Backend::dialect().text(quote::quote! { &[#(#parts),*] });
 
         let method = match &plan.dispatch {
-            emit::Kind::NoRows => quote::quote! { run_no_rows },
+            emit::Kind::NoRows(_) => quote::quote! { run_no_rows },
             emit::Kind::One(t) | emit::Kind::Aggregate(t) => quote::quote! { run_one::<#t, _, _> },
             emit::Kind::First(t) => quote::quote! { run_first::<#t, _, _> },
             emit::Kind::All(t) => quote::quote! { run_all::<#t, _, _> },
@@ -100,7 +100,7 @@ impl Query {
         };
 
         let ret = match &plan.dispatch {
-            emit::Kind::NoRows => quote::quote! { () },
+            emit::Kind::NoRows(_) => quote::quote! { () },
             emit::Kind::One(t) | emit::Kind::Aggregate(t) => quote::quote! {
                 <#t as ::cartel_sqlite::row::raw::Decode>::Borrowed<#row>
             },

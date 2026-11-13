@@ -34,6 +34,7 @@ pub(super) enum Progress {
     #[default]
     Running,
     Complete,
+    Missing,
     Skipping,
     /// ReadyForQuery can resolve this unclassified diagnostic against the ordered command.
     /// Connection loss cannot establish its scope.

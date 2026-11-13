@@ -151,10 +151,17 @@ impl PgBackend {
                 quote::quote! { () },
                 quote::format_ident!("run_stream"),
             ),
-            emit::Kind::NoRows => (
+            emit::Kind::NoRows(required) => (
                 None,
                 quote::quote! { () },
-                quote::format_ident!("run_no_rows"),
+                quote::format_ident!(
+                    "{}",
+                    if *required {
+                        "run_required"
+                    } else {
+                        "run_no_rows"
+                    }
+                ),
             ),
         };
         let response = quote::quote! {
