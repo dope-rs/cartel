@@ -17,7 +17,7 @@ pub mod common;
 #[test]
 fn encoding_failure_precedes_timer_exhaustion() {
     let config = common::session::config(Positive::from_secs::<1>()).expect("Redis configuration");
-    let prepared = common::topology::try_new::<Bundle<Tcp, Identity, Throughput>>(
+    let prepared = common::topology::try_new::<Bundle<Tcp, Identity, Throughput>, _, _, _>(
         config,
         SocketAddr::from(([127, 0, 0, 1], 0)),
         Plan::new(),

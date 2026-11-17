@@ -269,7 +269,7 @@ where
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Ready(Ok(reply)) => reply,
         };
-        match Pin::new(reply).poll_reply(cx) {
+        match Pin::new(reply).poll_reply(cx, X::extract, std::convert::identity) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(outcome) => Poll::Ready(finish(self, outcome)),
         }

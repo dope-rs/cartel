@@ -50,13 +50,18 @@ impl<const ID: u8> Plan<ID> {
         .map_err(Error::Connector)
     }
 
-    pub fn assemble<E>(
+    pub fn assemble<
+        E,
+        I: client::ops::scripts::Invocation + Unpin,
+        const EXPECTED: i64,
+        const COUNT: usize,
+    >(
         self,
         set: client::Snapshot<E>,
         base: time::Duration,
         max: time::Duration,
-        init: init::Plan,
-    ) -> Result<topology::Plan<(), client::Node<ID, E>>, Error>
+        init: init::Plan<I, EXPECTED, COUNT>,
+    ) -> Result<topology::Plan<(), client::Node<ID, E, I, EXPECTED, COUNT>>, Error>
     where
         E: env::Spec<Wire = Identity>,
         E::Transport: net::Transport,

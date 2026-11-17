@@ -39,7 +39,7 @@ fn exercise(case: Scored) {
             let addr = server.addr();
 
             {
-                let prepared = topology::try_new::<Env>(config, addr, Plan::new())
+                let prepared = topology::try_new::<Env, _, _, _>(config, addr, Plan::new())
                     .expect("topology fixture completed");
                 let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
                 let mut report = Completion::new();

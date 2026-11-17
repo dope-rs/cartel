@@ -187,9 +187,18 @@ impl<'b, 'd, const ID: u8> Routes<'b, 'd, ID> {
 
     /// The exact endpoint's native retirement consumes its admitted closing slot.
     /// Rejected activations never attach; the immutable root cannot replace this FIFO.
-    pub(crate) fn retire<'r, 's, 'storage, 'c, P>(
+    pub(crate) fn retire<
+        'r,
+        's,
+        'storage,
+        'c,
+        P,
+        I: client::ops::scripts::Invocation + Unpin,
+        const EXPECTED: i64,
+        const COUNT: usize,
+    >(
         &self,
-        proof: turns::Drained<'d, route::KeyTag<ID>, Owner<'r, 's, 'd, P, ID>>,
+        proof: turns::Drained<'d, route::KeyTag<ID>, Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>>,
     ) where
         's: 'b,
         'b: 'storage,

@@ -200,8 +200,6 @@ pub enum Decoded<'storage, 'd, 'g> {
 impl<'storage, 'g> codec::Stateful for Codec<'storage, 'g> {
     type State<'d> = parser::Parser<'storage, 'g>;
     type Storage<S> = S;
-    type Preview<'a> = Result<&'a [u8], &'a Failure>;
-    type Outcome<'d> = Decoded<'storage, 'd, 'g>;
 
     fn state<'d>(&self, _: resident::Budget<'d>) -> parser::Parser<'storage, 'g> {
         parser::Parser::new(self.store)
@@ -222,19 +220,24 @@ impl<'storage, 'g> codec::Stateful for Codec<'storage, 'g> {
     fn restart<'a, 'd, S>(&self, storage: &'a mut S, _: &Self::State<'d>) -> storage::Edit<'a, S> {
         Self::edit(storage)
     }
+}
 
-    fn decode<'d, S, T, F>(
+impl<'storage, 'g> Codec<'storage, 'g> {
+    pub fn decode<'d, S, T, F>(
         &self,
         storage: &mut S,
-        state: &mut Self::State<'d>,
+        state: &mut parser::Parser<'storage, 'g>,
         budget: &resident::Budget<'d>,
         limit: Limit,
-        admit: impl FnOnce(Result<Self::Preview<'_>, &Self::Error>) -> codec::Admission<F>,
+        admit: impl FnOnce(Result<Result<&[u8], &Failure>, &scope::Error>) -> codec::Admission<F>,
     ) -> codec::Step<T>
     where
         S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
         T: response::Outcome,
-        F: FnOnce(Result<Self::Outcome<'d>, Self::Error>, &mut Self::State<'d>) -> T::Accepted,
+        F: FnOnce(
+            Result<Decoded<'storage, 'd, 'g>, scope::Error>,
+            &mut parser::Parser<'storage, 'g>,
+        ) -> T::Accepted,
     {
         codec::Input::commit(storage, budget, limit, |input| {
             let parsed = match state.scan(&input, self.frame, self.values) {
@@ -292,20 +295,23 @@ impl<'storage, 'g> codec::Stateful for Codec<'storage, 'g> {
         })
     }
 
-    fn finish<'slot, 'id, 'd, S, T, F>(
+    pub fn finish<'slot, 'id, 'd, S, T, F>(
         &self,
-        mut owner: storage::Owner<'slot, 'id, S, Self::State<'d>>,
+        mut owner: storage::Owner<'slot, 'id, S, parser::Parser<'storage, 'g>>,
         budget: &resident::Budget<'d>,
         limit: Limit,
-        admit: impl FnOnce(Result<Self::Preview<'_>, &Self::Error>) -> codec::Admission<F>,
+        admit: impl FnOnce(Result<Result<&[u8], &Failure>, &scope::Error>) -> codec::Admission<F>,
     ) -> (
-        storage::Owner<'slot, 'id, S, Self::State<'d>>,
+        storage::Owner<'slot, 'id, S, parser::Parser<'storage, 'g>>,
         Result<codec::Finish<T>, T>,
     )
     where
         S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
         T: response::Outcome,
-        F: FnOnce(Result<Self::Outcome<'d>, Self::Error>, &mut Self::State<'d>) -> T::Accepted,
+        F: FnOnce(
+            Result<Decoded<'storage, 'd, 'g>, scope::Error>,
+            &mut parser::Parser<'storage, 'g>,
+        ) -> T::Accepted,
     {
         let (storage, state) = owner.parts();
         let result = codec::Input::with(storage, budget, limit, |input| {

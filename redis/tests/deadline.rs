@@ -44,9 +44,12 @@ pub mod common;
 fn waits_expire() {
     let config = config(Positive::from_millis::<5>()).expect("valid redis configuration");
     {
-        let prepared =
-            topology::try_new::<Env>(config, SocketAddr::from(([127, 0, 0, 1], 0)), Plan::new())
-                .expect("topology fixture completed");
+        let prepared = topology::try_new::<Env, _, _, _>(
+            config,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            Plan::new(),
+        )
+        .expect("topology fixture completed");
         let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
         let mut report = Completion::new();
         prepared.with_local(
@@ -120,7 +123,7 @@ fn detached_blocks_lease() {
             wait_closed(&socket)
         },
         |server| {
-            let prepared = topology::try_new::<Env>(config, server.addr(), Plan::new())
+            let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
                 .expect("topology fixture completed");
             let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
             let mut report = Completion::new();
@@ -170,7 +173,7 @@ fn detached_blocks_lease() {
 fn pool_timeout_reconnects() {
     let config = config(Positive::from_millis::<10>()).expect("valid redis configuration");
     AcceptScript::with(recovery_server, |server| {
-        let prepared = topology::try_new::<Env>(config, server.addr(), Plan::new())
+        let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
             .expect("topology fixture completed");
         let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
         let mut report = Completion::new();
@@ -245,7 +248,7 @@ fn completed_pool_timeout_preserves_new_lease() {
             common::session::held::pong_once(&socket)
         },
         |server| {
-            let prepared = topology::try_new::<Env>(config, server.addr(), Plan::new())
+            let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
                 .expect("Redis topology");
             let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
             let mut report = Completion::new();
@@ -308,7 +311,7 @@ fn completed_pool_timeout_preserves_new_lease() {
 fn lease_timeout_reconnects() {
     let config = config(Positive::from_millis::<10>()).expect("valid redis configuration");
     AcceptScript::with(recovery_server, |server| {
-        let prepared = topology::try_new::<Env>(config, server.addr(), Plan::new())
+        let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
             .expect("topology fixture completed");
         let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
         let mut report = Completion::new();
@@ -397,7 +400,7 @@ fn release_wakes_waiters() {
             Ok::<_, peer::Error>(())
         },
         |server| {
-            let prepared = topology::try_new::<Env>(config, server.addr(), Plan::new())
+            let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
                 .expect("topology fixture completed");
             let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
             let mut report = Completion::new();
@@ -470,7 +473,7 @@ fn idle_lease_remains() {
             Ok(())
         },
         |server| {
-            let prepared = topology::try_new::<Env>(config, server.addr(), Plan::new())
+            let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
                 .expect("topology fixture completed");
             let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
             let mut report = Completion::new();

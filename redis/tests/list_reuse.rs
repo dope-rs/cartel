@@ -43,7 +43,7 @@ fn pair_survives_reuse() {
         |server| {
             let address = server.addr();
             {
-                let prepared = topology::try_new::<Env>(
+                let prepared = topology::try_new::<Env, _, _, _>(
                     try_config(2).expect("list configuration"),
                     address,
                     Plan::new(),
@@ -132,7 +132,7 @@ fn drains_before_drop() {
             }
         },
         |server| {
-            let prepared = topology::try_new::<Env>(
+            let prepared = topology::try_new::<Env, _, _, _>(
                 try_config(1).expect("list configuration"),
                 server.addr(),
                 Plan::new(),

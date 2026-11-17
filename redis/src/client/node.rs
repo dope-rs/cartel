@@ -1,3 +1,5 @@
+use std::convert::Infallible;
+
 use dope::core::driver::route;
 use dope::core::driver::settings;
 use dope::core::driver::settings::{claim, errors};
@@ -20,11 +22,27 @@ use lending::Compose;
 
 use crate::client::{
     self,
+    ops::scripts::Invocation,
     plan::Error,
     settings::{Config, init},
 };
 
-type Host<'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n, 'd, const ID: u8, E> = app::Host<
+type Host<
+    'q,
+    'h,
+    'r,
+    's,
+    'storage,
+    'b,
+    'c,
+    'n,
+    'd,
+    const ID: u8,
+    E,
+    I,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> = app::Host<
     Pool<
         'q,
         'h,
@@ -37,7 +55,7 @@ type Host<'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n, 'd, const ID: u8, E> = app::Host
             'r,
             'd,
             crate::Port<'s, 'storage, 'b, 'c, 'd, ID>,
-            client::Logic<'s, 'd>,
+            client::Logic<'s, 'd, I, EXPECTED, COUNT>,
             route::KeyTag<ID>,
             { client::CONNECTOR_CONNECTION_LIMIT },
         >,
@@ -49,17 +67,23 @@ type Host<'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n, 'd, const ID: u8, E> = app::Host
 >;
 
 /// Owns Redis storage until the installed application's consumer returns.
-pub struct Node<const ID: u8, E: env::Spec>
-where
+pub struct Node<
+    const ID: u8,
+    E: env::Spec,
+    I: Unpin = Infallible,
+    const EXPECTED: i64 = 0,
+    const COUNT: usize = 0,
+> where
     E::Transport: net::Transport,
 {
     config: Config,
     set: client::Snapshot<E>,
     plan: plan::Plan<route::KeyTag<ID>, { client::CONNECTOR_CONNECTION_LIMIT }>,
-    init: init::Plan,
+    init: init::Plan<I, EXPECTED, COUNT>,
 }
 
-impl<const ID: u8, E: env::Spec> Node<ID, E>
+impl<const ID: u8, E: env::Spec, I: Invocation + Unpin, const EXPECTED: i64, const COUNT: usize>
+    Node<ID, E, I, EXPECTED, COUNT>
 where
     E::Transport: net::Transport,
 {
@@ -67,7 +91,7 @@ where
         config: Config,
         set: client::Snapshot<E>,
         plan: plan::Plan<route::KeyTag<ID>, { client::CONNECTOR_CONNECTION_LIMIT }>,
-        init: init::Plan,
+        init: init::Plan<I, EXPECTED, COUNT>,
     ) -> Self {
         Self {
             config,
@@ -90,7 +114,7 @@ where
         <E::Transport as net::Transport>::Addr: Eq,
         F: for<'stage, 'scope, 'life, 'p, 'd, 'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n> FnOnce(
             T,
-            Host<'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n, 'd, ID, E>,
+            Host<'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n, 'd, ID, E, I, EXPECTED, COUNT>,
             &mut lending::Stage<'stage, 'scope, 'life, 'p, 'd, S, Q>,
         )
             -> R,
@@ -103,12 +127,13 @@ where
         self,
         stage: &mut lending::Stage<'stage, 'scope, 'life, 'p, 'd, S, Q>,
         next: impl for<'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n> FnOnce(
-            Host<'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n, 'd, ID, E>,
+            Host<'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n, 'd, ID, E, I, EXPECTED, COUNT>,
             &mut lending::Stage<'stage, 'scope, 'life, 'p, 'd, S, Q>,
         ) -> O,
     ) -> Result<O, manifold::BuildError<Error>>
     where
         S: storage::Plan + 'd,
+        I: 'd,
         Q: executor::Startup,
         E: env::Spec<Wire = Identity> + 'd,
         <E::Transport as net::Transport>::Addr: Eq,
@@ -142,7 +167,8 @@ where
     }
 }
 
-impl<const ID: u8, E: env::Spec> settings::Resource for Node<ID, E>
+impl<const ID: u8, E: env::Spec, I: Unpin, const EXPECTED: i64, const COUNT: usize>
+    settings::Resource for Node<ID, E, I, EXPECTED, COUNT>
 where
     E::Transport: net::Transport,
 {
@@ -151,17 +177,33 @@ where
     }
 }
 
-impl<'stage, 'scope, 'life, 'p, 'd, S, Q, N, O, const ID: u8, E>
-    lending::Installer<lending::Stage<'stage, 'scope, 'life, 'p, 'd, S, Q>, N> for Node<ID, E>
+impl<
+    'stage,
+    'scope,
+    'life,
+    'p,
+    'd,
+    S,
+    Q,
+    N,
+    O,
+    const ID: u8,
+    E,
+    I: Invocation + Unpin,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> lending::Installer<lending::Stage<'stage, 'scope, 'life, 'p, 'd, S, Q>, N>
+    for Node<ID, E, I, EXPECTED, COUNT>
 where
     S: storage::Plan,
+    I: 'd,
     Q: executor::Startup,
     E: env::Spec<Wire = Identity> + 'd,
     E::Transport: net::Transport,
     <E::Transport as net::Transport>::Addr: Eq,
     N: for<'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n> lending::Next<
             lending::Stage<'stage, 'scope, 'life, 'p, 'd, S, Q>,
-            Host<'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n, 'd, ID, E>,
+            Host<'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n, 'd, ID, E, I, EXPECTED, COUNT>,
             Output = O,
         >,
 {
@@ -177,8 +219,8 @@ where
     }
 }
 
-impl<S, T, Q, F, R, const ID: u8, E> lending::ComposeFrom<S, lending::Composition<T, F>, Q>
-    for Node<ID, E>
+impl<S, T, Q, F, R, const ID: u8, E, I: Invocation + Unpin, const EXPECTED: i64, const COUNT: usize>
+    lending::ComposeFrom<S, lending::Composition<T, F>, Q> for Node<ID, E, I, EXPECTED, COUNT>
 where
     S: storage::Plan,
     Q: executor::Startup,
@@ -187,7 +229,7 @@ where
     <E::Transport as net::Transport>::Addr: Eq,
     F: for<'stage, 'scope, 'life, 'p, 'd, 'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n> FnOnce(
         T,
-        Host<'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n, 'd, ID, E>,
+        Host<'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n, 'd, ID, E, I, EXPECTED, COUNT>,
         &mut lending::Stage<'stage, 'scope, 'life, 'p, 'd, S, Q>,
     ) -> R,
 {

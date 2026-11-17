@@ -31,7 +31,7 @@ fn blocked_lease_waiters_finish_each_notification_round() {
         },
         |server| {
             let config = session::config(Positive::from_secs::<1>()).expect("Redis configuration");
-            let prepared = topology::try_new::<Bundle<Tcp, Identity, Throughput>>(
+            let prepared = topology::try_new::<Bundle<Tcp, Identity, Throughput>, _, _, _>(
                 config, server.addr(), Plan::new(),
             ).expect("Redis topology");
             let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);

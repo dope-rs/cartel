@@ -34,14 +34,15 @@ use o3::{
 };
 use protocol::parser::limit;
 
-type Owner<'r, 's, 'd, P, const ID: u8> = endpoint::State<
-    'r,
-    'd,
-    P,
-    client::Logic<'s, 'd>,
-    route::KeyTag<ID>,
-    { client::CONNECTOR_CONNECTION_LIMIT },
->;
+type Owner<'r, 's, 'd, P, const ID: u8, I, const EXPECTED: i64, const COUNT: usize> =
+    endpoint::State<
+        'r,
+        'd,
+        P,
+        client::Logic<'s, 'd, I, EXPECTED, COUNT>,
+        route::KeyTag<ID>,
+        { client::CONNECTOR_CONNECTION_LIMIT },
+    >;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Block {
@@ -72,6 +73,7 @@ pub enum Diagnostic<'a, 'd, const ID: u8 = 0> {
     Allocation,
     Exhausted(&'a alloc::Exhausted),
     Handshake(init::Failure<&'a [u8]>),
+    InitReply(&'a init::Mismatch),
     UnexpectedResponse,
     ReplySlotEmpty,
     Reply(&'a attach::Error),

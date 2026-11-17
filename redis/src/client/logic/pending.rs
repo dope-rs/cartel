@@ -9,6 +9,7 @@ use crate::{
     client::{
         CONNECTOR_CONNECTION_LIMIT, Logic,
         logic::{Owner, Root, reply},
+        ops::scripts::Invocation,
     },
     protocol::{
         self,
@@ -22,9 +23,27 @@ pub struct Pending<'s, 'd>(
     pub(super) storage::Lane<'s, 'd>,
 );
 
-impl<'life, 's, 'storage, 'b, 'c, 'd: 'life, P, const ID: u8>
-    response::Action<'life, 'd, P, Logic<'s, 'd>, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT>
-    for Pending<'s, 'd>
+impl<
+    'life,
+    's,
+    'storage,
+    'b,
+    'c,
+    'd: 'life,
+    P,
+    I: Invocation + Unpin,
+    const ID: u8,
+    const EXPECTED: i64,
+    const COUNT: usize,
+>
+    response::Action<
+        'life,
+        'd,
+        P,
+        Logic<'s, 'd, I, EXPECTED, COUNT>,
+        route::KeyTag<ID>,
+        CONNECTOR_CONNECTION_LIMIT,
+    > for Pending<'s, 'd>
 where
     's: 'b,
     'b: 'storage,
@@ -34,7 +53,7 @@ where
 {
     fn commit<'e, A: work::Admission>(
         item: response::Committed<Self>,
-        _: &mut Owner<'life, 's, 'd, P, ID>,
+        _: &mut Owner<'life, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         _: &mut A,
         _: &mut turns::Context<'_, 'e, 'd, protocol::ConnState, Buffer, route::KeyTag<ID>>,
     ) -> response::Settlement<Self> {
@@ -43,7 +62,7 @@ where
 
     fn settle<'e, A: work::Admission>(
         item: response::Item<Self>,
-        owner: &mut Owner<'life, 's, 'd, P, ID>,
+        owner: &mut Owner<'life, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         work: &mut A,
         ctx: &mut turns::Context<'_, 'e, 'd, protocol::ConnState, Buffer, route::KeyTag<ID>>,
     ) -> response::Settlement<Self> {

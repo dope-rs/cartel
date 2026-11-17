@@ -59,6 +59,7 @@ pub(crate) enum Failure<'d> {
     RequestTimeout(Elapsed),
     Protocol(protocol::Error),
     Handshake(crate::init::Failure<resident::Shared<'d>>),
+    InitReply(crate::init::Mismatch),
     UnexpectedResponse,
     ResponseCapacity(usage::Capacity),
     ResponseFront(order::Front),
@@ -103,6 +104,7 @@ impl<'d> Failure<'d> {
             Self::Input(_)
             | Self::Protocol(_)
             | Self::Handshake(_)
+            | Self::InitReply(_)
             | Self::UnexpectedResponse
             | Self::ResponseFront(_) => close::Reason::Protocol,
             Self::ResponseCapacity(_) => close::Reason::Capacity(close::Capacity::IngressRetention),
@@ -140,6 +142,7 @@ impl<'d> Failure<'d> {
             Self::Input(_)
             | Self::Protocol(_)
             | Self::Handshake(_)
+            | Self::InitReply(_)
             | Self::UnexpectedResponse
             | Self::Request(_)
             | Self::ResponseFrameCapacity(_)
@@ -177,6 +180,7 @@ impl<'d> Failure<'d> {
             Self::RequestTimeout(due) => crate::Error::RequestTimeout(due),
             Self::Protocol(error) => crate::Error::Protocol(error),
             Self::Handshake(error) => crate::Error::Handshake(error),
+            Self::InitReply(error) => crate::Error::InitReply(error),
             Self::UnexpectedResponse => crate::Error::UnexpectedResponse,
             Self::ResponseCapacity(cause) => crate::Error::ResponseCapacity(cause),
             Self::ResponseFront(front) => crate::Error::ResponseFront(front),
@@ -215,6 +219,7 @@ impl<'d> From<&Failure<'d>> for Failure<'d> {
             Self::RequestTimeout(error) => Self::RequestTimeout(*error),
             Self::Protocol(error) => Self::Protocol(*error),
             Self::Handshake(error) => Self::Handshake(error.observe()),
+            Self::InitReply(error) => Self::InitReply(*error),
             Self::UnexpectedResponse => Self::UnexpectedResponse,
             Self::ResponseCapacity(error) => Self::ResponseCapacity(*error),
             Self::ResponseFront(error) => Self::ResponseFront(*error),

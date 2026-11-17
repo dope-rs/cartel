@@ -12,6 +12,7 @@ use parser::frame;
 use crate::{
     client::{
         self,
+        ops::scripts::Invocation,
         settings::init::{Auth, Command, Plan, Step},
     },
     init,
@@ -24,14 +25,18 @@ use crate::{
 type Turn<'a, 'e, 'd, const ID: u8> =
     turns::Parts<'a, 'e, 'd, protocol::ConnState, Buffer, route::KeyTag<ID>>;
 
-impl Plan {
+impl<I: Invocation + Unpin, const EXPECTED: i64, const COUNT: usize> Plan<I, EXPECTED, COUNT> {
     fn send<'e, 's, 'b, 'c, 'd, const ID: u8>(
         port: &crate::Port<'s, '_, 'b, 'c, 'd, ID>,
-        command: Command<'_>,
+        command: Command<'_, I>,
         turn: &mut Turn<'_, 'e, 'd, ID>,
     ) -> Result<(), client::Failure<'d>> {
-        let frame = port
-            .encode(port.requests.frame(), |out| match command {
+        let frame = match command {
+            Command::Eval(call) => {
+                let call = call.prepare().map_err(client::Failure::Request)?;
+                port.encode_sized(call.length, |out| call.encode(out))
+            }
+            command => port.encode(port.requests.frame(), |out| match command {
                 Command::Authenticate(auth) => match auth {
                     Auth::Password(pass) => out.auth(pass),
                     Auth::User {
@@ -41,8 +46,10 @@ impl Plan {
                 },
                 Command::Select(database) => out.select(database),
                 Command::Name(name) => out.set_name(name),
-            })
-            .map_err(client::Failure::Request)?;
+                Command::Eval(_) => unreachable!("eval"),
+            }),
+        }
+        .map_err(client::Failure::Request)?;
         match turn
             .sink
             .try_insert(turn.driver.region_token(), frame.into_frame())
@@ -70,7 +77,7 @@ impl Plan {
 
     fn begin<'e, 's, 'b, 'c, 'd, const ID: u8>(
         port: &crate::Port<'s, '_, 'b, 'c, 'd, ID>,
-        command: Command<'_>,
+        command: Command<'_, I>,
         turn: &mut Turn<'_, 'e, 'd, ID>,
     ) {
         turn.state.begin_init(command.step());
@@ -102,7 +109,21 @@ impl Plan {
     ) {
         let mut turn = ctx.parts();
         let kind = match reply.reader().next_event() {
-            Some(value::Event::Ok) => None,
+            Some(value::Event::Integer(actual)) if COUNT != 0 && step == Step::Eval => {
+                if actual != EXPECTED {
+                    Self::fail(
+                        port,
+                        client::Failure::InitReply(init::Mismatch {
+                            expected: EXPECTED,
+                            actual,
+                        }),
+                        &mut turn,
+                    );
+                    return;
+                }
+                None
+            }
+            Some(value::Event::Ok) if COUNT == 0 || step != Step::Eval => None,
             Some(value::Event::Error(_)) => Some(init::Kind::Rejected),
             Some(_) | None => Some(init::Kind::Unexpected),
         };

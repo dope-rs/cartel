@@ -2,7 +2,10 @@ use std::{marker, mem, pin, task::Poll};
 
 use cartel_core::{
     deadline,
-    reply::{order, recv::attach::Attach},
+    reply::{
+        order,
+        recv::{Extract as _, attach::Attach},
+    },
 };
 use dope::{core::driver::route, manifold::client::conn};
 use dope_fiber::{abi, context, wait};
@@ -193,7 +196,11 @@ where
                         *this.state = State::Done;
                         return Poll::Ready(Err(crate::Error::from(due).into()));
                     }
-                    let poll = pin::Pin::new(reply).poll_reply(cx.as_mut());
+                    let poll = pin::Pin::new(reply).poll_reply(
+                        cx.as_mut(),
+                        replies::Extract::<ID>::extract,
+                        std::convert::identity,
+                    );
                     if poll.is_ready() {
                         *this.state = State::Done;
                     }

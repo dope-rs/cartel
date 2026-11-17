@@ -6,11 +6,16 @@ use dope::{
     net::wire::Identity, runtime::topology::Prepared,
 };
 
-pub fn try_new<E>(
+pub fn try_new<
+    E,
+    I: client::ops::scripts::Invocation + Unpin,
+    const EXPECTED: i64,
+    const COUNT: usize,
+>(
     config: Config,
     address: <E::Transport as Transport>::Addr,
-    init: init::Plan,
-) -> Result<Prepared<(), client::Node<0, E>>, plan::Error>
+    init: init::Plan<I, EXPECTED, COUNT>,
+) -> Result<Prepared<(), client::Node<0, E, I, EXPECTED, COUNT>>, plan::Error>
 where
     E: env::Spec<Wire = Identity>,
     E::Transport: Transport<Addr: Clone>,
@@ -20,7 +25,7 @@ where
         service::Endpoint::new(address.clone(), address),
     );
     plan::Plan::<0>::new(config)
-        .assemble::<E>(
+        .assemble::<E, _, _, _>(
             snapshot,
             settings::DEFAULT_BACKOFF,
             settings::DEFAULT_BACKOFF_MAXIMUM,

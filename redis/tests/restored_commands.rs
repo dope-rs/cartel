@@ -58,7 +58,7 @@ fn preserves_wire_and_geo() {
                 }
             }
         }, |server| {
-        let prepared = topology::try_new::<Bundle<Tcp, Identity, Throughput>>(
+        let prepared = topology::try_new::<Bundle<Tcp, Identity, Throughput>, _, _, _>(
             list::try_config(2).expect("Redis configuration"),
             server.addr(),
             Plan::new(),

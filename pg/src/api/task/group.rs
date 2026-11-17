@@ -10,7 +10,7 @@ use o3::{base::cell::region, depot::array::init};
 use reply::{
     Slot,
     recv::{
-        self,
+        self, Extract as _,
         attach::{self, Attach},
         outcome::Terminal,
     },
@@ -244,9 +244,11 @@ where
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(error)) => Stop::Admission(error),
                     Poll::Ready(Ok(())) => {
-                        let Poll::Ready(observed) =
-                            Pin::new(&mut *this.sync).poll_reply(cx.as_mut())
-                        else {
+                        let Poll::Ready(observed) = Pin::new(&mut *this.sync).poll_reply(
+                            cx.as_mut(),
+                            api::ExtractUnit::<ID>::extract,
+                            std::convert::identity,
+                        ) else {
                             return Poll::Pending;
                         };
                         sync = Some(observed);

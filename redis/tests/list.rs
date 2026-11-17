@@ -50,7 +50,7 @@ fn run(case: List) {
             let address = server.addr();
 
             {
-                let prepared = topology::try_new::<Env>(
+                let prepared = topology::try_new::<Env, _, _, _>(
                     try_config(1).expect("list configuration"),
                     address,
                     Plan::new(),

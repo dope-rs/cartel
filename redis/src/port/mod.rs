@@ -158,29 +158,29 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Port<'s, 'storage, 'b, 'c, 'd, ID> 
         )
     }
 
-    pub fn bind<'a>(
+    pub fn bind<'a, I: Unpin, const EXPECTED: i64, const COUNT: usize>(
         &'a self,
-        plan: init::Plan,
+        plan: init::Plan<I, EXPECTED, COUNT>,
     ) -> bindings::Bound<
         'a,
         'd,
         Self,
-        client::Logic<'s, 'd>,
+        client::Logic<'s, 'd, I, EXPECTED, COUNT>,
         route::KeyTag<ID>,
         { client::CONNECTOR_CONNECTION_LIMIT },
     > {
         bindings::Bound::bind(self, client::Logic::new(self, plan))
     }
 
-    pub fn bind_with<'a, F>(
+    pub fn bind_with<'a, F, I: Unpin, const EXPECTED: i64, const COUNT: usize>(
         &'a self,
-        plan: init::Plan,
+        plan: init::Plan<I, EXPECTED, COUNT>,
         failure: F,
     ) -> bindings::Bound<
         'a,
         'd,
         Self,
-        client::Logic<'s, 'd>,
+        client::Logic<'s, 'd, I, EXPECTED, COUNT>,
         route::KeyTag<ID>,
         { client::CONNECTOR_CONNECTION_LIMIT },
         External<F>,

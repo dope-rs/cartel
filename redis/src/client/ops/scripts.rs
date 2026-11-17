@@ -30,11 +30,28 @@ pub trait Invocation {
     }
 }
 
+impl Invocation for std::convert::Infallible {
+    type Key = &'static [u8];
+    type Argument = &'static [u8];
+
+    fn script(&self) -> &[u8] {
+        match *self {}
+    }
+
+    fn keys(&self) -> &[Self::Key] {
+        match *self {}
+    }
+
+    fn arguments(&self) -> &[Self::Argument] {
+        match *self {}
+    }
+}
+
 pub struct Prepared<'a, K, A> {
     source: &'a [u8],
     keys: &'a [K],
     args: &'a [A],
-    length: encode::Length,
+    pub(crate) length: encode::Length,
 }
 
 impl<K, A> Prepared<'_, K, A> {
@@ -44,7 +61,7 @@ impl<K, A> Prepared<'_, K, A> {
 }
 
 impl<K: AsRef<[u8]>, A: request::Bulk> Prepared<'_, K, A> {
-    fn encode(self, out: &mut encode::Writer) -> Result<(), request::Error> {
+    pub(crate) fn encode(self, out: &mut encode::Writer) -> Result<(), request::Error> {
         script::eval(out, self.source, self.keys, self.args)
     }
 }

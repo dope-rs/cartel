@@ -59,7 +59,7 @@ fn eval_owned() {
             let addr = server.addr();
 
             {
-                let prepared = topology::try_new::<Env>(
+                let prepared = topology::try_new::<Env, _, _, _>(
                     common::command::list::try_config(2).expect("test configuration"),
                     addr,
                     Plan::new(),
@@ -211,7 +211,7 @@ fn request_failure_recycles() {
             let addr = server.addr();
 
             {
-                let prepared = topology::try_new::<Env>(
+                let prepared = topology::try_new::<Env, _, _, _>(
                     try_config().expect("test configuration"),
                     addr,
                     Plan::new(),
@@ -397,7 +397,7 @@ fn bulk_boundary() {
             |server| {
                 let addr = server.addr();
                 {
-                    let prepared = topology::try_new::<Env>(
+                    let prepared = topology::try_new::<Env, _, _, _>(
                         try_bulk_config(capacity).expect("bulk configuration"),
                         addr,
                         Plan::new(),
@@ -495,7 +495,7 @@ fn bulk_reservation_retains_reply() {
         TcpScript::with(
             move |peer| retained_bulk(peer, need, complete),
             |server| {
-                let prepared = topology::try_new::<Env>(
+                let prepared = topology::try_new::<Env, _, _, _>(
                     try_retained_bulk_config(need.get()).expect("retained bulk configuration"),
                     server.addr(),
                     Plan::new(),
@@ -617,7 +617,7 @@ fn partial_reply_keeps_published_cohort() {
             common::session::deadline::wait_closed(peer)
         },
         |server| {
-            let prepared = topology::try_new::<Env>(
+            let prepared = topology::try_new::<Env, _, _, _>(
                 common::command::list::try_config(3).expect("cohort configuration"),
                 server.addr(),
                 Plan::new(),
@@ -744,7 +744,7 @@ fn split_is_one_bulk() {
             let addr = server.addr();
 
             {
-                let prepared = topology::try_new::<Env>(
+                let prepared = topology::try_new::<Env, _, _, _>(
                     try_config().expect("test configuration"),
                     addr,
                     Plan::new(),

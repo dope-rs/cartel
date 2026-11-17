@@ -31,7 +31,7 @@ fn unsigned_domain() {
                 socket.write_all(reply).expect("Redis response");
             }
         }, |server| {
-        let prepared = topology::try_new::<Bundle<Tcp, Identity, Throughput>>(
+        let prepared = topology::try_new::<Bundle<Tcp, Identity, Throughput>, _, _, _>(
             list::try_config(1).expect("Redis configuration"),
             server.addr(),
             Plan::new(),

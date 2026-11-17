@@ -62,12 +62,13 @@ fn main() -> ExitCode {
         service::Revision::new(1),
         service::Endpoint::new(addr, addr),
     );
-    let plan = match plan::Plan::<0>::new(config).assemble::<Bundle<Tcp, Identity, Throughput>>(
-        snap,
-        DEFAULT_BACKOFF,
-        DEFAULT_BACKOFF_MAXIMUM,
-        init::Plan::new(),
-    ) {
+    let plan = match plan::Plan::<0>::new(config)
+        .assemble::<Bundle<Tcp, Identity, Throughput>, _, _, _>(
+            snap,
+            DEFAULT_BACKOFF,
+            DEFAULT_BACKOFF_MAXIMUM,
+            init::Plan::new(),
+        ) {
         Ok(plan) => plan,
         Err(cause) => return fail(format_args!("Redis topology: {cause:?}")),
     };

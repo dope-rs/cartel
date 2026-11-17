@@ -6,6 +6,12 @@ use o3::{
 use crate::client::settings::init::Step;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mismatch {
+    pub expected: i64,
+    pub actual: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
     Rejected,
     Unexpected,

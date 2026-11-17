@@ -32,6 +32,7 @@ use crate::{
     Owner, Port,
     client::{
         self, CONNECTOR_CONNECTION_LIMIT,
+        ops::scripts::Invocation,
         settings::init::{Plan, Step},
     },
     port,
@@ -71,13 +72,16 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Root<'d, ID> for Port<'s, 'storage,
     }
 }
 
-pub struct Logic<'s, 'd> {
+pub struct Logic<'s, 'd, I: Unpin = Infallible, const EXPECTED: i64 = 0, const COUNT: usize = 0> {
     pub(in crate::client) codec: crate::protocol::Codec<'s, 'd>,
-    pub(in crate::client) init: Plan,
+    pub(in crate::client) init: Plan<I, EXPECTED, COUNT>,
 }
 
-impl<'s, 'd> Logic<'s, 'd> {
-    pub(crate) fn new<const ID: u8>(port: &Port<'s, '_, '_, '_, 'd, ID>, plan: Plan) -> Self {
+impl<'s, 'd, I: Unpin, const EXPECTED: i64, const COUNT: usize> Logic<'s, 'd, I, EXPECTED, COUNT> {
+    pub(crate) fn new<const ID: u8>(
+        port: &Port<'s, '_, '_, '_, 'd, ID>,
+        plan: Plan<I, EXPECTED, COUNT>,
+    ) -> Self {
         Self {
             codec: port.codec(),
             init: plan,
@@ -85,8 +89,20 @@ impl<'s, 'd> Logic<'s, 'd> {
     }
 }
 
-impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, P, const ID: u8>
-    protocol::Spec<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT> for Logic<'s, 'd>
+impl<
+    'r,
+    's,
+    'storage,
+    'b,
+    'c,
+    'd: 'r,
+    P,
+    I: Invocation + Unpin,
+    const ID: u8,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> protocol::Spec<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT>
+    for Logic<'s, 'd, I, EXPECTED, COUNT>
 where
     's: 'b,
     'b: 'storage,
@@ -103,12 +119,12 @@ where
     type Response = response::Resume<Pending<'s, 'd>, Pending<'s, 'd>>;
     type Receipt = (Option<Step>, Cutoff<'b>);
     type Send = Buffer;
-    fn codec<'a>(owner: &'a Owner<'r, 's, 'd, P, ID>) -> &'a Self::Codec {
+    fn codec<'a>(owner: &'a Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>) -> &'a Self::Codec {
         &owner.logic().codec
     }
 
     fn receipt(
-        owner: &Owner<'r, 's, 'd, P, ID>,
+        owner: &Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         conn: conn::Id<'d, route::KeyTag<ID>>,
         state: &Self::ConnState,
         region: &region::Token<region::Identity<'d>>,
@@ -127,7 +143,7 @@ where
     }
 
     fn received<'e>(
-        owner: &mut Owner<'r, 's, 'd, P, ID>,
+        owner: &mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         (step, cutoff): Self::Receipt,
         has_prefix: bool,
         ctx: &mut turns::Context<'_, 'e, 'd, Self::ConnState, Self::Send, route::KeyTag<ID>>,
@@ -140,8 +156,20 @@ where
             .received(ctx.conn_id, cutoff, has_prefix, ctx.region());
     }
 }
-impl<'r, 's: 'r, 'storage: 'r, 'b: 'r, 'c: 'r, 'd: 'r, P: 'r, const ID: u8>
-    policy::Output<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT> for Logic<'s, 'd>
+impl<
+    'r,
+    's: 'r,
+    'storage: 'r,
+    'b: 'r,
+    'c: 'r,
+    'd: 'r,
+    P: 'r,
+    I: Invocation + Unpin + 'r,
+    const ID: u8,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> policy::Output<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT>
+    for Logic<'s, 'd, I, EXPECTED, COUNT>
 where
     's: 'b,
     'b: 'storage,
@@ -150,7 +178,7 @@ where
     P: Root<'d, ID, Port = Port<'s, 'storage, 'b, 'c, 'd, ID>>,
 {
     fn sent() -> impl for<'a, 'x> Call<(
-        &'a mut Owner<'r, 's, 'd, P, ID>,
+        &'a mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         conn::Id<'d, route::KeyTag<ID>>,
         egress::Pending,
         &'x mut region::Token<region::Identity<'d, 1>>,
@@ -162,14 +190,14 @@ where
         _: &W::Connection<'w, route::KeyTag<ID>>,
     ) -> Option<
         impl for<'a, 'x, 'y, 'z> Call<(
-            &'a mut Owner<'r, 's, 'd, P, ID>,
+            &'a mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
             &'x mut turns::Context<'y, 'z, 'd, Self::ConnState, Self::Send, route::KeyTag<ID>>,
             session::Input,
         )>,
     > {
         Some(
             |(owner, ctx, input): (
-                &mut Owner<'r, 's, 'd, P, ID>,
+                &mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
                 &mut turns::Context<'_, '_, 'd, Self::ConnState, _, _>,
                 _,
             )| {
@@ -195,7 +223,7 @@ where
     }
 
     fn cancel() -> impl for<'a, 'x> Call<(
-        &'a Owner<'r, 's, 'd, P, ID>,
+        &'a Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         Self::Send,
         &'x mut region::Token<region::Identity<'d, 1>>,
     )> {
@@ -206,8 +234,20 @@ where
     }
 }
 
-impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, P, const ID: u8>
-    policy::Requests<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT> for Logic<'s, 'd>
+impl<
+    'r,
+    's,
+    'storage,
+    'b,
+    'c,
+    'd: 'r,
+    P,
+    I: Invocation + Unpin,
+    const ID: u8,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> policy::Requests<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT>
+    for Logic<'s, 'd, I, EXPECTED, COUNT>
 where
     's: 'b,
     'b: 'storage,
@@ -216,7 +256,7 @@ where
     P: Root<'d, ID, Port = Port<'s, 'storage, 'b, 'c, 'd, ID>>,
 {
     fn drain<'e>(
-        owner: &Owner<'r, 's, 'd, P, ID>,
+        owner: &Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         reqs: &mut request::Requests<'_, '_, 'e, 'd, Self::Send, route::KeyTag<ID>>,
         _: &mut region::Token<region::Identity<'d, 1>>,
     ) {
@@ -229,8 +269,20 @@ where
         port.fail(token, cause, reqs.region());
     }
 }
-impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, P, const ID: u8>
-    admit::Register<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT> for Logic<'s, 'd>
+impl<
+    'r,
+    's,
+    'storage,
+    'b,
+    'c,
+    'd: 'r,
+    P,
+    I: Invocation + Unpin,
+    const ID: u8,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> admit::Register<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT>
+    for Logic<'s, 'd, I, EXPECTED, COUNT>
 where
     's: 'b,
     'b: 'storage,
@@ -239,7 +291,7 @@ where
     P: Root<'d, ID, Port = Port<'s, 'storage, 'b, 'c, 'd, ID>>,
 {
     fn register(
-        owner: &Owner<'r, 's, 'd, P, ID>,
+        owner: &Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         entry: &conn::Activation<'_, 'd, route::KeyTag<ID>>,
     ) -> app::Admission {
         let port = owner.root().port();
@@ -254,8 +306,20 @@ where
         }
     }
 }
-impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, P, const ID: u8>
-    policy::Connected<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT> for Logic<'s, 'd>
+impl<
+    'r,
+    's,
+    'storage,
+    'b,
+    'c,
+    'd: 'r,
+    P,
+    I: Invocation + Unpin,
+    const ID: u8,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> policy::Connected<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT>
+    for Logic<'s, 'd, I, EXPECTED, COUNT>
 where
     's: 'b,
     'b: 'storage,
@@ -266,7 +330,7 @@ where
     type Activation = Registered;
 
     fn connect<'e>(
-        owner: &mut Owner<'r, 's, 'd, P, ID>,
+        owner: &mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         key: attempt::Completion<'_, 'd, route::KeyTag<ID>>,
         _: socket::Addr,
         ctx: turns::Startup<'_, 'e, 'd, Self::ConnState, Self::Send, route::KeyTag<ID>>,
@@ -277,8 +341,20 @@ where
         owner.root().complete(&key, Ok(()));
     }
 }
-impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, P, const ID: u8>
-    policy::Exhausted<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT> for Logic<'s, 'd>
+impl<
+    'r,
+    's,
+    'storage,
+    'b,
+    'c,
+    'd: 'r,
+    P,
+    I: Invocation + Unpin,
+    const ID: u8,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> policy::Exhausted<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT>
+    for Logic<'s, 'd, I, EXPECTED, COUNT>
 where
     's: 'b,
     'b: 'storage,
@@ -287,7 +363,7 @@ where
     P: Root<'d, ID, Port = Port<'s, 'storage, 'b, 'c, 'd, ID>>,
 {
     fn exhaust(
-        owner: &mut Owner<'r, 's, 'd, P, ID>,
+        owner: &mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         key: attempt::Completion<'_, 'd, route::KeyTag<ID>>,
         cause: opening::Exhaustion,
         _: &mut driver::Context<'_, 'd>,
@@ -303,8 +379,20 @@ where
         owner.root().complete(&key, Ok(()));
     }
 }
-impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, P, const ID: u8>
-    policy::Failed<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT> for Logic<'s, 'd>
+impl<
+    'r,
+    's,
+    'storage,
+    'b,
+    'c,
+    'd: 'r,
+    P,
+    I: Invocation + Unpin,
+    const ID: u8,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> policy::Failed<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT>
+    for Logic<'s, 'd, I, EXPECTED, COUNT>
 where
     's: 'b,
     'b: 'storage,
@@ -313,7 +401,7 @@ where
     P: Root<'d, ID, Port = Port<'s, 'storage, 'b, 'c, 'd, ID>, Failure = failure::Observed>,
 {
     fn failed(
-        owner: &mut Owner<'r, 's, 'd, P, ID>,
+        owner: &mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         key: attempt::Completion<'_, 'd, route::KeyTag<ID>>,
         cause: ConnectFault,
         _: &mut driver::Context<'_, 'd>,
@@ -321,8 +409,20 @@ where
         owner.root().complete(&key, Err(cause));
     }
 }
-impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, P, const ID: u8>
-    policy::Lifecycle<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT> for Logic<'s, 'd>
+impl<
+    'r,
+    's,
+    'storage,
+    'b,
+    'c,
+    'd: 'r,
+    P,
+    I: Invocation + Unpin,
+    const ID: u8,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> policy::Lifecycle<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT>
+    for Logic<'s, 'd, I, EXPECTED, COUNT>
 where
     's: 'b,
     'b: 'storage,
@@ -333,7 +433,7 @@ where
     type Drain = Application;
 
     fn transmit_failed(
-        owner: &Owner<'r, 's, 'd, P, ID>,
+        owner: &Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         conn: conn::Id<'d, route::KeyTag<ID>>,
         failure: conn::Transmit,
         regions: &mut (
@@ -349,7 +449,7 @@ where
     }
 
     fn io_fail<'e>(
-        owner: &mut Owner<'r, 's, 'd, P, ID>,
+        owner: &mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         error: Errno,
         ctx: &mut turns::Context<'_, 'e, 'd, Self::ConnState, Self::Send, route::KeyTag<ID>>,
     ) {
@@ -360,8 +460,14 @@ where
     }
 
     fn disconnect(
-        owner: &mut Owner<'r, 's, 'd, P, ID>,
-        ctx: turns::Retired<'_, 'd, Self::ConnState, route::KeyTag<ID>, Owner<'r, 's, 'd, P, ID>>,
+        owner: &mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
+        ctx: turns::Retired<
+            '_,
+            'd,
+            Self::ConnState,
+            route::KeyTag<ID>,
+            Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
+        >,
     ) {
         let reason = ctx.reason();
         owner
@@ -373,7 +479,7 @@ where
         owner.root().retired(reason);
     }
     fn quarantine(
-        owner: &Owner<'r, 's, 'd, P, ID>,
+        owner: &Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         conn: conn::Id<'d, route::KeyTag<ID>>,
         _: &mut Self::ConnState,
         reason: close::Reason,
@@ -389,7 +495,7 @@ where
             .quarantine(conn, reason, &mut regions.0);
     }
     fn clear_send<'turn>(
-        owner: &Owner<'r, 's, 'd, P, ID>,
+        owner: &Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         conn: conn::Id<'d, route::KeyTag<ID>>,
         ctx: &mut turns::Retirement<'_, 'turn, 'd>,
     ) -> egress::Cleared {
@@ -397,7 +503,7 @@ where
         port.schedule.clear_send(conn, ctx, &port.activity)
     }
     fn clear_recv<'turn>(
-        owner: &Owner<'r, 's, 'd, P, ID>,
+        owner: &Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         conn: conn::Id<'d, route::KeyTag<ID>>,
         _: close::Reason,
         ctx: &mut turns::Retirement<'_, 'turn, 'd>,
@@ -405,7 +511,7 @@ where
         owner.root().port().schedule.clear_recv(conn, ctx)
     }
     fn fence(
-        owner: &Owner<'r, 's, 'd, P, ID>,
+        owner: &Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         conn: conn::Id<'d, route::KeyTag<ID>>,
         _: &Self::ConnState,
         region: &mut region::Token<region::Identity<'d>>,
@@ -418,8 +524,20 @@ where
         }
     }
 }
-impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, P, const ID: u8>
-    policy::Quiescence<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT> for Logic<'s, 'd>
+impl<
+    'r,
+    's,
+    'storage,
+    'b,
+    'c,
+    'd: 'r,
+    P,
+    I: Invocation + Unpin,
+    const ID: u8,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> policy::Quiescence<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT>
+    for Logic<'s, 'd, I, EXPECTED, COUNT>
 where
     's: 'b,
     'b: 'storage,
@@ -428,15 +546,27 @@ where
     P: Root<'d, ID, Port = Port<'s, 'storage, 'b, 'c, 'd, ID>>,
 {
     fn quiesce<'a>(
-        _: &Owner<'r, 's, 'd, P, ID>,
+        _: &Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         barrier: app::Barrier<'a, 'd, route::KeyTag<ID>>,
         _: &mut region::Token<region::Identity<'d>>,
     ) -> app::Drain<'a, 'd, route::KeyTag<ID>> {
         barrier.ready()
     }
 }
-impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, P, const ID: u8>
-    policy::Scheduling<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT> for Logic<'s, 'd>
+impl<
+    'r,
+    's,
+    'storage,
+    'b,
+    'c,
+    'd: 'r,
+    P,
+    I: Invocation + Unpin,
+    const ID: u8,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> policy::Scheduling<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT>
+    for Logic<'s, 'd, I, EXPECTED, COUNT>
 where
     's: 'b,
     'b: 'storage,
@@ -445,7 +575,7 @@ where
     P: Root<'d, ID, Port = Port<'s, 'storage, 'b, 'c, 'd, ID>>,
 {
     fn park<'turn>(
-        owner: &mut Owner<'r, 's, 'd, P, ID>,
+        owner: &mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         work: Work<'turn, 'd>,
         region: &mut (
             region::Token<region::Identity<'d>>,
@@ -458,11 +588,11 @@ where
         }
         port.activity.flush(work);
     }
-    fn shutdown(owner: &mut Owner<'r, 's, 'd, P, ID>) {
+    fn shutdown(owner: &mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>) {
         owner.root().port().activity.wake_all();
     }
     fn progress(
-        owner: &Owner<'r, 's, 'd, P, ID>,
+        owner: &Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         _: &region::Token<region::Identity<'d>>,
         _clock: clock::Clock<'_, 'd>,
     ) -> Progress<'d> {
@@ -476,7 +606,7 @@ where
         }
     }
     fn inbound(
-        owner: &Owner<'r, 's, 'd, P, ID>,
+        owner: &Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         conn: conn::Id<'d, route::KeyTag<ID>>,
         state: &Self::ConnState,
         base: Positive,
@@ -494,8 +624,20 @@ where
     }
 }
 
-impl<'r, 's, 'storage, 'b, 'c, 'd: 'r, P, const ID: u8>
-    protocol::Stored<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT> for Logic<'s, 'd>
+impl<
+    'r,
+    's,
+    'storage,
+    'b,
+    'c,
+    'd: 'r,
+    P,
+    I: Invocation + Unpin,
+    const ID: u8,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> protocol::Stored<'r, 'd, P, route::KeyTag<ID>, CONNECTOR_CONNECTION_LIMIT>
+    for Logic<'s, 'd, I, EXPECTED, COUNT>
 where
     's: 'b,
     'b: 'storage,
@@ -504,7 +646,7 @@ where
     P: Root<'d, ID, Port = Port<'s, 'storage, 'b, 'c, 'd, ID>>,
 {
     fn blocked(
-        owner: &Owner<'r, 's, 'd, P, ID>,
+        owner: &Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         conn: conn::Id<'d, route::KeyTag<ID>>,
         state: &mut <Self::Codec as codec::Stateful>::State<'d>,
     ) -> session::Blocking {
@@ -523,7 +665,7 @@ where
     }
 
     fn decode<S>(
-        owner: &mut Owner<'r, 's, 'd, P, ID>,
+        owner: &mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         _: conn::Id<'d, route::KeyTag<ID>>,
         storage: &mut <Self::Codec as codec::Stateful>::Storage<S>,
         state: &mut <Self::Codec as codec::Stateful>::State<'d>,
@@ -535,15 +677,15 @@ where
         S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
     {
         let codec = owner.logic().codec;
-        codec::Stateful::decode(&codec, storage, state, budget, limit, |_| {
+        codec.decode(storage, state, budget, limit, |_| {
             codec::Admission::Ready(|decoded, _: &mut Parser<'s, 'd>| {
-                reply::deliver(owner.root().port(), decoded, ctx)
+                reply::deliver::<I, ID, EXPECTED, COUNT>(owner.root().port(), decoded, ctx)
             })
         })
     }
 
     fn finish<'slot, 'id, S>(
-        owner: &mut Owner<'r, 's, 'd, P, ID>,
+        owner: &mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
         input: storage::Owner<
             'slot,
             'id,
@@ -569,9 +711,9 @@ where
         S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
     {
         let codec = owner.logic().codec;
-        codec::Stateful::finish(&codec, input, budget, limit, |_| {
+        codec.finish(input, budget, limit, |_| {
             codec::Admission::Ready(|decoded, _: &mut Parser<'s, 'd>| {
-                reply::deliver(owner.root().port(), decoded, ctx)
+                reply::deliver::<I, ID, EXPECTED, COUNT>(owner.root().port(), decoded, ctx)
             })
         })
     }

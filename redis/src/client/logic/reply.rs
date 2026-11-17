@@ -6,7 +6,7 @@ use dope::{
 use o3::buffer::write::consume::scope;
 
 use crate::{
-    client::{self, logic::Pending, settings::init::Plan},
+    client::{self, logic::Pending, ops::scripts::Invocation, settings::init::Plan},
     protocol,
 };
 
@@ -45,7 +45,17 @@ pub(super) fn push<'e, 's, 'b, 'c, 'd, const ID: u8>(
     }
 }
 
-pub(super) fn deliver<'e, 's, 'b, 'c, 'd, const ID: u8>(
+pub(super) fn deliver<
+    'e,
+    's,
+    'b,
+    'c,
+    'd,
+    I: Invocation + Unpin,
+    const ID: u8,
+    const EXPECTED: i64,
+    const COUNT: usize,
+>(
     port: &crate::Port<'s, '_, 'b, 'c, 'd, ID>,
     decoded: Result<protocol::Decoded<'s, 'd, 'd>, scope::Error>,
     ctx: &mut turns::Context<'_, 'e, 'd, protocol::ConnState, Buffer, route::KeyTag<ID>>,
@@ -79,7 +89,7 @@ pub(super) fn deliver<'e, 's, 'b, 'c, 'd, const ID: u8>(
             let pending = Pending(frame, lane);
             match ctx.state.phase() {
                 protocol::Phase::Init(step) => {
-                    Plan::response(port, step, pending.0, ctx);
+                    Plan::<I, EXPECTED, COUNT>::response(port, step, pending.0, ctx);
                     None
                 }
                 protocol::Phase::Offline

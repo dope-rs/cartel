@@ -1,6 +1,6 @@
 //! One TCP attempt whose connection remains owned by the returned client.
 
-use std::{marker::PhantomData, ops::ControlFlow, pin::Pin};
+use std::{convert::Infallible, marker::PhantomData, ops::ControlFlow, pin::Pin};
 
 use dope::{
     core::driver::{
@@ -35,34 +35,69 @@ use crate::{
     api::Client as _,
     client::{
         self,
+        ops::scripts::Invocation,
         settings::{Config, init},
     },
     port,
 };
 
 type Mailbox<'d, const ID: u8> = mailbox::Domain<'d, Tcp, (), Result<(), ConnectFault>, KeyTag<ID>>;
-type Session<'r, 's, 'storage, 'b, 'c, 'd, const ID: u8> = bindings::Bound<
+type Session<
+    'r,
+    's,
+    'storage,
+    'b,
+    'c,
+    'd,
+    const ID: u8,
+    I,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> = bindings::Bound<
     'r,
     'd,
     Endpoint<'s, 'storage, 'b, 'c, 'd, ID>,
-    client::Logic<'s, 'd>,
+    client::Logic<'s, 'd, I, EXPECTED, COUNT>,
     KeyTag<ID>,
     { client::CONNECTOR_CONNECTION_LIMIT },
 >;
-type Machine<'p, 'r, 's, 'storage, 'b, 'c, 'd, const ID: u8> = engine::Machine<
+type Machine<
+    'p,
+    'r,
+    's,
+    'storage,
+    'b,
+    'c,
+    'd,
+    const ID: u8,
+    I,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> = engine::Machine<
     'p,
     'd,
     'd,
     KeyTag<ID>,
-    session::app::State<'d, 'd, KeyTag<ID>, Session<'r, 's, 'storage, 'b, 'c, 'd, ID>, Identity>,
+    session::app::State<
+        'd,
+        'd,
+        KeyTag<ID>,
+        Session<'r, 's, 'storage, 'b, 'c, 'd, ID, I, EXPECTED, COUNT>,
+        Identity,
+    >,
     queue::Control<'r, 'd, Tcp, KeyTag<ID>>,
     env::Bundle<Tcp, Identity, Balanced>,
 >;
 
 /// Admits exactly one physical connection and one consuming start capability.
-pub struct Plan<const ID: u8 = 0> {
+pub struct Plan<
+    const ID: u8 = 0,
+    I: Unpin = Infallible,
+    const EXPECTED: i64 = 0,
+    const COUNT: usize = 0,
+> {
     config: Config,
-    init: init::Plan,
+    init: init::Plan<I, EXPECTED, COUNT>,
     layout: Layout<KeyTag<ID>, 1>,
 }
 
@@ -90,16 +125,39 @@ pub struct Endpoint<'s, 'storage, 'b, 'c, 'd, const ID: u8> {
 #[pin_project::pin_project]
 #[derive(dope::Forward)]
 #[repr(transparent)]
-pub struct Connector<'p, 'r, 's, 'storage, 'b, 'c, 'd, const ID: u8 = 0> {
+pub struct Connector<
+    'p,
+    'r,
+    's,
+    'storage,
+    'b,
+    'c,
+    'd,
+    const ID: u8 = 0,
+    I: Invocation + Unpin = Infallible,
+    const EXPECTED: i64 = 0,
+    const COUNT: usize = 0,
+> {
     #[pin]
     #[forward('d)]
-    engine: Machine<'p, 'r, 's, 'storage, 'b, 'c, 'd, ID>,
+    engine: Machine<'p, 'r, 's, 'storage, 'b, 'c, 'd, ID, I, EXPECTED, COUNT>,
 }
 
-impl<'p, 'r, 's, 'storage, 'b, 'c, 'd, const ID: u8> lending::Root<'d>
-    for Connector<'p, 'r, 's, 'storage, 'b, 'c, 'd, ID>
+impl<
+    'p,
+    'r,
+    's,
+    'storage,
+    'b,
+    'c,
+    'd,
+    I: Invocation + Unpin + 'd,
+    const ID: u8,
+    const EXPECTED: i64,
+    const COUNT: usize,
+> lending::Root<'d> for Connector<'p, 'r, 's, 'storage, 'b, 'c, 'd, ID, I, EXPECTED, COUNT>
 {
-    type Provider = Session<'r, 's, 'storage, 'b, 'c, 'd, ID>;
+    type Provider = Session<'r, 's, 'storage, 'b, 'c, 'd, ID, I, EXPECTED, COUNT>;
 
     fn provider(self: Pin<&Self>) -> Pin<&Self::Provider> {
         Pin::new(self.project_ref().engine.application().session())
@@ -124,8 +182,13 @@ pub struct Connected<'app, 'source, 's, 'storage, 'b, 'c, 'd: 'app, B: ?Sized, c
     _attempt: queue::Lease<'source, 'd, Tcp, KeyTag<ID>>,
 }
 
-impl<const ID: u8> Plan<ID> {
-    pub fn new(config: Config, init: init::Plan) -> Result<Self, errors::Claim> {
+impl<const ID: u8, I: Invocation + Unpin, const EXPECTED: i64, const COUNT: usize>
+    Plan<ID, I, EXPECTED, COUNT>
+{
+    pub fn new(
+        config: Config,
+        init: init::Plan<I, EXPECTED, COUNT>,
+    ) -> Result<Self, errors::Claim> {
         Ok(Self {
             layout: Layout::new(config.connections())?,
             config,
@@ -139,11 +202,14 @@ impl<const ID: u8> Plan<ID> {
         state: &mut C,
         driver: impl for<'a> Fn(&'a mut C) -> driver::Context<'a, 'd>,
         run: impl for<'p, 'r, 's, 'storage, 'b, 'c> FnOnce(
-            app::Host<Connector<'p, 'r, 's, 'storage, 'b, 'c, 'd, ID>>,
+            app::Host<Connector<'p, 'r, 's, 'storage, 'b, 'c, 'd, ID, I, EXPECTED, COUNT>>,
             Start<'b, 'r, 'd, ID>,
             &mut C,
         ) -> R,
-    ) -> Result<R, CreateError<'d, ID>> {
+    ) -> Result<R, CreateError<'d, ID>>
+    where
+        I: 'd,
+    {
         let Self {
             config,
             init,
@@ -187,7 +253,9 @@ impl<const ID: u8> Plan<ID> {
     }
 }
 
-impl<const ID: u8> driver_settings::Resource for Plan<ID> {
+impl<const ID: u8, I: Unpin, const EXPECTED: i64, const COUNT: usize> driver_settings::Resource
+    for Plan<ID, I, EXPECTED, COUNT>
+{
     fn include_in(&self, needs: claim::Needs) -> Result<claim::Needs, errors::Claim> {
         driver_settings::Resource::include_in(&self.layout, needs)
     }

@@ -74,7 +74,7 @@ fn unsolicited_partial_cannot_bind_next_request() {
             }
         },
         |server| {
-            let prepared = topology::try_new::<Env>(config, server.addr(), Plan::new())
+            let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
                 .expect("Redis topology");
             let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
             let mut report = Completion::new();
@@ -140,7 +140,7 @@ fn detached_partial_preserves_next_request() {
             socket.write_all(b"NG\r\n:7\r\n")
         },
         |server| {
-            let prepared = topology::try_new::<Env>(config, server.addr(), Plan::new())
+            let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
                 .expect("Redis topology");
             let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
             let mut report = Completion::new();
@@ -205,7 +205,7 @@ fn half_close_preserves_truncated_response() {
                 Ok::<_, peer::Error>(())
             },
             |server| {
-                let prepared = topology::try_new::<Env>(config, server.addr(), Plan::new())
+                let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
                     .expect("Redis topology");
                 let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
                 let mut report = Completion::new();
@@ -299,7 +299,7 @@ fn mixed_close_drains() {
             .expect("valid redis configuration");
 
             {
-                let prepared = topology::try_new::<Env>(config, addr, Plan::new())
+                let prepared = topology::try_new::<Env, _, _, _>(config, addr, Plan::new())
                     .expect("topology fixture completed");
                 let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
                 let mut report = Completion::new();
@@ -398,7 +398,7 @@ fn bulk_admission() {
             .expect("production-shaped redis configuration");
 
             {
-                let prepared = topology::try_new::<Env>(config, addr, Plan::new())
+                let prepared = topology::try_new::<Env, _, _, _>(config, addr, Plan::new())
                     .expect("topology fixture completed");
                 let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
                 let mut report = Completion::new();
@@ -464,7 +464,7 @@ fn binding_reconnects() {
             let addr = server.addr();
 
             {
-                let prepared = topology::try_new::<Env>(config, addr, Plan::new())
+                let prepared = topology::try_new::<Env, _, _, _>(config, addr, Plan::new())
                     .expect("topology fixture completed");
                 let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
                 let mut report = Completion::new();
@@ -568,7 +568,7 @@ fn waiter_slot_reclaims() {
         service::Endpoint::new(addr, addr),
     );
     let (_, node) = cartel_redis::client::plan::Plan::<0>::new(config)
-        .assemble::<Env>(
+        .assemble::<Env, _, _, _>(
             snapshot,
             settings::DEFAULT_BACKOFF,
             settings::DEFAULT_BACKOFF_MAXIMUM,
@@ -720,7 +720,7 @@ fn parser_lane_waits_for_retained_replies() {
             pong_once(a)
         },
         |server| {
-            let prepared = topology::try_new::<Env>(config, server.addr(), Plan::new())
+            let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
                 .expect("Redis topology");
             let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
             let mut report = Completion::new();

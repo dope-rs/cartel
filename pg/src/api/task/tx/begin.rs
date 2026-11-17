@@ -4,7 +4,10 @@ use crate::{
     port::requests,
     schema,
 };
-use cartel_core::{deadline, reply::recv::attach::Attach};
+use cartel_core::{
+    deadline,
+    reply::recv::{Extract as _, attach::Attach},
+};
 use dope::core::driver::schedule::clock::timer;
 use dope_fiber::{abi, context, wait};
 use std::{mem, pin, task};
@@ -191,9 +194,11 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                 return task::Poll::Ready(Err(error));
             }
             if matches!(this.state, State::Admitted(..)) {
-                let task::Poll::Ready(next) =
-                    pin::Pin::new(&mut *this.reply).poll_reply(ctx.as_mut())
-                else {
+                let task::Poll::Ready(next) = pin::Pin::new(&mut *this.reply).poll_reply(
+                    ctx.as_mut(),
+                    api::ExtractUnit::<ID>::extract,
+                    std::convert::identity,
+                ) else {
                     return task::Poll::Pending;
                 };
                 return match mem::replace(this.state, State::Done) {

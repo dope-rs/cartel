@@ -50,12 +50,12 @@ fn reconnect_replays_init() {
             for epoch in 0..2 {
                 let socket = peer.accept()?;
                 for (request, step) in REQUESTS {
-                    assert_eq!(
-                        read_request(&socket, request.len())?,
-                        request,
-                        "{step:?}"
-                    );
-                    socket.write_all(b"+OK\r\n")?;
+                    assert_eq!(read_request(&socket, request.len())?, request, "{step:?}");
+                    socket.write_all(if step == Step::Eval {
+                        b":0\r\n"
+                    } else {
+                        b"+OK\r\n"
+                    })?;
                 }
                 assert_eq!(read_request(&socket, PING.len())?, PING);
                 socket.write_all(b"+PONG\r\n")?;
@@ -74,7 +74,9 @@ fn reconnect_replays_init() {
                 .select(3)
                 .name("worker")
                 .expect("client name storage must allocate");
-            let prepared = topology::try_new::<Env>(
+            let scope = *b"scope";
+            let init = init.eval::<0, _>(Verify([&scope]));
+            let prepared = topology::try_new::<Env, _, _, _>(
                 config(Positive::from_millis::<25>()).expect("valid redis configuration"),
                 server.addr(),
                 init,
@@ -162,7 +164,15 @@ fn reconnect_replays_init() {
 
 #[test]
 fn rejection_stops_init() {
-    for expected in [Step::Authenticate, Step::Select, Step::SetClientName] {
+    for (expected, response, kind) in [
+        (Step::Authenticate, REJECTED, Some(init::Kind::Rejected)),
+        (Step::Select, REJECTED, Some(init::Kind::Rejected)),
+        (Step::SetClientName, REJECTED, Some(init::Kind::Rejected)),
+        (Step::Select, b":00017\r\n", Some(init::Kind::Unexpected)),
+        (Step::Eval, REJECTED, Some(init::Kind::Rejected)),
+        (Step::Eval, b"+OK\r\n", Some(init::Kind::Unexpected)),
+        (Step::Eval, b":8\r\n", None),
+    ] {
         AcceptScript::with(
             move |peer| {
                 let socket = peer.accept()?;
@@ -173,7 +183,7 @@ fn rejection_stops_init() {
                         "{step:?}"
                     );
                     if step == expected {
-                        socket.write_all(REJECTED)?;
+                        socket.write_all(response)?;
                         socket.read_wait(Some(GUARD))?;
                         assert_eq!(
                             socket.read(&mut [0])?,
@@ -194,8 +204,18 @@ fn rejection_stops_init() {
                     .select(3)
                     .name("worker")
                     .expect("client name storage must allocate");
-                let prepared = topology::try_new::<Env>(
-                    config(Positive::from_millis::<25>()).expect("valid redis configuration"),
+                let scope = *b"scope";
+                let init = init.eval::<0, _>(Verify([&scope]));
+                let config = Builder::new(settings::Capacities {
+                    inflight: 3,
+                    response_values: 3,
+                    ..common::session::CAPACITIES
+                })
+                .window(Positive::from_secs::<5>())
+                .build()
+                .expect("queued command and initialization frames");
+                let prepared = topology::try_new::<Env, _, _, _>(
+                    config,
                     server.addr(),
                     init,
                 )
@@ -208,34 +228,33 @@ fn rejection_stops_init() {
                             node.install(stage, |host, stage| {
                                 stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
                                     let redis = runtime.root_client();
-                                    let first = runtime.block_on(redis.wait_active())
-                                        .expect("drive rejected connection")
-                                        .expect_err("initialization must fail");
+                                    let first = match runtime.block_on(redis.server().ping())
+                                        .expect("drive queued command before initialization")
+                                    {
+                                        Err(value::reply::Failure::Control(error)) => error,
+                                        _ => panic!("initialization must reject queued command"),
+                                    };
                                     runtime.block_on(dope_fiber::fiber!('_ => async move {
                                         fibers::Yield::new().await;
                                         fibers::Yield::new().await;
                                     })).expect("yield rejected connection");
-                                    {
-                                        let second = runtime.block_on(redis.wait_active())
-                                            .expect("drive repeated failure")
-                                            .expect_err("rejection must persist");
-                                        match &second {
-                                            cartel_redis::Error::Handshake(error) => assert!(
-                                                error.step == expected && error.kind == init::Kind::Rejected
-                                                    && matches!(&error.frame, Ok(frame) if frame.as_ref() == REJECTED),
+                                    let second = runtime.block_on(redis.wait_active())
+                                        .expect("drive repeated failure")
+                                        .expect_err("rejection must persist");
+                                    for error in [&first, &second] {
+                                        match (kind, error) {
+                                            (Some(kind), cartel_redis::Error::Handshake(error)) => assert!(
+                                                error.step == expected && error.kind == kind
+                                                    && matches!(&error.frame, Ok(frame) if frame.as_ref() == response),
                                                 "repeated initialization failure: {error:?}; frame: {:?}",
                                                 error.frame.as_ref().map(|frame| frame.as_ref())
                                             ),
-                                            error => assert!(
-                                                matches!(error, cartel_redis::Error::Handshake(_)),
-                                                "unexpected initialization failure: {:?}",
-                                                std::mem::discriminant(error)
-                                            ),
+                                            (None, cartel_redis::Error::InitReply(error)) => {
+                                                assert_eq!(*error, init::Mismatch { expected: 0, actual: 8 });
+                                            }
+                                            _ => panic!("unexpected initialization failure: {:?}", std::mem::discriminant(error)),
                                         }
                                     }
-                                    assert!(matches!(&first, cartel_redis::Error::Handshake(error)
-                                        if error.step == expected && error.kind == init::Kind::Rejected
-                                            && matches!(&error.frame, Ok(frame) if frame.as_ref() == REJECTED)));
                                 })
                             })
                         })
@@ -291,7 +310,7 @@ fn lane_failure_survives() {
             service::Endpoint::new(addr, addr),
         );
         let (_, node) = cartel_redis::client::plan::Plan::<0>::new(config)
-            .assemble::<Env>(
+            .assemble::<Env, _, _, _>(
                 snapshot,
                 settings::DEFAULT_BACKOFF,
                 settings::DEFAULT_BACKOFF_MAXIMUM,

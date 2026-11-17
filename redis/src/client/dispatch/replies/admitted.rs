@@ -23,7 +23,7 @@ impl<'a, 'b, 'c: 'b, 's, 'd: 'c, const ID: u8>
         match slot.terminal()? {
             Terminal::Failed(failure) => Some(Err(failure.into_error().into_error().into())),
             Terminal::Complete(done) => {
-                let retained = match done.try_retain() {
+                let retained = match done.try_retain(|| {}) {
                     Ok(retained) => retained,
                     Err(error) => return Some(Err(crate::Error::ResponseRetain(error).into())),
                 };
