@@ -104,7 +104,7 @@ impl<'a, 'd, const ID: u8> storage::Listed<'a, 'd, ID> {
     }
 
     pub(crate) fn reserve(self) -> Option<Reservation<'a, 'd, ID>> {
-        let Some(phase) = access::Access::reserve(&self) else {
+        let Some(phase) = access::Reservation::reserve(&self) else {
             self.remove();
             return None;
         };
@@ -221,7 +221,7 @@ impl<'d, const ID: u8> Shared<'d, ID> {
         let Some(entry) = self.entry(id.conn.index().into_usize()) else {
             return access::Finalization::Lost(id);
         };
-        let state = access::Access::new(entry.slot()).finalize(id);
+        let state = entry.slot().finalize(id);
         if let access::Finalization::Pending(_) = state {
             // SAFETY: Held -> Finalizing consumes the original counted blocker.
             let left = self.index.blockers.get().get() - 1;

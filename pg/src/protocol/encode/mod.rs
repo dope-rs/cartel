@@ -1,3 +1,4 @@
+mod bind;
 mod error;
 
 pub use error::Error;
@@ -23,6 +24,7 @@ use o3::buffer::{
 use crate::protocol::messages;
 
 pub(crate) const SYNC: &[u8; 5] = &[messages::Fe::SYNC, 0, 0, 0, 4];
+const EXECUTE: &[u8; 10] = &[messages::Fe::EXECUTE, 0, 0, 0, 9, 0, 0, 0, 0, 0];
 pub(crate) const COPY_DONE_SYNC: &[u8; 10] = &[
     messages::Fe::COPY_DONE,
     0,
@@ -76,17 +78,26 @@ impl write::Sink for Writer<'_> {
 }
 
 impl Writer<'_> {
+    #[inline]
+    pub(in crate::protocol) fn write_words(&mut self, words: &[[u8; 4]]) -> Result<(), Error> {
+        self.0.write_slice(words.as_flattened()).map_err(|error| {
+            let (_, room) = error.into_parts();
+            Error::Capacity {
+                required: std::num::NonZero::<usize>::MIN.saturating_add(3),
+                capacity: room % 4,
+            }
+        })
+    }
+
     /// Commits initialized partial writes before the frame's secret clearing.
-    pub(crate) fn encode<T>(
-        mut span: pool::Span,
-        kind: frame::Sensitivity,
+    pub(crate) fn with<T>(
+        span: &mut pool::Span,
         write: impl FnOnce(&mut Writer<'_>) -> Result<T, Error>,
-    ) -> Result<(frame::Buffer, T), Error> {
+    ) -> Result<T, Error> {
         let mut writer = Writer(span.spare());
         let result = write(&mut writer);
         writer.0.commit();
-        let frame = frame::Buffer::new(span, kind);
-        Ok((frame, result?))
+        result
     }
 
     /// The retained owner bounds the prefix and its appended suffix together.
@@ -194,38 +205,27 @@ impl Writer<'_> {
         })
     }
 
-    pub(crate) fn bind<T>(
+    fn run(
         &mut self,
-        name: &str,
-        formats: &[u16],
-        params: i16,
+        prefix: &bind::Prefix<'_>,
         results: &[u16],
-        write: impl FnOnce(&mut Writer<'_>) -> Result<T, Error>,
-    ) -> Result<T, Error> {
+        write: impl FnOnce(&mut Writer<'_>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         self.write_byte(messages::Fe::BIND)?;
         self.patch::<true, _>(|out| {
-            out.write_byte(0)?;
-            write_cstr(out, name)?;
-            out.write_formats(formats)?;
-            out.write_slice(&params.to_be_bytes())?;
-            let value = write(out)?;
-            out.write_formats(results)?;
-            Ok(value)
-        })
+            prefix.write(&mut out.0)?;
+            write(out)?;
+            bind::formats(results, |bytes| out.write_slice(bytes))
+        })?;
+        self.write_slice(EXECUTE)
     }
 
-    fn write_formats(&mut self, formats: &[u16]) -> Result<(), Error> {
-        // Bind callers retain query admission or supply the fixed singleton format.
-        self.write_slice(&(formats.len() as i16).to_be_bytes())?;
-        for format in formats {
-            self.write_slice(&format.to_be_bytes())?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn execute(&mut self) -> Result<(), Error> {
-        const MESSAGE: [u8; 10] = [messages::Fe::EXECUTE, 0, 0, 0, 9, 0, 0, 0, 0, 0];
-        self.write_slice(&MESSAGE)
+    pub(crate) fn unnamed(&mut self) -> Result<(), Error> {
+        self.run(
+            &bind::Prefix { name: "", formats: &[1], params: 0 },
+            &[1],
+            |_| Ok(()),
+        )
     }
 }
 

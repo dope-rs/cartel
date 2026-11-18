@@ -66,10 +66,13 @@ impl QueryMeta<'_> {
     }
 
     pub(crate) fn validate<Q: TypedQuery>() -> Result<Admission<Q>, Error> {
-        const { Self::check::<Q>() }?;
-        let mut formats = desc::Formats::new(Q::RESULT_FORMAT_CODES, Q::N_RESULT_COLS);
-        <Q::Row as desc::Validate>::formats(&mut formats)?;
-        formats.finish()?;
+        const {
+            match Self::check::<Q>() {
+                Err(error) => Err(error),
+                Ok(()) => <Q::Row as desc::Validate>::FORMATS
+                    .validate(Q::RESULT_FORMAT_CODES, Q::N_RESULT_COLS),
+            }
+        }?;
         Ok(Admission(PhantomData))
     }
 
@@ -162,12 +165,6 @@ impl QueryMeta<'_> {
 #[repr(transparent)]
 pub(crate) struct Admission<Q>(PhantomData<fn(Q) -> Q>);
 
-impl<Q: TypedQuery> Admission<Q> {
-    pub(crate) const fn count(&self) -> i16 {
-        Q::N_PARAMS
-    }
-}
-
 const _: () = assert!(mem::size_of::<Admission<()>>() == 0);
 
 #[derive(Clone, Copy)]
@@ -207,7 +204,7 @@ pub trait TypedQuery: Any {
     const PARAM_FORMAT_CODES: &[u16] = &[1];
     const RESULT_FORMAT_CODES: &[u16] = &[1];
 
-    fn encode(params: Self::Params<'_>, w: &mut encode::BindWriter<'_, '_>) -> Result<(), Error>;
+    fn bind(params: &Self::Params<'_>) -> impl encode::Arguments;
 }
 
 pub trait QueryGroup {

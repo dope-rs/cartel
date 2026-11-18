@@ -329,7 +329,7 @@ fn send<'d, B: ?Sized, I: schema::QuerySet, const ID: u8>(
     let requests = client.port.request();
     let frame = requests
         .encode(client.port.requests.acquire(), |frame| {
-            frame.copy_data(data)
+            crate::protocol::encode::Writer::with(frame, |out| out.copy_data(data))
         })
         .map_err(Error::from)?;
     requests

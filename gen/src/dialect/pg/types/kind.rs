@@ -14,11 +14,7 @@ impl<'a> Kind<'a> {
         if let syn::Type::Reference(rf) = syntax {
             return Self::reference(syntax, rf.elem.as_ref());
         }
-        Self {
-            syntax,
-            cause: syntax,
-            tag: Tag::Unsupported,
-        }
+        Self::unsupported(syntax)
     }
 
     fn path(syntax: &'a syn::Type, path: &'a syn::TypePath) -> Self {
@@ -55,18 +51,13 @@ impl<'a> Kind<'a> {
         let tag = if last.ident == "Vec" {
             match Tag::simple(inner) {
                 Some(ident) => Tag::vector(ident),
-                None => Tag::VecOther,
+                None => Tag::Unsupported,
             }
         } else if last.ident == "Option" {
             match Tag::simple(inner) {
                 Some(ident) => Tag::optional(ident),
-                None => {
-                    if let Tag::VecU8 = Self::new(inner).tag {
-                        Tag::OptBytes
-                    } else {
-                        Tag::OptOther
-                    }
-                }
+                None if matches!(Self::new(inner).tag, Tag::Bytes) => Tag::RowOnly,
+                None => Tag::Unsupported,
             }
         } else {
             Tag::Unsupported
@@ -79,17 +70,13 @@ impl<'a> Kind<'a> {
     }
 
     fn reference(syntax: &'a syn::Type, inner: &'a syn::Type) -> Self {
-        let (cause, tag) = if let Some(ident) = Tag::simple(inner) {
-            if ident == "str" {
-                (inner, Tag::RefStr)
-            } else {
-                (inner, Tag::RefOther)
-            }
-        } else if let syn::Type::Slice(slice) = inner {
+        let (cause, tag) = if let syn::Type::Slice(slice) = inner {
             let elem = slice.elem.as_ref();
             (elem, Tag::slice(elem))
+        } else if Tag::simple(inner).is_some_and(|ident| ident == "str") {
+            (inner, Tag::Borrowed)
         } else {
-            (inner, Tag::RefOther)
+            (inner, Tag::Unsupported)
         };
         Self { syntax, cause, tag }
     }
@@ -102,96 +89,30 @@ impl<'a> Kind<'a> {
         }
     }
 
-    pub(super) fn param(self) -> syn::Result<&'a syn::Type> {
+    pub(super) fn param(self) -> syn::Result<(&'a syn::Type, u16)> {
         match self.tag {
-            Tag::Bool
-            | Tag::I16
-            | Tag::I32
-            | Tag::I64
-            | Tag::F32
-            | Tag::F64
-            | Tag::String
-            | Tag::Text
-            | Tag::Jsonb
-            | Tag::Uuid
-            | Tag::Timestamp
-            | Tag::Date
-            | Tag::Ltree
-            | Tag::VecU8
-            | Tag::RefStr
-            | Tag::SliceU8
-            | Tag::SliceI16
-            | Tag::SliceI32
-            | Tag::SliceI64
-            | Tag::SliceF32
-            | Tag::SliceF64
-            | Tag::SliceBool
-            | Tag::SliceStr => Ok(match self.syntax {
-                syn::Type::Reference(value) => &value.elem,
-                value => value,
-            }),
-            _ => Err(syn::Error::new_spanned(
-                self.cause,
-                "#[query] cannot bind this parameter type",
-            )),
+            Tag::Scalar(_) | Tag::Bytes | Tag::Borrowed => {
+                let ty = match self.syntax {
+                    syn::Type::Reference(value) => value.elem.as_ref(),
+                    value => value,
+                };
+                Ok((ty, self.tag.format()))
+            }
+            Tag::RowOnly | Tag::OptionalLtree | Tag::Named | Tag::Unsupported => Err(
+                syn::Error::new_spanned(self.cause, "#[query] cannot bind this parameter type"),
+            ),
         }
     }
 
     pub(super) fn row_read(self) -> syn::Result<proc_macro2::TokenStream> {
         match self.tag {
-            Tag::Bool
-            | Tag::I16
-            | Tag::I32
-            | Tag::I64
-            | Tag::F32
-            | Tag::F64
-            | Tag::String
-            | Tag::Text
-            | Tag::Jsonb
-            | Tag::Uuid
-            | Tag::Timestamp
-            | Tag::Date
-            | Tag::Ltree
-            | Tag::VecU8
-            | Tag::VecI32
-            | Tag::VecI64
-            | Tag::VecString
-            | Tag::OptBool
-            | Tag::OptI16
-            | Tag::OptI32
-            | Tag::OptI64
-            | Tag::OptF32
-            | Tag::OptF64
-            | Tag::OptString
-            | Tag::OptText
-            | Tag::OptJsonb
-            | Tag::OptUuid
-            | Tag::OptTimestamp
-            | Tag::OptDate
-            | Tag::OptLtree
-            | Tag::OptBytes => {
+            Tag::Scalar(_) | Tag::Bytes | Tag::RowOnly | Tag::OptionalLtree => {
                 let syntax = self.syntax;
                 Ok(quote::quote! {
                     <#syntax as ::cartel_pg::schema::Row>::decode_owned(row)?
                 })
             }
-            Tag::U8
-            | Tag::U32
-            | Tag::Str
-            | Tag::VecOther
-            | Tag::OptOther
-            | Tag::RefStr
-            | Tag::SliceU8
-            | Tag::SliceI16
-            | Tag::SliceI32
-            | Tag::SliceI64
-            | Tag::SliceF32
-            | Tag::SliceF64
-            | Tag::SliceBool
-            | Tag::SliceStr
-            | Tag::RefOther
-            | Tag::Named
-            | Tag::Unsupported => Err(syn::Error::new_spanned(
+            Tag::Borrowed | Tag::Named | Tag::Unsupported => Err(syn::Error::new_spanned(
                 self.cause,
                 "#[derive(PgRow)] cannot decode this field type",
             )),

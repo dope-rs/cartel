@@ -297,13 +297,9 @@ impl<'d, const ID: u8> Slot<'d, ID> {
         &self,
         token: conn::Id<'d, KeyTag<ID>>,
     ) -> Result<Ready<'_, 'd, ID>, crate::Error> {
-        match self.snapshot() {
-            Some((bound, Lifecycle::Ready { access, .. }))
-                if bound.token == token && !matches!(access, access::State::Draining) =>
-            {
-                Ok(Ready { slot: self })
-            }
-            _ => Err(crate::Error::Closed),
+        match self.access(token) {
+            Some(access::State::Draining) | None => Err(crate::Error::Closed),
+            Some(_) => Ok(Ready { slot: self }),
         }
     }
 
@@ -312,13 +308,7 @@ impl<'d, const ID: u8> Slot<'d, ID> {
         token: conn::Id<'d, KeyTag<ID>>,
         generation: Option<access::Generation>,
     ) -> Option<Ready<'_, 'd, ID>> {
-        let Some((bound, Lifecycle::Ready { access, .. })) = self.snapshot() else {
-            return None;
-        };
-        if bound.token != token {
-            return None;
-        }
-        match (access, generation) {
+        match (self.access(token)?, generation) {
             (access::State::Shared(_), None) => Some(Ready { slot: self }),
             (access::State::Held(current), Some(generation)) if current == generation => {
                 Some(Ready { slot: self })

@@ -1,7 +1,7 @@
 use cartel_pg::api::traits::{Client, Status as _};
 
 use cartel_pg::{
-    protocol::{encode, value::encode::BindWriter},
+    protocol::value::encode::Arguments,
     schema::{self, groups, result},
 };
 use dope_fiber::{abi::Fiber, task::time::sleep};
@@ -23,8 +23,8 @@ impl schema::TypedQuery for Observer {
     const N_PARAMS: i16 = 1;
     const N_RESULT_COLS: u16 = 1;
 
-    fn encode(pid: i32, writer: &mut BindWriter<'_, '_>) -> Result<(), encode::Error> {
-        writer.param(&pid)
+    fn bind(pid: &Self::Params<'_>) -> impl Arguments {
+        (pid, ())
     }
 }
 

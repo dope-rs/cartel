@@ -1,4 +1,4 @@
-use crate::protocol::{Reason, encode};
+use crate::protocol::Reason;
 use crate::schema::{self, result};
 use std::{mem, num};
 mod formats;
@@ -164,74 +164,50 @@ const _: () = assert!(mem::size_of::<Types<'_>>() == mem::size_of::<(&[u8], [u16
 pub trait Validate {
     const DYNAMIC_TYPES: u8 = 0;
     const FORMAT: u16 = 1;
+    const FORMATS: Formats = Formats::Value(Self::FORMAT);
 
     fn validate(types: &mut Types<'_>) -> Result<(), crate::Error>;
-
-    #[doc(hidden)]
-    fn formats(values: &mut Formats<'_>) -> Result<(), encode::Error> {
-        values.take(Self::FORMAT)
-    }
 }
 
 impl Validate for () {
-    fn validate(_: &mut Types<'_>) -> Result<(), crate::Error> {
-        Ok(())
-    }
+    const FORMATS: Formats = Formats::Row(&[]);
 
-    fn formats(_: &mut Formats<'_>) -> Result<(), encode::Error> {
+    fn validate(_: &mut Types<'_>) -> Result<(), crate::Error> {
         Ok(())
     }
 }
 
 impl<A: Validate, B: Validate> Validate for (A, B) {
     const DYNAMIC_TYPES: u8 = A::DYNAMIC_TYPES | B::DYNAMIC_TYPES;
+    const FORMATS: Formats = Formats::Row(&[A::FORMATS, B::FORMATS]);
 
     fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
         A::validate(types)?;
         B::validate(types)
     }
-
-    #[inline(always)]
-    fn formats(values: &mut Formats<'_>) -> Result<(), encode::Error> {
-        A::formats(values)?;
-        B::formats(values)
-    }
 }
 
 impl<A: Validate, B: Validate, C: Validate> Validate for (A, B, C) {
     const DYNAMIC_TYPES: u8 = A::DYNAMIC_TYPES | B::DYNAMIC_TYPES | C::DYNAMIC_TYPES;
+    const FORMATS: Formats = Formats::Row(&[A::FORMATS, B::FORMATS, C::FORMATS]);
 
     fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
         A::validate(types)?;
         B::validate(types)?;
         C::validate(types)
     }
-
-    #[inline(always)]
-    fn formats(values: &mut Formats<'_>) -> Result<(), encode::Error> {
-        A::formats(values)?;
-        B::formats(values)?;
-        C::formats(values)
-    }
 }
 
 impl<A: Validate, B: Validate, C: Validate, D: Validate> Validate for (A, B, C, D) {
     const DYNAMIC_TYPES: u8 =
         A::DYNAMIC_TYPES | B::DYNAMIC_TYPES | C::DYNAMIC_TYPES | D::DYNAMIC_TYPES;
+    const FORMATS: Formats = Formats::Row(&[A::FORMATS, B::FORMATS, C::FORMATS, D::FORMATS]);
 
     fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
         A::validate(types)?;
         B::validate(types)?;
         C::validate(types)?;
         D::validate(types)
-    }
-
-    #[inline(always)]
-    fn formats(values: &mut Formats<'_>) -> Result<(), encode::Error> {
-        A::formats(values)?;
-        B::formats(values)?;
-        C::formats(values)?;
-        D::formats(values)
     }
 }
 

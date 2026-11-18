@@ -1,37 +1,57 @@
 use crate::protocol::encode::Error;
 
 #[doc(hidden)]
-pub struct Formats<'a> {
+pub enum Formats {
+    Value(u16),
+    Row(&'static [Formats]),
+}
+
+impl Formats {
+    pub(crate) const fn validate(&self, values: &[u16], columns: u16) -> Result<(), Error> {
+        let mut cursor = Cursor {
+            values,
+            columns,
+            index: 0,
+        };
+        match cursor.read(self) {
+            Err(error) => Err(error),
+            Ok(()) if cursor.index != columns => Err(Error::ResultValueCount {
+                expected: columns as usize,
+                actual: cursor.index as usize,
+            }),
+            Ok(()) => Ok(()),
+        }
+    }
+}
+
+struct Cursor<'a> {
     values: &'a [u16],
     columns: u16,
     index: u16,
 }
 
-impl<'a> Formats<'a> {
-    pub(crate) const fn new(values: &'a [u16], columns: u16) -> Self {
-        Self {
-            values,
-            columns,
-            index: 0,
+impl Cursor<'_> {
+    const fn read(&mut self, formats: &Formats) -> Result<(), Error> {
+        match formats {
+            Formats::Value(expected) => self.take(*expected),
+            Formats::Row(fields) => {
+                let mut index = 0;
+                while index < fields.len() {
+                    if let Err(error) = self.read(&fields[index]) {
+                        return Err(error);
+                    }
+                    index += 1;
+                }
+                Ok(())
+            }
         }
     }
 
-    pub(crate) fn finish(self) -> Result<(), Error> {
-        if self.index == self.columns {
-            Ok(())
-        } else {
-            Err(Error::ResultValueCount {
-                expected: usize::from(self.columns),
-                actual: usize::from(self.index),
-            })
-        }
-    }
-
-    pub(super) fn take(&mut self, expected: u16) -> Result<(), Error> {
-        let index = usize::from(self.index);
+    const fn take(&mut self, expected: u16) -> Result<(), Error> {
+        let index = self.index as usize;
         if self.index >= self.columns {
             return Err(Error::ResultValueCount {
-                expected: usize::from(self.columns),
+                expected: self.columns as usize,
                 actual: index + 1,
             });
         }

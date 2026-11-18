@@ -2,7 +2,7 @@ use crate::protocol::value::decode;
 use crate::protocol::value::decode::checked;
 use crate::reply::{Error, server};
 use crate::{api, port::replies, schema};
-use cartel_core::reply;
+use cartel_core::reply::usage;
 use dope_fiber::abi;
 use dope_fiber::context;
 use dope_fiber::wait;
@@ -12,7 +12,6 @@ use crate::api::{
     task,
     traits::{self, sealed::Sealed},
 };
-use reply::usage;
 use task::stream;
 
 pub mod copy;
@@ -161,8 +160,12 @@ where
         self.batch.iter().map(|row| read::<Q>(row.wire()))
     }
 
-    pub fn len(&self) -> reply::Length {
-        self.batch.len()
+    pub fn usage(&self) -> usage::Usage {
+        self.batch.usage()
+    }
+
+    pub fn len(&self) -> usage::Values {
+        self.usage().values()
     }
 
     pub(in crate::api) fn from_result<E>(batch: Result<B, E>) -> Result<Self, E> {
@@ -173,12 +176,7 @@ where
     }
 
     pub fn into_owned(self) -> Result<Vec<Q::Row>, crate::Error> {
-        self.batch.try_map(|row, slot| {
-            let mut reader = decode::RowReader::new(row.wire(), Q::N_RESULT_COLS)?;
-            let done = slot.insert(<Q::Row as schema::Row>::decode_owned(&mut reader)?);
-            reader.finish()?;
-            Ok(done)
-        })
+        self.batch.into_owned::<Q>()
     }
 
     pub fn validate(self) -> Result<Validated<Self>, crate::Error>
@@ -206,12 +204,12 @@ where
         }
     }
 
-    pub fn len(&self) -> reply::Length {
+    pub fn len(&self) -> usage::Values {
         self.0.len()
     }
 
     pub fn payload_len(&self) -> usage::Bytes {
-        self.0.batch.payload_len()
+        self.0.usage().bytes()
     }
 }
 

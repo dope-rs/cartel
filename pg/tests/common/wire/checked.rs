@@ -1,11 +1,10 @@
 use crate::common::postgres::{Error, Frame, startup};
 use cartel_pg::{
-    PgRow, port::config, protocol::encode, protocol::value::encode::BindWriter, schema,
-    schema::groups, schema::result,
+    PgRow, port::config, protocol::value::encode::Arguments, schema, schema::groups,
+    schema::result,
 };
 use dope_test::harness::peer;
-use std::cell::Cell;
-use std::iter;
+use std::{cell::Cell, iter};
 
 #[derive(PgRow)]
 pub struct TextRow {
@@ -42,8 +41,8 @@ impl schema::TypedQuery for TextQuery {
     const PARAM_OIDS: &[u32] = &[];
     const N_PARAMS: i16 = 0;
     const N_RESULT_COLS: u16 = 2;
-    fn encode(_: (), _: &mut BindWriter<'_, '_>) -> Result<(), encode::Error> {
-        Ok(())
+    fn bind(_: &Self::Params<'_>) -> impl Arguments {
+        ()
     }
 }
 
@@ -57,8 +56,8 @@ impl schema::TypedQuery for MixedQuery {
     const PARAM_OIDS: &[u32] = &[];
     const N_PARAMS: i16 = 0;
     const N_RESULT_COLS: u16 = 5;
-    fn encode(_: (), _: &mut BindWriter<'_, '_>) -> Result<(), encode::Error> {
-        Ok(())
+    fn bind(_: &Self::Params<'_>) -> impl Arguments {
+        ()
     }
 }
 
@@ -72,8 +71,8 @@ impl<const SCALAR: bool> schema::TypedQuery for ArrayQuery<SCALAR> {
     const PARAM_OIDS: &[u32] = &[];
     const N_PARAMS: i16 = 0;
     const N_RESULT_COLS: u16 = 1;
-    fn encode(_: (), _: &mut BindWriter<'_, '_>) -> Result<(), encode::Error> {
-        Ok(())
+    fn bind(_: &Self::Params<'_>) -> impl Arguments {
+        ()
     }
 }
 
@@ -125,8 +124,8 @@ impl<const OTHER: bool> schema::TypedQuery for Command<OTHER> {
     const PARAM_OIDS: &[u32] = &[];
     const N_PARAMS: i16 = 0;
     const N_RESULT_COLS: u16 = 0;
-    fn encode(_: (), _: &mut BindWriter<'_, '_>) -> Result<(), encode::Error> {
-        Ok(())
+    fn bind(_: &Self::Params<'_>) -> impl Arguments {
+        ()
     }
 }
 
@@ -137,7 +136,7 @@ impl schema::QueryGroup for CommandGroup {
 
 impl schema::QuerySet for Mismatch {
     type Groups = groups::Cons<CommandGroup, groups::End>;
-    const QUERIES: &[&[schema::QueryMeta<'_>]] = &[<CommandGroup as schema::QueryGroup>::QUERIES];
+    const QUERIES: &[&[schema::QueryMeta<'_>]] = &[&[schema::QueryMeta::fixed::<Command<false>>()]];
     const PREPARE: schema::Prepare<'_> = {
         const SIZE: usize = schema::Prepare::fixed_len::<Mismatch>();
         const WIRE: schema::Wire<'_, SIZE> = schema::Prepare::fixed::<Mismatch, SIZE>();
@@ -376,19 +375,50 @@ impl Database {
     }
 }
 
-const OVERSIZED: &str = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-
-#[derive(Clone, Copy)]
-pub enum BindCase {
-    MissingText,
-    MissingArray,
-    Retry,
-}
+pub const OVERSIZED: &str = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 
 pub struct Bind;
 
+pub struct CountedBind;
+
+impl schema::TypedQuery for CountedBind {
+    type Params<'p> = (&'p Cell<usize>, &'p Cell<usize>);
+    type Row = MixedRow;
+    type Result = result::Rows;
+    type Group = Bind;
+    const STATEMENT_NAME: &str = "count_projection";
+    const SQL: &str = "SELECT 1";
+    const PARAM_OIDS: &[u32] = &[];
+    const N_PARAMS: i16 = 0;
+    const N_RESULT_COLS: u16 = 5;
+
+    fn bind((calls, ordinal): &Self::Params<'_>) -> impl Arguments {
+        calls.set(calls.get() + 1);
+        ordinal.set(calls.get());
+    }
+}
+
+pub struct BadResultFormat;
+
+impl schema::TypedQuery for BadResultFormat {
+    type Params<'p> = ();
+    type Row = TextRow;
+    type Result = result::Rows;
+    type Group = Bind;
+    const STATEMENT_NAME: &str = "text";
+    const SQL: &str = "SELECT 1";
+    const PARAM_OIDS: &[u32] = &[];
+    const N_PARAMS: i16 = 0;
+    const N_RESULT_COLS: u16 = 2;
+    const RESULT_FORMAT_CODES: &[u16] = &[1, 0];
+
+    fn bind(_: &Self::Params<'_>) -> impl Arguments {
+        ()
+    }
+}
+
 impl schema::TypedQuery for Bind {
-    type Params<'p> = (BindCase, &'p [Cell<Option<encode::Error>>; 2]);
+    type Params<'p> = (i32, &'p str, &'p [&'p str]);
     type Row = ();
     type Result = result::Command;
     type Group = Self;
@@ -398,29 +428,19 @@ impl schema::TypedQuery for Bind {
     const N_PARAMS: i16 = 3;
     const N_RESULT_COLS: u16 = 0;
 
-    fn encode(
-        (case, observed): Self::Params<'_>,
-        w: &mut BindWriter<'_, '_>,
-    ) -> Result<(), encode::Error> {
-        w.param(&7i32)?;
-        if !matches!(case, BindCase::MissingArray) {
-            observed[0].set(w.param(OVERSIZED).err());
-            if matches!(case, BindCase::MissingText) {
-                return Ok(());
-            }
-        }
-        w.param("ok")?;
-        observed[1].set(w.param(["kept", OVERSIZED].as_slice()).err());
-        if matches!(case, BindCase::Retry) {
-            w.param(["x"].as_slice())?;
-        }
-        Ok(())
+    fn bind(params: &Self::Params<'_>) -> impl Arguments {
+        (&params.0, (params.1, (params.2, ())))
     }
 }
 
 impl schema::QueryGroup for Bind {
-    type Items = groups::Item<Self, groups::Empty>;
-    const QUERIES: &[schema::QueryMeta<'_>] = &[schema::QueryMeta::fixed::<Self>()];
+    type Items =
+        groups::Item<Self, groups::Item<BadResultFormat, groups::Item<CountedBind, groups::Empty>>>;
+    const QUERIES: &[schema::QueryMeta<'_>] = &[
+        schema::QueryMeta::fixed::<Self>(),
+        schema::QueryMeta::fixed::<BadResultFormat>(),
+        schema::QueryMeta::fixed::<CountedBind>(),
+    ];
 }
 
 impl schema::QuerySet for Bind {

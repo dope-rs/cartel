@@ -170,16 +170,13 @@ impl<'a> Request<'a> {
 
     fn write(self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
         out.parse_with(|out| self.sql.write(out))?;
-        out.bind("", &[1], 0, &[1], |_| Ok(()))?;
-        out.execute()?;
-        match self.extra {
-            Extra::Plain => out.sync()?,
-            Extra::CopyIn { data } => {
-                out.copy_data(data)?;
-                out.copy_done()?;
-                out.sync()?;
-            }
-            Extra::CopyInOpen => {}
+        out.unnamed()?;
+        if let Extra::CopyIn { data } = self.extra {
+            out.copy_data(data)?;
+            out.copy_done()?;
+        }
+        if !matches!(self.extra, Extra::CopyInOpen) {
+            out.sync()?;
         }
         Ok(())
     }
@@ -224,11 +221,11 @@ impl<'d> Pending<'d> {
             return Err(crate::Error::QueryMetadata);
         }
         let frame = port.request().encode(frame(&port.requests), |frame| {
-            schema::QueryMeta::validate::<Q>()?.write(frame, params)?;
+            let query = schema::QueryMeta::validate::<Q>()?;
             if matches!(X::BOUNDARY, requests::Boundary::Open) {
-                Ok(())
+                query.write::<false, 1>(frame, [params])
             } else {
-                frame.sync()
+                query.write::<true, 1>(frame, [params])
             }
         })?;
         Ok(Pending {
@@ -260,11 +257,7 @@ impl<'d> Pending<'d> {
             .ok_or(crate::Error::GroupDisabled)?;
         let ready = access.prepare()?;
         let frame = port.request().encode(frame(&port.requests), |frame| {
-            let query = schema::QueryMeta::validate::<Q>()?;
-            for params in params {
-                query.write(frame, params)?;
-            }
-            frame.sync()
+            schema::QueryMeta::validate::<Q>()?.write::<true, N>(frame, params)
         })?;
         Ok(Pending {
             frame,
@@ -283,9 +276,9 @@ impl<'d> Pending<'d> {
             (_, Extra::Plain | Extra::CopyIn { .. }) => requests::Boundary::Close,
             (_, Extra::CopyInOpen) => requests::Boundary::External,
         };
-        let frame = port
-            .request()
-            .encode(frame(&port.requests), |frame| req.write(frame))?;
+        let frame = port.request().encode(frame(&port.requests), |frame| {
+            encode::Writer::with(frame, |out| req.write(out))
+        })?;
         Ok(Self {
             frame,
             boundary,
@@ -299,28 +292,6 @@ impl<'d> Pending<'d> {
         let mut request = Self::raw(port, Request::raw("COMMIT"), pool::Pool::acquire)?;
         request.boundary = requests::Boundary::Commit;
         Ok(request)
-    }
-}
-
-impl<Q: schema::TypedQuery> schema::Admission<Q> {
-    fn write(
-        &self,
-        out: &mut encode::Writer<'_>,
-        params: Q::Params<'_>,
-    ) -> Result<(), encode::Error> {
-        use protocol::value::encode::BindWriter;
-        out.bind(
-            Q::STATEMENT_NAME,
-            Q::PARAM_FORMAT_CODES,
-            self.count(),
-            Q::RESULT_FORMAT_CODES,
-            |out| {
-                let mut values = BindWriter::new(out, self);
-                Q::encode(params, &mut values)?;
-                values.finish()
-            },
-        )?;
-        out.execute()
     }
 }
 

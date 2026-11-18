@@ -46,15 +46,8 @@ pub(crate) struct Reservation<'a, 'd, const ID: u8> {
     id: Transaction<'d, ID>,
 }
 
-impl<'d, const ID: u8> Reservation<'_, 'd, ID> {
-    pub(crate) fn commit(self) -> Transaction<'d, ID> {
-        self.slot.set_access(State::Reserved(self.id.generation));
-        self.id
-    }
-}
-
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub(in crate::port::runtime::ready::storage::pool) enum State {
+pub(crate) enum State {
     Shared(Sequence),
     Reserved(Generation),
     Held(Generation),
@@ -77,42 +70,13 @@ impl<'d, const ID: u8> Finalization<'d, ID> {
     }
 }
 
-#[repr(u8)]
-pub(crate) enum Current {
-    Stale,
-    Handshaking,
-    Shared,
-    Reserved(Generation),
-    Held(Generation),
-    Finalizing(Generation),
-    Draining,
-    Closing,
-}
-
-pub(crate) struct Access<'a, 'd, const ID: u8> {
-    slot: &'a slot::Slot<'d, ID>,
-}
-
-impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
-    pub(crate) const fn new(slot: &'a slot::Slot<'d, ID>) -> Self {
-        Self { slot }
+impl<'a, 'd, const ID: u8> Reservation<'a, 'd, ID> {
+    pub(crate) fn commit(self) -> Transaction<'d, ID> {
+        self.slot.set_access(State::Reserved(self.id.generation));
+        self.id
     }
 
-    pub(crate) fn is_current<const FINAL: bool>(&self, value: Generation) -> bool {
-        match self.slot.phase.get() {
-            Some(Lifecycle::Ready {
-                access: State::Finalizing(current),
-                ..
-            }) => FINAL && current == value,
-            Some(Lifecycle::Ready {
-                access: State::Reserved(current) | State::Held(current),
-                ..
-            }) => !FINAL && current == value,
-            _ => false,
-        }
-    }
-
-    pub(crate) fn reserve(listed: &ready::Listed<'a, 'd, ID>) -> Option<Reservation<'a, 'd, ID>> {
+    pub(crate) fn reserve(listed: &ready::Listed<'a, 'd, ID>) -> Option<Self> {
         let slot = listed.slot();
         let Some((
             bound,
@@ -128,7 +92,7 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
             slot.set_access(State::Draining);
             return None;
         };
-        Some(Reservation {
+        Some(Self {
             slot,
             id: Transaction {
                 conn: bound.token,
@@ -136,38 +100,24 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
             },
         })
     }
+}
 
-    pub(crate) fn finalize(&self, id: Transaction<'d, ID>) -> Finalization<'d, ID> {
-        let Some((bound, Lifecycle::Ready { access, .. })) = self.slot.snapshot() else {
-            return Finalization::Lost(id);
-        };
-        if bound.token != id.conn {
-            return Finalization::Lost(id);
+impl<'d, const ID: u8> slot::Slot<'d, ID> {
+    pub(crate) fn access(&self, token: conn::Id<'d, KeyTag<ID>>) -> Option<State> {
+        match self.snapshot() {
+            Some((bound, Lifecycle::Ready { access, .. })) if bound.token == token => Some(access),
+            _ => None,
         }
-        if access != State::Held(id.generation) {
-            return Finalization::Reusable(id);
-        }
-        self.slot.set_access(State::Finalizing(id.generation));
-        Finalization::Pending(id)
     }
 
-    pub(crate) fn current(&self, token: conn::Id<'d, KeyTag<ID>>) -> Current {
-        let Some((bound, phase)) = self.slot.snapshot() else {
-            return Current::Stale;
-        };
-        if bound.token != token {
-            return Current::Stale;
-        }
-        match phase {
-            Lifecycle::Handshaking => Current::Handshaking,
-            Lifecycle::Ready { access, .. } => match access {
-                State::Shared(_) => Current::Shared,
-                State::Reserved(generation) => Current::Reserved(generation),
-                State::Held(generation) => Current::Held(generation),
-                State::Finalizing(generation) => Current::Finalizing(generation),
-                State::Draining => Current::Draining,
-            },
-            Lifecycle::Closing { .. } => Current::Closing,
+    pub(crate) fn finalize(&self, id: Transaction<'d, ID>) -> Finalization<'d, ID> {
+        match self.access(id.conn) {
+            Some(State::Held(generation)) if generation == id.generation => {
+                self.set_access(State::Finalizing(generation));
+                Finalization::Pending(id)
+            }
+            Some(_) => Finalization::Reusable(id),
+            None => Finalization::Lost(id),
         }
     }
 }
@@ -303,9 +253,4 @@ const _: () = {
         std::mem::size_of::<Option<Transaction<'static, 0>>>()
             == std::mem::size_of::<Transaction<'static, 0>>()
     );
-    assert!(
-        std::mem::size_of::<Current>()
-            == std::mem::size_of::<Generation>() + std::mem::align_of::<Generation>()
-    );
-    assert!(std::mem::size_of::<Access<'static, 'static, 0>>() == std::mem::size_of::<&()>());
 };

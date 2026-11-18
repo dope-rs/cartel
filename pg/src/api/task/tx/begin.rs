@@ -207,10 +207,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                         task::Poll::Ready(match next {
                             Ok(()) => {
                                 let target = lease.target();
-                                if matches!(
-                                    client.port.shared.transaction().current(target.conn),
-                                    crate::port::pool::access::Current::Held(current) if current == target.generation
-                                ) {
+                                if client.port.shared.transaction().held(target).is_some() {
                                     Ok(lease)
                                 } else {
                                     let error = crate::Error::Protocol(

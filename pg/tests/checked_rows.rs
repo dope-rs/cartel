@@ -42,6 +42,7 @@ fn retains_source() {
 fn collects_multiple_rows() {
     let first = MixedRow::wire(3, 4, 0, b"\x01[]", 5);
     let second = MixedRow::wire(7, 8, 1, b"\x01{}", 9);
+    let payload_bytes = first.len() + second.len();
     let value = ArrayQuery::wire(&[b"value"], &[]);
     let empty = ArrayQuery::wire(&[], &[]);
     let mut trailing = ArrayQuery::NULL.to_vec();
@@ -56,6 +57,7 @@ fn collects_multiple_rows() {
                     &[empty.as_slice()][..],
                     &[ArrayQuery::NULL][..],
                     &[trailing.as_slice()][..],
+                    &[b"\0\0".as_slice()][..],
                 ]
                 .map(|rows| rows.iter().copied()),
             )
@@ -98,10 +100,14 @@ fn collects_multiple_rows() {
                                     let rows = rows
                                         .map_err(|error| format!("{:?}", Reply::from(&error)))
                                         .expect("query rows");
+                                    let usage = rows.usage();
+                                    let count = usage.values().get();
+                                    assert_eq!(count, 2);
+                                    assert_eq!(usage.bytes().get(), payload_bytes);
                                     let (projected, allocations) = Tracker::count(|| {
                                         let mut values = Vec::new();
                                         let initial = values
-                                            .try_reserve_exact(rows.len().get())
+                                            .try_reserve_exact(count)
                                             .map(|()| values);
                                         rows.iter().try_fold(initial, |state, row| {
                                             let row = row?;
@@ -188,6 +194,18 @@ fn collects_multiple_rows() {
                                             }
                                         }
                                     }
+                                    let (row, allocations) = Tracker::count(|| app
+                                        .block_on(traits::Query::run_one::<TextQuery>(client, ())));
+                                    let row = row.expect("driver tiny row")
+                                        .unwrap_or_else(|error| panic!("{:?}", Reply::from(&error)));
+                                    assert_eq!(allocations, 0);
+                                    assert!(matches!(
+                                        row.validate(),
+                                        Err(cartel_pg::Error::Protocol(Reason::ColumnCount {
+                                            actual: 0,
+                                            expected: 2,
+                                        }))
+                                    ));
                                 })
                             })
                         })

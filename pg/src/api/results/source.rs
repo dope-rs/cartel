@@ -1,7 +1,8 @@
 use cartel_core::reply::{self, usage};
-use o3::alloc::array;
 
-use crate::{api::traits::sealed::Sealed, port::replies, protocol};
+use crate::{api::traits::sealed::Sealed, port::replies, protocol, schema};
+use protocol::value::decode::RowReader;
+use schema::Row as _;
 
 /// Immutable bytes retained by their original storage and accounting owner.
 /// Only this crate's owners implement the trait; repeated borrows expose the
@@ -23,19 +24,8 @@ pub trait Batch: Sealed {
         Self: 'rows;
 
     fn iter(&self) -> Self::Iter<'_>;
-    fn len(&self) -> reply::Length;
-
-    fn is_empty(&self) -> bool {
-        self.len() == reply::Length::ZERO
-    }
-    fn payload_len(&self) -> usage::Bytes;
-    fn try_map<T>(
-        self,
-        make: impl for<'slot> FnMut(
-            &Self::Item,
-            array::Slot<'slot, T>,
-        ) -> Result<array::Written<'slot>, crate::Error>,
-    ) -> Result<Vec<T>, crate::Error>;
+    fn usage(&self) -> usage::Usage;
+    fn into_owned<Q: schema::TypedQuery>(self) -> Result<Vec<Q::Row>, crate::Error>;
 }
 
 impl<'d> Batch for reply::Batch<'_, '_, '_, 'd, replies::Row<'d>> {
@@ -49,21 +39,18 @@ impl<'d> Batch for reply::Batch<'_, '_, '_, 'd, replies::Row<'d>> {
         self.iter()
     }
 
-    fn len(&self) -> reply::Length {
-        self.len()
+    #[inline]
+    fn usage(&self) -> usage::Usage {
+        self.usage()
     }
 
-    fn payload_len(&self) -> usage::Bytes {
-        self.usage().bytes()
-    }
-
-    fn try_map<T>(
-        self,
-        make: impl for<'slot> FnMut(
-            &Self::Item,
-            array::Slot<'slot, T>,
-        ) -> Result<array::Written<'slot>, crate::Error>,
-    ) -> Result<Vec<T>, crate::Error> {
-        self.try_map(make).map_err(crate::Error::Allocation)?
+    fn into_owned<Q: schema::TypedQuery>(self) -> Result<Vec<Q::Row>, crate::Error> {
+        self.try_map(|row, slot| {
+            let mut reader = RowReader::new(row.wire(), Q::N_RESULT_COLS)?;
+            let done = slot.insert(Q::Row::decode_owned(&mut reader)?);
+            reader.finish()?;
+            Ok(done)
+        })
+        .map_err(crate::Error::Allocation)?
     }
 }

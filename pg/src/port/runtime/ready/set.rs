@@ -5,7 +5,7 @@ use dope_fiber::{context, wait};
 use o3::base::cell::region;
 use std::pin;
 
-use crate::port::pool::{access, slot};
+use crate::port::pool::slot;
 use crate::port::requests::Boundary;
 use crate::protocol;
 use crate::protocol::runtime::{Shared, ready};
@@ -107,13 +107,6 @@ impl<'d, const ID: u8> Shared<'d, ID> {
     ) -> Option<storage::Entry<'_, 'd, ID>> {
         let entry = self.entry(id.index().into_usize())?;
         entry.slot().matches(id).then_some(entry)
-    }
-
-    pub(crate) fn current(&self, id: conn::Id<'d, route::KeyTag<ID>>) -> access::Current {
-        let Some(entry) = self.entry(id.index().into_usize()) else {
-            return access::Current::Stale;
-        };
-        access::Access::new(entry.slot()).current(id)
     }
 
     pub(crate) fn bind(&self, id: conn::Id<'d, route::KeyTag<ID>>, target: Target<'d>) -> Bind {

@@ -1,6 +1,4 @@
-use cartel_pg::{
-    protocol::encode, protocol::value::encode::BindWriter, schema, schema::groups, schema::result,
-};
+use cartel_pg::{protocol::value::encode::Arguments, schema, schema::groups, schema::result};
 
 pub struct NegParams;
 
@@ -33,8 +31,8 @@ impl schema::TypedQuery for NegParams {
     const N_PARAMS: i16 = -1;
     const N_RESULT_COLS: u16 = 0;
     const PARAM_FORMAT_CODES: &[u16] = &[1];
-    fn encode(_: (), _: &mut BindWriter<'_, '_>) -> Result<(), encode::Error> {
-        Ok(())
+    fn bind(_: &Self::Params<'_>) -> impl Arguments {
+        ()
     }
 }
 
@@ -49,8 +47,8 @@ impl schema::TypedQuery for ParamCount {
     const N_PARAMS: i16 = 1;
     const N_RESULT_COLS: u16 = 0;
     const PARAM_FORMAT_CODES: &[u16] = &[1];
-    fn encode(_: (), _: &mut BindWriter<'_, '_>) -> Result<(), encode::Error> {
-        Ok(())
+    fn bind(_: &Self::Params<'_>) -> impl Arguments {
+        ()
     }
 }
 
@@ -65,8 +63,8 @@ impl schema::TypedQuery for BadFormats {
     const N_PARAMS: i16 = 0;
     const N_RESULT_COLS: u16 = 0;
     const PARAM_FORMAT_CODES: &[u16] = &[2];
-    fn encode(_: (), _: &mut BindWriter<'_, '_>) -> Result<(), encode::Error> {
-        Ok(())
+    fn bind(_: &Self::Params<'_>) -> impl Arguments {
+        ()
     }
 }
 
@@ -81,8 +79,8 @@ impl schema::TypedQuery for BadName {
     const N_PARAMS: i16 = 0;
     const N_RESULT_COLS: u16 = 0;
     const PARAM_FORMAT_CODES: &[u16] = &[1];
-    fn encode(_: (), _: &mut BindWriter<'_, '_>) -> Result<(), encode::Error> {
-        Ok(())
+    fn bind(_: &Self::Params<'_>) -> impl Arguments {
+        ()
     }
 }
 
@@ -97,8 +95,8 @@ impl schema::TypedQuery for EmptyName {
     const N_PARAMS: i16 = 0;
     const N_RESULT_COLS: u16 = 0;
     const PARAM_FORMAT_CODES: &[u16] = &[1];
-    fn encode(_: (), _: &mut BindWriter<'_, '_>) -> Result<(), encode::Error> {
-        Ok(())
+    fn bind(_: &Self::Params<'_>) -> impl Arguments {
+        ()
     }
 }
 
@@ -113,8 +111,8 @@ impl schema::TypedQuery for ReservedName {
     const N_PARAMS: i16 = 0;
     const N_RESULT_COLS: u16 = 0;
     const PARAM_FORMAT_CODES: &[u16] = &[1];
-    fn encode(_: (), _: &mut BindWriter<'_, '_>) -> Result<(), encode::Error> {
-        Ok(())
+    fn bind(_: &Self::Params<'_>) -> impl Arguments {
+        ()
     }
 }
 
@@ -129,8 +127,8 @@ impl schema::TypedQuery for TooManyCols {
     const N_PARAMS: i16 = 0;
     const N_RESULT_COLS: u16 = u16::MAX;
     const PARAM_FORMAT_CODES: &[u16] = &[1];
-    fn encode(_: (), _: &mut BindWriter<'_, '_>) -> Result<(), encode::Error> {
-        Ok(())
+    fn bind(_: &Self::Params<'_>) -> impl Arguments {
+        ()
     }
 }
 
@@ -145,8 +143,8 @@ impl schema::TypedQuery for LtreeQuery {
     const N_PARAMS: i16 = 0;
     const N_RESULT_COLS: u16 = 1;
     const PARAM_FORMAT_CODES: &[u16] = &[1];
-    fn encode(_: (), _: &mut BindWriter<'_, '_>) -> Result<(), encode::Error> {
-        Ok(())
+    fn bind(_: &Self::Params<'_>) -> impl Arguments {
+        ()
     }
 }
 

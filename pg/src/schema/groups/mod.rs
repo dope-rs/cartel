@@ -103,7 +103,7 @@ where
         let Some((head, tail)) = groups.split_first() else {
             return false;
         };
-        *head == Head::QUERIES && Head::Items::matches(head) && Tail::matches(tail)
+        Head::Items::matches(head) && Head::Items::matches(Head::QUERIES) && Tail::matches(tail)
     }
 
     fn contains<Q: schema::TypedQuery>() -> bool {

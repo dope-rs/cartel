@@ -158,44 +158,27 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             }
             messages::Be::READY_FOR_QUERY => {
                 let status = payloads::ready_status(data.wire())?;
-                match status {
-                    poll::Status::Transaction => {
-                        match self.port.shared.transaction().current(self.conn) {
-                            access::Current::Reserved(_) => {
-                                let mut queue = crate::port::replies::Lane::new(
-                                    self.port,
-                                    self.conn,
-                                    entry,
-                                    self.region,
-                                );
-                                if !matches!(
-                                    queue.front(self.state.batch)?.0,
-                                    Some(Completion::Begin)
-                                ) {
-                                    return Err(crate::Error::Protocol(Reason::TransactionLease));
-                                }
-                            }
-                            access::Current::Held(_) => {}
-                            access::Current::Finalizing(_) => {
-                                return Err(crate::Error::Protocol(Reason::TransactionOpen));
-                            }
-                            access::Current::Stale
-                            | access::Current::Handshaking
-                            | access::Current::Shared
-                            | access::Current::Draining
-                            | access::Current::Closing => {
-                                return Err(crate::Error::Protocol(Reason::TransactionLease));
-                            }
-                        }
-                    }
-                    poll::Status::Idle => {
-                        if matches!(
-                            self.port.shared.transaction().current(self.conn),
-                            access::Current::Held(_)
-                        ) {
+                match (status, entry.slot().access(self.conn)) {
+                    (poll::Status::Transaction, Some(access::State::Reserved(_))) => {
+                        let mut queue = crate::port::replies::Lane::new(
+                            self.port,
+                            self.conn,
+                            entry,
+                            self.region,
+                        );
+                        if !matches!(queue.front(self.state.batch)?.0, Some(Completion::Begin)) {
                             return Err(crate::Error::Protocol(Reason::TransactionLease));
                         }
                     }
+                    (poll::Status::Transaction, Some(access::State::Held(_))) => {}
+                    (poll::Status::Transaction, Some(access::State::Finalizing(_))) => {
+                        return Err(crate::Error::Protocol(Reason::TransactionOpen));
+                    }
+                    (poll::Status::Transaction, _)
+                    | (poll::Status::Idle, Some(access::State::Held(_))) => {
+                        return Err(crate::Error::Protocol(Reason::TransactionLease));
+                    }
+                    (poll::Status::Idle, _) => {}
                 }
                 if copy {
                     self.state.phase = state::Phase::Ready(entry);

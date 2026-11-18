@@ -23,6 +23,33 @@ impl Codec {
             max_frame_bytes: config.frame_limit(),
         }
     }
+
+    #[inline]
+    fn required(&self, bytes: &[u8]) -> Result<u32, (protocol::Reason, usize)> {
+        let Some(header) = bytes.first_chunk::<5>() else {
+            return Ok(5);
+        };
+        let declared = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+        if declared < 4 {
+            return Err((
+                protocol::Reason::FrameLength {
+                    declared,
+                    minimum: 4,
+                },
+                bytes.len(),
+            ));
+        }
+        if declared >= self.max_frame_bytes {
+            return Err((
+                protocol::Reason::FrameCapacity {
+                    declared,
+                    capacity: protocol::Length::from_u32(self.max_frame_bytes),
+                },
+                5,
+            ));
+        }
+        Ok(declared + 1)
+    }
 }
 
 impl codec::Codec for Codec {
@@ -48,37 +75,17 @@ impl codec::Stateless for Codec {
         'd: 'input,
     {
         let bytes = buffer.as_slice();
-        if bytes.len() < 5 {
-            return Ok(match buffer.need_to(5) {
-                Some(need) => codec::Parse::More(need),
-                None => codec::Parse::CapacityExhausted,
-            });
-        }
-        let typ = bytes[0];
-        let wire = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-        if wire < 4 {
-            let used =
-                buffer.try_consumed(num::NonZero::<usize>::MIN.saturating_add(bytes.len() - 1))?;
-            return Ok(codec::Parse::Item {
-                head: frame::Head::Fatal(crate::Error::Protocol(protocol::Reason::FrameLength {
-                    declared: wire,
-                    minimum: 4,
-                })),
-                consumed: used,
-            });
-        }
-        let len = wire as usize;
-        if wire >= self.max_frame_bytes {
-            let used = buffer.try_consumed(num::NonZero::<usize>::MIN.saturating_add(4))?;
-            return Ok(codec::Parse::Item {
-                head: frame::Head::Fatal(crate::Error::Protocol(protocol::Reason::FrameCapacity {
-                    declared: wire,
-                    capacity: protocol::Length::from_u32(self.max_frame_bytes),
-                })),
-                consumed: used,
-            });
-        }
-        let total = len + 1;
+        let total = match self.required(bytes) {
+            Ok(total) => total as usize,
+            Err((reason, discard)) => {
+                let consumed =
+                    buffer.try_consumed(num::NonZero::<usize>::MIN.saturating_add(discard - 1))?;
+                return Ok(codec::Parse::Item {
+                    head: frame::Head::Fatal(crate::Error::Protocol(reason)),
+                    consumed,
+                });
+            }
+        };
         if bytes.len() < total {
             return Ok(match buffer.need_to(total) {
                 Some(need) => codec::Parse::More(need),
@@ -89,7 +96,7 @@ impl codec::Stateless for Codec {
             buffer.try_prefix(5, num::NonZero::<usize>::MIN.saturating_add(total - 1))?;
         Ok(codec::Parse::Item {
             head: frame::Head::Message(frame::Message {
-                typ,
+                typ: bytes[0],
                 payload: frame::Payload(data),
             }),
             consumed: used,
@@ -113,30 +120,12 @@ impl eof::Finish for Codec {
                 Ok(actual) => actual,
                 Err(error) => return Ok(codec::Finish::Item(frame::Head::Fatal(error))),
             };
-            let reason = if bytes.len() < 5 {
-                protocol::Reason::FrameTruncated {
+            let reason = match self.required(bytes) {
+                Ok(required) => protocol::Reason::FrameTruncated {
                     actual,
-                    required: protocol::Length::from_u32(5),
-                }
-            } else {
-                let wire = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-                if wire < 4 {
-                    protocol::Reason::FrameLength {
-                        declared: wire,
-                        minimum: 4,
-                    }
-                } else if wire >= self.max_frame_bytes {
-                    protocol::Reason::FrameCapacity {
-                        declared: wire,
-                        capacity: protocol::Length::from_u32(self.max_frame_bytes),
-                    }
-                } else {
-                    let need = wire + 1;
-                    protocol::Reason::FrameTruncated {
-                        actual,
-                        required: protocol::Length::from_u32(need),
-                    }
-                }
+                    required: protocol::Length::from_u32(required),
+                },
+                Err((reason, _)) => reason,
             };
             Ok(codec::Finish::Item(frame::Head::Fatal(
                 crate::Error::Protocol(reason),

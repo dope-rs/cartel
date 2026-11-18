@@ -1,53 +1,63 @@
 #[derive(Clone, Copy)]
 pub(super) enum Tag {
+    Scalar(Scalar),
+    Bytes,
+    RowOnly,
+    OptionalLtree,
+    Borrowed,
+    Named,
+    Unsupported,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Scalar {
     Bool,
     I16,
     I32,
     I64,
-    U8,
-    U32,
     F32,
     F64,
     String,
-    Str,
     Text,
     Jsonb,
     Uuid,
     Timestamp,
     Date,
     Ltree,
-    VecU8,
-    VecI32,
-    VecI64,
-    VecString,
-    VecOther,
-    OptBool,
-    OptI16,
-    OptI32,
-    OptI64,
-    OptF32,
-    OptF64,
-    OptString,
-    OptText,
-    OptJsonb,
-    OptUuid,
-    OptTimestamp,
-    OptDate,
-    OptLtree,
-    OptBytes,
-    OptOther,
-    RefStr,
-    SliceU8,
-    SliceI16,
-    SliceI32,
-    SliceI64,
-    SliceF32,
-    SliceF64,
-    SliceBool,
-    SliceStr,
-    RefOther,
-    Named,
-    Unsupported,
+}
+
+impl Scalar {
+    fn from_ident(ident: &syn::Ident) -> Option<Self> {
+        Some(if ident == "bool" {
+            Self::Bool
+        } else if ident == "i16" {
+            Self::I16
+        } else if ident == "i32" {
+            Self::I32
+        } else if ident == "i64" {
+            Self::I64
+        } else if ident == "f32" {
+            Self::F32
+        } else if ident == "f64" {
+            Self::F64
+        } else if ident == "String" {
+            Self::String
+        } else if ident == "Text" {
+            Self::Text
+        } else if ident == "Jsonb" {
+            Self::Jsonb
+        } else if ident == "Uuid" {
+            Self::Uuid
+        } else if ident == "Timestamp" {
+            Self::Timestamp
+        } else if ident == "Date" {
+            Self::Date
+        } else if ident == "Ltree" {
+            Self::Ltree
+        } else {
+            return None;
+        })
+    }
 }
 
 impl Tag {
@@ -68,272 +78,90 @@ impl Tag {
     }
 
     pub(super) fn plain(ident: &syn::Ident) -> Self {
-        if ident == "bool" {
-            Self::Bool
-        } else if ident == "i16" {
-            Self::I16
-        } else if ident == "i32" {
-            Self::I32
-        } else if ident == "i64" {
-            Self::I64
-        } else if ident == "u8" {
-            Self::U8
-        } else if ident == "u32" {
-            Self::U32
-        } else if ident == "f32" {
-            Self::F32
-        } else if ident == "f64" {
-            Self::F64
-        } else if ident == "String" {
-            Self::String
-        } else if ident == "str" {
-            Self::Str
-        } else if ident == "Text" {
-            Self::Text
-        } else if ident == "Jsonb" {
-            Self::Jsonb
-        } else if ident == "Uuid" {
-            Self::Uuid
-        } else if ident == "Timestamp" {
-            Self::Timestamp
-        } else if ident == "Date" {
-            Self::Date
-        } else if ident == "Ltree" {
-            Self::Ltree
-        } else {
-            Self::Named
+        match Scalar::from_ident(ident) {
+            Some(scalar) => Self::Scalar(scalar),
+            None if ident == "u8" || ident == "u32" || ident == "str" => Self::Unsupported,
+            None => Self::Named,
         }
     }
 
     pub(super) fn vector(ident: &syn::Ident) -> Self {
         if ident == "u8" {
-            Self::VecU8
-        } else if ident == "i32" {
-            Self::VecI32
-        } else if ident == "i64" {
-            Self::VecI64
-        } else if ident == "String" {
-            Self::VecString
+            Self::Bytes
+        } else if ident == "i32" || ident == "i64" || ident == "String" {
+            Self::RowOnly
         } else {
-            Self::VecOther
+            Self::Unsupported
         }
     }
 
     pub(super) fn optional(ident: &syn::Ident) -> Self {
-        if ident == "bool" {
-            Self::OptBool
-        } else if ident == "i16" {
-            Self::OptI16
-        } else if ident == "i32" {
-            Self::OptI32
-        } else if ident == "i64" {
-            Self::OptI64
-        } else if ident == "f32" {
-            Self::OptF32
-        } else if ident == "f64" {
-            Self::OptF64
-        } else if ident == "String" {
-            Self::OptString
-        } else if ident == "Text" {
-            Self::OptText
-        } else if ident == "Jsonb" {
-            Self::OptJsonb
-        } else if ident == "Uuid" {
-            Self::OptUuid
-        } else if ident == "Timestamp" {
-            Self::OptTimestamp
-        } else if ident == "Date" {
-            Self::OptDate
-        } else if ident == "Ltree" {
-            Self::OptLtree
-        } else {
-            Self::OptOther
+        match Scalar::from_ident(ident) {
+            Some(Scalar::Ltree) => Self::OptionalLtree,
+            Some(_) => Self::RowOnly,
+            None => Self::Unsupported,
         }
     }
 
     pub(super) fn slice(syntax: &syn::Type) -> Self {
-        if let Some(ident) = Self::simple(syntax) {
-            if ident == "u8" {
-                Self::SliceU8
-            } else if ident == "i16" {
-                Self::SliceI16
-            } else if ident == "i32" {
-                Self::SliceI32
-            } else if ident == "i64" {
-                Self::SliceI64
-            } else if ident == "f32" {
-                Self::SliceF32
-            } else if ident == "f64" {
-                Self::SliceF64
-            } else if ident == "bool" {
-                Self::SliceBool
-            } else {
-                Self::RefOther
-            }
-        } else if let syn::Type::Reference(rf) = syntax
-            && let Some(ident) = Self::simple(rf.elem.as_ref())
-            && ident == "str"
-        {
-            Self::SliceStr
+        let supported = match syntax {
+            syn::Type::Reference(rf) => Self::simple(&rf.elem).is_some_and(|id| id == "str"),
+            _ => Self::simple(syntax).is_some_and(|id| {
+                id == "u8"
+                    || id == "i16"
+                    || id == "i32"
+                    || id == "i64"
+                    || id == "f32"
+                    || id == "f64"
+                    || id == "bool"
+            }),
+        };
+        if supported {
+            Self::Borrowed
         } else {
-            Self::RefOther
+            Self::Unsupported
         }
     }
 
     pub(super) fn format(self) -> u16 {
-        match self {
-            Self::Ltree | Self::OptLtree => 0,
-            Self::Bool
-            | Self::I16
-            | Self::I32
-            | Self::I64
-            | Self::U8
-            | Self::U32
-            | Self::F32
-            | Self::F64
-            | Self::String
-            | Self::Str
-            | Self::Text
-            | Self::Jsonb
-            | Self::Uuid
-            | Self::Timestamp
-            | Self::Date
-            | Self::VecU8
-            | Self::VecI32
-            | Self::VecI64
-            | Self::VecString
-            | Self::VecOther
-            | Self::OptBool
-            | Self::OptI16
-            | Self::OptI32
-            | Self::OptI64
-            | Self::OptF32
-            | Self::OptF64
-            | Self::OptString
-            | Self::OptText
-            | Self::OptJsonb
-            | Self::OptUuid
-            | Self::OptTimestamp
-            | Self::OptDate
-            | Self::OptBytes
-            | Self::OptOther
-            | Self::RefStr
-            | Self::SliceU8
-            | Self::SliceI16
-            | Self::SliceI32
-            | Self::SliceI64
-            | Self::SliceF32
-            | Self::SliceF64
-            | Self::SliceBool
-            | Self::SliceStr
-            | Self::RefOther
-            | Self::Named
-            | Self::Unsupported => 1,
-        }
+        u16::from(!matches!(
+            self,
+            Self::Scalar(Scalar::Ltree) | Self::OptionalLtree
+        ))
     }
 
     pub(super) fn slice_type(self) -> Option<proc_macro2::TokenStream> {
         match self {
-            Self::Bool => Some(quote::quote! { &'data [bool] }),
-            Self::I16 => Some(quote::quote! { &'data [i16] }),
-            Self::I32 => Some(quote::quote! { &'data [i32] }),
-            Self::I64 => Some(quote::quote! { &'data [i64] }),
-            Self::F32 => Some(quote::quote! { &'data [f32] }),
-            Self::F64 => Some(quote::quote! { &'data [f64] }),
-            Self::String => Some(quote::quote! { &'data [&'data str] }),
-            Self::Uuid => Some(quote::quote! { &'data [::cartel_pg::Uuid] }),
-            Self::Timestamp => Some(quote::quote! { &'data [::cartel_pg::Timestamp] }),
-            Self::Date => Some(quote::quote! { &'data [::cartel_pg::Date] }),
-            Self::Ltree => Some(quote::quote! { &'data [::cartel_pg::Ltree] }),
-            Self::VecU8 => Some(quote::quote! { &'data [&'data [u8]] }),
-            Self::U8
-            | Self::U32
-            | Self::Str
-            | Self::Text
-            | Self::Jsonb
-            | Self::VecI32
-            | Self::VecI64
-            | Self::VecString
-            | Self::VecOther
-            | Self::OptBool
-            | Self::OptI16
-            | Self::OptI32
-            | Self::OptI64
-            | Self::OptF32
-            | Self::OptF64
-            | Self::OptString
-            | Self::OptText
-            | Self::OptJsonb
-            | Self::OptUuid
-            | Self::OptTimestamp
-            | Self::OptDate
-            | Self::OptLtree
-            | Self::OptBytes
-            | Self::OptOther
-            | Self::RefStr
-            | Self::SliceU8
-            | Self::SliceI16
-            | Self::SliceI32
-            | Self::SliceI64
-            | Self::SliceF32
-            | Self::SliceF64
-            | Self::SliceBool
-            | Self::SliceStr
-            | Self::RefOther
+            Self::Scalar(Scalar::Bool) => Some(quote::quote! { &'data [bool] }),
+            Self::Scalar(Scalar::I16) => Some(quote::quote! { &'data [i16] }),
+            Self::Scalar(Scalar::I32) => Some(quote::quote! { &'data [i32] }),
+            Self::Scalar(Scalar::I64) => Some(quote::quote! { &'data [i64] }),
+            Self::Scalar(Scalar::F32) => Some(quote::quote! { &'data [f32] }),
+            Self::Scalar(Scalar::F64) => Some(quote::quote! { &'data [f64] }),
+            Self::Scalar(Scalar::String) => Some(quote::quote! { &'data [&'data str] }),
+            Self::Scalar(Scalar::Uuid) => Some(quote::quote! { &'data [::cartel_pg::Uuid] }),
+            Self::Scalar(Scalar::Timestamp) => {
+                Some(quote::quote! { &'data [::cartel_pg::Timestamp] })
+            }
+            Self::Scalar(Scalar::Date) => Some(quote::quote! { &'data [::cartel_pg::Date] }),
+            Self::Scalar(Scalar::Ltree) => Some(quote::quote! { &'data [::cartel_pg::Ltree] }),
+            Self::Bytes => Some(quote::quote! { &'data [&'data [u8]] }),
+            Self::Scalar(Scalar::Text | Scalar::Jsonb)
+            | Self::RowOnly
+            | Self::OptionalLtree
+            | Self::Borrowed
             | Self::Named
             | Self::Unsupported => None,
         }
     }
 
     pub(super) fn formats(self, syntax: &syn::Type) -> Option<proc_macro2::TokenStream> {
-        match self {
-            Self::Ltree | Self::OptLtree => Some(quote::quote! { &[0u16] }),
-            Self::Named => Some(quote::quote! { <#syntax>::__CARTEL_RESULT_FORMAT_CODES }),
-            Self::Bool
-            | Self::I16
-            | Self::I32
-            | Self::I64
-            | Self::U8
-            | Self::U32
-            | Self::F32
-            | Self::F64
-            | Self::String
-            | Self::Str
-            | Self::Text
-            | Self::Jsonb
-            | Self::Uuid
-            | Self::Timestamp
-            | Self::Date
-            | Self::VecU8
-            | Self::VecI32
-            | Self::VecI64
-            | Self::VecString
-            | Self::VecOther
-            | Self::OptBool
-            | Self::OptI16
-            | Self::OptI32
-            | Self::OptI64
-            | Self::OptF32
-            | Self::OptF64
-            | Self::OptString
-            | Self::OptText
-            | Self::OptJsonb
-            | Self::OptUuid
-            | Self::OptTimestamp
-            | Self::OptDate
-            | Self::OptBytes
-            | Self::OptOther
-            | Self::RefStr
-            | Self::SliceU8
-            | Self::SliceI16
-            | Self::SliceI32
-            | Self::SliceI64
-            | Self::SliceF32
-            | Self::SliceF64
-            | Self::SliceBool
-            | Self::SliceStr
-            | Self::RefOther
-            | Self::Unsupported => None,
+        if matches!(self, Self::Named) {
+            Some(quote::quote! { <#syntax>::__CARTEL_RESULT_FORMAT_CODES })
+        } else if self.format() == 0 {
+            Some(quote::quote! { &[0u16] })
+        } else {
+            None
         }
     }
 }

@@ -156,42 +156,17 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
                 State::Holding(lease) => {
                     let owner = lease.client();
                     let tx = lease.target();
-                    match owner.port.shared.transaction().current(tx.conn) {
-                        access::Current::Held(current) if current == tx.generation => {}
-                        access::Current::Stale
-                        | access::Current::Handshaking
-                        | access::Current::Shared
-                        | access::Current::Reserved(_)
-                        | access::Current::Held(_)
-                        | access::Current::Finalizing(_)
-                        | access::Current::Draining
-                        | access::Current::Closing => {
+                    match owner.port.poll_idle(tx, waiter, cx.as_mut()) {
+                        Poll::Ready(Ok(())) => {}
+                        Poll::Ready(Err(error)) => {
                             waiter.unregister();
                             timer.as_mut().complete();
-                            return Poll::Ready(Err(crate::Error::Closed.into()));
+                            return Poll::Ready(Err(error));
                         }
-                    }
-                    if owner.port.load(tx.conn, cx.as_mut().region_token()) != Some(0) {
-                        match owner
-                            .port
-                            .shared
-                            .transaction()
-                            .poll_settled(tx, waiter, cx.as_ref())
-                        {
-                            Poll::Pending => {}
-                            Poll::Ready(Ok(_)) => {
-                                waiter.unregister();
-                                timer.as_mut().complete();
-                                return Poll::Ready(Err(crate::Error::Closed.into()));
-                            }
-                            Poll::Ready(Err(error)) => {
-                                waiter.unregister();
-                                timer.as_mut().complete();
-                                return Poll::Ready(Err(crate::reply::Error::Wait(error)));
-                            }
+                        Poll::Pending => {
+                            *this.state = State::Holding(lease);
+                            return Poll::Pending;
                         }
-                        *this.state = State::Holding(lease);
-                        return Poll::Pending;
                     }
                     let req = match end {
                         End::Commit => api::Pending::commit(owner.port),

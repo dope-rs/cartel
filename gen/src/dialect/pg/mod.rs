@@ -75,7 +75,6 @@ impl PgBackend {
         let pool = names.fresh("__cartel_pool_");
         let args = names.fresh("__cartel_arguments_");
         let argument = names.fresh("__cartel_argument_");
-        let writer = names.fresh("__cartel_writer_");
 
         if caps.len() > i16::MAX as usize {
             return Err(syn::Error::new(
@@ -88,29 +87,41 @@ impl PgBackend {
             ));
         }
         let count = caps.len() as i16;
+        let single = params.len() == 1;
+        let input_shape = |fields: proc_macro2::TokenStream| {
+            if single { fields } else { quote::quote! { (#fields) } }
+        };
 
         let mut oids = Vec::new();
-        let mut calls = Vec::new();
+        let mut arguments = Vec::new();
         let mut fmts = Vec::new();
         let mut text = false;
         for &(fn_idx, _) in caps {
             let (_, ty) = &params[fn_idx];
-            let meta = ty.param()?;
+            let (meta, format) = ty.param()?;
             oids.push(
                 quote::quote! { <#meta as ::cartel_pg::protocol::value::encode::Param>::OID },
             );
             fmts.push(
                 quote::quote! { <#meta as ::cartel_pg::protocol::value::encode::Param>::FORMAT },
             );
-            text |= ty.format() == 0;
+            text |= format == 0;
             let idx = syn::Index::from(fn_idx);
-            let arg = if matches!(ty, syn::Type::Reference(_)) {
-                quote::quote! { #args.#idx }
-            } else {
-                quote::quote! { &#args.#idx }
+            let arg = match (single, ty) {
+                (true, syn::Type::Reference(_)) => quote::quote! { &**#args },
+                (true, _) => quote::quote! { #args },
+                (false, syn::Type::Reference(_)) => quote::quote! { &*#args.#idx },
+                (false, _) => quote::quote! { &#args.#idx },
             };
-            calls.push(quote::quote! { #writer.param(#arg)?; });
+            arguments.push(arg);
         }
+
+        let arguments = arguments
+            .into_iter()
+            .rev()
+            .fold(quote::quote! { () }, |tail, head| {
+                quote::quote! { (#head, #tail) }
+            });
 
         let decl = if text {
             quote::quote! {
@@ -121,7 +132,7 @@ impl PgBackend {
         };
 
         let ids = params.iter().map(|(id, _)| id);
-        let values = quote::quote! { ( #( #ids, )* ) };
+        let values = input_shape(quote::quote! { #(#ids),* });
 
         let parts = &plan.sql_parts;
         let cols = &plan.n_result_cols;
@@ -238,19 +249,7 @@ impl PgBackend {
         };
         let batch = if !matches!(plan.dispatch, emit::Kind::Stream(_)) {
             let count = names.fresh("__CARTEL_GROUP_LEN_");
-            let tys = params.iter().map(|(_, ty)| ty);
-            let (params, values, item) = match params.as_slice() {
-                [(_, ty)] => (
-                    quote::quote! { [#ty; #count] },
-                    quote::quote! { #args.map(|#argument| (#argument,)) },
-                    quote::quote! { (#argument,) },
-                ),
-                _ => (
-                    quote::quote! { [(#(#tys,)*); #count] },
-                    quote::quote! { #args },
-                    quote::quote! { #argument },
-                ),
-            };
+            let params = quote::quote! { [<#query as ::cartel_pg::schema::TypedQuery>::Params<'_>; #count] };
             let grouped = if matches!(plan.dispatch, emit::Kind::One(_)) {
                 let method = group::Group::batch_method(&method, "group");
                 quote::quote! {
@@ -277,7 +276,7 @@ impl PgBackend {
                     {
                         ::cartel_pg::api::traits::Query::run_group::<#query, #count>(
                             ::cartel_pg::api::traits::IntoQuery::into_query(#client),
-                            #values,
+                            #args,
                         )
                     }
                 }
@@ -307,7 +306,7 @@ impl PgBackend {
                     ::cartel_pg::dope_fiber::task::batch::Join::from_map(
                         #pool,
                         #args,
-                        |#argument| ::cartel_pg::api::traits::Query::#run::<#query>(::cartel_pg::api::traits::IntoQuery::into_query(#client), #item),
+                        |#argument| ::cartel_pg::api::traits::Query::#run::<#query>(::cartel_pg::api::traits::IntoQuery::into_query(#client), #argument),
                     )
                 }
             }
@@ -316,7 +315,7 @@ impl PgBackend {
         };
         param::Param::<false>::apply(params.iter_mut().map(|(_, ty)| ty), &input);
         let bound = params.iter().map(|(_, ty)| ty);
-        let params = quote::quote! { ( #( #bound, )* ) };
+        let params = input_shape(quote::quote! { #(#bound),* });
 
         Ok(quote::quote! {
             #vis struct #query;
@@ -335,12 +334,10 @@ impl PgBackend {
                 #codes
 
                 #[inline(always)]
-                fn encode(
-                    #args: Self::Params<'_>,
-                    #writer: &mut ::cartel_pg::protocol::value::encode::BindWriter<'_, '_>,
-                ) -> ::core::result::Result<(), ::cartel_pg::protocol::encode::Error> {
-                    #( #calls )*
-                    ::core::result::Result::Ok(())
+                fn bind(
+                    #args: &Self::Params<'_>,
+                ) -> impl ::cartel_pg::protocol::value::encode::Arguments {
+                    #arguments
                 }
             }
 

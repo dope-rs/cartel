@@ -104,14 +104,11 @@ impl Row<'_> {
             impl ::cartel_pg::schema::desc::Validate for #name {
                 const DYNAMIC_TYPES: u8 =
                     <#shape as ::cartel_pg::schema::desc::Validate>::DYNAMIC_TYPES;
+                const FORMATS: ::cartel_pg::schema::desc::Formats =
+                    <#shape as ::cartel_pg::schema::desc::Validate>::FORMATS;
 
                 fn validate(types: &mut ::cartel_pg::schema::desc::Types<'_>) -> ::core::result::Result<(), ::cartel_pg::Error> {
                     <#shape as ::cartel_pg::schema::desc::Validate>::validate(types)
-                }
-
-                #[inline(always)]
-                fn formats(values: &mut ::cartel_pg::schema::desc::Formats<'_>) -> ::core::result::Result<(), ::cartel_pg::protocol::encode::Error> {
-                    <#shape as ::cartel_pg::schema::desc::Validate>::formats(values)
                 }
             }
         })

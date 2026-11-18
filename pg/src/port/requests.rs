@@ -55,11 +55,12 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
     fn frame<T>(
         span: Option<pool::Span>,
         kind: frame::Sensitivity,
-        write: impl FnOnce(&mut encode::Writer) -> Result<T, encode::Error>,
+        write: impl FnOnce(&mut pool::Span) -> Result<T, encode::Error>,
     ) -> Result<(Complete<'d>, T), error::Error> {
-        let span = span.ok_or(error::Error::RequestCapacity)?;
-        let (frame, value) =
-            encode::Writer::encode(span, kind, write).map_err(error::Error::Request)?;
+        let mut span = span.ok_or(error::Error::RequestCapacity)?;
+        let result = write(&mut span);
+        let frame = frame::Buffer::new(span, kind);
+        let value = result.map_err(error::Error::Request)?;
         let frame = egress::NonEmpty::try_new(Frame(Body::Owned(frame)))
             .map_err(error::Error::RequestLoad)?;
         Ok((frame, value))
@@ -68,7 +69,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
     pub(crate) fn encode(
         &self,
         span: Option<pool::Span>,
-        write: impl FnOnce(&mut encode::Writer) -> Result<(), encode::Error>,
+        write: impl FnOnce(&mut pool::Span) -> Result<(), encode::Error>,
     ) -> Result<Complete<'d>, error::Error> {
         Self::frame(span, frame::Sensitivity::Plain, write).map(|(frame, ())| frame)
     }
@@ -80,7 +81,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         Self::frame(
             self.port.controls.acquire(),
             frame::Sensitivity::Plain,
-            write,
+            |span| encode::Writer::with(span, write),
         )
         .map(|(frame, ())| frame)
     }
@@ -92,7 +93,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         Self::frame(
             self.port.controls.acquire(),
             frame::Sensitivity::Secret,
-            write,
+            |span| encode::Writer::with(span, write),
         )
     }
 

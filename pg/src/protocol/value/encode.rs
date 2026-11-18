@@ -32,116 +32,95 @@ fn jsonb_payload(out: &mut encode::Writer<'_>, value: &str) -> Result<(), encode
     out.write_slices([&wire_length(len)?.to_be_bytes(), &[0x01], value.as_bytes()])
 }
 
-/// Encoding retains the exact parameter domains admitted for its query type.
-pub struct BindWriter<'a, 'out> {
-    out: &'a mut encode::Writer<'out>,
-    oids: &'a [u32],
-    formats: &'a [u16],
-    index: usize,
+/// A statically ordered borrow of supported parameter values.
+pub trait Arguments: arguments::Sealed {}
+
+impl<T: arguments::Sealed> Arguments for T {}
+
+#[inline]
+pub(crate) fn bind<Q: crate::schema::TypedQuery>(params: &Q::Params<'_>) -> impl Arguments {
+    admitted::<Q, _>(Q::bind(params))
 }
 
-impl<'a, 'out> BindWriter<'a, 'out> {
-    pub(crate) fn new<Q: crate::schema::TypedQuery>(
-        out: &'a mut encode::Writer<'out>,
-        _: &crate::schema::Admission<Q>,
-    ) -> Self {
-        Self {
-            out,
-            oids: Q::PARAM_OIDS,
-            formats: Q::PARAM_FORMAT_CODES,
-            index: 0,
+#[inline]
+fn admitted<Q: crate::schema::TypedQuery, A: Arguments>(values: A) -> A {
+    const {
+        match arguments::count::<A>(Q::PARAM_OIDS.len()) {
+            Ok(value) => value,
+            Err(_) => panic!("parameters"),
         }
     }
+    values
+}
 
-    pub fn write_null(&mut self) -> Result<(), encode::Error> {
-        self.check_any()?;
-        self.out.write_slice(&(-1i32).to_be_bytes())?;
-        self.index += 1;
-        Ok(())
+pub(crate) use arguments::Sealed as WriteArguments;
+
+mod arguments {
+    use super::{Param, encode};
+    use crate::schema::TypedQuery;
+
+    pub trait Sealed {
+        const COUNT: usize;
+
+        fn write<Q: TypedQuery>(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error>;
     }
 
-    pub fn param<P: Param + ?Sized>(&mut self, value: &P) -> Result<(), encode::Error> {
-        self.write(P::OID, P::FORMAT, |out| value.payload(out))
-    }
-
-    pub fn write_jsonb(&mut self, value: &str) -> Result<(), encode::Error> {
-        self.write(crate::Jsonb::OID, crate::Jsonb::FORMAT, |out| {
-            jsonb_payload(out, value)
-        })
-    }
-
-    pub fn write_ltree(&mut self, value: &str) -> Result<(), encode::Error> {
-        self.write(crate::Ltree::OID, crate::Ltree::FORMAT, |out| {
-            write_with_len(out, value.as_bytes())
-        })
-    }
-
-    pub(crate) fn finish(self) -> Result<(), encode::Error> {
-        if self.index == self.oids.len() {
-            Ok(())
-        } else {
-            Err(encode::Error::ParameterValueCount {
-                expected: self.oids.len(),
-                actual: self.index,
-            })
-        }
-    }
-
-    fn write(
-        &mut self,
-        oid: u32,
-        format: u16,
-        write: impl FnOnce(&mut encode::Writer<'_>) -> Result<(), encode::Error>,
-    ) -> Result<(), encode::Error> {
-        self.check(oid, format)?;
-        write(self.out)?;
-        self.index += 1;
-        Ok(())
-    }
-
-    #[inline]
-    fn check(&self, oid: u32, format: u16) -> Result<(), encode::Error> {
-        let index = self.index;
-        let Some(expected) = self.oids.get(index).copied() else {
+    pub(super) const fn count<A: Sealed>(expected: usize) -> Result<(), encode::Error> {
+        if A::COUNT != expected {
             return Err(encode::Error::ParameterValueCount {
-                expected: self.oids.len(),
-                actual: self.oids.len() + 1,
+                expected,
+                actual: A::COUNT,
             });
-        };
-        if oid != expected {
+        }
+        Ok(())
+    }
+
+    const fn parameter<Q: TypedQuery, P: Param + ?Sized>(index: usize) -> Result<(), encode::Error> {
+        let expected = Q::PARAM_OIDS[index];
+        if expected != P::OID {
             return Err(encode::Error::ParameterOid {
                 index,
                 expected,
-                actual: oid,
+                actual: P::OID,
             });
         }
-        let expected = match self.formats {
+        let expected = match Q::PARAM_FORMAT_CODES {
             [] => 0,
             [format] => *format,
-            formats => {
-                // SAFETY: admission binds these formats to the exact OID count;
-                // the same retained OID slice admitted this index above.
-                unsafe { *formats.get_unchecked(index) }
-            }
+            formats => formats[index],
         };
-        if format != expected {
+        if expected != P::FORMAT {
             return Err(encode::Error::ParameterEncoding {
                 index,
                 expected,
-                actual: format,
+                actual: P::FORMAT,
             });
         }
         Ok(())
     }
 
-    fn check_any(&self) -> Result<(), encode::Error> {
-        if self.index >= self.oids.len() {
-            return Err(encode::Error::ParameterValueCount {
-                expected: self.oids.len(),
-                actual: self.oids.len() + 1,
-            });
+    impl Sealed for () {
+        const COUNT: usize = 0;
+
+        fn write<Q: TypedQuery>(&self, _: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+            Ok(())
         }
-        Ok(())
+    }
+
+    impl<P: Param + ?Sized, T: Sealed> Sealed for (&P, T) {
+        const COUNT: usize = T::COUNT + 1;
+
+        #[inline]
+        fn write<Q: TypedQuery>(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
+            const {
+                match parameter::<Q, P>(Q::PARAM_OIDS.len() - Self::COUNT) {
+                    Ok(value) => value,
+                    Err(_) => panic!("parameters"),
+                }
+            }
+            self.0.payload(out)?;
+            self.1.write::<Q>(out)
+        }
     }
 }
 
@@ -182,7 +161,7 @@ impl Param for i32 {
 
     #[inline]
     fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
-        write_with_len(out, &self.to_be_bytes())
+        out.write_words(&[4i32.to_be_bytes(), self.to_be_bytes()])
     }
 }
 
@@ -200,7 +179,7 @@ impl Param for f32 {
 
     #[inline]
     fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
-        write_with_len(out, &self.to_be_bytes())
+        out.write_words(&[4i32.to_be_bytes(), self.to_be_bytes()])
     }
 }
 
@@ -291,7 +270,7 @@ impl Param for crate::Timestamp {
 
     #[inline]
     fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
-        write_with_len(out, &self.0.to_be_bytes())
+        self.0.payload(out)
     }
 }
 
@@ -300,7 +279,7 @@ impl Param for crate::Date {
 
     #[inline]
     fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
-        write_with_len(out, &self.0.to_be_bytes())
+        self.0.payload(out)
     }
 }
 
@@ -351,12 +330,12 @@ impl<T: Element> Param for [T] {
     fn payload(&self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
         let count = count32(self.len())?;
         out.patch::<false, _>(|out| {
-            out.write_slices([
-                &1i32.to_be_bytes(),
-                &0i32.to_be_bytes(),
-                &T::OID.to_be_bytes(),
-                &count.to_be_bytes(),
-                &1i32.to_be_bytes(),
+            out.write_words(&[
+                1i32.to_be_bytes(),
+                0i32.to_be_bytes(),
+                T::OID.to_be_bytes(),
+                count.to_be_bytes(),
+                1i32.to_be_bytes(),
             ])?;
             for value in self {
                 value.payload(out)?;
@@ -365,5 +344,3 @@ impl<T: Element> Param for [T] {
         })
     }
 }
-
-const _: () = assert!(size_of::<BindWriter<'_, '_>>() == 6 * size_of::<usize>());

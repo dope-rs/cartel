@@ -2,7 +2,7 @@ mod kind;
 mod tag;
 
 pub(super) trait TypeExt {
-    fn param(&self) -> syn::Result<&syn::Type>;
+    fn param(&self) -> syn::Result<(&syn::Type, u16)>;
     fn row_read(&self) -> syn::Result<proc_macro2::TokenStream>;
     fn format(&self) -> u16;
     fn slice_type(&self) -> Option<proc_macro2::TokenStream>;
@@ -10,7 +10,7 @@ pub(super) trait TypeExt {
 }
 
 impl TypeExt for syn::Type {
-    fn param(&self) -> syn::Result<&syn::Type> {
+    fn param(&self) -> syn::Result<(&syn::Type, u16)> {
         kind::Kind::new(self).param()
     }
 
