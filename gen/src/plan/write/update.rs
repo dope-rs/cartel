@@ -10,7 +10,6 @@ use syn::spanned::Spanned as _;
 use syn::visit::{self, Visit as _};
 
 use crate::ext::FnParamsExt as _;
-use crate::ext::SqlIdent as _;
 
 use crate::plan::read::filter;
 use crate::plan::write::reply;
@@ -26,16 +25,33 @@ fn table(source: &shape::QuerySource) -> syn::Result<&syn::Path> {
     Ok(&source.primary_path)
 }
 
-fn join_ons(
-    state: &plan::State<'_, '_>,
+fn where_clause(
+    state: &mut plan::State<'_, '_>,
     source: &shape::QuerySource,
-) -> syn::Result<Vec<Vec<proc_macro2::TokenStream>>> {
-    let mut joins = Vec::with_capacity(source.joins.len());
-    for (index, join) in source.joins.iter().enumerate() {
-        let on_scope = pred::RowScope::for_join_on(source, index)?;
-        joins.push(filter::join(state, &join.cond, &on_scope)?);
+    ids: &[syn::Ident],
+    predicate: &syn::Expr,
+    join_keyword: &str,
+    sql: &mut Vec<proc_macro2::TokenStream>,
+) -> syn::Result<()> {
+    let scope = pred::RowScope::for_source(source, ids)?;
+    if !source.joins.is_empty() {
+        sql.push(state.dialect.kw(join_keyword));
+        for (index, join) in source.joins.iter().enumerate() {
+            if index > 0 {
+                sql.push(state.dialect.kw("COMMA"));
+            }
+            sql.extend(source.render_join(index, join));
+        }
     }
-    Ok(joins)
+    sql.push(state.dialect.kw("WHERE_KW"));
+    for (index, join) in source.joins.iter().enumerate() {
+        let on = pred::RowScope::for_join_on(source, index)?;
+        sql.extend(filter::join(state, &join.cond, &on)?);
+        sql.push(state.dialect.kw("AND_KW"));
+    }
+    let filter = pred::build(predicate, &scope, false, &state.context())?;
+    state.render_into(filter, sql);
+    Ok(())
 }
 
 pub(in crate::plan) fn build<'a>(
@@ -73,50 +89,17 @@ pub(in crate::plan) fn build<'a>(
         body,
         set_id,
         &scope,
-        state.params,
-        state.dialect,
-        &state.cte_map,
+        &state.context(),
+        "`.update(...)` body must assign at least one column",
     )?;
-    if assigns.is_empty() {
-        return Err(syn::Error::new(
-            set_body.span(),
-            "`.update(...)` body must assign at least one column",
-        ));
-    }
 
-    let scope = pred::RowScope::for_source(source, preds)?;
-
-    let joins = join_ons(state, source)?;
-
-    let filter = filter::build(state, pred, &scope, false)?;
-
+    let mut conditions = Vec::new();
+    where_clause(state, source, preds, pred, "FROM_KW", &mut conditions)?;
     let mut sql = vec![state.dialect.kw("UPDATE_KW")];
     sql.extend(source.render_base());
     sql.push(state.dialect.kw("SET_KW"));
-    for (index, assign) in assigns.into_iter().enumerate() {
-        if index > 0 {
-            sql.push(state.dialect.kw("COMMA"));
-        }
-        let col_eq = format!("{} = ", assign.column.quoted());
-        sql.push(quote::quote! { #col_eq });
-        sql.extend(state.render(assign.value));
-    }
-    if !source.joins.is_empty() {
-        sql.push(state.dialect.kw("FROM_KW"));
-        for (i, j) in source.joins.iter().enumerate() {
-            if i > 0 {
-                sql.push(state.dialect.kw("COMMA"));
-            }
-            sql.extend(source.render_join(i, j));
-        }
-    }
-    sql.push(state.dialect.kw("WHERE_KW"));
-    for on_parts in joins {
-        sql.extend(on_parts);
-        sql.push(state.dialect.kw("AND_KW"));
-    }
-    sql.extend(filter);
-
+    super::assignments(state, &mut sql, assigns);
+    sql.extend(conditions);
     Ok(reply::build(state, sql, table, source.qualifier(0), output))
 }
 
@@ -130,30 +113,9 @@ pub(in crate::plan) fn delete<'a>(
     let table = table(source)?;
     let output = reply::validate(state, Op::Delete, ret, table)?;
 
-    let scope = pred::RowScope::for_source(source, preds)?;
-
-    let joins = join_ons(state, source)?;
-
-    let filter = filter::build(state, pred, &scope, false)?;
-
     let mut sql = vec![state.dialect.kw("DELETE_FROM_KW")];
     sql.extend(source.render_base());
-    if !source.joins.is_empty() {
-        sql.push(state.dialect.kw("USING_KW"));
-        for (i, j) in source.joins.iter().enumerate() {
-            if i > 0 {
-                sql.push(state.dialect.kw("COMMA"));
-            }
-            sql.extend(source.render_join(i, j));
-        }
-    }
-    sql.push(state.dialect.kw("WHERE_KW"));
-    for on_parts in joins {
-        sql.extend(on_parts);
-        sql.push(state.dialect.kw("AND_KW"));
-    }
-    sql.extend(filter);
-
+    where_clause(state, source, preds, pred, "USING_KW", &mut sql)?;
     Ok(reply::build(state, sql, table, source.qualifier(0), output))
 }
 
@@ -186,26 +148,13 @@ pub(in crate::plan) fn each<'a>(
         set_body,
         row_var,
         &scope,
-        state.params,
-        state.dialect,
-        &state.cte_map,
+        &state.context(),
+        "`.update(...)` body must assign at least one column",
     )?;
-    if changes.is_empty() {
-        return Err(syn::Error::new(
-            set_body.span(),
-            "`.update(...)` body must assign at least one column",
-        ));
-    }
-    let mut assigns: Vec<proc_macro2::TokenStream> = Vec::new();
-    for (i, assign) in changes.into_iter().enumerate() {
-        let rhs = state.render(assign.value);
-        if i > 0 {
-            assigns.push(state.dialect.kw("COMMA"));
-        }
-        let col_eq = format!("{} = ", assign.column.quoted());
-        assigns.push(quote::quote! { #col_eq });
-        assigns.extend(rhs);
-    }
+    let mut sql = vec![state.dialect.kw("UPDATE_KW")];
+    sql.extend(source.render_base());
+    sql.push(state.dialect.kw("SET_KW"));
+    super::assignments(state, &mut sql, changes);
     let filter = filter::build(state, pred, &scope, true)?;
 
     let mut cols = String::new();
@@ -218,10 +167,6 @@ pub(in crate::plan) fn each<'a>(
         cols.push_str(i.format_into(&mut digits));
     }
 
-    let mut sql = vec![state.dialect.kw("UPDATE_KW")];
-    sql.extend(source.render_base());
-    sql.push(state.dialect.kw("SET_KW"));
-    sql.extend(assigns);
     sql.push(state.dialect.kw("UNNEST_FROM_OPEN"));
     for (i, ph) in params.into_iter().enumerate() {
         if i > 0 {

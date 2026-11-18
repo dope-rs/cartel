@@ -21,7 +21,7 @@ impl Sql {
         Self(Vec::new())
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
 
@@ -41,23 +41,20 @@ impl Sql {
         self.0.extend(tokens.into_iter().map(Part::Token));
     }
 
-    pub(crate) fn render(
+    pub(crate) fn render_into(
         self,
         captures: &mut Vec<backend::Capture>,
         params: &[backend::Param],
         dialect: &backend::Dialect,
-    ) -> Vec<proc_macro2::TokenStream> {
-        let mut tokens = Vec::with_capacity(self.0.len());
-        for part in self.0 {
-            match part {
-                Part::Token(token) => tokens.push(token),
-                Part::Capture(capture) => {
-                    let index = intern(captures, capture);
-                    tokens.push(dialect.placeholder(index, &params[capture.0].1));
-                }
+        tokens: &mut Vec<proc_macro2::TokenStream>,
+    ) {
+        tokens.extend(self.0.into_iter().map(|part| match part {
+            Part::Token(token) => token,
+            Part::Capture(capture) => {
+                let index = intern(captures, capture);
+                dialect.placeholder(index, &params[capture.0].1)
             }
-        }
-        tokens
+        }));
     }
 
     pub(crate) fn join_tokens(self) -> syn::Result<Vec<proc_macro2::TokenStream>> {

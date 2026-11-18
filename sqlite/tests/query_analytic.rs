@@ -33,6 +33,8 @@ fn window_functions(runtime: Runtime) -> Result<(), plan::Error> {
             dope_fiber::fiber!('_ => async move {
                 let rows = user_row_numbers(&mut conn).await?;
                 ::core::assert_eq!(rows, &[(1, 4), (2, 2), (3, 5), (4, 1), (5, 3)]);
+                let rows = widget_positions(&mut conn, -1, 1).await?;
+                ::core::assert_eq!(rows, &[2, 1, 2, 1, 1]);
                 Ok(())
             }),
         )

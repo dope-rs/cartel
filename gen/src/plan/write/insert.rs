@@ -4,69 +4,42 @@ use crate::plan;
 use crate::pred;
 use crate::shape;
 
-use syn::spanned::Spanned as _;
-
 use crate::ext::SqlIdent as _;
 
 use crate::plan::write::reply::Op;
 use crate::plan::write::{Conflict, reply};
 
-#[derive(Clone, Copy)]
-enum Kind {
-    Single,
-    Each,
-}
-
 pub(in crate::plan) fn build<'a>(
     state: &mut plan::State<'_, 'a>,
-    table: &syn::Path,
-    arg: &syn::Ident,
-    body: &syn::Expr,
+    insert: &shape::mutation::Insert,
     ret: shape::Returning,
-    conflict: &shape::Conflict,
 ) -> syn::Result<emit::Plan<'a>> {
-    insert(state, table, arg, body, ret, conflict, Kind::Single)
-}
+    use shape::mutation::{Input, Values};
 
-pub(in crate::plan) fn each<'a>(
-    state: &mut plan::State<'_, 'a>,
-    table: &syn::Path,
-    arg: &syn::Ident,
-    body: &syn::Expr,
-    ret: shape::Returning,
-    conflict: &shape::Conflict,
-) -> syn::Result<emit::Plan<'a>> {
-    insert(state, table, arg, body, ret, conflict, Kind::Each)
-}
-
-fn insert<'a>(
-    state: &mut plan::State<'_, 'a>,
-    table: &syn::Path,
-    arg: &syn::Ident,
-    body: &syn::Expr,
-    ret: shape::Returning,
-    conflict: &shape::Conflict,
-    kind: Kind,
-) -> syn::Result<emit::Plan<'a>> {
+    let (Values { table, arg, body }, keyword, empty) = match &insert.input {
+        Input::One(values) => (
+            values,
+            "VALUES_OPEN",
+            "`Table::insert(...)` body must assign at least one column",
+        ),
+        Input::Each(values) => (
+            values,
+            "UNNEST_OPEN",
+            "`Table::insert_each(...)` body must assign at least one column",
+        ),
+        Input::From(source) => return from(state, source, ret, &insert.conflict),
+    };
     let output = reply::validate(state, Op::Insert, ret, table)?;
 
     let assigns = assign::Assign::collect(
         body,
         arg,
         &pred::RowScope::single(arg.clone()),
-        state.params,
-        state.dialect,
-        &state.cte_map,
+        &state.context(),
+        empty,
     )?;
-    if assigns.is_empty() {
-        let message = match kind {
-            Kind::Single => "`Table::insert(...)` body must assign at least one column",
-            Kind::Each => "`Table::insert_each(...)` body must assign at least one column",
-        };
-        return Err(syn::Error::new(body.span(), message));
-    }
     let target = shape::QuerySource::new(table.clone());
-    let action = Conflict::new(conflict, &target, state)?;
+    let action = Conflict::new(&insert.conflict, &target, state)?;
 
     let mut cols_str = String::new();
     for (i, a) in assigns.iter().enumerate() {
@@ -81,23 +54,20 @@ fn insert<'a>(
     sql.extend([
         state.dialect.kw("PAREN_OPEN_LEADING_SPACE"),
         quote::quote! { #cols_str },
-        state.dialect.kw(match kind {
-            Kind::Single => "VALUES_OPEN",
-            Kind::Each => "UNNEST_OPEN",
-        }),
+        state.dialect.kw(keyword),
     ]);
     for (index, assign) in assigns.into_iter().enumerate() {
         if index > 0 {
             sql.push(state.dialect.kw("COMMA_TIGHT"));
         }
-        sql.extend(state.render(assign.value));
+        state.render_into(assign.value, &mut sql);
     }
     sql.push(state.dialect.kw("PAREN_CLOSE"));
-    sql.extend(action.render(state));
+    action.append(state, &mut sql);
     Ok(reply::build(state, sql, table, target.qualifier(0), output))
 }
 
-pub(in crate::plan) fn from<'a>(
+fn from<'a>(
     state: &mut plan::State<'_, 'a>,
     input: &shape::mutation::From,
     ret: shape::Returning,
@@ -119,16 +89,9 @@ pub(in crate::plan) fn from<'a>(
         body,
         target,
         &scope,
-        state.params,
-        state.dialect,
-        &state.cte_map,
+        &state.context(),
+        "`Table::insert_from(...)` body must assign at least one column",
     )?;
-    if selected.is_empty() {
-        return Err(syn::Error::new(
-            body.span(),
-            "`Table::insert_from(...)` body must assign at least one column",
-        ));
-    }
     let scope = pred::RowScope::for_source(query, preds)?;
     let context = state.context();
     let where_ = pred::build(pred, &scope, false, &context)?;
@@ -143,13 +106,12 @@ pub(in crate::plan) fn from<'a>(
     let mut cols_str = String::new();
     let mut select: Vec<proc_macro2::TokenStream> = Vec::new();
     for (index, assign) in selected.into_iter().enumerate() {
-        let rhs = state.render(assign.value);
         if index > 0 {
             cols_str.push(',');
             select.push(state.dialect.kw("COMMA"));
         }
         cols_str.push_str(&assign.column.quoted());
-        select.extend(rhs);
+        state.render_into(assign.value, &mut select);
     }
     let where_ = state.render(where_);
 
@@ -171,6 +133,6 @@ pub(in crate::plan) fn from<'a>(
     }
     sql.push(state.dialect.kw("WHERE_KW"));
     sql.extend(where_);
-    sql.extend(action.render(state));
+    action.append(state, &mut sql);
     Ok(reply::build(state, sql, table, target.qualifier(0), output))
 }

@@ -65,7 +65,7 @@ pub(in crate::plan) fn build<'a>(
             if i > 0 {
                 sql.push(state.dialect.kw("COMMA"));
             }
-            sql.extend(project::element(state, elem, &scope, quals.lock)?);
+            project::element(state, elem, &scope, quals.lock, &mut sql)?;
         }
     } else if source.joins.is_empty() {
         let table = &source.primary_path;

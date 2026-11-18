@@ -1,316 +1,233 @@
+use crate::ext::PatExt as _;
 use crate::plan;
-use crate::pred::{self, sql};
-use crate::shape::qualify;
-
+use crate::plan::read::qualify::Integer;
+use crate::pred;
 use syn::{ext::IdentExt as _, spanned::Spanned as _};
 
-use crate::ext::PatExt as _;
-use crate::plan::read::qualify::Integer;
-
 enum Function {
-    Nullary(Nullary),
+    Nullary(&'static str),
     Count,
-    Unary(Unary),
-    Offset(Offset),
+    Unary(&'static str),
+    Offset(&'static str),
 }
 
-enum Nullary {
-    RowNumber,
-    Rank,
-    DenseRank,
-}
-
-enum Unary {
-    Sum,
-    Avg,
-    Min,
-    Max,
-}
-
-enum Offset {
-    Lag,
-    Lead,
-}
-
-enum Keyword {
-    RowNumber,
-    Rank,
-    DenseRank,
-    CountStar,
-    Count,
-    Sum,
-    Avg,
-    Min,
-    Max,
-}
-
-enum Head {
-    Keyword(Keyword),
-    Expr(Keyword, sql::Sql),
-    Offset(&'static str, sql::Sql, Integer),
-}
-
-struct Chain<'a>(Vec<&'a syn::ExprMethodCall>);
-
-struct Part {
-    sql: sql::Sql,
-    kind: Kind,
-}
-
-enum Kind {
-    Group,
-    Order(qualify::Dir),
-}
-
-struct Spec(Vec<Part>);
-
-impl Nullary {
-    fn syntax(&self) -> (&str, Keyword) {
-        match self {
-            Self::RowNumber => ("row_number", Keyword::RowNumber),
-            Self::Rank => ("rank", Keyword::Rank),
-            Self::DenseRank => ("dense_rank", Keyword::DenseRank),
-        }
+fn head(
+    call: &syn::ExprCall,
+    scope: &pred::RowScope<'_>,
+    state: &mut plan::State<'_, '_>,
+    output: &mut Vec<proc_macro2::TokenStream>,
+) -> syn::Result<()> {
+    let expr = call.func.as_ref();
+    let syn::Expr::Path(syn::ExprPath { attrs, qself, path }) = expr else {
+        return Err(syn::Error::new(
+            expr.span(),
+            "window function must be a path ending in `row_number` / `rank` / `dense_rank` / `count` / `sum` / `avg` / `min` / `max` / `lag` / `lead`",
+        ));
+    };
+    if let Some(attr) = attrs.first() {
+        return Err(syn::Error::new(
+            attr.span(),
+            "window function path must not have outer attributes",
+        ));
     }
-}
-
-impl Unary {
-    fn syntax(&self) -> (&str, Keyword) {
-        match self {
-            Self::Sum => ("sum", Keyword::Sum),
-            Self::Avg => ("avg", Keyword::Avg),
-            Self::Min => ("min", Keyword::Min),
-            Self::Max => ("max", Keyword::Max),
-        }
+    if let Some(qself) = qself {
+        return Err(syn::Error::new(
+            qself.span(),
+            "window function path must not use qualified-self syntax",
+        ));
     }
-}
-
-impl Keyword {
-    fn render(self, state: &plan::State<'_, '_>) -> proc_macro2::TokenStream {
-        state.dialect.kw(match self {
-            Self::RowNumber => "ROW_NUMBER_OVER",
-            Self::Rank => "RANK_OVER",
-            Self::DenseRank => "DENSE_RANK_OVER",
-            Self::CountStar => "COUNT_STAR_OVER",
-            Self::Count => "COUNT_OPEN",
-            Self::Sum => "SUM_OPEN",
-            Self::Avg => "AVG_OPEN",
-            Self::Min => "MIN_OPEN",
-            Self::Max => "MAX_OPEN",
-        })
-    }
-}
-
-impl Offset {
-    fn syntax(&self) -> (&'static str, &'static str) {
-        match self {
-            Self::Lag => ("lag", "lag("),
-            Self::Lead => ("lead", "lead("),
-        }
-    }
-}
-
-impl Function {
-    fn parse(expr: &syn::Expr) -> syn::Result<Self> {
-        let syn::Expr::Path(syn::ExprPath { attrs, qself, path }) = expr else {
+    let segment = path
+        .segments
+        .last()
+        .ok_or_else(|| syn::Error::new(path.span(), "window function path is empty"))?;
+    let name = segment.ident.to_string();
+    let function = match name.as_str() {
+        "row_number" => Function::Nullary("ROW_NUMBER_OVER"),
+        "rank" => Function::Nullary("RANK_OVER"),
+        "dense_rank" => Function::Nullary("DENSE_RANK_OVER"),
+        "count" => Function::Count,
+        "sum" => Function::Unary("SUM_OPEN"),
+        "avg" => Function::Unary("AVG_OPEN"),
+        "min" => Function::Unary("MIN_OPEN"),
+        "max" => Function::Unary("MAX_OPEN"),
+        "lag" => Function::Offset("lag("),
+        "lead" => Function::Offset("lead("),
+        other => {
             return Err(syn::Error::new(
-                expr.span(),
-                "window function must be a path ending in `row_number` / `rank` / `dense_rank` / `count` / `sum` / `avg` / `min` / `max` / `lag` / `lead`",
-            ));
-        };
-        if let Some(attr) = attrs.first() {
-            return Err(syn::Error::new(
-                attr.span(),
-                "window function path must not have outer attributes",
-            ));
-        }
-        if let Some(qself) = qself {
-            return Err(syn::Error::new(
-                qself.span(),
-                "window function path must not use qualified-self syntax",
-            ));
-        }
-        let segment = path
-            .segments
-            .last()
-            .ok_or_else(|| syn::Error::new(path.span(), "window function path is empty"))?;
-        match segment.ident.to_string().as_str() {
-            "row_number" => Ok(Self::Nullary(Nullary::RowNumber)),
-            "rank" => Ok(Self::Nullary(Nullary::Rank)),
-            "dense_rank" => Ok(Self::Nullary(Nullary::DenseRank)),
-            "count" => Ok(Self::Count),
-            "sum" => Ok(Self::Unary(Unary::Sum)),
-            "avg" => Ok(Self::Unary(Unary::Avg)),
-            "min" => Ok(Self::Unary(Unary::Min)),
-            "max" => Ok(Self::Unary(Unary::Max)),
-            "lag" => Ok(Self::Offset(Offset::Lag)),
-            "lead" => Ok(Self::Offset(Offset::Lead)),
-            other => Err(syn::Error::new(
                 path.span(),
                 format!(
                     "unsupported window function `{other}`; allowed: row_number, rank, dense_rank, count, sum, avg, min, max, lag, lead"
                 ),
-            )),
+            ));
         }
+    };
+    let open = match function {
+        Function::Nullary(keyword) => {
+            if !call.args.is_empty() {
+                return Err(syn::Error::new(
+                    call.args.span(),
+                    format!("`{name}()` takes no arguments"),
+                ));
+            }
+            output.push(state.dialect.kw(keyword));
+            return Ok(());
+        }
+        Function::Count if call.args.is_empty() => {
+            output.push(state.dialect.kw("COUNT_STAR_OVER"));
+            return Ok(());
+        }
+        Function::Count => {
+            if call.args.len() != 1 {
+                return Err(syn::Error::new(
+                    call.args.span(),
+                    "`count(...)` window takes 0 or 1 args",
+                ));
+            }
+            state.dialect.kw("COUNT_OPEN")
+        }
+        Function::Unary(keyword) => {
+            if call.args.len() != 1 {
+                return Err(syn::Error::new(
+                    call.args.span(),
+                    format!("`{name}(...)` window takes one column / expression argument"),
+                ));
+            }
+            state.dialect.kw(keyword)
+        }
+        Function::Offset(prefix) => {
+            if call.args.len() != 2 {
+                return Err(syn::Error::new(
+                    call.args.span(),
+                    format!("`{name}(col, offset)` window takes two arguments"),
+                ));
+            }
+            quote::quote! { #prefix }
+        }
+    };
+    let expr = &call.args[0];
+    let sql = state.parse(scope, expr, || {
+        let arg = if matches!(function, Function::Offset(_)) {
+            "first arg"
+        } else {
+            "window arg"
+        };
+        syn::Error::new(
+            expr.span(),
+            format!("`{name}(...)` {arg} must be a column / expression"),
+        )
+    })?;
+    output.push(open);
+    state.render_into(sql, output);
+    if matches!(function, Function::Offset(_)) {
+        let offset = Integer::parse(&call.args[1], state.params)?;
+        output.push(state.dialect.kw("COMMA"));
+        output.push(offset.render(state, plan::Bound::Offset));
+    }
+    output.push(state.dialect.kw("OVER_OPEN"));
+    Ok(())
+}
+
+enum Clause {
+    Partition,
+    Order,
+    Descending,
+    Unknown,
+}
+
+fn root(expr: &syn::Expr, root: &syn::Ident) -> syn::Result<()> {
+    match expr {
+        syn::Expr::Path(syn::ExprPath { attrs, qself, path }) => {
+            if let Some(attr) = attrs.first() {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "window-spec root identifier must not have outer attributes",
+                ));
+            }
+            if let Some(qself) = qself {
+                return Err(syn::Error::new(
+                    qself.span(),
+                    "window-spec root identifier must not use qualified-self syntax",
+                ));
+            }
+            if path.segments.len() == 1 && path.segments[0].ident.unraw() == root.unraw() {
+                return Ok(());
+            }
+            Err(syn::Error::new(
+                path.span(),
+                "window-spec chain must start at the closure parameter identifier",
+            ))
+        }
+        other => Err(syn::Error::new(
+            other.span(),
+            "window-spec chain must start at the `w` ident and use `.partition_by` / `.order_by` / `.order_by_desc`",
+        )),
     }
 }
 
-impl Head {
-    fn new(
-        call: &syn::ExprCall,
-        scope: &pred::RowScope<'_>,
-        state: &plan::State<'_, '_>,
-    ) -> syn::Result<Self> {
-        match Function::parse(call.func.as_ref())? {
-            Function::Nullary(function) => {
-                let (name, keyword) = function.syntax();
-                if !call.args.is_empty() {
-                    return Err(syn::Error::new(
-                        call.args.span(),
-                        format!("`{name}()` takes no arguments"),
-                    ));
-                }
-                Ok(Self::Keyword(keyword))
+fn specification(
+    mut expr: &syn::Expr,
+    root_ident: &syn::Ident,
+    scope: &pred::RowScope<'_>,
+    state: &mut plan::State<'_, '_>,
+    output: &mut Vec<proc_macro2::TokenStream>,
+) -> syn::Result<()> {
+    let mut calls = Vec::new();
+    let mut last_partition = None;
+    while let syn::Expr::MethodCall(call) = expr {
+        let kind = match call.method.to_string().as_str() {
+            "partition_by" => {
+                last_partition.get_or_insert(calls.len());
+                Clause::Partition
             }
-            Function::Count if call.args.is_empty() => Ok(Self::Keyword(Keyword::CountStar)),
-            Function::Count if call.args.len() == 1 => {
-                let expr = &call.args[0];
-                let sql = state.parse(scope, expr, || {
-                    syn::Error::new(
-                        expr.span(),
-                        "`count(...)` window arg must be a column / expression",
-                    )
-                })?;
-                Ok(Self::Expr(Keyword::Count, sql))
-            }
-            Function::Count => Err(syn::Error::new(
-                call.args.span(),
-                "`count(...)` window takes 0 or 1 args",
-            )),
-            Function::Unary(function) => {
-                let (name, keyword) = function.syntax();
-                if call.args.len() != 1 {
-                    return Err(syn::Error::new(
-                        call.args.span(),
-                        format!("`{name}(...)` window takes one column / expression argument"),
-                    ));
-                }
-                let expr = &call.args[0];
-                let sql = state.parse(scope, expr, || {
-                    syn::Error::new(
-                        expr.span(),
-                        format!("`{name}(...)` window arg must be a column / expression"),
-                    )
-                })?;
-                Ok(Self::Expr(keyword, sql))
-            }
-            Function::Offset(function) => {
-                let (name, open) = function.syntax();
-                if call.args.len() != 2 {
-                    return Err(syn::Error::new(
-                        call.args.span(),
-                        format!("`{name}(col, offset)` window takes two arguments"),
-                    ));
-                }
-                let expr = &call.args[0];
-                let sql = state.parse(scope, expr, || {
-                    syn::Error::new(
-                        expr.span(),
-                        format!("`{name}(...)` first arg must be a column / expression"),
-                    )
-                })?;
-                let offset = Integer::parse(&call.args[1], state.params)?;
-                Ok(Self::Offset(open, sql, offset))
-            }
-        }
+            "order_by" => Clause::Order,
+            "order_by_desc" => Clause::Descending,
+            _ => Clause::Unknown,
+        };
+        calls.push((call, kind));
+        expr = &call.receiver;
     }
+    root(expr, root_ident)?;
 
-    fn render(self, state: &mut plan::State<'_, '_>) -> Vec<proc_macro2::TokenStream> {
-        match self {
-            Self::Keyword(keyword) => vec![keyword.render(state)],
-            Self::Expr(keyword, sql) => {
-                let mut parts = vec![keyword.render(state)];
-                parts.extend(state.render(sql));
-                parts.push(state.dialect.kw("OVER_OPEN"));
-                parts
-            }
-            Self::Offset(open, sql, offset) => {
-                let mut parts = vec![quote::quote! { #open }];
-                parts.extend(state.render(sql));
-                parts.push(state.dialect.kw("COMMA"));
-                parts.push(offset.render(state, plan::Bound::Offset));
-                parts.push(state.dialect.kw("OVER_OPEN"));
-                parts
-            }
-        }
-    }
-}
-
-impl<'a> Chain<'a> {
-    fn new(expr: &'a syn::Expr, root: &syn::Ident) -> syn::Result<Self> {
-        Ok(Self(Self::collect(expr, root)?))
-    }
-
-    fn collect(
-        expr: &'a syn::Expr,
-        root: &syn::Ident,
-    ) -> syn::Result<Vec<&'a syn::ExprMethodCall>> {
-        match expr {
-            syn::Expr::MethodCall(call) => {
-                let mut chain = Self::collect(call.receiver.as_ref(), root)?;
-                chain.push(call);
-                Ok(chain)
-            }
-            syn::Expr::Path(syn::ExprPath { attrs, qself, path }) => {
-                if let Some(attr) = attrs.first() {
-                    return Err(syn::Error::new(
-                        attr.span(),
-                        "window-spec root identifier must not have outer attributes",
-                    ));
-                }
-                if let Some(qself) = qself {
-                    return Err(syn::Error::new(
-                        qself.span(),
-                        "window-spec root identifier must not use qualified-self syntax",
-                    ));
-                }
-                if path.segments.len() == 1 && path.segments[0].ident.unraw() == root.unraw() {
-                    return Ok(Vec::new());
-                }
-                Err(syn::Error::new(
-                    path.span(),
-                    "window-spec chain must start at the closure parameter identifier",
-                ))
-            }
-            other => Err(syn::Error::new(
-                other.span(),
-                "window-spec chain must start at the `w` ident and use `.partition_by` / `.order_by` / `.order_by_desc`",
-            )),
-        }
-    }
-}
-
-impl Part {
-    fn new(
-        call: &syn::ExprMethodCall,
-        scope: &pred::RowScope<'_>,
-        state: &plan::State<'_, '_>,
-    ) -> syn::Result<Self> {
+    let mut partition = false;
+    let mut order = false;
+    let mut deferred = Vec::new();
+    for (index, (call, kind)) in calls.into_iter().enumerate().rev() {
         if call.args.len() != 1 {
             return Err(syn::Error::new(
                 call.args.span(),
                 format!("`.{}(...)` takes one argument", call.method),
             ));
         }
-        let kind = match call.method.to_string().as_str() {
-            "partition_by" => Kind::Group,
-            "order_by" => Kind::Order(qualify::Dir::Asc),
-            "order_by_desc" => Kind::Order(qualify::Dir::Desc),
-            other => {
+        let dst = match kind {
+            Clause::Partition => {
+                let prefix = if partition { "COMMA" } else { "PARTITION_BY" };
+                partition = true;
+                output.push(state.dialect.kw(prefix));
+                &mut *output
+            }
+            Clause::Order | Clause::Descending => {
+                let dst = if last_partition.is_some_and(|last| index > last) {
+                    &mut deferred
+                } else {
+                    &mut *output
+                };
+                if order {
+                    dst.push(state.dialect.kw("COMMA"));
+                } else {
+                    if last_partition.is_some() {
+                        dst.push(state.dialect.kw("SPACE"));
+                    }
+                    dst.push(state.dialect.kw("WIN_ORDER_BY"));
+                    order = true;
+                }
+                dst
+            }
+            Clause::Unknown => {
                 return Err(syn::Error::new(
                     call.method.span(),
                     format!(
-                        "unsupported window-spec method `.{other}`; allowed: partition_by / order_by / order_by_desc"
+                        "unsupported window-spec method `.{}`; allowed: partition_by / order_by / order_by_desc",
+                        call.method
                     ),
                 ));
             }
@@ -321,71 +238,27 @@ impl Part {
                 expr.span(),
                 format!(
                     "`.{}(...)` arg must be a column / arithmetic / function expression",
-                    call.method,
+                    call.method
                 ),
             )
         })?;
-        Ok(Self { sql, kind })
+        state.render_into(sql, dst);
+        if matches!(kind, Clause::Descending) {
+            dst.push(state.dialect.kw("DESC"));
+        }
+        if last_partition == Some(index) {
+            output.append(&mut deferred);
+        }
     }
-}
-
-impl Spec {
-    fn new(
-        chain: Chain<'_>,
-        scope: &pred::RowScope<'_>,
-        state: &plan::State<'_, '_>,
-    ) -> syn::Result<Self> {
-        let mut parts = Vec::new();
-        for call in chain.0 {
-            parts.push(Part::new(call, scope, state)?);
-        }
-        Ok(Self(parts))
-    }
-
-    fn render(self, state: &mut plan::State<'_, '_>) -> Vec<proc_macro2::TokenStream> {
-        let mut groups = Vec::new();
-        let mut orders = Vec::new();
-        for part in self.0 {
-            let sql = state.render(part.sql);
-            match part.kind {
-                Kind::Group => groups.push(sql),
-                Kind::Order(dir) => orders.push((sql, dir)),
-            }
-        }
-        let mut output = Vec::new();
-        if !groups.is_empty() {
-            output.push(state.dialect.kw("PARTITION_BY"));
-            for (index, parts) in groups.into_iter().enumerate() {
-                if index > 0 {
-                    output.push(state.dialect.kw("COMMA"));
-                }
-                output.extend(parts);
-            }
-        }
-        if !orders.is_empty() {
-            if !output.is_empty() {
-                output.push(state.dialect.kw("SPACE"));
-            }
-            output.push(state.dialect.kw("WIN_ORDER_BY"));
-            for (index, (parts, dir)) in orders.into_iter().enumerate() {
-                if index > 0 {
-                    output.push(state.dialect.kw("COMMA"));
-                }
-                output.extend(parts);
-                if matches!(dir, qualify::Dir::Desc) {
-                    output.push(state.dialect.kw("DESC"));
-                }
-            }
-        }
-        output
-    }
+    Ok(())
 }
 
 pub(in crate::plan) fn build(
     state: &mut plan::State<'_, '_>,
     call: &syn::ExprMethodCall,
     scope: &pred::RowScope<'_>,
-) -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    output: &mut Vec<proc_macro2::TokenStream>,
+) -> syn::Result<()> {
     if call.args.len() != 1 {
         return Err(syn::Error::new(
             call.args.span(),
@@ -401,7 +274,7 @@ pub(in crate::plan) fn build(
             ));
         }
     };
-    let head = Head::new(function, scope, state)?;
+    head(function, scope, state, output)?;
     let syn::Expr::Closure(closure) = &call.args[0] else {
         return Err(syn::Error::new(
             call.args[0].span(),
@@ -415,11 +288,7 @@ pub(in crate::plan) fn build(
         ));
     }
     let root = closure.inputs[0].ident()?;
-    let chain = Chain::new(&closure.body, root)?;
-    let spec = Spec::new(chain, scope, state)?;
-
-    let mut value = head.render(state);
-    value.extend(spec.render(state));
-    value.push(state.dialect.kw("PAREN_CLOSE"));
-    Ok(value)
+    specification(&closure.body, root, scope, state, output)?;
+    output.push(state.dialect.kw("PAREN_CLOSE"));
+    Ok(())
 }

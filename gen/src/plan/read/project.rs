@@ -13,12 +13,13 @@ pub(in crate::plan) fn element(
     elem: &syn::Expr,
     scope: &pred::RowScope<'_>,
     lock: shape::lock::Lock,
-) -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    output: &mut Vec<proc_macro2::TokenStream>,
+) -> syn::Result<()> {
     if let syn::Expr::MethodCall(mc) = elem
         && mc.method == "over"
     {
         lock.reject("row locking is not supported with window functions")?;
-        return window::build(state, mc, scope);
+        return window::build(state, mc, scope, output);
     }
     let parsed = state
         .parse(
@@ -29,7 +30,8 @@ pub(in crate::plan) fn element(
                 "`.select(...)` element must be a column / arithmetic / function expression or a window expression `<fn>().over(|w| ...)`",
             ),
         )?;
-    Ok(state.render(parsed))
+    state.render_into(parsed, output);
+    Ok(())
 }
 
 pub(in crate::plan) fn lateral(

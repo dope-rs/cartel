@@ -10,7 +10,7 @@ pub(crate) fn build<'a>(
     state: &mut plan::State<'_, 'a>,
     shape: &shape::QueryShape,
 ) -> syn::Result<emit::Plan<'a>> {
-    use mutation::{Input, Mutation};
+    use mutation::Mutation;
 
     match shape {
         shape::QueryShape::Select {
@@ -39,25 +39,7 @@ pub(crate) fn build<'a>(
                 query.returning,
             ),
             Mutation::Each(each) => update::each(state, each, query.returning),
-            Mutation::Insert(insert) => match &insert.input {
-                Input::One(values) => insert::build(
-                    state,
-                    &values.table,
-                    &values.arg,
-                    &values.body,
-                    query.returning,
-                    &insert.conflict,
-                ),
-                Input::Each(values) => insert::each(
-                    state,
-                    &values.table,
-                    &values.arg,
-                    &values.body,
-                    query.returning,
-                    &insert.conflict,
-                ),
-                Input::From(from) => insert::from(state, from, query.returning, &insert.conflict),
-            },
+            Mutation::Insert(insert) => insert::build(state, insert, query.returning),
         },
         shape::QueryShape::Aggregate(agg) => agg::build(state, agg),
         shape::QueryShape::SetOp {

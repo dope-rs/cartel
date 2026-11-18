@@ -12,3 +12,14 @@ pub fn user_row_numbers() -> Vec<(i64, i64)> {
         .select(|u| (u.id, Dialect::row_number().over(|w| w.order_by(u.age))))
         .all()
 }
+
+#[cartel_sqlite::query]
+pub fn widget_positions(sign: i64, group: i32) -> Vec<i64> {
+    Widget::filter(|_w| true)
+        .order_by(|w| w.id)
+        .select(|w| {
+            Dialect::row_number()
+                .over(|v| v.order_by(w.value * sign).partition_by(w.bucket * group))
+        })
+        .all()
+}

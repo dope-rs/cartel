@@ -161,6 +161,7 @@ queries! {
     query::item::insert,
     query::analytic::count_widgets_arith,
     query::analytic::user_row_numbers,
+    query::analytic::widget_positions,
 }
 
 statements! {

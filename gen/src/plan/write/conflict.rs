@@ -5,7 +5,6 @@ use crate::pred;
 use crate::shape;
 
 use std::slice;
-use syn::spanned::Spanned as _;
 
 pub(in crate::plan) enum Conflict {
     None,
@@ -44,16 +43,9 @@ impl Conflict {
                     &update.set_body,
                     &update.set_arg,
                     &scope,
-                    state.params,
-                    state.dialect,
-                    &state.cte_map,
+                    &state.context(),
+                    "`.do_update(...)` body must assign at least one column",
                 )?;
-                if assigns.is_empty() {
-                    return Err(syn::Error::new(
-                        update.set_body.span(),
-                        "`.do_update(...)` body must assign at least one column",
-                    ));
-                }
                 let cols = Self::columns(&target.cols);
                 let prefix = format!(" ON CONFLICT ({cols}) DO UPDATE SET ");
                 Ok(Self::Update(prefix, assigns))
@@ -61,25 +53,18 @@ impl Conflict {
         }
     }
 
-    pub(in crate::plan) fn render(
+    pub(in crate::plan) fn append(
         self,
         state: &mut plan::State<'_, '_>,
-    ) -> Vec<proc_macro2::TokenStream> {
+        sql: &mut Vec<proc_macro2::TokenStream>,
+    ) {
         match self {
-            Self::None => Vec::new(),
-            Self::DoNothing => vec![state.dialect.kw("ON_CONFLICT_DO_NOTHING")],
-            Self::Target(sql) => vec![quote::quote! { #sql }],
+            Self::None => {}
+            Self::DoNothing => sql.push(state.dialect.kw("ON_CONFLICT_DO_NOTHING")),
+            Self::Target(target) => sql.push(quote::quote! { #target }),
             Self::Update(prefix, assigns) => {
-                let mut parts = vec![quote::quote! { #prefix }];
-                for (index, assign) in assigns.into_iter().enumerate() {
-                    if index > 0 {
-                        parts.push(state.dialect.kw("COMMA"));
-                    }
-                    let col_eq = format!("{} = ", assign.column.quoted());
-                    parts.push(quote::quote! { #col_eq });
-                    parts.extend(state.render(assign.value));
-                }
-                parts
+                sql.push(quote::quote! { #prefix });
+                super::assignments(state, sql, assigns);
             }
         }
     }

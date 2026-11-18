@@ -51,6 +51,12 @@ impl State<'_, '_> {
     }
 
     pub(super) fn render(&mut self, sql: Sql) -> Vec<proc_macro2::TokenStream> {
-        sql.render(&mut self.captures, self.params, self.dialect)
+        let mut tokens = Vec::with_capacity(sql.len());
+        self.render_into(sql, &mut tokens);
+        tokens
+    }
+
+    pub(super) fn render_into(&mut self, sql: Sql, tokens: &mut Vec<proc_macro2::TokenStream>) {
+        sql.render_into(&mut self.captures, self.params, self.dialect, tokens);
     }
 }

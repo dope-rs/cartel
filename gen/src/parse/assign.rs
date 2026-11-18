@@ -1,7 +1,5 @@
-use crate::backend;
 use crate::pred;
 use crate::pred::sql;
-use std::collections;
 use syn::spanned::Spanned as _;
 
 use crate::ext::ExprExt as _;
@@ -16,9 +14,8 @@ impl Assign {
         body: &syn::Expr,
         row_var: &syn::Ident,
         scope: &pred::RowScope<'_>,
-        params: &[backend::Param],
-        dialect: &backend::Dialect,
-        cte_map: &collections::BTreeMap<String, syn::Path>,
+        context: &pred::WhereContext<'_>,
+        empty: &'static str,
     ) -> syn::Result<Vec<Self>> {
         match body {
             syn::Expr::Block(block) => {
@@ -34,6 +31,9 @@ impl Assign {
                         "labels are not supported on an assignment block",
                     ));
                 }
+                if block.block.stmts.is_empty() {
+                    return Err(syn::Error::new(body.span(), empty));
+                }
                 let mut assigns = Vec::with_capacity(block.block.stmts.len());
                 for stmt in &block.block.stmts {
                     let syn::Stmt::Expr(expr, semi) = stmt else {
@@ -48,15 +48,11 @@ impl Assign {
                             "an assignment block statement must end with `;`",
                         ));
                     }
-                    assigns.push(Self::parse_single(
-                        expr, row_var, scope, params, dialect, cte_map,
-                    )?);
+                    assigns.push(Self::parse_single(expr, row_var, scope, context)?);
                 }
                 Ok(assigns)
             }
-            single => Ok(vec![Self::parse_single(
-                single, row_var, scope, params, dialect, cte_map,
-            )?]),
+            single => Ok(vec![Self::parse_single(single, row_var, scope, context)?]),
         }
     }
 
@@ -64,9 +60,7 @@ impl Assign {
         expr: &syn::Expr,
         row_var: &syn::Ident,
         scope: &pred::RowScope<'_>,
-        params: &[backend::Param],
-        dialect: &backend::Dialect,
-        cte_map: &collections::BTreeMap<String, syn::Path>,
+        context: &pred::WhereContext<'_>,
     ) -> syn::Result<Self> {
         let syn::Expr::Assign(assign) = expr else {
             return Err(syn::Error::new(
@@ -89,7 +83,7 @@ impl Assign {
             )
         })?;
         let value = scope
-            .parse(right, Some(params), dialect, cte_map)?
+            .parse(right, Some(context.params), context.dialect, context.cte_map)?
             .ok_or_else(|| syn::Error::new(
                 right.span(),
                 "right side of assignment must be a fn-parameter, literal, or arithmetic/function expression",
