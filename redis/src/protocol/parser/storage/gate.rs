@@ -3,9 +3,10 @@ use dope::{
     manifold::client::conn,
 };
 use o3::{alloc, depot::queue::indexed::shared};
-use std::{cell, marker, mem};
+use std::{cell, mem, num};
 
-use crate::protocol::parser::storage::Storage;
+use super::{Error, Finished, Storage, Tape};
+use crate::protocol::parser::{self, limit};
 
 struct Waiting<'a, 'd> {
     slot: shared::Slot<'a, ready::Target<'d>, cell::Cell<Option<ready::Target<'d>>>>,
@@ -18,21 +19,23 @@ enum Phase<'a, 'd> {
     Waiting(Waiting<'a, 'd>),
 }
 
-pub(super) struct Held<'a, 'd>(marker::PhantomData<fn(&'a mut Storage<'d>) -> &'a mut Storage<'d>>);
-
 /// One live charge of this exact gate, transferred from held access or a grant.
 /// Clearing the previous holder before constructing this owner prevents double refunds.
 #[doc(hidden)]
 pub struct Lane<'a, 'd>(&'a Gate<'d>);
 
-pub(super) enum Acquire<'a, 'd> {
-    Acquired(Held<'a, 'd>),
-    Blocked,
-}
-
-pub(crate) struct Access<'a, 'd> {
+/// An in-progress tape whose nodes are already in their final retained storage.
+pub(crate) struct Builder<'a, 'd> {
     storage: &'a Storage<'d>,
     phase: Phase<'a, 'd>,
+    tail: Option<parser::Key<parser::Occupied>>,
+    len: u32,
+}
+
+pub(in crate::protocol::parser) struct Stored<'a, 'b, 'd> {
+    builder: &'a mut Builder<'b, 'd>,
+    tail: parser::Key<parser::Occupied>,
+    len: num::NonZero<u32>,
 }
 
 pub(super) struct Gate<'d> {
@@ -41,33 +44,70 @@ pub(super) struct Gate<'d> {
     waiters: shared::Fifo<ready::Target<'d>, cell::Cell<Option<ready::Target<'d>>>>,
 }
 
-impl<'a, 'd> Access<'a, 'd> {
-    pub(super) const fn new(storage: &'a Storage<'d>) -> Self {
-        Self {
-            storage,
+impl<'d> Storage<'d> {
+    pub(in crate::protocol::parser) fn builder(&self) -> Builder<'_, 'd> {
+        Builder {
+            storage: self,
             phase: Phase::Idle,
+            tail: None,
+            len: 0,
         }
     }
+}
 
-    pub(super) const fn storage(&self) -> &'a Storage<'d> {
-        self.storage
+impl<'a, 'd> Builder<'a, 'd> {
+    pub(in crate::protocol::parser) fn len(&self) -> u32 {
+        self.len
     }
 
-    pub(super) fn acquire(&mut self) -> Acquire<'a, 'd> {
-        if let Phase::Idle = &self.phase {
-            let gate = &self.storage.gate;
-            let active = gate.active.get();
-            if active >= gate.lanes {
-                return Acquire::Blocked;
+    pub(in crate::protocol::parser) fn try_push(
+        &mut self,
+        slot: limit::Slot,
+        value: parser::Kind,
+    ) -> Result<Stored<'_, 'a, 'd>, Error> {
+        let storage = self.storage;
+        let tail = match self.tail {
+            Some(tail) => storage.tapes.append(tail, &value),
+            None => {
+                if !self.acquire() {
+                    return Err(Error::Blocked(slot));
+                }
+                storage.tapes.first(&value)
             }
-            gate.active.set(active + 1);
-        } else if let Phase::Waiting(waiting) = &self.phase
-            && !self.storage.gate.resume(waiting)
-        {
-            return Acquire::Blocked;
+        };
+        let Some(tail) = tail else {
+            return Err(Error::Full(slot));
+        };
+        let len = slot.commit();
+        self.tail = Some(tail);
+        self.len = len.get();
+        Ok(Stored {
+            builder: self,
+            tail,
+            len,
+        })
+    }
+
+    pub(in crate::protocol::parser) fn reset(&mut self) {
+        *self = self.storage.builder();
+    }
+
+    fn acquire(&mut self) -> bool {
+        match &self.phase {
+            Phase::Idle => {
+                let gate = &self.storage.gate;
+                let active = gate.active.get();
+                if active >= gate.lanes {
+                    return false;
+                }
+                gate.active.set(active + 1);
+            }
+            Phase::Waiting(waiting) if !self.storage.gate.resume(waiting) => return false,
+            Phase::Waiting(_) => {}
+            Phase::Held => return true,
         }
         self.phase = Phase::Held;
-        Acquire::Acquired(Held(marker::PhantomData))
+        true
     }
 
     pub(crate) fn wait<const ID: u8>(
@@ -95,8 +135,11 @@ impl<'a, 'd> Access<'a, 'd> {
         }
         Ok(())
     }
+}
 
-    pub(super) fn release(&mut self) {
+impl Drop for Builder<'_, '_> {
+    fn drop(&mut self) {
+        self.storage.tapes.release(self.tail);
         let phase = mem::replace(&mut self.phase, Phase::Idle);
         match phase {
             Phase::Idle => {}
@@ -104,11 +147,22 @@ impl<'a, 'd> Access<'a, 'd> {
             Phase::Waiting(waiting) => self.storage.gate.cancel(waiting),
         }
     }
+}
 
-    pub(super) fn finish(&mut self, held: Held<'a, 'd>) -> Lane<'a, 'd> {
-        let Held(marker::PhantomData) = held;
-        self.phase = Phase::Idle;
-        Lane(&self.storage.gate)
+impl<'a, 'g> Stored<'_, 'a, 'g> {
+    pub(in crate::protocol::parser) fn finish(self) -> Finished<'a, 'g> {
+        self.builder.tail = None;
+        self.builder.len = 0;
+        self.builder.phase = Phase::Idle;
+        let storage = self.builder.storage;
+        Finished {
+            nodes: Tape {
+                pool: &storage.tapes,
+                tail: self.tail,
+                len: self.len,
+            },
+            lane: Lane(&storage.gate),
+        }
     }
 }
 

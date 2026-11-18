@@ -652,7 +652,7 @@ where
     ) -> session::Blocking {
         let port = owner.root().port();
         if let Some(target) = port.schedule.routes.target(conn) {
-            match state.builder.access.wait(conn, target) {
+            match state.builder.wait(conn, target) {
                 Ok(()) => session::Blocking::Registered,
                 Err(cause) => {
                     port.activity.record_stop(port::Stop::ParserWait(cause));

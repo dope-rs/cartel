@@ -1,10 +1,23 @@
+use std::net::SocketAddr;
+
 use cartel_redis::{
     client, client::plan, client::settings, client::settings::Config, client::settings::init,
 };
 use dope::{
-    manifold::app::env, manifold::service, manifold::timing::Throughput, net::Transport,
-    net::wire::Identity, runtime::topology::Prepared,
+    core::driver::{
+        life::recovery,
+        route::{Id, KeyTag},
+    },
+    manifold::{
+        app::{self, env},
+        network::client::Pool,
+        service::{self, bindings, sync},
+        timing::Throughput,
+    },
+    net::{Transport, tcp::Tcp, wire::Identity},
+    runtime::{executor::session, topology::Prepared},
 };
+use dope_test::{harness::GUARD, reclaim::Reports};
 
 pub fn try_new<
     E,
@@ -33,4 +46,55 @@ where
         )?
         .for_install::<Throughput>()
         .map_err(plan::Error::Connector)
+}
+
+type Env = env::Bundle<Tcp, Identity, Throughput>;
+const LIMIT: usize = u32::MAX as usize;
+
+type Host<'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n, 'd> = app::Host<
+    Pool<
+        'q,
+        'h,
+        'n,
+        'd,
+        'd,
+        KeyTag<0>,
+        LIMIT,
+        bindings::Bound<
+            'r,
+            'd,
+            cartel_redis::Port<'s, 'storage, 'b, 'c, 'd>,
+            client::Logic<'s, 'd>,
+            KeyTag<0>,
+            LIMIT,
+        >,
+        sync::Replace,
+        SocketAddr,
+        Env,
+    >,
+>;
+
+pub fn run(
+    config: Config,
+    address: SocketAddr,
+    test: impl for<'app, 'life, 'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n, 'd> FnOnce(
+        session::App<'app, 'life, 'd, Host<'q, 'h, 'r, 's, 'storage, 'b, 'c, 'n, 'd>>,
+    ),
+) -> Reports<1> {
+    let prepared =
+        try_new::<Env, _, _, _>(config, address, init::Plan::new()).expect("Redis topology");
+    let mut reports = Reports::new(prepared.layout(), [Id::fixed::<0>()]);
+    let mut completion = session::Completion::new();
+    prepared.with_local(
+        |worker| {
+            worker.lend(|node, stage| {
+                node.install(stage, |host, stage| {
+                    stage.with_quiesce(&mut completion, host, GUARD, test)
+                })
+            })
+        },
+        recovery::Policy::new(|event| reports.push(event), crate::common::recover),
+        |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
+    );
+    reports
 }

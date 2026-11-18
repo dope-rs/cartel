@@ -3,33 +3,21 @@ use cartel_redis::protocol::parser::storage;
 use cartel_redis::value::source::{
     Bulks as _, Bytes as _, Chunks as _, Exact as _, Optional as _, Pairs as _,
 };
-use dope::core::driver::life::recovery;
-use dope::runtime::executor::session::Completion;
 use std::{convert, time::Duration};
 
 use cartel_redis::{
-    client::{nonempty::Slice, settings::init::Plan},
+    client::nonempty::Slice,
     value,
     value::{
         list::{bulks, pair},
         reply,
     },
 };
-use common::{command::list::*, recover, topology};
-use dope::{
-    core::driver::route::Id,
-    manifold::{app::env::Bundle, timing::Throughput},
-    net::{tcp::Tcp, wire::Identity},
-};
+use common::{command::list::*, topology};
 use dope_fiber::BlockOn as _;
-use dope_test::{
-    harness::{GUARD, peer::TcpScript},
-    reclaim::Reports,
-};
+use dope_test::harness::peer::TcpScript;
 
 type Failure<'b, 'c, 'd> = reply::Failure<cartel_redis::Error<'d>, value::Bytes<'b, 'c, 'd>>;
-
-type Env = Bundle<Tcp, Identity, Throughput>;
 
 pub mod common;
 
@@ -50,95 +38,81 @@ fn run(case: List) {
             let address = server.addr();
 
             {
-                let prepared = topology::try_new::<Env, _, _, _>(
+                let reports = topology::run(
                     try_config(1).expect("list configuration"),
                     address,
-                    Plan::new(),
-                )
-                .expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let redis = runtime.root_client();
+                    |mut runtime| {
+                        let redis = runtime.root_client();
 
-                                    assert!(matches!(
-                                        runtime.block_on(redis.wait_active()),
-                                        Ok(Ok(()))
-                                    ));
-                                    match case {
-                                        List::Optional => {
-                                            let fields = [b"a".as_slice(), b"b".as_slice()];
-                                            let values = runtime
-                                                .block_on(
-                                                    redis
-                                                        .hashes()
-                                                        .values(b"hash", Slice::from_pair(&fields)),
-                                                )
-                                                .expect("optional operation")
-                                                .ok()
-                                                .expect("optional reply");
-                                            assert!(matches!(
-                                                values.try_array::<3>(),
-                                                Err(reply::Decode::ArrayLength {
-                                                    expected: 3,
-                                                    actual: 2
-                                                })
-                                            ));
-                                            let expected = [Some(b"".as_slice()), None];
-                                            assert_eq!(
-                                                values
-                                                    .try_array::<2>()
-                                                    .ok()
-                                                    .expect("optional pair"),
-                                                expected
-                                            );
-                                            let mut iter = values.iter();
-                                            for (index, value) in expected.into_iter().enumerate() {
-                                                let remaining = expected.len() - index;
-                                                assert_eq!(iter.len(), remaining);
-                                                assert_eq!(
-                                                    iter.size_hint(),
-                                                    (remaining, Some(remaining))
-                                                );
-                                                assert_eq!(iter.next(), Some(value));
-                                            }
-                                            assert_eq!(iter.len(), 0);
-                                            assert_eq!(iter.size_hint(), (0, Some(0)));
-                                            assert_eq!(iter.next(), None);
-                                        }
-                                        List::Array
-                                        | List::ArrayProof
-                                        | List::ArrayEmpty
-                                        | List::ArrayLate
-                                        | List::ArrayVisit
-                                        | List::ArrayVisitAt => {
-                                            let result =
-                                                runtime.block_on(redis.sets().members(b"set"));
-                                            let result =
-                                                result.expect("test operation must succeed");
-                                            check_array_case(case, result);
-                                        }
-                                        List::Pairs
-                                        | List::PairsOdd
-                                        | List::PairsLate
-                                        | List::PairsVisit => {
-                                            let result =
-                                                runtime.block_on(redis.hashes().entries(b"hash"));
-                                            let result =
-                                                result.expect("test operation must succeed");
-                                            check_pairs_case(case, result);
-                                        }
-                                    }
-                                })
-                            })
-                        })
+                        assert!(matches!(
+                            runtime.block_on(redis.wait_active()),
+                            Ok(Ok(()))
+                        ));
+                        match case {
+                            List::Optional => {
+                                let fields = [b"a".as_slice(), b"b".as_slice()];
+                                let values = runtime
+                                    .block_on(
+                                        redis
+                                            .hashes()
+                                            .values(b"hash", Slice::from_pair(&fields)),
+                                    )
+                                    .expect("optional operation")
+                                    .ok()
+                                    .expect("optional reply");
+                                assert!(matches!(
+                                    values.try_array::<3>(),
+                                    Err(reply::Decode::ArrayLength {
+                                        expected: 3,
+                                        actual: 2
+                                    })
+                                ));
+                                let expected = [Some(b"".as_slice()), None];
+                                assert_eq!(
+                                    values
+                                        .try_array::<2>()
+                                        .ok()
+                                        .expect("optional pair"),
+                                    expected
+                                );
+                                let mut iter = values.iter();
+                                for (index, value) in expected.into_iter().enumerate() {
+                                    let remaining = expected.len() - index;
+                                    assert_eq!(iter.len(), remaining);
+                                    assert_eq!(
+                                        iter.size_hint(),
+                                        (remaining, Some(remaining))
+                                    );
+                                    assert_eq!(iter.next(), Some(value));
+                                }
+                                assert_eq!(iter.len(), 0);
+                                assert_eq!(iter.size_hint(), (0, Some(0)));
+                                assert_eq!(iter.next(), None);
+                            }
+                            List::Array
+                            | List::ArrayProof
+                            | List::ArrayEmpty
+                            | List::ArrayLate
+                            | List::ArrayVisit
+                            | List::ArrayVisitAt => {
+                                let result =
+                                    runtime.block_on(redis.sets().members(b"set"));
+                                let result =
+                                    result.expect("test operation must succeed");
+                                check_array_case(case, result);
+                            }
+                            List::Pairs
+                            | List::PairsOdd
+                            | List::PairsLate
+                            | List::PairsVisit => {
+                                let result =
+                                    runtime.block_on(redis.hashes().entries(b"hash"));
+                                let result =
+                                    result.expect("test operation must succeed");
+                                check_pairs_case(case, result);
+                            }
+                        }
                     },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
                 );
                 reports.events().expect("valid reclaim observations");
             };

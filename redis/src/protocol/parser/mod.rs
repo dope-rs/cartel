@@ -303,11 +303,6 @@ pub(crate) struct Pool {
     free: cell::Cell<Option<parser::Key<parser::Vacant>>>,
 }
 
-pub(crate) struct Free<'d> {
-    pool: &'d Pool,
-    tail: parser::Key<parser::Vacant>,
-}
-
 impl Pool {
     fn try_new(capacity: usize) -> Result<Self, alloc::Error> {
         let nodes = Box::<[cell::Cell<parser::Node>]>::try_from_fn(capacity, |index| {
@@ -327,10 +322,6 @@ impl Pool {
     /// Keys are minted from this allocation and remain inside its closed chain API.
     fn node<S>(&self, key: parser::Key<S>) -> &cell::Cell<parser::Node> {
         unsafe { self.nodes.get_unchecked(key.offset()) }
-    }
-
-    fn reserve(&self) -> Option<parser::Free<'_>> {
-        self.free.get().map(|tail| Free { pool: self, tail })
     }
 
     fn release(&self, tail: Option<parser::Key<parser::Occupied>>) {
@@ -361,33 +352,41 @@ impl Pool {
     fn write(&self, key: parser::Key<parser::Occupied>, node: parser::Node) {
         self.node(key).set(node);
     }
-}
 
-impl Free<'_> {
+    fn first(&self, value: &parser::Kind) -> Option<parser::Key<parser::Occupied>> {
+        self.insert(value, std::convert::identity)
+    }
+
     fn append(
-        self,
-        tail: Option<parser::Key<parser::Occupied>>,
-        value: parser::Kind,
-    ) -> parser::Key<parser::Occupied> {
-        let key = self.pool.node(self.tail).get().vacant_next();
-        if key.raw() == self.tail.raw() {
-            self.pool.free.set(None);
+        &self,
+        tail: parser::Key<parser::Occupied>,
+        value: &parser::Kind,
+    ) -> Option<parser::Key<parser::Occupied>> {
+        self.insert(value, |key| {
+            let tail = self.node(tail);
+            let node = tail.get();
+            tail.set(node.with_next(key));
+            node.next()
+        })
+    }
+
+    fn insert(
+        &self,
+        value: &parser::Kind,
+        next: impl FnOnce(parser::Key<parser::Occupied>) -> parser::Key<parser::Occupied>,
+    ) -> Option<parser::Key<parser::Occupied>> {
+        let free = self.free.get()?;
+        let tail = self.node(free);
+        let key = tail.get().vacant_next();
+        if key.raw() == free.raw() {
+            self.free.set(None);
         } else {
-            let next = self.pool.node(key).get().vacant_next();
-            let free = self.pool.node(self.tail);
-            free.set(free.get().with_free(next));
+            let next = self.node(key).get().vacant_next();
+            tail.set(tail.get().with_free(next));
         }
         let key = key.occupy();
-        match tail {
-            Some(tail) => {
-                let head = self.pool.node(tail).get().next();
-                self.pool.node(key).set(parser::Node::new(head, value));
-                let tail = self.pool.node(tail);
-                tail.set(tail.get().with_next(key));
-            }
-            None => self.pool.node(key).set(parser::Node::new(key, value)),
-        }
-        key
+        self.write(key, parser::Node::new(next(key), *value));
+        Some(key)
     }
 }
 
@@ -419,5 +418,3 @@ impl Span {
         start..end
     }
 }
-
-const _: [(); 16] = [(); mem::size_of::<Free<'_>>()];

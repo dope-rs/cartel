@@ -1,7 +1,5 @@
 use cartel_redis::api::{Client as _, Commands as _};
 use cartel_redis::value::source::{Bytes as _, Reader as _, Reply as _};
-use dope::core::driver::life::recovery;
-use dope::runtime::executor::session::Completion;
 use std::{iter, num::NonZero, time::Duration};
 
 use cartel_redis::{
@@ -9,26 +7,15 @@ use cartel_redis::{
         GeoCoord,
         nonempty::Slice,
         ops::scripts::{self, Invocation as _},
-        settings::init::Plan,
     },
     request, value,
 };
 use common::{
     command::{Changed, scripts::*},
-    recover, topology,
-};
-use dope::{
-    core::driver::route::Id,
-    manifold::{app::env::Bundle, timing::Throughput},
-    net::{tcp::Tcp, wire::Identity},
+    topology,
 };
 use dope_fiber::BlockOn as _;
-use dope_test::{
-    harness::{GUARD, peer::TcpScript},
-    reclaim::Reports,
-};
-
-type Env = Bundle<Tcp, Identity, Throughput>;
+use dope_test::harness::{GUARD, peer::TcpScript};
 
 pub mod common;
 
@@ -59,98 +46,84 @@ fn eval_owned() {
             let addr = server.addr();
 
             {
-                let prepared = topology::try_new::<Env, _, _, _>(
+                let reports = topology::run(
                     common::command::list::try_config(2).expect("test configuration"),
                     addr,
-                    Plan::new(),
-                )
-                .expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let redis = runtime.root_client();
+                    |mut runtime| {
+                        let redis = runtime.root_client();
 
-                                    assert!(matches!(
-                                        runtime.block_on(redis.wait_active()),
-                                        Ok(Ok(()))
-                                    ));
+                        assert!(matches!(
+                            runtime.block_on(redis.wait_active()),
+                            Ok(Ok(()))
+                        ));
 
-                                    let keys = vec![b"event:42".to_vec(), vec![0, 1, 2]];
-                                    let args = vec![b"first".to_vec(), b"second".to_vec()];
-                                    assert!(matches!(
-                                        runtime.block_on(redis.scripts().eval::<i64, _, _>(
-                                            b"return 17",
-                                            &keys,
-                                            &args
-                                        ),),
-                                        Ok(Ok(17))
-                                    ));
-                                    let reply = runtime
-                                        .block_on(redis.scripts().eval::<Retain, _, _>(
-                                            b"return 17",
-                                            &keys,
-                                            &args,
-                                        ))
-                                        .expect("custom decoder completed")
-                                        .ok()
-                                        .expect("custom decoder retained the error");
-                                    let mut reader = reply.reader();
-                                    assert!(matches!(
-                                        reader.next_event(),
-                                        Some(value::Event::Error(b"ERR retained"))
-                                    ));
-                                    assert!(reader.finish().is_ok());
-                                    drop(reply);
-                                    let (first, second) = runtime
-                                        .block_on(redis.scripts().eval::<(
-                                            value::Bytes<'_, '_, '_>,
-                                            value::Bytes<'_, '_, '_>,
-                                        ), _, _>(b"return 17", &keys, &args))
-                                        .expect("pair decoder completed")
-                                        .ok()
-                                        .expect("two retained bulk owners");
-                                    assert!(matches!(
-                                        runtime.block_on(redis.scripts().eval::<GeoCoord, _, _>(
-                                            b"return 17", &keys, &args
-                                        )),
-                                        Ok(Ok(value)) if value.longitude == 1.25 && value.latitude == -2.0
-                                    ));
-                                    assert!(matches!(
-                                        runtime.block_on(redis.scripts().eval::<(
-                                            value::Bytes<'_, '_, '_>,
-                                            value::Bytes<'_, '_, '_>,
-                                        ), _, _>(b"return 17", &keys, &args)),
-                                        Ok(Err(value::reply::Failure::Decode(
-                                            value::reply::Decode::Expected {
-                                                expected: value::reply::Expectation::Bulk,
-                                                actual: value::reply::Actual::Array { len: 3 },
-                                            }
-                                        )))
-                                    ));
-                                    assert_eq!(&*first, b"first");
-                                    drop(first);
-                                    assert!(matches!(
-                                        runtime.block_on(redis.scripts().eval::<GeoCoord, _, _>(
-                                            b"return 17", &keys, &args
-                                        )),
-                                        Ok(Err(value::reply::Failure::Decode(
-                                            value::reply::Decode::Expected {
-                                                expected: value::reply::Expectation::Float,
-                                                actual: value::reply::Actual::Array { len: 3 },
-                                            }
-                                        )))
-                                    ));
-                                    assert_eq!(&*second, b"second");
-                                })
-                            })
-                        })
+                        let keys = vec![b"event:42".to_vec(), vec![0, 1, 2]];
+                        let args = vec![b"first".to_vec(), b"second".to_vec()];
+                        assert!(matches!(
+                            runtime.block_on(redis.scripts().eval::<i64, _, _>(
+                                b"return 17",
+                                &keys,
+                                &args
+                            ),),
+                            Ok(Ok(17))
+                        ));
+                        let reply = runtime
+                            .block_on(redis.scripts().eval::<Retain, _, _>(
+                                b"return 17",
+                                &keys,
+                                &args,
+                            ))
+                            .expect("custom decoder completed")
+                            .ok()
+                            .expect("custom decoder retained the error");
+                        let mut reader = reply.reader();
+                        assert!(matches!(
+                            reader.next_event(),
+                            Some(value::Event::Error(b"ERR retained"))
+                        ));
+                        assert!(reader.finish().is_ok());
+                        drop(reply);
+                        let (first, second) = runtime
+                            .block_on(redis.scripts().eval::<(
+                                value::Bytes<'_, '_, '_>,
+                                value::Bytes<'_, '_, '_>,
+                            ), _, _>(b"return 17", &keys, &args))
+                            .expect("pair decoder completed")
+                            .ok()
+                            .expect("two retained bulk owners");
+                        assert!(matches!(
+                            runtime.block_on(redis.scripts().eval::<GeoCoord, _, _>(
+                                b"return 17", &keys, &args
+                            )),
+                            Ok(Ok(value)) if value.longitude == 1.25 && value.latitude == -2.0
+                        ));
+                        assert!(matches!(
+                            runtime.block_on(redis.scripts().eval::<(
+                                value::Bytes<'_, '_, '_>,
+                                value::Bytes<'_, '_, '_>,
+                            ), _, _>(b"return 17", &keys, &args)),
+                            Ok(Err(value::reply::Failure::Decode(
+                                value::reply::Decode::Expected {
+                                    expected: value::reply::Expectation::Bulk,
+                                    actual: value::reply::Actual::Array { len: 3 },
+                                }
+                            )))
+                        ));
+                        assert_eq!(&*first, b"first");
+                        drop(first);
+                        assert!(matches!(
+                            runtime.block_on(redis.scripts().eval::<GeoCoord, _, _>(
+                                b"return 17", &keys, &args
+                            )),
+                            Ok(Err(value::reply::Failure::Decode(
+                                value::reply::Decode::Expected {
+                                    expected: value::reply::Expectation::Float,
+                                    actual: value::reply::Actual::Array { len: 3 },
+                                }
+                            )))
+                        ));
+                        assert_eq!(&*second, b"second");
                     },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
                 );
                 reports.events().expect("valid reclaim observations");
             };
@@ -211,155 +184,141 @@ fn request_failure_recycles() {
             let addr = server.addr();
 
             {
-                let prepared = topology::try_new::<Env, _, _, _>(
+                let reports = topology::run(
                     try_config().expect("test configuration"),
                     addr,
-                    Plan::new(),
-                )
-                .expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let redis = runtime.root_client();
+                    |mut runtime| {
+                        let redis = runtime.root_client();
 
-                                    assert!(matches!(
-                                        runtime.block_on(redis.wait_active()),
-                                        Ok(Ok(()))
-                                    ));
-                                    let invalid = [Segmented {
-                                        len: 1,
-                                        chunks: [b"xx".as_slice()],
-                                    }];
-                                    assert!(
-                                        matches!(
-                                            runtime.block_on(
-                                                redis.scripts().eval::<i64, &[u8], _>(
-                                                    b"return 17",
-                                                    &[],
-                                                    &invalid,
-                                                )
-                                            ),
-                                            Ok(Err(value::reply::Failure::Control(
-                                                cartel_redis::Error::Request(
-                                                    request::Error::BulkLength {
-                                                        declared: 1,
-                                                        actual: 2
-                                                    }
-                                                )
-                                            )))
-                                        ),
-                                        "invalid bulk must fail before submission"
-                                    );
+                        assert!(matches!(
+                            runtime.block_on(redis.wait_active()),
+                            Ok(Ok(()))
+                        ));
+                        let invalid = [Segmented {
+                            len: 1,
+                            chunks: [b"xx".as_slice()],
+                        }];
+                        assert!(
+                            matches!(
+                                runtime.block_on(
+                                    redis.scripts().eval::<i64, &[u8], _>(
+                                        b"return 17",
+                                        &[],
+                                        &invalid,
+                                    )
+                                ),
+                                Ok(Err(value::reply::Failure::Control(
+                                    cartel_redis::Error::Request(
+                                        request::Error::BulkLength {
+                                            declared: 1,
+                                            actual: 2
+                                        }
+                                    )
+                                )))
+                            ),
+                            "invalid bulk must fail before submission"
+                        );
 
-                                    let fields = [(b"a".as_slice(), b"b".as_slice())];
-                                    assert!(matches!(
-                                        runtime.block_on(redis.hashes().set_iter(
-                                            b"key",
-                                            NonZero::new(2).expect("count"),
-                                            fields.into_iter(),
-                                        )),
-                                        Ok(Err(value::reply::Failure::Control(
-                                            cartel_redis::Error::Request(request::Error::Items {
-                                                declared: 2,
-                                                actual: 1,
-                                            })
-                                        )))
-                                    ));
-                                    assert!(matches!(
-                                        runtime.block_on(redis.hashes().set_iter(
-                                            b"key",
-                                            NonZero::<usize>::MIN,
-                                            Changed {
-                                                measured: &[(b"abcdefgh", b"abcdefgh")],
-                                                emitted: &[(b"a", b"b"), (b"a", b"b")],
-                                            },
-                                        )),
-                                        Ok(Err(value::reply::Failure::Control(
-                                            cartel_redis::Error::Request(request::Error::Items {
-                                                declared: 1,
-                                                actual: 2,
-                                            })
-                                        )))
-                                    ));
-                                    let hash = {
-                                        let field = String::from("field");
-                                        let value = String::from("value");
-                                        redis.hashes().set_iter(
-                                            b"key",
-                                            NonZero::<usize>::MIN,
-                                            [(field.as_bytes(), value.as_bytes())].into_iter(),
-                                        )
-                                    };
-                                    assert!(matches!(runtime.block_on(hash), Ok(Ok(1))));
-                                    assert!(matches!(
-                                        runtime.block_on(
-                                            redis.hashes().set(b"key", b"field", b"value")
-                                        ),
-                                        Ok(Ok(false))
-                                    ));
-                                    let delete = {
-                                        let keys = [String::from("one"), String::from("two")];
-                                        redis.basic().del_iter(
-                                            NonZero::new(keys.len()).expect("count"),
-                                            keys.iter().map(String::as_bytes),
-                                        )
-                                    };
-                                    assert!(matches!(runtime.block_on(delete), Ok(Ok(2))));
-                                    let add = {
-                                        let key = String::from("set");
-                                        let members = [String::from("one"), String::from("two")];
-                                        redis.sets().add_iter(
-                                            key.as_bytes(),
-                                            NonZero::new(members.len()).expect("count"),
-                                            members.iter().map(String::as_bytes),
-                                        )
-                                    };
-                                    assert!(matches!(runtime.block_on(add), Ok(Ok(2))));
-
-                                    let ack = {
-                                        let key = String::from("key");
-                                        let group = String::from("group");
-                                        let ids = [String::from("1-0"), String::from("2-0")];
-                                        redis.streams().ack(
-                                            key.as_bytes(),
-                                            group.as_bytes(),
-                                            Slice::from_pair(&ids),
-                                        )
-                                    };
-                                    assert!(matches!(runtime.block_on(ack), Ok(Ok(2))));
-                                    let empty = runtime
-                                        .block_on(
-                                            redis
-                                                .scripts()
-                                                .eval::<value::Bytes<'_, '_, '_>, &[u8], _>(
-                                                    b"return 17",
-                                                    &[],
-                                                    &[b"ok".as_slice()],
-                                                ),
-                                        )
-                                        .expect("empty response completed")
-                                        .ok()
-                                        .expect("empty bulk");
-                                    let clone = empty.try_clone().expect("empty clone");
-                                    assert!(matches!(
-                                        runtime.block_on(redis.scripts().eval::<i64, &[u8], _>(
-                                            b"return 17",
-                                            &[],
-                                            &[b"ok".as_slice()],
-                                        )),
-                                        Ok(Ok(17))
-                                    ));
-                                    assert!(empty.is_empty() && clone.is_empty());
+                        let fields = [(b"a".as_slice(), b"b".as_slice())];
+                        assert!(matches!(
+                            runtime.block_on(redis.hashes().set_iter(
+                                b"key",
+                                NonZero::new(2).expect("count"),
+                                fields.into_iter(),
+                            )),
+                            Ok(Err(value::reply::Failure::Control(
+                                cartel_redis::Error::Request(request::Error::Items {
+                                    declared: 2,
+                                    actual: 1,
                                 })
-                            })
-                        })
+                            )))
+                        ));
+                        assert!(matches!(
+                            runtime.block_on(redis.hashes().set_iter(
+                                b"key",
+                                NonZero::<usize>::MIN,
+                                Changed {
+                                    measured: &[(b"abcdefgh", b"abcdefgh")],
+                                    emitted: &[(b"a", b"b"), (b"a", b"b")],
+                                },
+                            )),
+                            Ok(Err(value::reply::Failure::Control(
+                                cartel_redis::Error::Request(request::Error::Items {
+                                    declared: 1,
+                                    actual: 2,
+                                })
+                            )))
+                        ));
+                        let hash = {
+                            let field = String::from("field");
+                            let value = String::from("value");
+                            redis.hashes().set_iter(
+                                b"key",
+                                NonZero::<usize>::MIN,
+                                [(field.as_bytes(), value.as_bytes())].into_iter(),
+                            )
+                        };
+                        assert!(matches!(runtime.block_on(hash), Ok(Ok(1))));
+                        assert!(matches!(
+                            runtime.block_on(
+                                redis.hashes().set(b"key", b"field", b"value")
+                            ),
+                            Ok(Ok(false))
+                        ));
+                        let delete = {
+                            let keys = [String::from("one"), String::from("two")];
+                            redis.basic().del_iter(
+                                NonZero::new(keys.len()).expect("count"),
+                                keys.iter().map(String::as_bytes),
+                            )
+                        };
+                        assert!(matches!(runtime.block_on(delete), Ok(Ok(2))));
+                        let add = {
+                            let key = String::from("set");
+                            let members = [String::from("one"), String::from("two")];
+                            redis.sets().add_iter(
+                                key.as_bytes(),
+                                NonZero::new(members.len()).expect("count"),
+                                members.iter().map(String::as_bytes),
+                            )
+                        };
+                        assert!(matches!(runtime.block_on(add), Ok(Ok(2))));
+
+                        let ack = {
+                            let key = String::from("key");
+                            let group = String::from("group");
+                            let ids = [String::from("1-0"), String::from("2-0")];
+                            redis.streams().ack(
+                                key.as_bytes(),
+                                group.as_bytes(),
+                                Slice::from_pair(&ids),
+                            )
+                        };
+                        assert!(matches!(runtime.block_on(ack), Ok(Ok(2))));
+                        let empty = runtime
+                            .block_on(
+                                redis
+                                    .scripts()
+                                    .eval::<value::Bytes<'_, '_, '_>, &[u8], _>(
+                                        b"return 17",
+                                        &[],
+                                        &[b"ok".as_slice()],
+                                    ),
+                            )
+                            .expect("empty response completed")
+                            .ok()
+                            .expect("empty bulk");
+                        let clone = empty.try_clone().expect("empty clone");
+                        assert!(matches!(
+                            runtime.block_on(redis.scripts().eval::<i64, &[u8], _>(
+                                b"return 17",
+                                &[],
+                                &[b"ok".as_slice()],
+                            )),
+                            Ok(Ok(17))
+                        ));
+                        assert!(empty.is_empty() && clone.is_empty());
                     },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
                 );
                 reports.events().expect("valid reclaim observations");
             };
@@ -397,80 +356,66 @@ fn bulk_boundary() {
             |server| {
                 let addr = server.addr();
                 {
-                    let prepared = topology::try_new::<Env, _, _, _>(
+                    let reports = topology::run(
                         try_bulk_config(capacity).expect("bulk configuration"),
                         addr,
-                        Plan::new(),
-                    )
-                    .expect("topology fixture completed");
-                    let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                    let mut report = Completion::new();
-                    prepared.with_local(
-                        |worker| {
-                            worker.lend(|node, stage| {
-                                node.install(stage, |host, stage| {
-                                    stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                        let redis = runtime.root_client();
-                                        assert!(matches!(
-                                            runtime.block_on(redis.wait_active()),
-                                            Ok(Ok(()))
-                                        ));
-                                        let request = if capacity == need {
-                                            use common::session::deadline::release_after_poll;
-                                            use dope_fiber::abi::Task;
-                                            let prepared = call.prepare().expect("prepared EVAL");
-                                            let held = redis.scripts().eval_prepared::<i64, _, _>(
-                                                call.prepare().expect("held EVAL"),
-                                            );
-                                            let waiting = Box::pin(Task::new(
-                                                redis
-                                                    .try_acquire_bulk(prepared.wire_len())
-                                                    .expect("bulk capacity"),
-                                            ));
-                                            let reserved = runtime
-                                                .block_on(release_after_poll(waiting, held))
-                                                .expect("reservation drive")
-                                                .ok()
-                                                .expect("command return wakes reservation");
-                                            let waiting = Box::pin(Task::new(
-                                                redis
-                                                    .try_acquire_bulk(prepared.wire_len())
-                                                    .expect("bulk capacity"),
-                                            ));
-                                            let reserved = runtime
-                                                .block_on(release_after_poll(waiting, reserved))
-                                                .expect("reservation drive")
-                                                .ok()
-                                                .expect("reservation return wakes reservation");
-                                            reserved.scripts().eval_prepared::<i64, _, _>(prepared)
-                                        } else {
-                                            redis.scripts().eval_call::<i64, _>(&call)
-                                        };
-                                        let result = runtime.block_on(request);
-                                        if capacity == need {
-                                            assert!(matches!(result, Ok(Ok(17))));
-                                        } else {
-                                            assert!(
-                                                matches!(
-                                                    result,
-                                                    Ok(Err(value::reply::Failure::Control(
-                                                        cartel_redis::Error::Request(
-                                                            request::Error::Capacity(cause)
-                                                        )
-                                                    ))) if {
-                                                        let (actual, cap) = cause.into_parts();
-                                                        actual.get() == need && cap == need - 1
-                                                    }
-                                                ),
-                                                "oversized EVAL must fail before submission"
-                                            );
+                        |mut runtime| {
+                            let redis = runtime.root_client();
+                            assert!(matches!(
+                                runtime.block_on(redis.wait_active()),
+                                Ok(Ok(()))
+                            ));
+                            let request = if capacity == need {
+                                use common::session::deadline::release_after_poll;
+                                use dope_fiber::abi::Task;
+                                let prepared = call.prepare().expect("prepared EVAL");
+                                let held = redis.scripts().eval_prepared::<i64, _, _>(
+                                    call.prepare().expect("held EVAL"),
+                                );
+                                let waiting = Box::pin(Task::new(
+                                    redis
+                                        .try_acquire_bulk(prepared.wire_len())
+                                        .expect("bulk capacity"),
+                                ));
+                                let reserved = runtime
+                                    .block_on(release_after_poll(waiting, held))
+                                    .expect("reservation drive")
+                                    .ok()
+                                    .expect("command return wakes reservation");
+                                let waiting = Box::pin(Task::new(
+                                    redis
+                                        .try_acquire_bulk(prepared.wire_len())
+                                        .expect("bulk capacity"),
+                                ));
+                                let reserved = runtime
+                                    .block_on(release_after_poll(waiting, reserved))
+                                    .expect("reservation drive")
+                                    .ok()
+                                    .expect("reservation return wakes reservation");
+                                reserved.scripts().eval_prepared::<i64, _, _>(prepared)
+                            } else {
+                                redis.scripts().eval_call::<i64, _>(&call)
+                            };
+                            let result = runtime.block_on(request);
+                            if capacity == need {
+                                assert!(matches!(result, Ok(Ok(17))));
+                            } else {
+                                assert!(
+                                    matches!(
+                                        result,
+                                        Ok(Err(value::reply::Failure::Control(
+                                            cartel_redis::Error::Request(
+                                                request::Error::Capacity(cause)
+                                            )
+                                        ))) if {
+                                            let (actual, cap) = cause.into_parts();
+                                            actual.get() == need && cap == need - 1
                                         }
-                                    })
-                                })
-                            })
+                                    ),
+                                    "oversized EVAL must fail before submission"
+                                );
+                            }
                         },
-                        recovery::Policy::new(|event| reports.push(event), recover),
-                        |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
                     );
                     reports.events().expect("valid reclaim observations");
                 };
@@ -495,95 +440,81 @@ fn bulk_reservation_retains_reply() {
         TcpScript::with(
             move |peer| retained_bulk(peer, need, complete),
             |server| {
-                let prepared = topology::try_new::<Env, _, _, _>(
+                let reports = topology::run(
                     try_retained_bulk_config(need.get()).expect("retained bulk configuration"),
                     server.addr(),
-                    Plan::new(),
-                )
-                .expect("topology fixture");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let redis = runtime.root_client();
-                                    let held = runtime
-                                        .block_on(redis.basic().get(b"held"))
-                                        .expect("source drive")
-                                        .ok()
-                                        .expect("source reply")
-                                        .expect("source bytes");
-                                    let mut read = Box::pin(Task::new(redis.basic().get(b"next")));
-                                    assert!(
-                                        runtime
-                                            .block_on(dope_test::fibers::TEST.poll_once(read.as_mut()))
-                                            .expect("publish next read")
-                                            .is_none()
-                                    );
-                                    dope_test::fibers::TEST
-                                        .try_pause(&mut runtime, Duration::from_millis(20))
-                                        .expect("retain blocked reply");
-                                    let mut send =
-                                        Box::pin(Task::new(redis.scripts().eval_call::<i64, _>(&call)));
-                                    drop(call);
-                                    let mut reserve = Box::pin(Task::new(
-                                        redis.try_acquire_bulk(need)
-                                            .expect("bulk capacity"),
-                                    ));
-                                    let kept = &held;
-                                    let mut first = true;
-                                    let running = &mut send;
-                                    let reserved = runtime
-                                        .block_on(PollFn::admitted(move |admit| {
-                                            let (next, mut cx) = admit.poll(read.as_mut());
-                                            match next {
-                                                Poll::Pending => {}
-                                                Poll::Ready(Ok(_)) => {
-                                                    panic!("read completed")
-                                                }
-                                                Poll::Ready(Err(error)) => panic!(
-                                                    "read: {:?}",
-                                                    value::source::Error::diagnostic(&error)
-                                                ),
-                                            }
-                                            match cx.as_mut().try_poll(running.as_mut()) {
-                                                PollResult::Exhausted => return Poll::Pending,
-                                                PollResult::Polled(sent) => {
-                                                    assert!(sent.is_pending());
-                                                }
-                                            }
-                                            let result = match cx.try_poll(reserve.as_mut()) {
-                                                PollResult::Exhausted => return Poll::Pending,
-                                                PollResult::Polled(result) => result,
-                                            };
-                                            if std::mem::take(&mut first) {
-                                                assert!(result.is_pending());
-                                            }
-                                            if result.is_ready() {
-                                                assert_eq!(kept.as_ref(), &[b'x'; 41]);
-                                            }
-                                            result
-                                        }))
-                                        .expect("retained reservation drive")
-                                        .ok()
-                                        .expect("send returns bulk frame");
-                                    drop(reserved);
-                                    drop(held);
-                                    let error = runtime.block_on(send.as_mut())
-                                        .expect("queued EVAL drive").expect_err("old suffix rejected");
-                                    assert!(
-                                        matches!(&error, value::reply::Failure::Control(cartel_redis::Error::ResponseFront(cartel_core::reply::order::Front::Empty)) if complete)
-                                        || matches!(&error, value::reply::Failure::Control(cartel_redis::Error::UnexpectedResponse) if !complete),
-                                        "{:?}", value::source::Error::diagnostic(&error)
-                                    );
-                                })
-                            })
-                        })
+                    |mut runtime| {
+                        let redis = runtime.root_client();
+                        let held = runtime
+                            .block_on(redis.basic().get(b"held"))
+                            .expect("source drive")
+                            .ok()
+                            .expect("source reply")
+                            .expect("source bytes");
+                        let mut read = Box::pin(Task::new(redis.basic().get(b"next")));
+                        assert!(
+                            runtime
+                                .block_on(dope_test::fibers::TEST.poll_once(read.as_mut()))
+                                .expect("publish next read")
+                                .is_none()
+                        );
+                        dope_test::fibers::TEST
+                            .try_pause(&mut runtime, Duration::from_millis(20))
+                            .expect("retain blocked reply");
+                        let mut send =
+                            Box::pin(Task::new(redis.scripts().eval_call::<i64, _>(&call)));
+                        drop(call);
+                        let mut reserve = Box::pin(Task::new(
+                            redis.try_acquire_bulk(need)
+                                .expect("bulk capacity"),
+                        ));
+                        let kept = &held;
+                        let mut first = true;
+                        let running = &mut send;
+                        let reserved = runtime
+                            .block_on(PollFn::admitted(move |admit| {
+                                let (next, mut cx) = admit.poll(read.as_mut());
+                                match next {
+                                    Poll::Pending => {}
+                                    Poll::Ready(Ok(_)) => {
+                                        panic!("read completed")
+                                    }
+                                    Poll::Ready(Err(error)) => panic!(
+                                        "read: {:?}",
+                                        value::source::Error::diagnostic(&error)
+                                    ),
+                                }
+                                match cx.as_mut().try_poll(running.as_mut()) {
+                                    PollResult::Exhausted => return Poll::Pending,
+                                    PollResult::Polled(sent) => {
+                                        assert!(sent.is_pending());
+                                    }
+                                }
+                                let result = match cx.try_poll(reserve.as_mut()) {
+                                    PollResult::Exhausted => return Poll::Pending,
+                                    PollResult::Polled(result) => result,
+                                };
+                                if std::mem::take(&mut first) {
+                                    assert!(result.is_pending());
+                                }
+                                if result.is_ready() {
+                                    assert_eq!(kept.as_ref(), &[b'x'; 41]);
+                                }
+                                result
+                            }))
+                            .expect("retained reservation drive")
+                            .ok()
+                            .expect("send returns bulk frame");
+                        drop(reserved);
+                        drop(held);
+                        let error = runtime.block_on(send.as_mut())
+                            .expect("queued EVAL drive").expect_err("old suffix rejected");
+                        assert!(
+                            matches!(&error, value::reply::Failure::Control(cartel_redis::Error::ResponseFront(cartel_core::reply::order::Front::Empty)) if complete)
+                            || matches!(&error, value::reply::Failure::Control(cartel_redis::Error::UnexpectedResponse) if !complete),
+                            "{:?}", value::source::Error::diagnostic(&error)
+                        );
                     },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
                 );
                 reports.events().expect("reclaim observations");
                 server
@@ -617,62 +548,48 @@ fn partial_reply_keeps_published_cohort() {
             common::session::deadline::wait_closed(peer)
         },
         |server| {
-            let prepared = topology::try_new::<Env, _, _, _>(
+            let reports = topology::run(
                 common::command::list::try_config(3).expect("cohort configuration"),
                 server.addr(),
-                Plan::new(),
-            )
-            .expect("Redis topology");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared.with_local(
-                |worker| {
-                    worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
-                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                let redis = runtime.root_client();
-                                assert!(matches!(
-                                    runtime.block_on(redis.wait_active()),
-                                    Ok(Ok(()))
-                                ));
-                                let mut first = Box::pin(Task::new(redis.basic().incr(b"key")));
-                                let mut second = Box::pin(Task::new(redis.basic().incr(b"key")));
-                                assert!(
-                                    runtime
-                                        .block_on(fibers::TEST.poll_once(first.as_mut()))
-                                        .expect("publish first request")
-                                        .is_none()
-                                );
-                                assert!(
-                                    runtime
-                                        .block_on(fibers::TEST.poll_once(second.as_mut()))
-                                        .expect("publish second request")
-                                        .is_none()
-                                );
-                                assert!(matches!(runtime.block_on(first.as_mut()), Ok(Ok(1))));
-                                let mut third = Box::pin(Task::new(redis.basic().incr(b"key")));
-                                assert!(
-                                    runtime
-                                        .block_on(fibers::TEST.poll_once(third.as_mut()))
-                                        .expect("publish later request")
-                                        .is_none()
-                                );
-                                assert!(matches!(runtime.block_on(second.as_mut()), Ok(Ok(2))));
-                                assert!(matches!(runtime.block_on(third.as_mut()), Ok(Ok(3))));
-                                assert!(matches!(
-                                    runtime.block_on(redis.basic().incr(b"key")),
-                                    Ok(Err(value::reply::Failure::Control(
-                                        cartel_redis::Error::ResponseFront(
-                                            cartel_core::reply::order::Front::Empty
-                                        )
-                                    )))
-                                ));
-                            })
-                        })
-                    })
+                |mut runtime| {
+                    let redis = runtime.root_client();
+                    assert!(matches!(
+                        runtime.block_on(redis.wait_active()),
+                        Ok(Ok(()))
+                    ));
+                    let mut first = Box::pin(Task::new(redis.basic().incr(b"key")));
+                    let mut second = Box::pin(Task::new(redis.basic().incr(b"key")));
+                    assert!(
+                        runtime
+                            .block_on(fibers::TEST.poll_once(first.as_mut()))
+                            .expect("publish first request")
+                            .is_none()
+                    );
+                    assert!(
+                        runtime
+                            .block_on(fibers::TEST.poll_once(second.as_mut()))
+                            .expect("publish second request")
+                            .is_none()
+                    );
+                    assert!(matches!(runtime.block_on(first.as_mut()), Ok(Ok(1))));
+                    let mut third = Box::pin(Task::new(redis.basic().incr(b"key")));
+                    assert!(
+                        runtime
+                            .block_on(fibers::TEST.poll_once(third.as_mut()))
+                            .expect("publish later request")
+                            .is_none()
+                    );
+                    assert!(matches!(runtime.block_on(second.as_mut()), Ok(Ok(2))));
+                    assert!(matches!(runtime.block_on(third.as_mut()), Ok(Ok(3))));
+                    assert!(matches!(
+                        runtime.block_on(redis.basic().incr(b"key")),
+                        Ok(Err(value::reply::Failure::Control(
+                            cartel_redis::Error::ResponseFront(
+                                cartel_core::reply::order::Front::Empty
+                            )
+                        )))
+                    ));
                 },
-                recovery::Policy::new(|event| reports.push(event), recover),
-                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
             );
             reports.events().expect("reclaim observations");
             server
@@ -744,65 +661,51 @@ fn split_is_one_bulk() {
             let addr = server.addr();
 
             {
-                let prepared = topology::try_new::<Env, _, _, _>(
+                let reports = topology::run(
                     try_config().expect("test configuration"),
                     addr,
-                    Plan::new(),
-                )
-                .expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let redis = runtime.root_client();
+                    |mut runtime| {
+                        let redis = runtime.root_client();
 
-                                    assert!(matches!(
-                                        runtime.block_on(redis.wait_active()),
-                                        Ok(Ok(()))
-                                    ));
-                                    let keys = [b"k".as_slice(); 10];
-                                    for (count, header) in KEY_COUNTS {
-                                        let call = Split {
-                                            keys: &keys[..count],
-                                            ..SPLIT
-                                        };
-                                        assert!(matches!(call.wire_len(), Ok(len)
-                                            if len == header.len() + count * KEY_BULK.len() + SPLIT_BULK.len()));
-                                        assert!(matches!(
-                                            runtime.block_on(
-                                                redis.scripts().eval_call::<i64, _>(&call)
-                                            ),
-                                            Ok(Ok(17))
-                                        ));
-                                    }
-                                    for len in [0, 9, 10, 99, 100] {
-                                        let call = Owned {
-                                            args: [vec![b'x'; len]],
-                                        };
-                                        assert!(matches!(
-                                            runtime.block_on(
-                                                redis.scripts().eval_call::<i64, _>(&call)
-                                            ),
-                                            Ok(Ok(17))
-                                        ));
-                                    }
-                                    assert!(matches!(
-                                        runtime.block_on(redis.scripts().eval::<i64, &[u8], _>(
-                                            b"return 17",
-                                            &[],
-                                            &[b"".as_slice(); 7],
-                                        )),
-                                        Ok(Ok(17))
-                                    ));
-                                })
-                            })
-                        })
+                        assert!(matches!(
+                            runtime.block_on(redis.wait_active()),
+                            Ok(Ok(()))
+                        ));
+                        let keys = [b"k".as_slice(); 10];
+                        for (count, header) in KEY_COUNTS {
+                            let call = Split {
+                                keys: &keys[..count],
+                                ..SPLIT
+                            };
+                            assert!(matches!(call.wire_len(), Ok(len)
+                                if len == header.len() + count * KEY_BULK.len() + SPLIT_BULK.len()));
+                            assert!(matches!(
+                                runtime.block_on(
+                                    redis.scripts().eval_call::<i64, _>(&call)
+                                ),
+                                Ok(Ok(17))
+                            ));
+                        }
+                        for len in [0, 9, 10, 99, 100] {
+                            let call = Owned {
+                                args: [vec![b'x'; len]],
+                            };
+                            assert!(matches!(
+                                runtime.block_on(
+                                    redis.scripts().eval_call::<i64, _>(&call)
+                                ),
+                                Ok(Ok(17))
+                            ));
+                        }
+                        assert!(matches!(
+                            runtime.block_on(redis.scripts().eval::<i64, &[u8], _>(
+                                b"return 17",
+                                &[],
+                                &[b"".as_slice(); 7],
+                            )),
+                            Ok(Ok(17))
+                        ));
                     },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
                 );
                 reports.events().expect("valid reclaim observations");
             };

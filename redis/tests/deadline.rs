@@ -123,42 +123,28 @@ fn detached_blocks_lease() {
             wait_closed(&socket)
         },
         |server| {
-            let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
-                .expect("topology fixture completed");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared.with_local(
-                |worker| {
-                    worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
-                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                let redis = runtime.root_client();
+            let reports = topology::run(config, server.addr(), |mut runtime| {
+                let redis = runtime.root_client();
 
-                                assert!(matches!(
-                                    runtime.block_on(redis.wait_active()),
-                                    Ok(Ok(()))
-                                ));
-                                assert!(
-                                    matches!(
-                                        runtime.block_on(
-                                            fibers::TEST.poll_once(redis.server().ping())
-                                        ),
-                                        Ok(None)
-                                    ),
-                                    "command completed before it could be detached"
-                                );
-                                assert!(matches!(
-                                    runtime.block_on(redis.connection()),
-                                    Ok(Err(cartel_redis::Error::RequestTimeout(timeout)))
-                                        if timeout.phase() == cartel_redis::RequestPhase::Lease
-                                ));
-                            })
-                        })
-                    })
-                },
-                recovery::Policy::new(|event| reports.push(event), recover),
-                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-            );
+                assert!(matches!(
+                    runtime.block_on(redis.wait_active()),
+                    Ok(Ok(()))
+                ));
+                assert!(
+                    matches!(
+                        runtime.block_on(
+                            fibers::TEST.poll_once(redis.server().ping())
+                        ),
+                        Ok(None)
+                    ),
+                    "command completed before it could be detached"
+                );
+                assert!(matches!(
+                    runtime.block_on(redis.connection()),
+                    Ok(Err(cartel_redis::Error::RequestTimeout(timeout)))
+                        if timeout.phase() == cartel_redis::RequestPhase::Lease
+                ));
+            });
             reports.events().expect("valid reclaim observations");
             server
                 .finish()
@@ -248,55 +234,41 @@ fn completed_pool_timeout_preserves_new_lease() {
             common::session::held::pong_once(&socket)
         },
         |server| {
-            let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
-                .expect("Redis topology");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared.with_local(
-                |worker| {
-                    worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
-                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                let redis = runtime.root_client();
-                                assert!(matches!(
-                                    runtime.block_on(redis.wait_active()),
-                                    Ok(Ok(()))
-                                ));
-                                let mut old = Box::pin(Task::new(redis.server().ping()));
-                                assert!(
-                                    runtime
-                                        .block_on(fibers::TEST.poll_once(old.as_mut()))
-                                        .expect("submit pooled command")
-                                        .is_none()
-                                );
-                                let mut lease = fibers::TEST
-                                    .try_run(&mut runtime, redis.connection())
-                                    .expect("drive replacement lease")
-                                    .ok()
-                                    .expect("completed reply releases connection order");
-                                fibers::TEST
-                                    .try_pause(&mut runtime, Duration::from_millis(200))
-                                    .expect("expire completed command");
-                                assert!(matches!(
-                                    fibers::TEST.try_run(&mut runtime, old.as_mut()),
-                                    Ok(Err(cartel_redis::value::reply::Failure::Control(
-                                        cartel_redis::Error::RequestTimeout(timeout)
-                                    ))) if timeout.phase() == cartel_redis::RequestPhase::Response
-                                ));
-                                assert!(
-                                    matches!(
-                                        fibers::TEST.try_run(&mut runtime, lease.ping()),
-                                        Ok(Ok(()))
-                                    ),
-                                    "completed pooled timeout preserves the new lease"
-                                );
-                            })
-                        })
-                    })
-                },
-                recovery::Policy::new(|event| reports.push(event), recover),
-                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-            );
+            let reports = topology::run(config, server.addr(), |mut runtime| {
+                let redis = runtime.root_client();
+                assert!(matches!(
+                    runtime.block_on(redis.wait_active()),
+                    Ok(Ok(()))
+                ));
+                let mut old = Box::pin(Task::new(redis.server().ping()));
+                assert!(
+                    runtime
+                        .block_on(fibers::TEST.poll_once(old.as_mut()))
+                        .expect("submit pooled command")
+                        .is_none()
+                );
+                let mut lease = fibers::TEST
+                    .try_run(&mut runtime, redis.connection())
+                    .expect("drive replacement lease")
+                    .ok()
+                    .expect("completed reply releases connection order");
+                fibers::TEST
+                    .try_pause(&mut runtime, Duration::from_millis(200))
+                    .expect("expire completed command");
+                assert!(matches!(
+                    fibers::TEST.try_run(&mut runtime, old.as_mut()),
+                    Ok(Err(cartel_redis::value::reply::Failure::Control(
+                        cartel_redis::Error::RequestTimeout(timeout)
+                    ))) if timeout.phase() == cartel_redis::RequestPhase::Response
+                ));
+                assert!(
+                    matches!(
+                        fibers::TEST.try_run(&mut runtime, lease.ping()),
+                        Ok(Ok(()))
+                    ),
+                    "completed pooled timeout preserves the new lease"
+                );
+            });
             reports.events().expect("valid reclaim observations");
             server
                 .finish()
@@ -311,58 +283,44 @@ fn completed_pool_timeout_preserves_new_lease() {
 fn lease_timeout_reconnects() {
     let config = config(Positive::from_millis::<10>()).expect("valid redis configuration");
     AcceptScript::with(recovery_server, |server| {
-        let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
-            .expect("topology fixture completed");
-        let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-        let mut report = Completion::new();
-        prepared.with_local(
-            |worker| {
-                worker.lend(|node, stage| {
-                    node.install(stage, |host, stage| {
-                        stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                            let redis = runtime.root_client();
+        let reports = topology::run(config, server.addr(), |mut runtime| {
+            let redis = runtime.root_client();
 
-                            assert!(matches!(runtime.block_on(redis.wait_active()), Ok(Ok(()))));
-                            let conn = runtime
-                                .block_on(redis.connection())
-                                .expect("drive active connection");
-                            let mut conn = conn.ok().expect("lease active connection");
-                            assert!(matches!(
-                                runtime.block_on(conn.ping()),
-                                Ok(Err(cartel_redis::value::reply::Failure::Control(
-                                    cartel_redis::Error::RequestTimeout(timeout)
-                                )))
-                                    if timeout.phase() == cartel_redis::RequestPhase::Response
-                            ));
-                            assert!(
-                                matches!(
-                                    fibers::TEST.try_run(&mut runtime, redis.wait_active()),
-                                    Ok(Ok(()))
-                                ),
-                                "replacement connection becomes active"
-                            );
-                            let next = runtime
-                                .block_on(redis.connection())
-                                .expect("drive replacement lease");
-                            let mut next = next.ok().expect("lease replacement generation");
-                            assert!(matches!(
-                                runtime.block_on(conn.ping()),
-                                Ok(Err(cartel_redis::value::reply::Failure::Control(
-                                    cartel_redis::Error::Unavailable
-                                )))
-                            ));
-                            drop(conn);
-                            assert!(
-                                matches!(runtime.block_on(next.ping()), Ok(Ok(()))),
-                                "dropping the retired lease preserves the replacement lease"
-                            );
-                        })
-                    })
-                })
-            },
-            recovery::Policy::new(|event| reports.push(event), recover),
-            |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-        );
+            assert!(matches!(runtime.block_on(redis.wait_active()), Ok(Ok(()))));
+            let conn = runtime
+                .block_on(redis.connection())
+                .expect("drive active connection");
+            let mut conn = conn.ok().expect("lease active connection");
+            assert!(matches!(
+                runtime.block_on(conn.ping()),
+                Ok(Err(cartel_redis::value::reply::Failure::Control(
+                    cartel_redis::Error::RequestTimeout(timeout)
+                )))
+                    if timeout.phase() == cartel_redis::RequestPhase::Response
+            ));
+            assert!(
+                matches!(
+                    fibers::TEST.try_run(&mut runtime, redis.wait_active()),
+                    Ok(Ok(()))
+                ),
+                "replacement connection becomes active"
+            );
+            let next = runtime
+                .block_on(redis.connection())
+                .expect("drive replacement lease");
+            let mut next = next.ok().expect("lease replacement generation");
+            assert!(matches!(
+                runtime.block_on(conn.ping()),
+                Ok(Err(cartel_redis::value::reply::Failure::Control(
+                    cartel_redis::Error::Unavailable
+                )))
+            ));
+            drop(conn);
+            assert!(
+                matches!(runtime.block_on(next.ping()), Ok(Ok(()))),
+                "dropping the retired lease preserves the replacement lease"
+            );
+        });
         reports.events().expect("valid reclaim observations");
         server
             .finish()
@@ -400,41 +358,27 @@ fn release_wakes_waiters() {
             Ok::<_, peer::Error>(())
         },
         |server| {
-            let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
-                .expect("topology fixture completed");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared.with_local(
-                |worker| {
-                    worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
-                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                let redis = runtime.root_client();
+            let reports = topology::run(config, server.addr(), |mut runtime| {
+                let redis = runtime.root_client();
 
-                                let first = runtime
-                                    .block_on(redis.connection())
-                                    .expect("drive first connection");
-                                let first = first.ok().expect("lease first connection");
-                                let second = runtime
-                                    .block_on(redis.connection())
-                                    .expect("drive second connection");
-                                let second = second.ok().expect("lease second connection");
-                                let joined = Box::pin(Task::new(Join::new(
-                                    redis.server().ping(),
-                                    redis.connection(),
-                                )));
-                                let release = release_after_poll(joined, (first, second));
-                                let result = runtime.block_on(release);
-                                let (ping, lease) = result.expect("drive released waiters");
-                                assert!(ping.is_ok(), "released request must complete");
-                                assert!(lease.is_ok(), "released lease must wake its waiter");
-                            })
-                        })
-                    })
-                },
-                recovery::Policy::new(|event| reports.push(event), recover),
-                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-            );
+                let first = runtime
+                    .block_on(redis.connection())
+                    .expect("drive first connection");
+                let first = first.ok().expect("lease first connection");
+                let second = runtime
+                    .block_on(redis.connection())
+                    .expect("drive second connection");
+                let second = second.ok().expect("lease second connection");
+                let joined = Box::pin(Task::new(Join::new(
+                    redis.server().ping(),
+                    redis.connection(),
+                )));
+                let release = release_after_poll(joined, (first, second));
+                let result = runtime.block_on(release);
+                let (ping, lease) = result.expect("drive released waiters");
+                assert!(ping.is_ok(), "released request must complete");
+                assert!(lease.is_ok(), "released lease must wake its waiter");
+            });
             reports.events().expect("valid reclaim observations");
             server
                 .finish()
@@ -473,45 +417,31 @@ fn idle_lease_remains() {
             Ok(())
         },
         |server| {
-            let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
-                .expect("topology fixture completed");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared.with_local(
-                |worker| {
-                    worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
-                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                let redis = runtime.root_client();
+            let reports = topology::run(config, server.addr(), |mut runtime| {
+                let redis = runtime.root_client();
 
-                                let blocked = runtime
-                                    .block_on(redis.connection())
-                                    .expect("drive blocked connection");
-                                let mut blocked = blocked.ok().expect("lease blocked connection");
-                                let idle = runtime
-                                    .block_on(redis.connection())
-                                    .expect("drive idle connection");
-                                let idle = idle.ok().expect("lease idle connection");
-                                assert!(
-                                    matches!(
-                                        runtime.block_on(fibers::TEST.poll_once(blocked.ping())),
-                                        Ok(None)
-                                    ),
-                                    "leased command completed before detachment"
-                                );
-                                drop(blocked);
-                                drop(idle);
-                                assert!(
-                                    matches!(runtime.block_on(redis.connection()), Ok(Ok(_))),
-                                    "released connections must return to the pool"
-                                );
-                            })
-                        })
-                    })
-                },
-                recovery::Policy::new(|event| reports.push(event), recover),
-                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-            );
+                let blocked = runtime
+                    .block_on(redis.connection())
+                    .expect("drive blocked connection");
+                let mut blocked = blocked.ok().expect("lease blocked connection");
+                let idle = runtime
+                    .block_on(redis.connection())
+                    .expect("drive idle connection");
+                let idle = idle.ok().expect("lease idle connection");
+                assert!(
+                    matches!(
+                        runtime.block_on(fibers::TEST.poll_once(blocked.ping())),
+                        Ok(None)
+                    ),
+                    "leased command completed before detachment"
+                );
+                drop(blocked);
+                drop(idle);
+                assert!(
+                    matches!(runtime.block_on(redis.connection()), Ok(Ok(_))),
+                    "released connections must return to the pool"
+                );
+            });
             reports.events().expect("valid reclaim observations");
             server
                 .finish()

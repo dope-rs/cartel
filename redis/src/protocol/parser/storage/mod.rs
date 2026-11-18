@@ -1,5 +1,5 @@
 use o3::{alloc, mem::Rejected};
-use std::{cell, iter, marker, mem, num};
+use std::{cell, iter, marker, mem};
 
 use crate::{client::GeoCoord, protocol::parser};
 use parser::{capacity, limit};
@@ -7,6 +7,8 @@ use parser::{capacity, limit};
 mod cursors;
 mod gate;
 pub(in crate::protocol::parser) use cursors::{Array, Batch, Cursor, Read};
+pub(crate) use gate::Builder;
+pub(super) use gate::Stored;
 mod tape;
 #[doc(hidden)]
 pub use gate::Lane;
@@ -18,20 +20,6 @@ pub use tape::Tape;
 pub struct Storage<'d> {
     tapes: parser::Pool,
     gate: gate::Gate<'d>,
-}
-
-/// An in-progress tape whose nodes are already in their final retained storage.
-pub(crate) struct Builder<'a, 'd> {
-    pub(crate) access: gate::Access<'a, 'd>,
-    tail: Option<parser::Key<parser::Occupied>>,
-    len: u32,
-}
-
-pub(super) struct Stored<'a, 'b, 'd> {
-    builder: &'a mut Builder<'b, 'd>,
-    held: gate::Held<'b, 'd>,
-    tail: parser::Key<parser::Occupied>,
-    len: num::NonZero<u32>,
 }
 
 pub(super) struct Finished<'a, 'g> {
@@ -113,73 +101,6 @@ impl<'d> Storage<'d> {
     }
 
     pub(crate) const NODE_SIZE: usize = mem::size_of::<cell::Cell<parser::Node>>();
-
-    pub(super) fn builder(&self) -> Builder<'_, 'd> {
-        Builder {
-            access: gate::Access::new(self),
-            tail: None,
-            len: 0,
-        }
-    }
-}
-
-impl<'a, 'd> Builder<'a, 'd> {
-    pub(super) fn len(&self) -> u32 {
-        self.len
-    }
-
-    pub(super) fn try_push(
-        &mut self,
-        slot: limit::Slot,
-        value: parser::Kind,
-    ) -> Result<Stored<'_, 'a, 'd>, Error> {
-        match self.access.acquire() {
-            gate::Acquire::Acquired(held) => {
-                let Some(free) = self.access.storage().tapes.reserve() else {
-                    return Err(Error::Full(slot));
-                };
-                let (value, len) = slot.commit(value);
-                let tail = free.append(self.tail, value);
-                self.tail = Some(tail);
-                self.len = len.get();
-                Ok(Stored {
-                    builder: self,
-                    held,
-                    tail,
-                    len,
-                })
-            }
-            gate::Acquire::Blocked => Err(Error::Blocked(slot)),
-        }
-    }
-
-    pub(super) fn reset(&mut self) {
-        let next = self.access.storage().builder();
-        *self = next;
-    }
-}
-
-impl<'a, 'g> Stored<'_, 'a, 'g> {
-    pub(super) fn finish(self) -> Finished<'a, 'g> {
-        self.builder.tail = None;
-        self.builder.len = 0;
-        let storage = self.builder.access.storage();
-        Finished {
-            nodes: Tape {
-                pool: &storage.tapes,
-                tail: self.tail,
-                len: self.len,
-            },
-            lane: self.builder.access.finish(self.held),
-        }
-    }
-}
-
-impl Drop for Builder<'_, '_> {
-    fn drop(&mut self) {
-        self.access.storage().tapes.release(self.tail);
-        self.access.release();
-    }
 }
 
 impl<'a> Region<'a, Raw> {

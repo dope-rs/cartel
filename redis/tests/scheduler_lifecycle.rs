@@ -74,44 +74,30 @@ fn unsolicited_partial_cannot_bind_next_request() {
             }
         },
         |server| {
-            let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
-                .expect("Redis topology");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared.with_local(
-                |worker| {
-                    worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
-                            stage.with_quiesce(&mut report, host, GUARD, |mut rt| {
-                                let redis = rt.root_client();
-                                let mut connection = fibers::TEST
-                                    .try_run(&mut rt, redis.connection())
-                                    .expect("acquire connection")
-                                    .ok()
-                                    .expect("lease connection");
-                                assert!(matches!(
-                                    fibers::TEST.try_run(&mut rt, connection.ping()),
-                                    Ok(Ok(()))
-                                ));
-                                fibers::TEST
-                                    .try_pause(&mut rt, Duration::from_millis(20))
-                                    .expect("process unsolicited partial response");
-                                assert!(
-                                    matches!(
-                                        fibers::TEST.try_run(&mut rt, connection.ping()),
-                                        Ok(Err(value::reply::Failure::Control(
-                                            cartel_redis::Error::Unavailable
-                                        )))
-                                    ),
-                                    "an unsolicited partial response must not belong to the next request"
-                                );
-                            })
-                        })
-                    })
-                },
-                recovery::Policy::new(|event| reports.push(event), recover),
-                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-            );
+            let reports = topology::run(config, server.addr(), |mut rt| {
+                let redis = rt.root_client();
+                let mut connection = fibers::TEST
+                    .try_run(&mut rt, redis.connection())
+                    .expect("acquire connection")
+                    .ok()
+                    .expect("lease connection");
+                assert!(matches!(
+                    fibers::TEST.try_run(&mut rt, connection.ping()),
+                    Ok(Ok(()))
+                ));
+                fibers::TEST
+                    .try_pause(&mut rt, Duration::from_millis(20))
+                    .expect("process unsolicited partial response");
+                assert!(
+                    matches!(
+                        fibers::TEST.try_run(&mut rt, connection.ping()),
+                        Ok(Err(value::reply::Failure::Control(
+                            cartel_redis::Error::Unavailable
+                        )))
+                    ),
+                    "an unsolicited partial response must not belong to the next request"
+                );
+            });
             assert!(
                 matches!(reports.events(), Ok(events) if events.is_empty()),
                 "unexpected reclamation"
@@ -140,39 +126,25 @@ fn detached_partial_preserves_next_request() {
             socket.write_all(b"NG\r\n:7\r\n")
         },
         |server| {
-            let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
-                .expect("Redis topology");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared.with_local(
-                |worker| {
-                    worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
-                            stage.with_quiesce(&mut report, host, GUARD, |mut rt| {
-                                let redis = rt.root_client();
-                                let mut connection = fibers::TEST
-                                    .try_run(&mut rt, redis.connection())
-                                    .expect("acquire connection")
-                                    .ok()
-                                    .expect("lease connection");
-                                assert!(matches!(
-                                    rt.block_on(fibers::TEST.poll_once(connection.ping())),
-                                    Ok(None)
-                                ));
-                                fibers::TEST
-                                    .try_pause(&mut rt, Duration::from_millis(20))
-                                    .expect("process detached partial response");
-                                assert!(matches!(
-                                    fibers::TEST.try_run(&mut rt, connection.client_id()),
-                                    Ok(Ok(7))
-                                ));
-                            })
-                        })
-                    })
-                },
-                recovery::Policy::new(|event| reports.push(event), recover),
-                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-            );
+            let reports = topology::run(config, server.addr(), |mut rt| {
+                let redis = rt.root_client();
+                let mut connection = fibers::TEST
+                    .try_run(&mut rt, redis.connection())
+                    .expect("acquire connection")
+                    .ok()
+                    .expect("lease connection");
+                assert!(matches!(
+                    rt.block_on(fibers::TEST.poll_once(connection.ping())),
+                    Ok(None)
+                ));
+                fibers::TEST
+                    .try_pause(&mut rt, Duration::from_millis(20))
+                    .expect("process detached partial response");
+                assert!(matches!(
+                    fibers::TEST.try_run(&mut rt, connection.client_id()),
+                    Ok(Ok(7))
+                ));
+            });
             assert!(
                 matches!(reports.events(), Ok(events) if events.is_empty()),
                 "unexpected reclamation"
@@ -205,49 +177,35 @@ fn half_close_preserves_truncated_response() {
                 Ok::<_, peer::Error>(())
             },
             |server| {
-                let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
-                    .expect("Redis topology");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut rt| {
-                                    let redis = rt.root_client();
-                                    let result = fibers::TEST
-                                        .try_run(&mut rt, redis.server().ping())
-                                        .expect("drive truncated response");
-                                    assert!(match (partial[0], result) {
-                                        (
-                                            b'+',
-                                            Err(reply::Failure::Control(
-                                                cartel_redis::Error::Protocol(Error::Truncated(
-                                                    Truncated::Line {
-                                                        kind: Line::Status,
-                                                        start,
-                                                        actual,
-                                                    },
-                                                )),
-                                            )),
-                                        ) => start.get() == 1 && actual.get() == 3,
-                                        (
-                                            b'$',
-                                            Err(reply::Failure::Control(
-                                                cartel_redis::Error::Protocol(Error::Truncated(
-                                                    Truncated::Bulk { actual, required },
-                                                )),
-                                            )),
-                                        ) => actual.get() == 5 && required.get() == 9,
-                                        _ => false,
-                                    });
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-                );
+                let reports = topology::run(config, server.addr(), |mut rt| {
+                    let redis = rt.root_client();
+                    let result = fibers::TEST
+                        .try_run(&mut rt, redis.server().ping())
+                        .expect("drive truncated response");
+                    assert!(match (partial[0], result) {
+                        (
+                            b'+',
+                            Err(reply::Failure::Control(
+                                cartel_redis::Error::Protocol(Error::Truncated(
+                                    Truncated::Line {
+                                        kind: Line::Status,
+                                        start,
+                                        actual,
+                                    },
+                                )),
+                            )),
+                        ) => start.get() == 1 && actual.get() == 3,
+                        (
+                            b'$',
+                            Err(reply::Failure::Control(
+                                cartel_redis::Error::Protocol(Error::Truncated(
+                                    Truncated::Bulk { actual, required },
+                                )),
+                            )),
+                        ) => actual.get() == 5 && required.get() == 9,
+                        _ => false,
+                    });
+                });
                 assert!(reports.events().expect("reclamation events").is_empty());
                 assert!(
                     matches!(server.finish(), Ok(Ok(()))),
@@ -299,53 +257,39 @@ fn mixed_close_drains() {
             .expect("valid redis configuration");
 
             {
-                let prepared = topology::try_new::<Env, _, _, _>(config, addr, Plan::new())
-                    .expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut rt| {
-                                    let redis = rt.root_client();
+                let reports = topology::run(config, addr, |mut rt| {
+                    let redis = rt.root_client();
 
-                                    assert!(matches!(
-                                        BlockOn::block_on(&mut rt, redis.wait_active()),
-                                        Ok(Ok(()))
-                                    ));
-                                    let keys: [Vec<u8>; 0] = [];
-                                    let args = [vec![b'x'; ARGUMENT_BYTES]];
-                                    let result = BlockOn::block_on(
-                                        &mut rt,
-                                        Join::new(
-                                            redis.server().ping(),
-                                            redis.scripts().eval::<i64, _, _>(
-                                                b"return 1",
-                                                &keys,
-                                                &args,
-                                            ),
-                                        ),
-                                    );
-                                    let (direct, bulk) =
-                                        result.expect("drive direct and bulk requests");
-                                    assert_committed_close(direct);
-                                    assert_committed_close(bulk);
-                                    assert!(matches!(
-                                        BlockOn::block_on(&mut rt, redis.wait_active()),
-                                        Ok(Ok(()))
-                                    ));
-                                    assert!(matches!(
-                                        BlockOn::block_on(&mut rt, redis.server().ping()),
-                                        Ok(Ok(()))
-                                    ));
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-                );
+                    assert!(matches!(
+                        BlockOn::block_on(&mut rt, redis.wait_active()),
+                        Ok(Ok(()))
+                    ));
+                    let keys: [Vec<u8>; 0] = [];
+                    let args = [vec![b'x'; ARGUMENT_BYTES]];
+                    let result = BlockOn::block_on(
+                        &mut rt,
+                        Join::new(
+                            redis.server().ping(),
+                            redis.scripts().eval::<i64, _, _>(
+                                b"return 1",
+                                &keys,
+                                &args,
+                            ),
+                        ),
+                    );
+                    let (direct, bulk) =
+                        result.expect("drive direct and bulk requests");
+                    assert_committed_close(direct);
+                    assert_committed_close(bulk);
+                    assert!(matches!(
+                        BlockOn::block_on(&mut rt, redis.wait_active()),
+                        Ok(Ok(()))
+                    ));
+                    assert!(matches!(
+                        BlockOn::block_on(&mut rt, redis.server().ping()),
+                        Ok(Ok(()))
+                    ));
+                });
                 reports.events().expect("valid reclaim observations");
             };
             assert!(
@@ -398,42 +342,28 @@ fn bulk_admission() {
             .expect("production-shaped redis configuration");
 
             {
-                let prepared = topology::try_new::<Env, _, _, _>(config, addr, Plan::new())
-                    .expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut rt| {
-                                    let redis = rt.root_client();
+                let reports = topology::run(config, addr, |mut rt| {
+                    let redis = rt.root_client();
 
-                                    assert!(matches!(
-                                        BlockOn::block_on(&mut rt, redis.wait_active()),
-                                        Ok(Ok(()))
-                                    ));
-                                    let keys: [Vec<u8>; 0] = [];
-                                    let args = [vec![b'x'; ARGUMENT_BYTES]];
-                                    let value = BlockOn::block_on(
-                                        &mut rt,
-                                        redis.scripts().eval::<i64, _, _>(b"return 1", &keys, &args),
-                                    );
-                                    assert!(
-                                        matches!(value, Ok(Ok(1))),
-                                        "a frame past the direct limit must be admitted through the bulk buffer"
-                                    );
-                                    assert!(matches!(
-                                        BlockOn::block_on(&mut rt, redis.server().ping()),
-                                        Ok(Ok(()))
-                                    ));
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-                );
+                    assert!(matches!(
+                        BlockOn::block_on(&mut rt, redis.wait_active()),
+                        Ok(Ok(()))
+                    ));
+                    let keys: [Vec<u8>; 0] = [];
+                    let args = [vec![b'x'; ARGUMENT_BYTES]];
+                    let value = BlockOn::block_on(
+                        &mut rt,
+                        redis.scripts().eval::<i64, _, _>(b"return 1", &keys, &args),
+                    );
+                    assert!(
+                        matches!(value, Ok(Ok(1))),
+                        "a frame past the direct limit must be admitted through the bulk buffer"
+                    );
+                    assert!(matches!(
+                        BlockOn::block_on(&mut rt, redis.server().ping()),
+                        Ok(Ok(()))
+                    ));
+                });
                 reports.events().expect("valid reclaim observations");
 
             };
@@ -464,65 +394,51 @@ fn binding_reconnects() {
             let addr = server.addr();
 
             {
-                let prepared = topology::try_new::<Env, _, _, _>(config, addr, Plan::new())
-                    .expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut rt| {
-                                    let redis = rt.root_client();
+                let reports = topology::run(config, addr, |mut rt| {
+                    let redis = rt.root_client();
 
-                                    assert!(matches!(
-                                        BlockOn::block_on(&mut rt, redis.wait_active()),
-                                        Ok(Ok(()))
-                                    ));
-                                    let first = BlockOn::block_on(&mut rt, redis.server().ping());
-                                    let cause: Option<(&str, &dyn fmt::Debug)> = match &first {
-                                        Ok(Err(Failure::Control(Closed(value)))) => {
-                                            Some(("Closed", value))
-                                        }
-                                        Ok(Err(Failure::Control(RequestTimeout(value)))) => {
-                                            Some(("RequestTimeout", value))
-                                        }
-                                        Ok(Err(Failure::Control(Timeout(value)))) => {
-                                            Some(("Timeout", value))
-                                        }
-                                        Ok(Err(Failure::Control(Receive(value)))) => {
-                                            Some(("Receive", value))
-                                        }
-                                        Ok(Err(Failure::Control(ResponseRetention(value)))) => {
-                                            Some(("ResponseRetention", value))
-                                        }
-                                        _ => None,
-                                    };
-                                    assert!(
-                                        matches!(&first, Ok(Ok(()))),
-                                        "initial PING: driver={:?}, cause={cause:?}",
-                                        first.as_ref().err(),
-                                    );
+                    assert!(matches!(
+                        BlockOn::block_on(&mut rt, redis.wait_active()),
+                        Ok(Ok(()))
+                    ));
+                    let first = BlockOn::block_on(&mut rt, redis.server().ping());
+                    let cause: Option<(&str, &dyn fmt::Debug)> = match &first {
+                        Ok(Err(Failure::Control(Closed(value)))) => {
+                            Some(("Closed", value))
+                        }
+                        Ok(Err(Failure::Control(RequestTimeout(value)))) => {
+                            Some(("RequestTimeout", value))
+                        }
+                        Ok(Err(Failure::Control(Timeout(value)))) => {
+                            Some(("Timeout", value))
+                        }
+                        Ok(Err(Failure::Control(Receive(value)))) => {
+                            Some(("Receive", value))
+                        }
+                        Ok(Err(Failure::Control(ResponseRetention(value)))) => {
+                            Some(("ResponseRetention", value))
+                        }
+                        _ => None,
+                    };
+                    assert!(
+                        matches!(&first, Ok(Ok(()))),
+                        "initial PING: driver={:?}, cause={cause:?}",
+                        first.as_ref().err(),
+                    );
 
-                                    let result = BlockOn::block_on(&mut rt, redis.server().ping());
-                                    let result = result.expect("drive reconnecting request");
-                                    if result.is_err() {
-                                        assert!(matches!(
-                                            BlockOn::block_on(&mut rt, redis.wait_active()),
-                                            Ok(Ok(()))
-                                        ));
-                                        assert!(matches!(
-                                            BlockOn::block_on(&mut rt, redis.server().ping()),
-                                            Ok(Ok(()))
-                                        ));
-                                    }
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-                );
+                    let result = BlockOn::block_on(&mut rt, redis.server().ping());
+                    let result = result.expect("drive reconnecting request");
+                    if result.is_err() {
+                        assert!(matches!(
+                            BlockOn::block_on(&mut rt, redis.wait_active()),
+                            Ok(Ok(()))
+                        ));
+                        assert!(matches!(
+                            BlockOn::block_on(&mut rt, redis.server().ping()),
+                            Ok(Ok(()))
+                        ));
+                    }
+                });
                 reports.events().expect("valid reclaim observations");
             };
             assert!(
@@ -720,101 +636,87 @@ fn parser_lane_waits_for_retained_replies() {
             pong_once(a)
         },
         |server| {
-            let prepared = topology::try_new::<Env, _, _, _>(config, server.addr(), Plan::new())
-                .expect("Redis topology");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared.with_local(
-                |worker| {
-                    worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
-                            stage.with_quiesce(&mut report, host, GUARD, |mut rt| {
-                                let redis = rt.root_client();
-                                {
-                                    let (a, b) = fibers::TEST
-                                        .try_run(
-                                            &mut rt,
-                                            Join::new(redis.connection(), redis.connection()),
-                                        )
-                                        .expect("activate both connections");
-                                    assert!(a.is_ok() && b.is_ok());
-                                }
-                                let held = fibers::TEST
-                                    .try_run(&mut rt, redis.sets().members(b"set"))
-                                    .expect("first array operation")
-                                    .ok()
-                                    .expect("first retained array");
-                                assert!(held.iter().eq([b"one".as_slice(), b"uno".as_slice()]));
-                                let mut second = Box::pin(Task::new(redis.sets().members(b"set")));
-                                assert!(
-                                    rt.block_on(fibers::TEST.poll_once(second.as_mut()))
-                                        .expect("submit second array")
-                                        .is_none()
-                                );
-                                fibers::TEST
-                                    .try_pause(&mut rt, Duration::from_millis(20))
-                                    .expect("retain the second decoded reply");
-                                let mut third = Box::pin(Task::new(redis.sets().members(b"set")));
-                                assert!(
-                                    rt.block_on(fibers::TEST.poll_once(third.as_mut()))
-                                        .expect("submit third array")
-                                        .is_none()
-                                );
-                                fibers::TEST
-                                    .try_pause(&mut rt, Duration::from_millis(20))
-                                    .expect("drive parser backpressure");
-                                assert!(
-                                    rt.block_on(fibers::TEST.poll_once(second.as_mut()))
-                                        .expect("second pending")
-                                        .is_none()
-                                );
-                                assert!(
-                                    rt.block_on(fibers::TEST.poll_once(third.as_mut()))
-                                        .expect("third pending")
-                                        .is_none()
-                                );
-                                drop(held);
-                                {
-                                    let values = fibers::TEST.try_run(&mut rt, second.as_mut());
-                                    drop(second);
-                                    let values = values
-                                        .expect("resume second array")
-                                        .ok()
-                                        .expect("second reply preserves its connection");
-                                    assert!(
-                                        values.iter().eq([b"two".as_slice(), b"dos".as_slice()])
-                                    );
-                                    assert!(
-                                        rt.block_on(fibers::TEST.poll_once(third.as_mut()))
-                                            .expect("third waits for credit")
-                                            .is_none()
-                                    );
-                                }
-                                {
-                                    let values = fibers::TEST.try_run(&mut rt, third.as_mut());
-                                    drop(third);
-                                    let values = values
-                                        .expect("resume third array")
-                                        .ok()
-                                        .expect("third reply preserves FIFO");
-                                    assert!(
-                                        values.iter().eq([b"tri".as_slice(), b"tres".as_slice()])
-                                    );
-                                }
-                                let (a, b) = fibers::TEST
-                                    .try_run(
-                                        &mut rt,
-                                        Join::new(redis.server().ping(), redis.server().ping()),
-                                    )
-                                    .expect("reuse both original connections");
-                                assert!(a.is_ok() && b.is_ok());
-                            })
-                        })
-                    })
-                },
-                recovery::Policy::new(|event| reports.push(event), recover),
-                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-            );
+            let reports = topology::run(config, server.addr(), |mut rt| {
+                let redis = rt.root_client();
+                {
+                    let (a, b) = fibers::TEST
+                        .try_run(
+                            &mut rt,
+                            Join::new(redis.connection(), redis.connection()),
+                        )
+                        .expect("activate both connections");
+                    assert!(a.is_ok() && b.is_ok());
+                }
+                let held = fibers::TEST
+                    .try_run(&mut rt, redis.sets().members(b"set"))
+                    .expect("first array operation")
+                    .ok()
+                    .expect("first retained array");
+                assert!(held.iter().eq([b"one".as_slice(), b"uno".as_slice()]));
+                let mut second = Box::pin(Task::new(redis.sets().members(b"set")));
+                assert!(
+                    rt.block_on(fibers::TEST.poll_once(second.as_mut()))
+                        .expect("submit second array")
+                        .is_none()
+                );
+                fibers::TEST
+                    .try_pause(&mut rt, Duration::from_millis(20))
+                    .expect("retain the second decoded reply");
+                let mut third = Box::pin(Task::new(redis.sets().members(b"set")));
+                assert!(
+                    rt.block_on(fibers::TEST.poll_once(third.as_mut()))
+                        .expect("submit third array")
+                        .is_none()
+                );
+                fibers::TEST
+                    .try_pause(&mut rt, Duration::from_millis(20))
+                    .expect("drive parser backpressure");
+                assert!(
+                    rt.block_on(fibers::TEST.poll_once(second.as_mut()))
+                        .expect("second pending")
+                        .is_none()
+                );
+                assert!(
+                    rt.block_on(fibers::TEST.poll_once(third.as_mut()))
+                        .expect("third pending")
+                        .is_none()
+                );
+                drop(held);
+                {
+                    let values = fibers::TEST.try_run(&mut rt, second.as_mut());
+                    drop(second);
+                    let values = values
+                        .expect("resume second array")
+                        .ok()
+                        .expect("second reply preserves its connection");
+                    assert!(
+                        values.iter().eq([b"two".as_slice(), b"dos".as_slice()])
+                    );
+                    assert!(
+                        rt.block_on(fibers::TEST.poll_once(third.as_mut()))
+                            .expect("third waits for credit")
+                            .is_none()
+                    );
+                }
+                {
+                    let values = fibers::TEST.try_run(&mut rt, third.as_mut());
+                    drop(third);
+                    let values = values
+                        .expect("resume third array")
+                        .ok()
+                        .expect("third reply preserves FIFO");
+                    assert!(
+                        values.iter().eq([b"tri".as_slice(), b"tres".as_slice()])
+                    );
+                }
+                let (a, b) = fibers::TEST
+                    .try_run(
+                        &mut rt,
+                        Join::new(redis.server().ping(), redis.server().ping()),
+                    )
+                    .expect("reuse both original connections");
+                assert!(a.is_ok() && b.is_ok());
+            });
             reports.events().expect("valid reclaim observations");
             assert!(
                 matches!(server.finish(), Ok(Ok(()))),

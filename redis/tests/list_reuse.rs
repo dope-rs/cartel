@@ -6,7 +6,6 @@ use std::{convert::Infallible, ops::ControlFlow, time::Duration};
 use cartel_redis::client::settings::init::Plan;
 use common::{command::list::*, recover, topology};
 use dope::{
-    core::driver::route::Id,
     manifold::{app::env::Bundle, timing::Throughput},
     net::{tcp::Tcp, wire::Identity},
     runtime::executor::session::Completion,
@@ -15,7 +14,6 @@ use dope_fiber::BlockOn as _;
 use dope_test::{
     alloc::Tracker,
     harness::{GUARD, peer::TcpScript},
-    reclaim::Reports,
 };
 
 type Env = Bundle<Tcp, Identity, Throughput>;
@@ -43,68 +41,54 @@ fn pair_survives_reuse() {
         |server| {
             let address = server.addr();
             {
-                let prepared = topology::try_new::<Env, _, _, _>(
+                let reports = topology::run(
                     try_config(2).expect("list configuration"),
                     address,
-                    Plan::new(),
-                )
-                .expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let redis = runtime.root_client();
+                    |mut runtime| {
+                        let redis = runtime.root_client();
 
-                                    assert!(
-                                        matches!(runtime.block_on(redis.wait_active()), Ok(Ok(()))),
-                                        "connection"
-                                    );
-                                    let pairs = runtime.block_on(redis.hashes().entries(b"hash"));
-                                    let pairs = pairs.expect("runtime").ok().expect("first reply");
-                                    let mut origin = None;
-                                    let (rejected, counts) = Tracker::usage(|| {
-                                        pairs
-                                            .try_check(|field, value| {
-                                                if field == b"b" {
-                                                    assert_eq!(value, b"2");
-                                                    origin = Some((field.as_ptr(), value.as_ptr()));
-                                                    Err(7_u32)
-                                                } else {
-                                                    Ok(())
-                                                }
-                                            })
-                                            .err()
-                                            .expect("second pair must fail")
-                                    });
-                                    assert_eq!(counts, (0, 0));
-                                    assert_eq!(rejected.index(), 1);
-                                    assert_eq!(*rejected.error(), 7);
-                                    let origin = origin.expect("rejected source pointers");
-                                    let pairs = runtime.block_on(redis.hashes().entries(b"hash"));
-                                    let pairs = pairs
-                                        .expect("runtime")
-                                        .ok()
-                                        .expect("parser credits must have been released");
-                                    let ((), counts) = Tracker::usage(|| {
-                                        assert_eq!(
-                                            pairs.iter().next(),
-                                            Some((&b"x"[..], &b"3"[..]))
-                                        );
-                                        let (field, value) = rejected.values();
-                                        assert_eq!((field, value), (&b"b"[..], &b"2"[..]));
-                                        assert_eq!((field.as_ptr(), value.as_ptr()), origin);
-                                    });
-                                    assert_eq!(counts, (0, 0));
-                                    assert!(pairs.try_check::<Infallible>(|_, _| Ok(())).is_ok());
+                        assert!(
+                            matches!(runtime.block_on(redis.wait_active()), Ok(Ok(()))),
+                            "connection"
+                        );
+                        let pairs = runtime.block_on(redis.hashes().entries(b"hash"));
+                        let pairs = pairs.expect("runtime").ok().expect("first reply");
+                        let mut origin = None;
+                        let (rejected, counts) = Tracker::usage(|| {
+                            pairs
+                                .try_check(|field, value| {
+                                    if field == b"b" {
+                                        assert_eq!(value, b"2");
+                                        origin = Some((field.as_ptr(), value.as_ptr()));
+                                        Err(7_u32)
+                                    } else {
+                                        Ok(())
+                                    }
                                 })
-                            })
-                        })
+                                .err()
+                                .expect("second pair must fail")
+                        });
+                        assert_eq!(counts, (0, 0));
+                        assert_eq!(rejected.index(), 1);
+                        assert_eq!(*rejected.error(), 7);
+                        let origin = origin.expect("rejected source pointers");
+                        let pairs = runtime.block_on(redis.hashes().entries(b"hash"));
+                        let pairs = pairs
+                            .expect("runtime")
+                            .ok()
+                            .expect("parser credits must have been released");
+                        let ((), counts) = Tracker::usage(|| {
+                            assert_eq!(
+                                pairs.iter().next(),
+                                Some((&b"x"[..], &b"3"[..]))
+                            );
+                            let (field, value) = rejected.values();
+                            assert_eq!((field, value), (&b"b"[..], &b"2"[..]));
+                            assert_eq!((field.as_ptr(), value.as_ptr()), origin);
+                        });
+                        assert_eq!(counts, (0, 0));
+                        assert!(pairs.try_check::<Infallible>(|_, _| Ok(())).is_ok());
                     },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
                 );
                 reports.events().expect("valid reclaim observations");
             };

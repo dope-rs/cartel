@@ -1,26 +1,18 @@
 use cartel_redis::api::{Client as _, Commands as _};
 use cartel_redis::value::source::Bytes as _;
 use cartel_redis::{
-    client::settings::init::Plan, value, value::list::pair::ScoredBulks, value::reply,
+    value, value::list::pair::ScoredBulks, value::reply,
 };
 use common::{
     command::{list, scored::*},
-    recover, topology,
-};
-use dope::core::driver::life::recovery;
-use dope::runtime::executor::session::Completion;
-use dope::{
-    core::driver::route::Id, manifold::app::env::Bundle, manifold::timing::Throughput,
-    net::tcp::Tcp, net::wire::Identity,
+    topology,
 };
 use dope_fiber::BlockOn as _;
-use dope_test::{harness::GUARD, harness::peer::TcpScript, reclaim::Reports};
+use dope_test::harness::peer::TcpScript;
 use std::time::Duration;
 use value::source::{self, ScoredText as _};
 
 type Failure<'b, 'c, 'd> = reply::Failure<cartel_redis::Error<'d>, value::Bytes<'b, 'c, 'd>>;
-
-type Env = Bundle<Tcp, Identity, Throughput>;
 
 pub mod common;
 
@@ -39,32 +31,18 @@ fn exercise(case: Scored) {
             let addr = server.addr();
 
             {
-                let prepared = topology::try_new::<Env, _, _, _>(config, addr, Plan::new())
-                    .expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let redis = runtime.root_client();
+                let reports = topology::run(config, addr, |mut runtime| {
+                    let redis = runtime.root_client();
 
-                                    assert!(matches!(
-                                        runtime.block_on(redis.wait_active()),
-                                        Ok(Ok(()))
-                                    ));
-                                    let result = runtime
-                                        .block_on(redis.sorted_sets().rev_range(b"board", 0, -1))
-                                        .expect("drive scored reply");
-                                    check(case, result);
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "Redis scope"),
-                );
+                    assert!(matches!(
+                        runtime.block_on(redis.wait_active()),
+                        Ok(Ok(()))
+                    ));
+                    let result = runtime
+                        .block_on(redis.sorted_sets().rev_range(b"board", 0, -1))
+                        .expect("drive scored reply");
+                    check(case, result);
+                });
                 reports.events().expect("valid reclaim observations");
             };
             assert!(server.finish().is_ok(), "finish Redis peer");

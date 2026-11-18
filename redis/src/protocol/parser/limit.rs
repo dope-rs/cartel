@@ -264,8 +264,8 @@ impl Count {
 }
 
 impl Slot {
-    pub(super) fn commit<T>(self, value: T) -> (T, num::NonZero<u32>) {
-        (value, self.0)
+    pub(super) const fn commit(self) -> num::NonZero<u32> {
+        self.0
     }
 }
 
