@@ -66,10 +66,9 @@ unsafe impl<'local, 'd: 'local, I: catalogs::Catalog> executor::raw::App<'d>
 {
     const ROUTES: settings::Routes = settings::Routes::EMPTY;
     const COORDS: usize = 1;
+    const PARK: bool = true;
 
-    fn select_park() -> Option<Self::ParkPlan> {
-        Some(())
-    }
+    fn select_park() -> Self::ParkPlan {}
 
     fn released(
         mut released: executor::raw::Released<'_, Self>,

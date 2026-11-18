@@ -14,7 +14,6 @@ use settings::{config, limits, memory, options};
 #[doc(hidden)]
 pub use api::{Bound, IntoQuery, Limit, Offset};
 pub use api::{
-    batches::Rows,
     exec::Query,
     tx::{Savepoint, Transaction},
 };

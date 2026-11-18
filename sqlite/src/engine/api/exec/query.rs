@@ -1,6 +1,6 @@
 use crate::Cursor;
-use crate::{api, catalogs, row};
-use api::{batches, exec};
+use crate::api::exec;
+use crate::{api, catalogs, row, runtime};
 use dope_fiber::abi;
 use std::result;
 
@@ -11,7 +11,7 @@ pub struct Query<
     I: catalogs::Catalog = catalogs::Empty,
 > {
     start: exec::Start<'query, 'connection, 'd, I>,
-    arena: &'query mut batches::Arena<'connection>,
+    arena: &'query mut runtime::raw::Span,
 }
 
 impl<'query, 'connection: 'query, 'd: 'connection, I: catalogs::Catalog>
@@ -19,7 +19,7 @@ impl<'query, 'connection: 'query, 'd: 'connection, I: catalogs::Catalog>
 {
     pub(crate) const fn new(
         start: exec::Start<'query, 'connection, 'd, I>,
-        arena: &'query mut batches::Arena<'connection>,
+        arena: &'query mut runtime::raw::Span,
     ) -> Self {
         Self { start, arena }
     }
@@ -74,13 +74,13 @@ impl<'query, 'connection: 'query, 'd: 'connection, I: catalogs::Catalog>
         self,
         stmt: catalogs::Statement<I, Q>,
         params: P,
-    ) -> impl abi::Fiber<'d, Output = result::Result<batches::Rows<'query, R>, crate::Error>>
+    ) -> impl abi::Fiber<'d, Output = result::Result<&'query [R::Borrowed<'query>], crate::Error>>
     + use<'query, 'connection, 'd, I, R, P, Q>
     where
         I: catalogs::HasQuery<Q>,
     {
         let machine = self.start.run(stmt, params);
-        exec::Rows::new(machine, exec::Collect::<R>::new(self.arena))
+        exec::Rows::<I, Q, R, P, _>::new(machine, row::modes::Input::new(self.arena))
     }
 
     #[doc(hidden)]

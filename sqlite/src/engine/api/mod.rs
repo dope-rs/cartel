@@ -1,4 +1,3 @@
-pub(crate) mod batches;
 mod bind;
 pub(crate) mod exec;
 mod state;

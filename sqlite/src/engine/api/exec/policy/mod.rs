@@ -1,7 +1,7 @@
 use crate::{config, row};
 use std::{ops, result};
 
-pub(super) mod collect;
+mod collect;
 pub(super) mod single;
 pub(super) mod visit;
 

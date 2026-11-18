@@ -1,14 +1,14 @@
-use crate::api::{batches, stmt, work};
-use crate::catalogs;
+use crate::api::{stmt, work};
 use crate::retry::lease;
 use crate::runtime::slot::Ready;
 use crate::runtime::slot::lease::Lease;
+use crate::{catalogs, runtime};
 use o3::mem::lease::Open;
 use work::guard::{self, open};
 
 pub(crate) struct Prepare<'slot, 'd, I: catalogs::Catalog> {
     pub(super) prepare: stmt::Prepare<'slot, I>,
-    pub(super) arena: batches::Arena<'slot>,
+    pub(super) arena: &'slot mut runtime::raw::Span,
     pub(super) guard: guard::Guard<'slot, open::Open>,
     pub(super) lease: Lease<'slot, 'd, I, Open>,
 }

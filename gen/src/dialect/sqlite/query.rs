@@ -107,7 +107,9 @@ impl Query {
             emit::Kind::First(t) => quote::quote! {
                 ::core::option::Option<<#t as ::cartel_sqlite::row::raw::Decode>::Borrowed<#row>>
             },
-            emit::Kind::All(t) => quote::quote! { ::cartel_sqlite::Rows<#row, #t> },
+            emit::Kind::All(t) => quote::quote! {
+                &#row [<#t as ::cartel_sqlite::row::raw::Decode>::Borrowed<#row>]
+            },
             emit::Kind::Stream(t) => quote::quote! {
                 ::cartel_sqlite::Cursor<
                     #row,

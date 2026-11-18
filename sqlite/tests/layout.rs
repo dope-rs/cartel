@@ -120,8 +120,7 @@ fn bounded_fiber_state() -> Result<(), plan::Error> {
                     fibers::TEST
                         .try_run(driver, rows)
                         .map_err(plan::Error::Run)?
-                        .map_err(plan::Error::Call)?
-                        .as_slice(),
+                        .map_err(plan::Error::Call)?,
                     &[1]
                 );
 
@@ -134,8 +133,7 @@ fn bounded_fiber_state() -> Result<(), plan::Error> {
                     fibers::TEST
                         .try_run(driver, views)
                         .map_err(plan::Error::Run)?
-                        .map_err(plan::Error::Call)?
-                        .as_slice(),
+                        .map_err(plan::Error::Call)?,
                     &["value"]
                 );
 

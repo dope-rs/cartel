@@ -1,4 +1,4 @@
-use crate::{api::batches, row};
+use crate::{row, runtime};
 
 #[doc(hidden)]
 pub struct Plain;
@@ -13,21 +13,21 @@ pub struct ArenaState<'arena, T: Copy + 'arena> {
 }
 
 #[doc(hidden)]
-pub struct Input<'query, 'owner: 'query> {
-    arena: &'query mut batches::Arena<'owner>,
+pub struct Input<'query> {
+    arena: &'query mut runtime::raw::Span,
 }
 
 /// A static retention layout selected by one `Decode` implementation.
 #[doc(hidden)]
 pub trait Kind: Sized {
     type With<K: Kind>: Kind;
-    type Init<'query, 'owner: 'query>;
+    type Init<'query>;
     type State<'arena, T: Copy + 'arena>;
 
-    fn init<'query, 'owner: 'query>(input: Input<'query, 'owner>) -> Self::Init<'query, 'owner>;
+    fn init<'query>(input: Input<'query>) -> Self::Init<'query>;
 
-    fn start<'query, 'owner: 'query, T: Copy + 'query>(
-        init: Self::Init<'query, 'owner>,
+    fn start<'query, T: Copy + 'query>(
+        init: Self::Init<'query>,
         rows: usize,
     ) -> Result<Self::State<'query, T>, crate::Error>;
 
@@ -43,23 +43,23 @@ pub trait Contains<K: Kind>: Kind {
     ) -> &'borrow mut K::State<'arena, T>;
 }
 
-impl<'query, 'owner: 'query> Input<'query, 'owner> {
-    pub(crate) const fn new(arena: &'query mut batches::Arena<'owner>) -> Self {
+impl<'query> Input<'query> {
+    pub(crate) const fn new(arena: &'query mut runtime::raw::Span) -> Self {
         Self { arena }
     }
 }
 
 impl Kind for Plain {
     type With<K: Kind> = K;
-    type Init<'query, 'owner: 'query> = Self;
+    type Init<'query> = Self;
     type State<'arena, T: Copy + 'arena> = Self;
 
-    fn init<'query, 'owner: 'query>(_input: Input<'query, 'owner>) -> Self::Init<'query, 'owner> {
+    fn init<'query>(_input: Input<'query>) -> Self::Init<'query> {
         Self
     }
 
-    fn start<'query, 'owner: 'query, T: Copy + 'query>(
-        init: Self::Init<'query, 'owner>,
+    fn start<'query, T: Copy + 'query>(
+        init: Self::Init<'query>,
         _rows: usize,
     ) -> Result<Self::State<'query, T>, crate::Error> {
         Ok(init)
@@ -74,15 +74,15 @@ impl Kind for Plain {
 
 impl Kind for Arena {
     type With<K: Kind> = Self;
-    type Init<'query, 'owner: 'query> = Input<'query, 'owner>;
+    type Init<'query> = Input<'query>;
     type State<'arena, T: Copy + 'arena> = ArenaState<'arena, T>;
 
-    fn init<'query, 'owner: 'query>(input: Input<'query, 'owner>) -> Self::Init<'query, 'owner> {
+    fn init<'query>(input: Input<'query>) -> Self::Init<'query> {
         input
     }
 
-    fn start<'query, 'owner: 'query, T: Copy + 'query>(
-        init: Self::Init<'query, 'owner>,
+    fn start<'query, T: Copy + 'query>(
+        init: Self::Init<'query>,
         rows: usize,
     ) -> Result<Self::State<'query, T>, crate::Error> {
         Ok(ArenaState {

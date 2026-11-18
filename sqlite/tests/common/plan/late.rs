@@ -1,4 +1,4 @@
-use std::{cell, convert, mem, ops, pin};
+use std::{cell, mem, ops, pin};
 
 use cartel_sqlite::{Connection, Error, Installed};
 use dope_core::driver::{self, schedule, settings};
@@ -25,7 +25,7 @@ pub struct Held<'app, 'local: 'app, 'd: 'local> {
 }
 
 impl<'app, 'local: 'app, 'd: 'local> executor::raw::Layout<'d> for Held<'app, 'local, 'd> {
-    type ParkPlan = convert::Infallible;
+    type ParkPlan = ();
 }
 
 // SAFETY: these ordinary fields own no routes or lifecycle delegates. The pinned
@@ -33,21 +33,19 @@ impl<'app, 'local: 'app, 'd: 'local> executor::raw::Layout<'d> for Held<'app, 'l
 unsafe impl<'app, 'local: 'app, 'd: 'local> executor::raw::App<'d> for Held<'app, 'local, 'd> {
     const ROUTES: settings::Routes = settings::Routes::EMPTY;
     const COORDS: usize = 0;
+    const PARK: bool = false;
 
-    fn select_park() -> Option<Self::ParkPlan> {
-        None
-    }
+    fn select_park() -> Self::ParkPlan {}
 
     /// # Safety
-    /// The selected plan is uninhabited, so this operation cannot be invoked.
+    /// This dependent owns no pre-park work.
     unsafe fn park<'loan, 'driver, 'turn>(
         _: pin::Pin<&'loan mut Self>,
-        plan: &mut Self::ParkPlan,
+        _: &mut Self::ParkPlan,
         _: executor::raw::Park<'driver, 'turn, 'd>,
     ) where
         'd: 'driver + 'turn,
     {
-        match *plan {}
     }
 
     fn progress(

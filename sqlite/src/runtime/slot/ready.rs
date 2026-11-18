@@ -1,6 +1,6 @@
-use crate::api::{batches, exec, stmt, work};
+use crate::api::{exec, stmt, work};
 use crate::runtime::slot::lease;
-use crate::{catalogs, sys};
+use crate::{catalogs, runtime, sys};
 use dope_fiber::abi;
 use std::{mem, result};
 use stmt::{access::Access, target::Target};
@@ -8,7 +8,7 @@ use work::cleanup;
 
 pub(crate) struct Ready<'slot, 'd: 'slot, I: catalogs::Catalog = catalogs::Empty> {
     pub(super) engine: stmt::Engine<'slot, I>,
-    pub(super) arena: batches::Arena<'slot>,
+    pub(super) arena: &'slot mut runtime::raw::Span,
     pub(super) lease: lease::Lease<'slot, 'd, I, lease::Ready>,
 }
 
@@ -39,10 +39,10 @@ impl<'slot, 'd: 'slot, I: catalogs::Catalog> Ready<'slot, 'd, I> {
     fn start<'a>(
         &'a mut self,
         txn: exec::Tx<'a>,
-    ) -> (exec::Start<'a, 'slot, 'd, I>, &'a mut batches::Arena<'slot>) {
+    ) -> (exec::Start<'a, 'slot, 'd, I>, &'a mut runtime::raw::Span) {
         (
             exec::Start::new(&mut self.engine, self.lease.work(), self.lease.call(), txn),
-            &mut self.arena,
+            self.arena,
         )
     }
 

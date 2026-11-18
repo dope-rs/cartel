@@ -1,8 +1,8 @@
-use crate::api::{batches, stmt, work};
+use crate::api::{stmt, work};
 use crate::retry::lease;
 use crate::runtime::slot::{Prepare, lease::Lease};
 use crate::sys;
-use crate::{catalogs, config};
+use crate::{catalogs, config, runtime};
 use o3::mem::lease::Open;
 use work::call::Call;
 use work::guard::{self, open};
@@ -11,8 +11,8 @@ pub(crate) struct Opening<'slot, 'd, I: catalogs::Catalog> {
     pub(super) guard: guard::Guard<'slot, open::Open>,
     pub(super) connection: &'slot sys::Connection,
     pub(super) statements: &'slot mut stmt::Storage<I>,
-    pub(super) arena: batches::Arena<'slot>,
-    pub(super) lookaside: &'slot mut crate::runtime::raw::Span,
+    pub(super) arena: &'slot mut runtime::raw::Span,
+    pub(super) lookaside: &'slot mut runtime::raw::Span,
     pub(super) lookaside_layout: crate::memory::Lookaside,
     pub(super) lease: Lease<'slot, 'd, I, Open>,
 }

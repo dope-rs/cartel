@@ -1,14 +1,41 @@
-use crate::common::database::COMMANDS;
-use crate::common::plan;
+use crate::common::database::{COMMANDS, IntegrationDatabase};
+use crate::common::{assert_reclaimed, assert_retirement, plan};
 use cartel_sqlite::{
     Budget, Busy, Cache, Limits, Lookaside, Memory, OpenOptions, Parameters, Program, Progress,
     Results, Scan, Table, Work, database, runtime::Runtime,
 };
+use dope_core::driver::life::recovery::Policy;
+use dope_runtime::executor::session::App;
+use dope_test::fibers;
 use std::{num::NonZero, time::Duration};
 
 mod keyword;
 
 pub use keyword::Keyword;
+
+pub fn run(
+    runtime: Runtime,
+    query: impl for<'app, 'owner, 'local, 'd> FnOnce(
+        &mut App<'app, 'owner, 'd, cartel_sqlite::Installed<'local, 'd, IntegrationDatabase>>,
+        cartel_sqlite::Connection<'app, 'local, 'd, IntegrationDatabase>,
+    ) -> Result<
+        Result<(), cartel_sqlite::Error>,
+        fibers::Run,
+    >,
+) -> Result<(), plan::Error> {
+    let (limits, memory) = try_settings()?;
+    plan::Plan::try_new(open(runtime)?, limits, memory)?
+        .try_run(
+            |driver, conn| {
+                query(driver, conn)
+                    .map_err(plan::Error::Run)?
+                    .map_err(plan::Error::Call)
+            },
+            Policy::new(assert_reclaimed, assert_retirement),
+            |result| result.expect("SQLite scope"),
+        )
+        .expect("SQLite integration scope")
+}
 
 pub fn try_settings() -> Result<(Limits, Memory), plan::Error> {
     Ok((

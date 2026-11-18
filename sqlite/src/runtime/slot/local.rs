@@ -1,4 +1,4 @@
-use crate::api::{batches, stmt, work};
+use crate::api::{stmt, work};
 use crate::retry;
 use crate::runtime::slot::{Opening, lease::Lease};
 use crate::runtime::{self, Error, heap};
@@ -101,7 +101,7 @@ impl<I: catalogs::Catalog> Owned<I> {
 pub(crate) struct Vacant<'slot, 'd, I: catalogs::Catalog> {
     connection: &'slot mut Option<crate::sys::Connection>,
     statements: &'slot mut stmt::Storage<I>,
-    arena: batches::Arena<'slot>,
+    arena: &'slot mut runtime::raw::Span,
     lookaside: &'slot mut runtime::raw::Span,
     lookaside_layout: crate::memory::Lookaside,
     lease: Lease<'slot, 'd, I, Open>,

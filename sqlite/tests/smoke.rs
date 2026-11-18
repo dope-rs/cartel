@@ -106,7 +106,7 @@ fn round_trip(runtime: Runtime) -> Result<(), plan::Error> {
                         .try_run(driver, user_names(&mut conn, 1))
                         .map_err(plan::Error::Run)?
                         .map_err(plan::Error::Call)?;
-                    assert_eq!(names.as_slice(), &["alice", "bob"]);
+                    assert_eq!(names, &["alice", "bob"]);
 
                     let missing = fibers::TEST
                         .try_run(driver, maybe_user(&mut conn, 99))

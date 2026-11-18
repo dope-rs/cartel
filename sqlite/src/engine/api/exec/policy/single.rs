@@ -1,11 +1,11 @@
+use crate::api::exec;
 use crate::row::modes::{self, Kind as _};
-use crate::{api, config, row};
-use api::{batches, exec};
+use crate::{config, row, runtime};
 use exec::{Create, Policy};
 use std::{ops, result};
 
-pub(crate) struct Single<'query, 'owner: 'query, R: row::raw::Decode, M> {
-    init: <R::Retention as modes::Kind>::Init<'query, 'owner>,
+pub(crate) struct Single<'query, R: row::raw::Decode, M> {
+    init: <R::Retention as modes::Kind>::Init<'query>,
     finish: M,
 }
 
@@ -15,8 +15,8 @@ pub(crate) struct Take<'query, R: row::raw::Decode, M> {
     finish: M,
 }
 
-impl<'query, 'owner: 'query, R: row::raw::Decode, M> Single<'query, 'owner, R, M> {
-    pub(crate) fn new(arena: &'query mut batches::Arena<'owner>, finish: M) -> Self {
+impl<'query, R: row::raw::Decode, M> Single<'query, R, M> {
+    pub(crate) fn new(arena: &'query mut runtime::raw::Span, finish: M) -> Self {
         Self {
             init: R::Retention::init(modes::Input::new(arena)),
             finish,
@@ -24,7 +24,7 @@ impl<'query, 'owner: 'query, R: row::raw::Decode, M> Single<'query, 'owner, R, M
     }
 }
 
-impl<'query, 'owner: 'query, R, M> Create<R> for Single<'query, 'owner, R, M>
+impl<'query, R, M> Create<R> for Single<'query, R, M>
 where
     R: row::raw::Decode + 'query,
     Take<'query, R, M>: Policy<R>,
