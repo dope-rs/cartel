@@ -1,6 +1,6 @@
 [package]
 name = "cartel-core"
-version = "0.42.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "Shared core for cartel database drivers"

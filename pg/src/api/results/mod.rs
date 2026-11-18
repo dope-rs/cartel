@@ -168,11 +168,11 @@ where
         self.usage().values()
     }
 
-    pub(in crate::api) fn from_result<E>(batch: Result<B, E>) -> Result<Self, E> {
-        Ok(Self {
-            batch: batch?,
+    pub(in crate::api) const fn new(batch: B) -> Self {
+        Self {
+            batch,
             marker: marker::PhantomData,
-        })
+        }
     }
 
     pub fn into_owned(self) -> Result<Vec<Q::Row>, crate::Error> {

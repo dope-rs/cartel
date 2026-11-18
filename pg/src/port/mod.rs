@@ -81,7 +81,6 @@ pub struct Port<'e, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8 = 
         replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
     >,
     pub(crate) diagnostics: Option<groups::Access<'g, 'r, 's, 'b, 'c, 'd>>,
-    pub(crate) batches: &'e reply::Batches<'b, 'c, 'd, replies::Row<'d>>,
     queries: marker::PhantomData<fn() -> I>,
 }
 

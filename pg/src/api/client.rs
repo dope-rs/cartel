@@ -109,15 +109,7 @@ where
     where
         S: request::Input<'d>,
         Q: schema::TypedQuery,
-        X: recv::Extract<
-                'app,
-                'b,
-                'c,
-                'd,
-                replies::Row<'d>,
-                replies::ReplyFailure<'d>,
-                Output = Result<T, Error<'d, ID>>,
-            > + api::Sync,
+        X: task::Read<'app, 'b, 'c, 'd, Output = Result<T, Error<'d, ID>>> + api::Sync,
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {

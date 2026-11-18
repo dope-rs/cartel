@@ -142,9 +142,9 @@ impl<'s, 'storage, 'b, 'c, 'd, const ID: u8> Schedule<'s, 'storage, 'b, 'c, 'd, 
             ));
         }
         let reps = self.lane(conn.position());
-        let push = reps.select(region);
-        let last = push.is_cutoff(frontier.map_or(Cutoff::EMPTY, |[_, last]| last));
-        match push.try_push(frame) {
+        let selected = reps.ordered(region);
+        let last = selected.is_cutoff(frontier.map_or(Cutoff::EMPTY, |[_, last]| last));
+        match selected.into_push().try_push(frame) {
             Ok(()) => {}
             Err(usage::InsertError::Front {
                 value,

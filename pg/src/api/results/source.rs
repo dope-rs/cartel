@@ -44,13 +44,19 @@ impl<'d> Batch for reply::Batch<'_, '_, '_, 'd, replies::Row<'d>> {
         self.usage()
     }
 
-    fn into_owned<Q: schema::TypedQuery>(self) -> Result<Vec<Q::Row>, crate::Error> {
-        self.try_map(|row, slot| {
+    fn into_owned<Q: schema::TypedQuery>(mut self) -> Result<Vec<Q::Row>, crate::Error> {
+        use o3::alloc::VecExt as _;
+
+        let mut rows = Vec::try_new(self.len().get()).map_err(crate::Error::Allocation)?;
+        self.try_drain(|row| {
             let mut reader = RowReader::new(row.wire(), Q::N_RESULT_COLS)?;
-            let done = slot.insert(Q::Row::decode_owned(&mut reader)?);
-            reader.finish()?;
-            Ok(done)
-        })
-        .map_err(crate::Error::Allocation)?
+            let value = Q::Row::decode_owned(&mut reader)?;
+            // SAFETY: each visited FIFO entry produces one row. The original
+            // length reserves a slot for every entry before draining starts.
+            let insert = unsafe { o3::alloc::raw::VecExt::vacancy(&mut rows) };
+            insert(value);
+            reader.finish()
+        })?;
+        Ok(rows)
     }
 }

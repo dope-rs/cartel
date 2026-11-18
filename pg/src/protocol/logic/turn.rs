@@ -112,7 +112,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 let mut lane = replies::Lane::new(self.port, self.conn, *entry, self.region);
                 let receiving = match input {
                     Input::Empty => false,
-                    Input::Partial => lane.front(self.state.batch)?.0.is_none(),
+                    Input::Partial => lane.current(self.state.batch)?.is_none(),
                     Input::Yield | Input::Blocked => true,
                 };
                 lane.set_receiving(receiving);

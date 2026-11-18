@@ -1,6 +1,5 @@
 use crate::{
     api::{self, Response},
-    port::replies,
     reply::Error,
     schema,
 };
@@ -12,7 +11,7 @@ use dope::{
 use dope_fiber::context;
 use dope_fiber::wait;
 use o3::base::cell::region;
-use reply::recv::{self, attach::Attach};
+use reply::recv::attach::Attach;
 use std::{mem, pin::Pin, task::Poll};
 
 mod call;
@@ -24,7 +23,7 @@ pub(in crate::api) mod tx;
 
 pub(in crate::api) use dispatch::Budget;
 
-pub(in crate::api) use call::Call;
+pub(in crate::api) use call::{Call, Read, Receiver};
 
 type Completed<'d, T, L, const ID: u8> = Result<(T, L), Error<'d, ID>>;
 
@@ -101,7 +100,7 @@ pub(super) struct Core<
     P = lease::Detached,
 > where
     I: schema::QuerySet + 'd,
-    X: recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>,
+    X: Read<'app, 'b, 'c, 'd>,
     A: lease::Target<'d, ID>,
     P: lease::Policy,
 {
@@ -110,7 +109,7 @@ pub(super) struct Core<
         R,
         api::Pending<'d, (S, X::Context), M>,
         lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>,
-        Response<'app, 'g, 'r, 's, 'b, 'c, 'd, X>,
+        Response<'app, 'g, 'r, 's, 'b, 'c, 'd, X::Spec>,
     >,
 }
 
@@ -123,7 +122,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, X, const ID: u8, R, M, S,
     Core<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID, R, M, S, A, P>
 where
     I: schema::QuerySet + 'd,
-    X: recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>,
+    X: Read<'app, 'b, 'c, 'd>,
     A: lease::Target<'d, ID>,
     P: lease::Policy,
     R: Copy + Into<Option<api::Target<'d, ID>>>,
@@ -154,7 +153,7 @@ where
             api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
             conn::Id<'d, KeyTag<ID>>,
         ) -> lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>,
-    ) -> Poll<Result<&mut Response<'app, 'g, 'r, 's, 'b, 'c, 'd, X>, Error<'d, ID>>>
+    ) -> Poll<Result<&mut Response<'app, 'g, 'r, 's, 'b, 'c, 'd, X::Spec>, Error<'d, ID>>>
     where
         'app: 'target,
         'd: 'target,
@@ -168,19 +167,18 @@ where
                     context,
                     this,
                     |region, lane, tag, this| {
-                        Response::<X>::try_with(region, lane, tag, this, |this| match mem::replace(
-                            this,
-                            State::Done,
-                        ) {
-                            State::Connecting { request, .. } => {
-                                let api::Pending {
-                                    frame,
-                                    state: (state, context),
-                                    ..
-                                } = request;
-                                (context, (this, frame, state))
+                        Response::<X::Spec>::try_with(region, lane, tag, this, |this| {
+                            match mem::replace(this, State::Done) {
+                                State::Connecting { request, .. } => {
+                                    let api::Pending {
+                                        frame,
+                                        state: (state, context),
+                                        ..
+                                    } = request;
+                                    (context, (this, frame, state))
+                                }
+                                _ => unreachable!("connecting"),
                             }
-                            _ => unreachable!("connecting"),
                         })
                         .map(|(depth, reply, input)| (depth, (reply, input)))
                     },
@@ -234,15 +232,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, X, const ID: u8, R, M,
     Core<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID, R, M, S, A, P>
 where
     I: schema::QuerySet + 'd,
-    X: recv::Extract<
-            'app,
-            'b,
-            'c,
-            'd,
-            replies::Row<'d>,
-            replies::ReplyFailure<'d>,
-            Output = Result<T, Error<'d, ID>>,
-        >,
+    X: Read<'app, 'b, 'c, 'd, Output = Result<T, Error<'d, ID>>>,
     A: lease::Target<'d, ID>,
     P: lease::Policy,
     R: Copy + Into<Option<api::Target<'d, ID>>>,
@@ -269,7 +259,7 @@ where
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Ready(Ok(reply)) => reply,
         };
-        match Pin::new(reply).poll_reply(cx, X::extract, std::convert::identity) {
+        match X::poll(Pin::new(reply), cx, std::convert::identity) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(outcome) => Poll::Ready(finish(self, outcome)),
         }

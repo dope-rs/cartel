@@ -18,12 +18,9 @@ pub(super) enum Progress {
 }
 
 enum Action {
-    Done,
     Complete,
-    Retire,
-    FailGroup,
-    FailOne,
     Missing,
+    Skip { server: bool },
 }
 
 impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
@@ -34,105 +31,77 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         status: poll::Status,
         work: &mut A,
     ) -> Result<Progress, crate::Error> {
+        use state::Progress::{Complete, Missing, Running, Skipping, Unknown};
+
         let entry = self
             .state
             .entry()
             .ok_or(crate::Error::Protocol(protocol::Reason::ReadyUnknown))?;
         let mut lane = replies::Lane::new(self.port, self.conn, entry, self.region);
         let depth = loop {
-            let (action, selected) = lane.inspect(self.state.batch, |end, front| {
-                if matches!(self.state.progress, state::Progress::Complete) {
-                    if !matches!(
-                        end,
-                        Some(
-                            Kind::Ready
-                                | Kind::Required
-                                | Kind::Begin
-                                | Kind::Commit
-                                | Kind::Sync(_)
-                        )
-                    ) {
-                        return Err(crate::Error::Protocol(protocol::Reason::ReadyUnknown));
-                    }
-                    return Ok(work.admit(|| Action::Complete));
+            let selected = lane.ordered();
+            let tag = replies::Tag::current(selected.tag(), self.state.batch)?;
+            let action = match (self.state.progress, tag) {
+                (Complete, Some(tag))
+                    if matches!(
+                        tag.kind(),
+                        Kind::Ready | Kind::Required | Kind::Begin | Kind::Commit | Kind::Sync(_)
+                    ) =>
+                {
+                    work.admit(|| Action::Complete)
                 }
-                if matches!(self.state.progress, state::Progress::Missing) {
-                    if !matches!(end, Some(Kind::Required)) {
-                        return Err(crate::Error::Protocol(protocol::Reason::ReadyUnknown));
-                    }
-                    return match front {
-                        Front::Open | Front::Denied => Ok(work.admit(|| Action::Missing)),
-                        Front::Detached => Ok(work.admit(|| Action::Complete)),
-                        Front::Empty => Err(crate::Error::Protocol(protocol::Reason::ReadyUnknown)),
-                    };
+                (Missing, Some(tag)) if matches!(tag.kind(), Kind::Required) => {
+                    work.admit(|| Action::Missing)
                 }
-                let Some(end) = end else {
-                    return Ok(work::Capacity::Available(Action::Done));
-                };
-                if let Kind::Sync(group) = end {
-                    if matches!(self.state.progress, state::Progress::Running) {
-                        return Err(crate::Error::Protocol(protocol::Reason::ReadyUnknown));
-                    }
-                    return Ok(work.admit(|| {
-                        if matches!(self.state.progress, state::Progress::Unknown) {
+                (progress @ (Skipping | Unknown), Some(tag)) => match tag.kind() {
+                    Kind::Sync(group) => work.admit(|| {
+                        if matches!(progress, Unknown) {
                             group.resolve(Position::Sync);
                         }
                         Action::Complete
-                    }));
-                }
-                let command = match self.state.progress {
-                    state::Progress::Skipping => None,
-                    state::Progress::Unknown => match end {
-                        Kind::Group(index, group) | Kind::Last(index, group) => {
-                            Some((group, Position::Command(index as usize)))
-                        }
-                        Kind::Command
-                        | Kind::Ready
-                        | Kind::Required
-                        | Kind::Begin
-                        | Kind::Commit
-                        | Kind::Sync(_) => {
-                            return Err(crate::Error::Protocol(protocol::Reason::GroupReply));
-                        }
-                    },
-                    state::Progress::Running
-                    | state::Progress::Complete
-                    | state::Progress::Missing => {
-                        return Err(crate::Error::Protocol(protocol::Reason::ReadyUnknown));
+                    }),
+                    _ if matches!(progress, Unknown) => {
+                        let (group, position) = tag
+                            .diagnostic()
+                            .ok_or(crate::Error::Protocol(protocol::Reason::GroupReply))?;
+                        work.admit(|| Action::Skip {
+                            server: group.resolve(position),
+                        })
                     }
-                };
-                Ok(work.admit(|| {
-                    let server = command.is_some_and(|(group, position)| group.resolve(position));
-                    if matches!(front, Front::Detached) {
-                        Action::Retire
-                    } else if server {
-                        Action::FailGroup
+                    _ => work.admit(|| Action::Skip { server: false }),
+                },
+                (Running | Skipping | Unknown, None) => break None,
+                _ => return Err(crate::Error::Protocol(protocol::Reason::ReadyUnknown)),
+            };
+            let work::Capacity::Available(action) = action else {
+                return Ok(Progress::Blocked);
+            };
+            let selected = selected.into_push();
+            match action {
+                Action::Complete => break Some(selected.complete()),
+                Action::Missing => {
+                    break if matches!(selected.front(), Front::Detached) {
+                        Some(selected.complete())
                     } else {
-                        Action::FailOne
+                        selected.fail_one(replies::Failure::from_error(crate::Error::NotFound))
+                    };
+                }
+                Action::Skip { server } => {
+                    if matches!(selected.front(), Front::Detached) {
+                        let depth = selected.complete();
+                        lane.reindex(depth);
+                    } else {
+                        let depth = if server {
+                            selected.fail_one(replies::GroupServer)
+                        } else {
+                            selected.fail_one(replies::Failure::from_error(crate::Error::Skipped))
+                        };
+                        lane.after_failure(depth);
                     }
-                }))
-            })?;
-            match action? {
-                work::Capacity::Available(Action::Done) => break lane.depth(),
-                work::Capacity::Available(Action::Complete) => break selected.complete(),
-                work::Capacity::Available(Action::Missing) => {
-                    break selected
-                        .fail_one(replies::Failure::from_error(crate::Error::NotFound))
-                        .unwrap_or_else(|| unreachable!("reply"));
                 }
-                work::Capacity::Available(Action::Retire) => {
-                    let depth = selected.complete();
-                    lane.reindex(depth);
-                }
-                work::Capacity::Available(Action::FailGroup) => {
-                    lane.fail_group();
-                }
-                work::Capacity::Available(Action::FailOne) => {
-                    lane.fail_one(replies::Failure::from_error(crate::Error::Skipped))
-                }
-                work::Capacity::Exhausted(()) => return Ok(Progress::Blocked),
             }
         };
+        let depth = depth.unwrap_or_else(|| lane.depth());
         let settled = lane
             .settle(status, depth)
             .ok_or(crate::Error::Protocol(protocol::Reason::ReadyUnknown))?;

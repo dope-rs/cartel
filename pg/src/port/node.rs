@@ -230,7 +230,7 @@ where
                 None => None,
             };
             storage
-                .try_batches(|replies, batches| {
+                .try_arena(|replies| {
                     let queue = queue
                         .try_bind(replies.domain())
                         .map_err(port::Build::QueueDomain)
@@ -246,7 +246,6 @@ where
                         requests,
                         controls,
                         responses: replies,
-                        batches,
                         diagnostics: access,
                         queries: marker::PhantomData,
                     };

@@ -2,7 +2,10 @@ use cartel_core::reply::{order::Front, usage};
 use o3::buffer::{self, hold};
 
 use crate::{
-    port::{pool::access, replies::Completion},
+    port::{
+        pool::access,
+        replies::{Kind, Tag},
+    },
     protocol::{
         Reason, frame,
         logic::{self, payloads, state, turn::Turn},
@@ -87,9 +90,11 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             messages::Be::COMMAND_COMPLETE | messages::Be::EMPTY_QUERY_RESPONSE => {
                 let mut queue =
                     crate::port::replies::Lane::new(self.port, self.conn, entry, self.region);
-                let end = queue.front(self.state.batch).map(|front| front.0);
+                let selected = queue.ordered();
+                let end =
+                    Tag::current(selected.tag(), self.state.batch).map(|tag| tag.map(Tag::kind));
                 let found = if typ == messages::Be::COMMAND_COMPLETE {
-                    if matches!(end, Ok(Some(Completion::Required))) {
+                    if matches!(end, Ok(Some(Kind::Required))) {
                         payloads::update(data.wire())?
                     } else {
                         payloads::command(typ, data.wire())?;
@@ -103,15 +108,19 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                     return Err(crate::Error::Protocol(Reason::CommandEmpty));
                 };
                 match end {
-                    Completion::Command | Completion::Group => queue.complete(),
-                    Completion::Last => {
-                        queue.complete();
+                    Kind::Command | Kind::Group(..) => {
+                        let depth = selected.into_push().complete();
+                        queue.reindex(depth);
+                    }
+                    Kind::Last(..) => {
+                        let depth = selected.into_push().complete();
+                        queue.reindex(depth);
                         self.state.progress = state::Progress::Complete;
                     }
-                    Completion::Ready | Completion::Begin => {
+                    Kind::Ready | Kind::Begin => {
                         self.state.progress = state::Progress::Complete;
                     }
-                    Completion::Required => {
+                    Kind::Required => {
                         if typ == messages::Be::EMPTY_QUERY_RESPONSE {
                             return Err(crate::Error::UnexpectedReadyMessage(typ));
                         }
@@ -121,17 +130,20 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                             state::Progress::Missing
                         };
                     }
-                    Completion::Commit => match data.wire().as_slice() {
+                    Kind::Commit => match data.wire().as_slice() {
                         b"COMMIT\0" => self.state.progress = state::Progress::Complete,
                         b"ROLLBACK\0" => {
-                            queue.fail_one(crate::port::replies::Failure::from_error(
-                                crate::Error::CommitRolledBack,
-                            ));
+                            let depth = selected.into_push().fail_one(
+                                crate::port::replies::Failure::from_error(
+                                    crate::Error::CommitRolledBack,
+                                ),
+                            );
+                            queue.after_failure(depth);
                             self.state.progress = state::Progress::Skipping;
                         }
                         _ => return Err(crate::Error::Protocol(Reason::CommitTag)),
                     },
-                    Completion::Sync => {
+                    Kind::Sync(_) => {
                         return Err(crate::Error::UnexpectedReadyMessage(typ));
                     }
                 }
@@ -160,13 +172,16 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 let status = payloads::ready_status(data.wire())?;
                 match (status, entry.slot().access(self.conn)) {
                     (poll::Status::Transaction, Some(access::State::Reserved(_))) => {
-                        let mut queue = crate::port::replies::Lane::new(
+                        let queue = crate::port::replies::Lane::new(
                             self.port,
                             self.conn,
                             entry,
                             self.region,
                         );
-                        if !matches!(queue.front(self.state.batch)?.0, Some(Completion::Begin)) {
+                        if !matches!(
+                            queue.current(self.state.batch)?.map(Tag::kind),
+                            Some(Kind::Begin)
+                        ) {
                             return Err(crate::Error::Protocol(Reason::TransactionLease));
                         }
                     }
@@ -200,29 +215,29 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         use crate::port::replies;
 
         let mut queue = replies::Lane::new(self.port, self.conn, entry, self.region);
-        let (end, selected) = queue.front(self.state.batch)?;
-        match end {
+        let selected = queue.ordered();
+        match Tag::current(selected.tag(), self.state.batch)?.map(Tag::kind) {
             None => {
                 return Err(crate::Error::Protocol(Reason::RowEmpty));
             }
-            Some(Completion::Sync) => {
-                return match selected.front() {
+            Some(Kind::Sync(_)) => {
+                return match selected.into_push().front() {
                     Front::Detached => Ok(None),
                     Front::Open | Front::Denied => Err(crate::Error::Protocol(Reason::CommandData)),
                     Front::Empty => Err(crate::Error::Protocol(Reason::ReadyUnknown)),
                 };
             }
             Some(
-                Completion::Command
-                | Completion::Group
-                | Completion::Last
-                | Completion::Ready
-                | Completion::Required
-                | Completion::Begin
-                | Completion::Commit,
+                Kind::Command
+                | Kind::Group(..)
+                | Kind::Last(..)
+                | Kind::Ready
+                | Kind::Required
+                | Kind::Begin
+                | Kind::Commit,
             ) => {}
         }
-        match selected.try_build(replies::RowPlan::row(
+        match selected.into_push().try_build(replies::RowPlan::row(
             data,
             self.port.shared.config.retention_headroom(),
         )) {
@@ -273,19 +288,18 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
             self.state.phase = state::Phase::Ready(entry);
         }
         let mut queue = replies::Lane::new(self.port, self.conn, entry, self.region);
-        let (end, mut selected) = queue.front(self.state.batch)?;
-        let plan = match end {
-            None => plan,
-            Some(_) => {
+        let selected = queue.ordered();
+        let plan = match Tag::current(selected.tag(), self.state.batch)? {
+            None => {
+                self.fail_server(plan.class(), plan.try_build()?);
+                return Ok(None);
+            }
+            Some(tag) => {
                 let skipping = matches!(
                     self.state.progress,
                     state::Progress::Skipping | state::Progress::Unknown
                 );
-                match selected
-                    .tag()
-                    .ok_or(crate::Error::Protocol(Reason::ResponseUnknown))?
-                    .record_error(skipping, plan)?
-                {
+                match tag.record_error(skipping, plan)? {
                     replies::ErrorRoute::Single(plan) => plan,
                     replies::ErrorRoute::Group {
                         scope,
@@ -300,11 +314,13 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                             reply::Scope::Unknown => self.state.progress = state::Progress::Unknown,
                             reply::Scope::Command => {
                                 if command {
-                                    let detached = matches!(selected.front(), Front::Detached);
-                                    if detached {
-                                        queue.complete();
+                                    let selected = selected.into_push();
+                                    if matches!(selected.front(), Front::Detached) {
+                                        let depth = selected.complete();
+                                        queue.reindex(depth);
                                     } else {
-                                        queue.fail_group();
+                                        let depth = selected.fail_one(replies::GroupServer);
+                                        queue.after_failure(depth);
                                     }
                                 }
                                 self.state.progress = state::Progress::Skipping;
@@ -317,11 +333,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         };
         let scope = plan.scope();
         let class = plan.class();
-        if end.is_none() {
-            self.fail_server(class, plan.try_build()?);
-            return Ok(None);
-        }
-        let pending = match selected.try_failure() {
+        let pending = match selected.into_push().try_failure() {
             Ok(failure) => match failure.try_fail(replies::ReplyFailure::Server(plan.try_build()?))
             {
                 Ok(depth) => {

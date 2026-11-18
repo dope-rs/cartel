@@ -9,12 +9,17 @@ pub(in crate::client) type Admitted<'a, 'b, 'c, 's, 'd, const ID: u8> =
 
 pub(in crate::client) struct Extract<const ID: u8>;
 
+impl<'a, 'b, 'c, 's, 'd, const ID: u8>
+    recv::Spec<'a, 'b, 'c, 'd, frame::Stored<'s, 'd>, client::Failure<'d>> for Extract<ID>
+{
+    type Context = ();
+    type Mode = ();
+}
+
 impl<'a, 'b, 'c: 'b, 's, 'd: 'c, const ID: u8>
     recv::Extract<'a, 'b, 'c, 'd, frame::Stored<'s, 'd>, client::Failure<'d>> for Extract<ID>
 {
     type Output = Result<value::Reply<'s, 'b, 'c, 'd>, ReplyError<'b, 'c, 'd, ID>>;
-
-    type Context = ();
 
     fn extract(
         _: &Self::Context,

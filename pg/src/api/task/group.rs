@@ -36,14 +36,20 @@ type Output<'r, 's, 'b, 'c, 'd, Q, const ID: u8, const N: usize> =
 
 struct First<Q>(PhantomData<Q>);
 
+impl<'app, 'b, 'c, 'd, Q> recv::Spec<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>
+    for First<Q>
+{
+    type Context = ();
+    type Mode = ();
+    const ACCEPTANCE: recv::Acceptance = recv::Acceptance::First;
+}
+
 impl<'app, 'b, 'c: 'b, 'd: 'c, Q>
     recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>> for First<Q>
 where
     Q: schema::TypedQuery<Result = schema::result::Rows>,
 {
     type Output = Outcome<Row<replies::Payload<'b, 'c, 'd>, Q>, replies::ReplyFailure<'d>>;
-    type Context = ();
-    const ACCEPTANCE: recv::Acceptance = recv::Acceptance::First;
 
     fn extract(
         _: &(),

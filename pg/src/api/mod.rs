@@ -4,7 +4,7 @@
 //!
 
 use dope::core::driver::route::KeyTag;
-use dope_fiber::reply::{Batch, Batches};
+use dope_fiber::reply::Batch;
 
 use crate::port::{pool::access, replies, replies::Response};
 use crate::protocol::{self, runtime::tx::Access};
@@ -93,42 +93,49 @@ fn check_open<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet
     client.port.shared.failure().map_or(Ok(()), Err)
 }
 
-pub(super) struct ExtractAll<const ID: u8 = 0>;
+pub(super) struct ExtractAll<Q, const ID: u8 = 0>(marker::PhantomData<Q>);
 
-impl<'app, 'b: 'app, 'c: 'b, 'd: 'c, const ID: u8>
-    recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>
-    for ExtractAll<ID>
+impl<'app, 'b: 'app, 'c: 'b, 'd: 'c, Q: schema::TypedQuery, const ID: u8>
+    task::Read<'app, 'b, 'c, 'd> for ExtractAll<Q, ID>
 {
-    type Output = Result<Batch<'app, 'b, 'c, 'd, replies::Row<'d>>, reply::Error<'d, ID>>;
+    type Context = ();
+    type Spec = recv::Collected;
+    type Output = Result<
+        results::Collection<Batch<'app, 'b, 'c, 'd, replies::Row<'d>>, Q>,
+        reply::Error<'d, ID>,
+    >;
 
-    const ACCEPTANCE: recv::Acceptance = recv::Acceptance::Collected;
-
-    type Context = &'app Batches<'b, 'c, 'd, replies::Row<'d>>;
-
-    fn extract(
-        batches: &Self::Context,
-        slot: &mut Slot<'_, 'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>,
-    ) -> Option<Self::Output> {
-        match slot.terminal()? {
-            Terminal::Failed(failure) => Some(Err(failure.into_error().into_error())),
-            Terminal::Complete(done) => Some(
-                Batch::try_new(done, batches)
-                    .map_err(|error| crate::Error::ResponseRetain(error).into()),
-            ),
-        }
+    fn poll<K, T>(
+        reply: std::pin::Pin<&mut task::Receiver<'app, 'b, 'c, 'd, Self::Spec, K>>,
+        cx: std::pin::Pin<&mut dope_fiber::context::Context<'_, 'd>>,
+        finish: impl FnOnce(Self::Output) -> T,
+    ) -> std::task::Poll<T> {
+        reply.poll_all(cx, |result| {
+            finish(
+                result
+                    .map(results::Collection::new)
+                    .map_err(replies::ReplyFailure::into_error),
+            )
+        })
     }
 }
 
 pub struct ExtractUnit<const ID: u8 = 0, const REQUIRED: bool = false>;
 
 impl<'app, 'b, 'c, 'd, const ID: u8, const REQUIRED: bool>
+    recv::Spec<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>
+    for ExtractUnit<ID, REQUIRED>
+{
+    type Context = ();
+    type Mode = ();
+    const ACCEPTANCE: recv::Acceptance = recv::Acceptance::Unit;
+}
+
+impl<'app, 'b, 'c, 'd, const ID: u8, const REQUIRED: bool>
     recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>
     for ExtractUnit<ID, REQUIRED>
 {
     type Output = Result<(), reply::Error<'d, ID>>;
-    const ACCEPTANCE: recv::Acceptance = recv::Acceptance::Unit;
-
-    type Context = ();
 
     fn extract(
         _: &Self::Context,
@@ -148,13 +155,18 @@ impl<'app, 'b, 'c, 'd, const ID: u8, const REQUIRED: bool>
 
 pub(super) struct ExtractOne<const ID: u8 = 0>;
 
+impl<'app, 'b, 'c, 'd, const ID: u8>
+    recv::Spec<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>> for ExtractOne<ID>
+{
+    type Context = ();
+    type Mode = ();
+}
+
 impl<'app, 'b, 'c: 'b, 'd: 'c, const ID: u8>
     recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>
     for ExtractOne<ID>
 {
     type Output = Result<replies::Payload<'b, 'c, 'd>, reply::Error<'d, ID>>;
-
-    type Context = ();
 
     fn extract(
         _: &Self::Context,
@@ -174,6 +186,15 @@ impl<'app, 'b, 'c: 'b, 'd: 'c, const ID: u8>
 
 pub(super) struct ExtractFirst<M, const ID: u8 = 0>(marker::PhantomData<M>);
 
+impl<'app, 'b, 'c, 'd, M: Unpin, const ID: u8>
+    recv::Spec<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>
+    for ExtractFirst<M, ID>
+{
+    type Context = M;
+    type Mode = ();
+    const ACCEPTANCE: recv::Acceptance = recv::Acceptance::First;
+}
+
 impl<'app, 'b, 'c: 'b, 'd: 'c, M, T, const ID: u8>
     recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>
     for ExtractFirst<M, ID>
@@ -181,10 +202,6 @@ where
     M: Unpin + Fn(Result<Option<replies::Payload<'b, 'c, 'd>>, reply::Error<'d, ID>>) -> T,
 {
     type Output = T;
-
-    const ACCEPTANCE: recv::Acceptance = recv::Acceptance::First;
-
-    type Context = M;
 
     fn extract(
         map: &Self::Context,
@@ -204,7 +221,7 @@ pub(in crate::api) trait Sync {
     const BOUNDARY: crate::port::requests::Boundary = crate::port::requests::Boundary::Close;
 }
 
-impl<const ID: u8> Sync for ExtractAll<ID> {}
+impl<Q, const ID: u8> Sync for ExtractAll<Q, ID> {}
 impl<const ID: u8, const REQUIRED: bool> Sync for ExtractUnit<ID, REQUIRED> {
     const BOUNDARY: crate::port::requests::Boundary = if REQUIRED {
         crate::port::requests::Boundary::Required

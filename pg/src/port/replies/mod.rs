@@ -45,48 +45,18 @@ pub(crate) type Response<'app, 'g, 'r, 's, 'b, 'c, 'd, X> = reply::recv::Respons
 pub(crate) struct Tag<'g, 'r, 's, 'b, 'c, 'd> {
     batch: Batch,
     /// Admission proves a Ready-completed order closes this exact batch.
-    kind: Kind<NonNull<groups::State<'r, 's, 'b, 'c, 'd>>, groups::Owner<'g, 'r, 's, 'b, 'c, 'd>>,
+    kind: Kind<'g, 'r, 's, 'b, 'c, 'd>,
 }
 
-pub(crate) enum Kind<G, S = G> {
+pub(crate) enum Kind<'g, 'r, 's, 'b, 'c, 'd> {
     Command,
     Ready,
     Required,
     Begin,
     Commit,
-    Group(u32, G),
-    Last(u32, G),
-    Sync(S),
-}
-
-impl<G, S> Kind<G, S> {
-    fn completion(&self) -> Completion {
-        match self {
-            Self::Command => Completion::Command,
-            Self::Ready => Completion::Ready,
-            Self::Required => Completion::Required,
-            Self::Begin => Completion::Begin,
-            Self::Commit => Completion::Commit,
-            Self::Group(_, _) => Completion::Group,
-            Self::Last(_, _) => Completion::Last,
-            Self::Sync(_) => Completion::Sync,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-#[repr(u8)]
-pub(crate) enum Completion {
-    Command,
-    Group,
-    /// The final command closes command progress, while its Sync stays ordered.
-    Last,
-    Ready,
-    Required,
-    Begin,
-    Commit,
-    /// A group barrier owns no command and completes only at ReadyForQuery.
-    Sync,
+    Group(u32, NonNull<groups::State<'r, 's, 'b, 'c, 'd>>),
+    Last(u32, NonNull<groups::State<'r, 's, 'b, 'c, 'd>>),
+    Sync(groups::Owner<'g, 'r, 's, 'b, 'c, 'd>),
 }
 
 impl<'g, 'r, 's, 'b, 'c, 'd> Tag<'g, 'r, 's, 'b, 'c, 'd> {
@@ -107,20 +77,29 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Tag<'g, 'r, 's, 'b, 'c, 'd> {
         self.batch
     }
 
+    pub(crate) fn current(
+        tag: Option<&Self>,
+        expected: Batch,
+    ) -> Result<Option<&Self>, crate::Error> {
+        let Some(tag) = tag else { return Ok(None) };
+        match tag.batch.relative_to(expected) {
+            Ordering::Greater => Ok(None),
+            Ordering::Less => Err(crate::Error::Protocol(Reason::ReadyUnknown)),
+            Ordering::Equal => Ok(Some(tag)),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> &Kind<'g, 'r, 's, 'b, 'c, 'd> {
+        &self.kind
+    }
+
     pub(crate) fn record_error<'input, R: buffer::Cursor>(
         &self,
         skipping: bool,
         plan: crate::reply::Plan<'input, 'd, R>,
     ) -> Result<ErrorRoute<'input, 'd, R>, crate::Error> {
-        let end = self.as_ref();
-        let (group, command) = match end {
-            Kind::Command | Kind::Ready | Kind::Required | Kind::Begin | Kind::Commit => {
-                return Ok(ErrorRoute::Single(plan));
-            }
-            Kind::Group(index, owner) | Kind::Last(index, owner) => {
-                (owner, Position::Command(index as usize))
-            }
-            Kind::Sync(owner) => (owner, Position::Sync),
+        let Some((group, command)) = self.diagnostic() else {
+            return Ok(ErrorRoute::Single(plan));
         };
         let scope = plan.scope();
         let class = plan.class();
@@ -179,22 +158,20 @@ where
 }
 
 mod raw {
-    use super::{Kind, Tag, groups};
+    use super::{Kind, Position, Tag, groups};
 
     impl<'g, 'r, 's, 'b, 'c, 'd> Tag<'g, 'r, 's, 'b, 'c, 'd> {
-        pub(super) fn as_ref(&self) -> Kind<&groups::State<'r, 's, 'b, 'c, 'd>> {
+        pub(crate) fn diagnostic(&self) -> Option<(&groups::State<'r, 's, 'b, 'c, 'd>, Position)> {
             match &self.kind {
-                Kind::Command => Kind::Command,
-                Kind::Ready => Kind::Ready,
-                Kind::Required => Kind::Required,
-                Kind::Begin => Kind::Begin,
-                Kind::Commit => Kind::Commit,
-                // SAFETY: only try_group_by constructs these command tags. Its
-                // later Sync retains the stable state through this front borrow.
-                Kind::Group(index, group) => Kind::Group(*index, unsafe { group.as_ref() }),
-                // SAFETY: the same ordered Sync also outlives the final command.
-                Kind::Last(index, group) => Kind::Last(*index, unsafe { group.as_ref() }),
-                Kind::Sync(group) => Kind::Sync(group),
+                Kind::Group(index, group) | Kind::Last(index, group) => {
+                    // SAFETY: try_group_by queues the owning Sync after these commands.
+                    Some((
+                        unsafe { group.as_ref() },
+                        Position::Command(*index as usize),
+                    ))
+                }
+                Kind::Sync(owner) => Some((owner, Position::Sync)),
+                Kind::Command | Kind::Ready | Kind::Required | Kind::Begin | Kind::Commit => None,
             }
         }
     }
@@ -288,7 +265,7 @@ pub enum ReplyFailure<'d> {
     Failed(crate::Error),
 }
 
-struct GroupServer;
+pub(crate) struct GroupServer;
 
 pub(crate) enum ErrorRoute<'input, 'd, R: buffer::Cursor> {
     Single(crate::reply::Plan<'input, 'd, R>),
@@ -428,11 +405,6 @@ impl From<&GroupServer> for ReplyFailure<'_> {
     }
 }
 
-type Front<'turn, 'g, 'r, 's, 'b, 'c, 'd, R = Option<Completion>> = (
-    R,
-    reply::Push<'turn, 'b, 'c, 'd, Row<'d>, ReplyFailure<'d>, Tag<'g, 'r, 's, 'b, 'c, 'd>>,
-);
-
 pub(crate) struct Lane<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, const ID: u8> {
     entry: ready::Entry<'life, 'd, ID>,
     lane: reply::Lane<'life, 'b, 'c, 'd, Row<'d>, ReplyFailure<'d>, Tag<'g, 'r, 's, 'b, 'c, 'd>>,
@@ -510,13 +482,8 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, const ID: u8> Lane<'life, 'g, 'r, 's,
         self.entry.try_settle(status, depth)
     }
 
-    pub(crate) fn fail_one(&mut self, cause: Failure) {
-        let depth = self.lane.fail_one(self.region, cause);
-        self.reindex(depth);
-    }
-
-    pub(crate) fn fail_group(&mut self) {
-        let depth = self.lane.fail_one(self.region, GroupServer);
+    pub(crate) fn after_failure(&mut self, changed: Option<order::Depth>) {
+        let depth = changed.unwrap_or_else(|| self.depth());
         self.reindex(depth);
     }
 
@@ -524,38 +491,18 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, const ID: u8> Lane<'life, 'g, 'r, 's,
         reply::Retirement::new(self.region).fail(work, self.lane, &cause)
     }
 
-    pub(crate) fn front<'turn>(
-        &'turn mut self,
+    pub(crate) fn current(
+        &self,
         expected: Batch,
-    ) -> Result<Front<'turn, 'g, 'r, 's, 'b, 'c, 'd>, crate::Error>
-    where
-        'life: 'turn,
-    {
-        self.inspect(expected, |end, _| end.map(|kind| kind.completion()))
+    ) -> Result<Option<&Tag<'g, 'r, 's, 'b, 'c, 'd>>, crate::Error> {
+        Tag::current(self.lane.control().front_tag(self.region), expected)
     }
 
-    pub(crate) fn inspect<'turn, R>(
-        &'turn mut self,
-        expected: Batch,
-        inspect: impl for<'tag> FnOnce(
-            Option<Kind<&'tag groups::State<'r, 's, 'b, 'c, 'd>>>,
-            order::Front,
-        ) -> R,
-    ) -> Result<Front<'turn, 'g, 'r, 's, 'b, 'c, 'd, R>, crate::Error>
-    where
-        'life: 'turn,
+    pub(crate) fn ordered(
+        &mut self,
+    ) -> reply::Selection<'_, 'b, 'c, 'd, Row<'d>, ReplyFailure<'d>, Tag<'g, 'r, 's, 'b, 'c, 'd>>
     {
-        let mut selected = self.lane.select(self.region);
-        let front = selected.front();
-        let Some(tag) = selected.tag() else {
-            return Ok((inspect(None, front), selected));
-        };
-        let end = match tag.batch.relative_to(expected) {
-            Ordering::Greater => None,
-            Ordering::Less => return Err(crate::Error::Protocol(Reason::ReadyUnknown)),
-            Ordering::Equal => Some(tag.as_ref()),
-        };
-        Ok((inspect(end, front), selected))
+        self.lane.ordered(self.region)
     }
 }
 

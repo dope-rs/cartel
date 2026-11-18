@@ -11,7 +11,47 @@ use dope::{
 };
 use dope_fiber::{abi, context, wait};
 use reply::recv;
-use std::{pin, task::Poll};
+use std::{pin::Pin, task::Poll};
+
+pub(in crate::api) type Receiver<'app, 'b, 'c, 'd, X, K> =
+    recv::Response<'app, 'b, 'c, 'd, replies::Row<'d>, X, replies::ReplyFailure<'d>, K>;
+
+pub(in crate::api) trait Read<'app, 'b, 'c, 'd> {
+    type Context: Unpin;
+    type Spec: recv::Spec<
+            'app,
+            'b,
+            'c,
+            'd,
+            replies::Row<'d>,
+            replies::ReplyFailure<'d>,
+            Context = Self::Context,
+        >;
+    type Output;
+
+    fn poll<K, T>(
+        reply: Pin<&mut Receiver<'app, 'b, 'c, 'd, Self::Spec, K>>,
+        cx: Pin<&mut context::Context<'_, 'd>>,
+        finish: impl FnOnce(Self::Output) -> T,
+    ) -> Poll<T>;
+}
+
+impl<'app, 'b, 'c, 'd, X> Read<'app, 'b, 'c, 'd> for X
+where
+    X: recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>,
+{
+    type Context = X::Context;
+    type Spec = X;
+    type Output = X::Output;
+
+    fn poll<K, T>(
+        reply: Pin<&mut Receiver<'app, 'b, 'c, 'd, X, K>>,
+        cx: Pin<&mut context::Context<'_, 'd>>,
+        finish: impl FnOnce(Self::Output) -> T,
+    ) -> Poll<T> {
+        reply.poll_reply(cx, X::extract, finish)
+    }
+}
 
 #[pin_project::pin_project]
 pub(in crate::api) struct Call<'app, 'd, C, F> {
@@ -71,15 +111,7 @@ where
     R: Copy + Into<Option<api::Target<'d, ID>>>,
     M: Copy + Into<requests::Boundary>,
     P: task::lease::Policy,
-    X: recv::Extract<
-            'app,
-            'b,
-            'c,
-            'd,
-            replies::Row<'d>,
-            replies::ReplyFailure<'d>,
-            Output = Result<T, Error<'d, ID>>,
-        >,
+    X: Read<'app, 'b, 'c, 'd, Output = Result<T, Error<'d, ID>>>,
     F: FnMut(
         &mut task::Core<
             'app,
@@ -108,7 +140,7 @@ where
         let (this, mut cx) = call.into_parts();
         let mut this = this.project();
         let mut guard = match this.deadline.as_mut().get_mut() {
-            Ok(guard) => pin::Pin::new(guard),
+            Ok(guard) => Pin::new(guard),
             Err(error) => {
                 this.waiter.as_ref().unregister();
                 return Poll::Ready(Err(this.core.abort(crate::Error::Deadline(*error))));

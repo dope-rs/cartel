@@ -1,17 +1,8 @@
-use cartel_core::{reply, reply::recv};
-use std::convert::Infallible;
+use cartel_core::reply::recv;
 
 pub(crate) struct Pending;
 
-impl<'s, 'b, 'c, 'd> recv::Extract<'s, 'b, 'c, 'd, ()> for Pending {
-    type Output = Infallible;
-
+impl<'s, 'b, 'c, 'd> recv::Spec<'s, 'b, 'c, 'd, ()> for Pending {
     type Context = ();
-
-    fn extract(
-        _: &Self::Context,
-        _: &mut reply::Slot<'_, 's, 'b, 'c, 'd, ()>,
-    ) -> Option<Infallible> {
-        None
-    }
+    type Mode = ();
 }

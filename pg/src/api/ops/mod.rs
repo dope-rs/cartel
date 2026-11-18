@@ -177,11 +177,7 @@ where
         I: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
-        let batches = self.client.port.batches;
-        abi::Map::new(
-            self.typed::<Q, api::ExtractAll<ID>, _>(params, batches),
-            results::Collection::<_, Q>::from_result,
-        )
+        self.typed::<Q, api::ExtractAll<Q, ID>, _>(params, ())
     }
 
     fn run_no_rows<Q>(
