@@ -4,38 +4,14 @@ use crate::{
     Error,
     api::Storage,
     client,
-    value::{
-        self,
-        list::{self, bulks, coords, pair},
-        reply,
-    },
+    value::{self, reply},
 };
-use std::marker::PhantomData;
 
 /// Decodes retained storage after response bookkeeping completes in the same poll.
 /// The reply retains RESP errors until the decoder classifies them.
 pub trait Decode<S: Storage> {
     type Output;
     fn decode(reply: S::Reply) -> Result<Self::Output, S::Error>;
-}
-
-/// Adapts a normalized decoder to an eagerly encoded command's exact storage.
-#[doc(hidden)]
-#[derive(Debug)]
-pub struct Adapter<S, D>(PhantomData<fn() -> (S, D)>);
-
-impl<'app, 's, 'b, 'c: 'b, 'd: 'app + 'c, B: ?Sized, D, const ID: u8>
-    value::Decode<'s, 'b, 'c, 'd, ID> for Adapter<client::Redis<'app, 's, 'b, 'c, 'd, B, ID>, D>
-where
-    D: Decode<client::Redis<'app, 's, 'b, 'c, 'd, B, ID>>,
-{
-    type Output = D::Output;
-
-    fn decode(
-        reply: value::Reply<'s, 'b, 'c, 'd>,
-    ) -> Result<Self::Output, reply::Failure<Error<'d, ID>, value::Bytes<'b, 'c, 'd>>> {
-        D::decode(reply)
-    }
 }
 
 impl<S: Storage> Decode<S> for () {
@@ -224,30 +200,6 @@ impl<S: Storage> Decode<S> for Kind {
 }
 
 impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>
-    Decode<client::Redis<'app, 's, 'b, 'c, 'd, B, ID>> for value::Bytes<'b, 'c, 'd>
-{
-    type Output = Self;
-
-    fn decode(
-        reply: value::Reply<'s, 'b, 'c, 'd>,
-    ) -> Result<Self, reply::Failure<Error<'d, ID>, value::Bytes<'b, 'c, 'd>>> {
-        <Self as value::Decode<'s, 'b, 'c, 'd, ID>>::decode(reply)
-    }
-}
-
-impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>
-    Decode<client::Redis<'app, 's, 'b, 'c, 'd, B, ID>> for Option<value::Bytes<'b, 'c, 'd>>
-{
-    type Output = Self;
-
-    fn decode(
-        reply: value::Reply<'s, 'b, 'c, 'd>,
-    ) -> Result<Self, reply::Failure<Error<'d, ID>, value::Bytes<'b, 'c, 'd>>> {
-        <Self as value::Decode<'s, 'b, 'c, 'd, ID>>::decode(reply)
-    }
-}
-
-impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>
     Decode<client::Redis<'app, 's, 'b, 'c, 'd, B, ID>>
     for (value::Bytes<'b, 'c, 'd>, value::Bytes<'b, 'c, 'd>)
 {
@@ -256,90 +208,6 @@ impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>
     fn decode(
         reply: value::Reply<'s, 'b, 'c, 'd>,
     ) -> Result<Self, reply::Failure<Error<'d, ID>, value::Bytes<'b, 'c, 'd>>> {
-        <Self as value::Decode<'s, 'b, 'c, 'd, ID>>::decode(reply)
-    }
-}
-
-impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>
-    Decode<client::Redis<'app, 's, 'b, 'c, 'd, B, ID>> for bulks::Array<'s, 'b, 'c, 'd>
-{
-    type Output = Self;
-
-    fn decode(
-        reply: value::Reply<'s, 'b, 'c, 'd>,
-    ) -> Result<Self, reply::Failure<Error<'d, ID>, value::Bytes<'b, 'c, 'd>>> {
-        <Self as value::Decode<'s, 'b, 'c, 'd, ID>>::decode(reply)
-    }
-}
-
-impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>
-    Decode<client::Redis<'app, 's, 'b, 'c, 'd, B, ID>> for bulks::Optional<'s, 'b, 'c, 'd>
-{
-    type Output = Self;
-
-    fn decode(
-        reply: value::Reply<'s, 'b, 'c, 'd>,
-    ) -> Result<Self, reply::Failure<Error<'d, ID>, value::Bytes<'b, 'c, 'd>>> {
-        <Self as value::Decode<'s, 'b, 'c, 'd, ID>>::decode(reply)
-    }
-}
-
-impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>
-    Decode<client::Redis<'app, 's, 'b, 'c, 'd, B, ID>> for pair::BulkPairs<'s, 'b, 'c, 'd>
-{
-    type Output = Self;
-
-    fn decode(
-        reply: value::Reply<'s, 'b, 'c, 'd>,
-    ) -> Result<Self, reply::Failure<Error<'d, ID>, value::Bytes<'b, 'c, 'd>>> {
-        <Self as value::Decode<'s, 'b, 'c, 'd, ID>>::decode(reply)
-    }
-}
-
-impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>
-    Decode<client::Redis<'app, 's, 'b, 'c, 'd, B, ID>> for pair::ScoredBulks<'s, 'b, 'c, 'd>
-{
-    type Output = Self;
-
-    fn decode(
-        reply: value::Reply<'s, 'b, 'c, 'd>,
-    ) -> Result<Self, reply::Failure<Error<'d, ID>, value::Bytes<'b, 'c, 'd>>> {
-        <Self as value::Decode<'s, 'b, 'c, 'd, ID>>::decode(reply)
-    }
-}
-
-impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>
-    Decode<client::Redis<'app, 's, 'b, 'c, 'd, B, ID>> for coords::Coordinates<'s, 'b, 'c, 'd>
-{
-    type Output = Self;
-
-    fn decode(
-        reply: value::Reply<'s, 'b, 'c, 'd>,
-    ) -> Result<Self, reply::Failure<Error<'d, ID>, value::Bytes<'b, 'c, 'd>>> {
-        <Self as value::Decode<'s, 'b, 'c, 'd, ID>>::decode(reply)
-    }
-}
-
-impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>
-    Decode<client::Redis<'app, 's, 'b, 'c, 'd, B, ID>> for list::Scan<'s, 'b, 'c, 'd>
-{
-    type Output = Self;
-
-    fn decode(
-        reply: value::Reply<'s, 'b, 'c, 'd>,
-    ) -> Result<Self, reply::Failure<Error<'d, ID>, value::Bytes<'b, 'c, 'd>>> {
-        <Self as value::Decode<'s, 'b, 'c, 'd, ID>>::decode(reply)
-    }
-}
-
-impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8>
-    Decode<client::Redis<'app, 's, 'b, 'c, 'd, B, ID>> for value::Reply<'s, 'b, 'c, 'd>
-{
-    type Output = Self;
-
-    fn decode(
-        reply: value::Reply<'s, 'b, 'c, 'd>,
-    ) -> Result<Self, reply::Failure<Error<'d, ID>, value::Bytes<'b, 'c, 'd>>> {
-        <Self as value::Decode<'s, 'b, 'c, 'd, ID>>::decode(reply)
+        reply.try_pair::<ID>()
     }
 }

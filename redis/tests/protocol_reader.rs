@@ -82,10 +82,15 @@ fn resumes_nested() {
 
 #[test]
 fn accepts_i64_min() {
+    use cartel_core::reply::usage::Footprint as _;
     use protocol::{Line, Number};
 
+    let mut padded = [b'0'; 128];
+    padded[0] = b':';
+    padded[124..].copy_from_slice(b"17\r\n");
     for (bytes, expected) in [
         (b":-9223372036854775808\r\n".as_slice(), Ok(i64::MIN)),
+        (padded.as_slice(), Ok(17)),
         (b":+0\r\n", Ok(0)),
         (b":+9223372036854775807\r\n", Ok(i64::MAX)),
         (
@@ -127,10 +132,11 @@ fn accepts_i64_min() {
             )),
         ),
     ] {
-        with_reply(bytes, 64, 1, |decoded| {
+        with_reply(bytes, padded.len(), 1, |decoded| {
             assert!(
                 match (decoded, expected) {
                     (Ok(protocol::Decoded::Frame(frame, _)), Ok(expected)) => {
+                        assert_eq!(frame.footprint().bytes().get(), bytes.len());
                         let mut reader = frame.reader();
                         matches!(reader.next_event(), Some(value::Event::Integer(actual)) if actual == expected)
                             && reader.finish().is_ok()

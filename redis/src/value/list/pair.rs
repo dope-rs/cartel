@@ -123,12 +123,8 @@ impl<'s, 'arena, 'credits, 'region> source::Pairs for BulkPairs<'s, 'arena, 'cre
     }
 }
 
-impl<'s, 'arena, 'credits, 'region, const ID: u8> value::Decode<'s, 'arena, 'credits, 'region, ID>
-    for BulkPairs<'s, 'arena, 'credits, 'region>
-{
-    type Output = Self;
-
-    fn decode(
+impl<'s, 'arena, 'credits, 'region> BulkPairs<'s, 'arena, 'credits, 'region> {
+    pub(crate) fn try_decode<const ID: u8>(
         reply: value::Reply<'s, 'arena, 'credits, 'region>,
     ) -> Result<
         Self,
@@ -227,12 +223,8 @@ impl<'s, 'arena, 'credits, 'region> source::ScoredText
     }
 }
 
-impl<'s, 'arena, 'credits, 'region, const ID: u8> value::Decode<'s, 'arena, 'credits, 'region, ID>
-    for ScoredBulks<'s, 'arena, 'credits, 'region>
-{
-    type Output = Self;
-
-    fn decode(
+impl<'s, 'arena, 'credits, 'region> ScoredBulks<'s, 'arena, 'credits, 'region> {
+    pub(crate) fn try_decode<const ID: u8>(
         reply: value::Reply<'s, 'arena, 'credits, 'region>,
     ) -> Result<
         Self,

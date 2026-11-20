@@ -1,4 +1,4 @@
-use cartel_redis::api::{Client as _, Commands as _};
+use cartel_redis::api::{Client as _, Commands as _, decode};
 use cartel_redis::value::source::{Bytes as _, Reader as _, Reply as _};
 use std::{iter, num::NonZero, time::Duration};
 
@@ -296,15 +296,11 @@ fn request_failure_recycles() {
                         };
                         assert!(matches!(runtime.block_on(ack), Ok(Ok(2))));
                         let empty = runtime
-                            .block_on(
-                                redis
-                                    .scripts()
-                                    .eval::<value::Bytes<'_, '_, '_>, &[u8], _>(
-                                        b"return 17",
-                                        &[],
-                                        &[b"ok".as_slice()],
-                                    ),
-                            )
+                            .block_on(redis.scripts().eval::<decode::Bytes, &[u8], _>(
+                                b"return 17",
+                                &[],
+                                &[b"ok".as_slice()],
+                            ))
                             .expect("empty response completed")
                             .ok()
                             .expect("empty bulk");
@@ -431,6 +427,7 @@ fn bulk_reservation_retains_reply() {
     use dope_fiber::abi::{PollFn, Task};
     use dope_fiber::context::PollResult;
     use std::task::Poll;
+    use value::source::Error as _;
 
     for complete in [true, false] {
         let call = Owned {
@@ -451,6 +448,12 @@ fn bulk_reservation_retains_reply() {
                             .ok()
                             .expect("source reply")
                             .expect("source bytes");
+                        let pointer = held.as_ptr();
+                        let alias = held.try_clone().expect("shared source");
+                        let Err(held) = held.try_owned() else {
+                            panic!("shared rejection");
+                        };
+                        drop(alias);
                         let mut read = Box::pin(Task::new(redis.basic().get(b"next")));
                         assert!(
                             runtime
@@ -472,7 +475,7 @@ fn bulk_reservation_retains_reply() {
                         let mut first = true;
                         let running = &mut send;
                         let reserved = runtime
-                            .block_on(PollFn::admitted(move |admit| {
+                            .block_on(PollFn::admitted(|admit| {
                                 let (next, mut cx) = admit.poll(read.as_mut());
                                 match next {
                                     Poll::Pending => {}
@@ -506,7 +509,15 @@ fn bulk_reservation_retains_reply() {
                             .ok()
                             .expect("send returns bulk frame");
                         drop(reserved);
-                        drop(held);
+                        let owned = held.try_owned().ok().expect("unique transfer");
+                        assert_eq!(owned.as_ptr(), pointer);
+                        let next = runtime.block_on(read.as_mut())
+                            .expect("released credit drive")
+                            .map_err(|error| error.kind())
+                            .expect("released credit reply")
+                            .expect("next bytes");
+                        assert_eq!(next.as_ref(), &[b'y'; 25]);
+                        drop(next);
                         let error = runtime.block_on(send.as_mut())
                             .expect("queued EVAL drive").expect_err("old suffix rejected");
                         assert!(
@@ -514,6 +525,7 @@ fn bulk_reservation_retains_reply() {
                             || matches!(&error, value::reply::Failure::Control(cartel_redis::Error::UnexpectedResponse) if !complete),
                             "{:?}", value::source::Error::diagnostic(&error)
                         );
+                        assert_eq!(owned.as_ref(), &[b'x'; 41]);
                     },
                 );
                 reports.events().expect("reclaim observations");

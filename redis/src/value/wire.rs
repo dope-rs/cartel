@@ -25,8 +25,9 @@ impl<'s, 'arena, 'credits, 'region> Wire<'_, 's, 'arena, 'credits, 'region> {
         decode: impl for<'id> FnOnce(&Wire<'id, 's, 'arena, 'credits, 'region>) -> Result<T, Fault<'id>>,
     ) -> Result<T, reply::Failure<crate::Error<'region, ID>, value::Bytes<'arena, 'credits, 'region>>>
     {
-        Self::with(reply, |wire| {
-            decode(&wire).map_err(|error| wire.failure(error))
+        Self::with(reply, |wire| match decode(&wire) {
+            Ok(value) => Ok(value),
+            Err(error) => Err(wire.failure(error)),
         })
     }
 

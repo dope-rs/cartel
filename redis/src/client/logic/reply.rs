@@ -45,6 +45,33 @@ pub(super) fn push<'e, 's, 'b, 'c, 'd, const ID: u8>(
     }
 }
 
+fn accepts_frame(status: &conn::CloseStatus) -> bool {
+    matches!(
+        status,
+        conn::CloseStatus::Open
+            | conn::CloseStatus::Closing(
+                conn::ClosePhase::Withdrawing
+                    | conn::ClosePhase::Requested
+                    | conn::ClosePhase::Quarantining,
+                _,
+            )
+    )
+}
+
+pub(super) fn reject<'d, const ID: u8>(
+    port: &crate::Port<'_, '_, '_, '_, 'd, ID>,
+    failure: protocol::Failure,
+    ctx: &mut turns::Context<'_, '_, 'd, protocol::ConnState, Buffer, route::KeyTag<ID>>,
+) {
+    let status = ctx.close_status();
+    if accepts_frame(&status)
+        || matches!(status, conn::CloseStatus::Closing(conn::ClosePhase::Retiring, rule)
+            if matches!(rule.reason(), close::Reason::Remote))
+    {
+        fail(port, client::Failure::protocol(failure), ctx);
+    }
+}
+
 pub(super) fn deliver<
     'e,
     's,
@@ -60,31 +87,12 @@ pub(super) fn deliver<
     decoded: Result<protocol::Decoded<'s, 'd, 'd>, scope::Error>,
     ctx: &mut turns::Context<'_, 'e, 'd, protocol::ConnState, Buffer, route::KeyTag<ID>>,
 ) -> Option<Pending<'s, 'd>> {
-    match ctx.close_status() {
-        conn::CloseStatus::Open
-        | conn::CloseStatus::Closing(
-            conn::ClosePhase::Withdrawing
-            | conn::ClosePhase::Requested
-            | conn::ClosePhase::Quarantining,
-            _,
-        ) => {}
-        conn::CloseStatus::Closing(conn::ClosePhase::Retiring, directive)
-            if matches!(directive.reason(), close::Reason::Remote) =>
-        {
-            if let Ok(protocol::Decoded::Rejected(failure)) = decoded {
-                fail(port, client::Failure::protocol(failure), ctx);
-            }
-            return None;
-        }
-        conn::CloseStatus::Closing(
-            conn::ClosePhase::Retiring
-            | conn::ClosePhase::Settled
-            | conn::ClosePhase::Finalized
-            | conn::ClosePhase::Claimed,
-            _,
-        ) => return None,
-    }
     match decoded {
+        Ok(protocol::Decoded::Rejected(failure)) => {
+            reject(port, failure, ctx);
+            None
+        }
+        _ if !accepts_frame(&ctx.close_status()) => None,
         Ok(protocol::Decoded::Frame(frame, lane)) => {
             let pending = Pending(frame, lane);
             match ctx.state.phase() {
@@ -100,10 +108,6 @@ pub(super) fn deliver<
                 }
                 protocol::Phase::Ready => push(port, pending, ctx),
             }
-        }
-        Ok(protocol::Decoded::Rejected(failure)) => {
-            fail(port, client::Failure::protocol(failure), ctx);
-            None
         }
         Ok(protocol::Decoded::Retain(error)) => {
             let failure = match ctx.state.phase() {

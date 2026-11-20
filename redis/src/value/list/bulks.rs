@@ -122,12 +122,8 @@ impl<'s, 'arena, 'credits, 'region> source::Bulks for Array<'s, 'arena, 'credits
     }
 }
 
-impl<'s, 'arena, 'credits, 'region, const ID: u8> value::Decode<'s, 'arena, 'credits, 'region, ID>
-    for Array<'s, 'arena, 'credits, 'region>
-{
-    type Output = Self;
-
-    fn decode(
+impl<'s, 'arena, 'credits, 'region> Array<'s, 'arena, 'credits, 'region> {
+    pub fn try_decode<const ID: u8>(
         reply: value::Reply<'s, 'arena, 'credits, 'region>,
     ) -> Result<
         Self,
@@ -199,12 +195,8 @@ impl<'s, 'arena, 'credits, 'region> source::Optional for Optional<'s, 'arena, 'c
     }
 }
 
-impl<'s, 'arena, 'credits, 'region, const ID: u8> value::Decode<'s, 'arena, 'credits, 'region, ID>
-    for Optional<'s, 'arena, 'credits, 'region>
-{
-    type Output = Self;
-
-    fn decode(
+impl<'s, 'arena, 'credits, 'region> Optional<'s, 'arena, 'credits, 'region> {
+    pub(crate) fn try_decode<const ID: u8>(
         reply: value::Reply<'s, 'arena, 'credits, 'region>,
     ) -> Result<
         Self,

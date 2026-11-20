@@ -20,10 +20,6 @@ pub struct Parsed<'input, 'd, 'storage, 'g, R: buffer::Cursor> {
 }
 
 impl<'input, 'd, 'storage, 'g, R: buffer::Cursor> Parsed<'input, 'd, 'storage, 'g, R> {
-    pub(crate) fn as_slice(&self) -> &'input [u8] {
-        self.frame.as_slice()
-    }
-
     pub(crate) fn into_stored(
         self,
         policy: hold::Policy,

@@ -223,30 +223,23 @@ impl<'storage, 'g> codec::Stateful for Codec<'storage, 'g> {
 }
 
 impl<'storage, 'g> Codec<'storage, 'g> {
-    pub fn decode<'d, S, T, F>(
+    pub fn decode<'d, S, T>(
         &self,
         storage: &mut S,
         state: &mut parser::Parser<'storage, 'g>,
         budget: &resident::Budget<'d>,
         limit: Limit,
-        admit: impl FnOnce(Result<Result<&[u8], &Failure>, &scope::Error>) -> codec::Admission<F>,
+        deliver: impl FnOnce(Result<Decoded<'storage, 'd, 'g>, scope::Error>) -> T::Accepted,
     ) -> codec::Step<T>
     where
         S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
         T: response::Outcome,
-        F: FnOnce(
-            Result<Decoded<'storage, 'd, 'g>, scope::Error>,
-            &mut parser::Parser<'storage, 'g>,
-        ) -> T::Accepted,
     {
         codec::Input::commit(storage, budget, limit, |input| {
-            let parsed = match state.scan(&input, self.frame, self.values) {
+            let (decoded, consumed) = match state.scan(&input, self.frame, self.values) {
                 parser::Scan::Source(error) => {
                     state.reset();
-                    return Err(match admit(Err(&error)) {
-                        codec::Admission::RetryInput => T::retry_input(),
-                        codec::Admission::Ready(emit) => T::accept(emit(Err(error), state)),
-                    });
+                    return Err(T::accept(deliver(Err(error))));
                 }
                 parser::Scan::Blocked => return Ok(codec::Parse::Blocked),
                 parser::Scan::Pending => {
@@ -255,79 +248,33 @@ impl<'storage, 'g> Codec<'storage, 'g> {
                         None => codec::Parse::CapacityExhausted,
                     });
                 }
-                parser::Scan::Complete(frame, consumed) => (Ok(frame), consumed),
-                parser::Scan::Invalid(error, consumed) => {
-                    state.reset();
-                    (Err(Failure::Invalid(error)), consumed)
+                parser::Scan::Complete(frame, consumed) => {
+                    let decoded = match frame.into_stored(self.keep) {
+                        Ok((frame, lane)) => Decoded::Frame(frame, lane),
+                        Err(error) => Decoded::Retain(error),
+                    };
+                    (decoded, consumed)
                 }
-                parser::Scan::FrameCapacity(error, consumed) => {
+                parser::Scan::Rejected(failure, consumed) => {
                     state.reset();
-                    (Err(Failure::FrameCapacity(error)), consumed)
-                }
-                parser::Scan::ValueCapacity(error, consumed) => {
-                    state.reset();
-                    (Err(Failure::ValueCapacity(error)), consumed)
+                    (Decoded::Rejected(failure), consumed)
                 }
                 parser::Scan::RetainCapacity => return Ok(codec::Parse::CapacityExhausted),
             };
-            let (head, consumed) = parsed;
-            let emit = match admit(Ok(head.as_ref().map(frame::Parsed::as_slice))) {
-                codec::Admission::RetryInput => {
-                    state.reset();
-                    return Ok(codec::Parse::Item {
-                        head: T::retry_input(),
-                        consumed,
-                    });
-                }
-                codec::Admission::Ready(emit) => emit,
-            };
-            let decoded = match head {
-                Ok(frame) => match frame.into_stored(self.keep) {
-                    Ok((frame, lane)) => Decoded::Frame(frame, lane),
-                    Err(error) => Decoded::Retain(error),
-                },
-                Err(failure) => Decoded::Rejected(failure),
-            };
             Ok(codec::Parse::Item {
-                head: T::accept(emit(Ok(decoded), state)),
+                head: T::accept(deliver(Ok(decoded))),
                 consumed,
             })
         })
     }
 
-    pub fn finish<'slot, 'id, 'd, S, T, F>(
+    pub fn finish(
         &self,
-        mut owner: storage::Owner<'slot, 'id, S, parser::Parser<'storage, 'g>>,
-        budget: &resident::Budget<'d>,
-        limit: Limit,
-        admit: impl FnOnce(Result<Result<&[u8], &Failure>, &scope::Error>) -> codec::Admission<F>,
-    ) -> (
-        storage::Owner<'slot, 'id, S, parser::Parser<'storage, 'g>>,
-        Result<codec::Finish<T>, T>,
-    )
-    where
-        S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
-        T: response::Outcome,
-        F: FnOnce(
-            Result<Decoded<'storage, 'd, 'g>, scope::Error>,
-            &mut parser::Parser<'storage, 'g>,
-        ) -> T::Accepted,
-    {
-        let (storage, state) = owner.parts();
-        let result = codec::Input::with(storage, budget, limit, |input| {
-            let Some(actual) = num::NonZero::<usize>::new(input.len()) else {
-                state.reset();
-                return Ok(codec::Finish::Empty);
-            };
-            let failure = state.finish(actual, self.frame);
-            Ok(codec::Finish::Item(match admit(Ok(Err(&failure))) {
-                codec::Admission::RetryInput => T::retry_input(),
-                codec::Admission::Ready(emit) => {
-                    state.reset();
-                    T::accept(emit(Ok(Decoded::Rejected(failure)), state))
-                }
-            }))
-        });
-        (owner, result)
+        buffered: usize,
+        state: &mut parser::Parser<'storage, 'g>,
+    ) -> Option<Failure> {
+        let failure = num::NonZero::new(buffered).map(|actual| state.finish(actual, self.frame));
+        state.reset();
+        failure
     }
 }

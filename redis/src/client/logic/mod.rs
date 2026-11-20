@@ -36,7 +36,7 @@ use crate::{
         settings::init::{Plan, Step},
     },
     port,
-    protocol::{Phase, parser::Parser},
+    protocol::Phase,
 };
 mod pending;
 pub(super) use pending::Pending;
@@ -677,23 +677,21 @@ where
         S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
     {
         let codec = owner.logic().codec;
-        codec.decode(storage, state, budget, limit, |_| {
-            codec::Admission::Ready(|decoded, _: &mut Parser<'s, 'd>| {
-                reply::deliver::<I, ID, EXPECTED, COUNT>(owner.root().port(), decoded, ctx)
-            })
+        codec.decode(storage, state, budget, limit, |decoded| {
+            reply::deliver::<I, ID, EXPECTED, COUNT>(owner.root().port(), decoded, ctx)
         })
     }
 
     fn finish<'slot, 'id, S>(
         owner: &mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
-        input: storage::Owner<
+        mut input: storage::Owner<
             'slot,
             'id,
             <Self::Codec as codec::Stateful>::Storage<S>,
             <Self::Codec as codec::Stateful>::State<'d>,
         >,
-        budget: &resident::Budget<'d>,
-        limit: Limit,
+        _: &resident::Budget<'d>,
+        _: Limit,
         ctx: &mut turns::Context<'_, '_, 'd, Self::ConnState, Self::Send, route::KeyTag<ID>>,
     ) -> (
         storage::Owner<
@@ -710,11 +708,14 @@ where
     where
         S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
     {
-        let codec = owner.logic().codec;
-        codec.finish(input, budget, limit, |_| {
-            codec::Admission::Ready(|decoded, _: &mut Parser<'s, 'd>| {
-                reply::deliver::<I, ID, EXPECTED, COUNT>(owner.root().port(), decoded, ctx)
-            })
-        })
+        let (storage, state) = input.parts();
+        let finish = match owner.logic().codec.finish(storage.as_ref().len(), state) {
+            Some(failure) => {
+                reply::reject(owner.root().port(), failure, ctx);
+                codec::Finish::Item(response::Outcome::committed())
+            }
+            None => codec::Finish::Empty,
+        };
+        (input, Ok(finish))
     }
 }

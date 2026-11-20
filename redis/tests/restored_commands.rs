@@ -1,6 +1,7 @@
 use cartel_redis::api::{Client as _, Commands as _, decode};
 use cartel_redis::value::source::{
-    Bulks as _, Bytes as _, Coordinates as _, Reader as _, Reply as _, Scan as _, Scored as _,
+    Bulks as _, Bytes as _, Coordinates as _, Error as _, Reader as _, Reply as _, Scan as _,
+    Scored as _,
 };
 use std::{num::NonZero, time::Duration};
 
@@ -9,7 +10,7 @@ use cartel_redis::{
         nonempty::Slice,
         ops::commands::{geo::Unit, strings::Operation},
     },
-    value::reply,
+    value::{list::bulks, reply},
 };
 use common::{
     command::{list, restored::SCRIPT},
@@ -200,7 +201,13 @@ fn preserves_wire_and_geo() {
                 let mut reader = user.reader();
                 assert!(matches!(reader.next_event(), Some(cartel_redis::value::Event::Nil)));
                 assert!(reader.finish().is_ok());
-                drop(user);
+                let empty = bulks::Array::try_decode::<0>(user)
+                    .map_err(|failure| failure.kind())
+                    .expect("nil bulk array");
+                let (empty, length) = empty.try_exact::<1>().err().expect("empty array width").into_parts();
+                assert_eq!((length.width, length.actual), (1, 0));
+                assert!(empty.is_empty());
+                drop(empty);
                 let rules = [b"on".as_slice(), b">s\0".as_slice()];
                 assert!(matches!(runtime.block_on(redis.server().set_user(b"user", &rules)),
                     Ok(Err(reply::Failure::Server(value)))

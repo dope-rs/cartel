@@ -1,10 +1,8 @@
-use dope::core::io::transfer;
 use dope::manifold::client::session::codec;
-use o3::buffer::write::consume::scope;
 use o3::{buffer, depot::array::copy};
 use std::{mem, num};
 
-use crate::protocol::{self, parser};
+use crate::protocol::{self, Failure, parser};
 use parser::{frame, limit, number, storage};
 
 #[derive(Default)]
@@ -108,22 +106,6 @@ impl State {
         }
     }
 
-    fn consumed<'id, 'input, 'd, 'storage, 'g, R: buffer::Cursor>(
-        buf: &codec::Input<'id, 'input, 'd, R>,
-        amount: num::NonZero<usize>,
-        build: impl FnOnce(
-            scope::End<'id, { transfer::MAX_BYTES as u32 }>,
-        ) -> parser::Scan<'id, 'input, 'd, 'storage, 'g, R>,
-    ) -> parser::Scan<'id, 'input, 'd, 'storage, 'g, R>
-    where
-        'd: 'input,
-    {
-        match buf.try_consumed(amount) {
-            Ok(consumed) => build(consumed),
-            Err(cause) => parser::Scan::Source(cause),
-        }
-    }
-
     fn finish_value(&mut self, end: limit::End) -> Completion {
         loop {
             let Some(left) = self.left.last_mut() else {
@@ -182,98 +164,68 @@ impl State {
             self.reset();
             builder.reset();
         }
-        loop {
+        let (failure, amount) = loop {
             match mem::take(&mut self.mode) {
                 mode @ (Mode::Start | Mode::Marker(_)) => {
                     let cursor = mode.cursor();
-                    self.mode = mode;
                     let Some(marker) = bytes.get(cursor) else {
+                        self.mode = mode;
                         return parser::Scan::Pending;
                     };
                     let end = match byte_max.next(cursor) {
                         Ok(end) => end,
-                        Err(error) => {
-                            return Self::consumed(buf, byte_max.consumed(), |consumed| {
-                                parser::Scan::FrameCapacity(error, consumed)
-                            });
-                        }
+                        Err(error) => break (Failure::FrameCapacity(error), byte_max.consumed()),
                     };
                     let slot = match node_max.next(builder.len()) {
                         Ok(slot) => slot,
-                        Err(error) => {
-                            return Self::consumed(buf, end.consumed(), |consumed| {
-                                parser::Scan::ValueCapacity(error, consumed)
-                            });
-                        }
+                        Err(error) => break (Failure::ValueCapacity(error), end.consumed()),
                     };
-                    let offset = end.count().get() - 1;
-                    let marker = *marker;
-                    self.mode = Mode::Marker(end);
-                    self.scan = end.get();
-                    let kind = match marker {
+                    let kind = match *marker {
                         b'+' => protocol::Line::Status,
                         b'-' => protocol::Line::Server,
                         b':' => protocol::Line::Integer,
                         b'$' => protocol::Line::Bulk,
                         b'*' => protocol::Line::Array,
                         marker => {
-                            return Self::consumed(buf, end.consumed(), |consumed| {
-                                parser::Scan::Invalid(
-                                    protocol::Error::Marker {
-                                        offset,
-                                        actual: marker,
-                                    },
-                                    consumed,
-                                )
-                            });
+                            let error = protocol::Error::Marker {
+                                offset: end.count().get() - 1,
+                                actual: marker,
+                            };
+                            break (Failure::Invalid(error), end.consumed());
                         }
                     };
+                    self.scan = end.get();
                     self.mode.line(kind, end, slot);
                 }
                 Mode::Line { kind, pending } => {
                     let line = match limit::Line::find(bytes, pending.start, self.scan, kind) {
                         Ok(Some(line)) => line,
                         Ok(None) => {
+                            if let Err(error) = byte_max.check(bytes.len()) {
+                                break (Failure::FrameCapacity(error), byte_max.consumed());
+                            }
                             self.scan = bytes.len().saturating_sub(1).max(pending.start.get());
                             self.mode = Mode::Line { kind, pending };
-                            return match byte_max.check(bytes.len()) {
-                                Ok(()) => parser::Scan::Pending,
-                                Err(error) => {
-                                    Self::consumed(buf, byte_max.consumed(), |consumed| {
-                                        parser::Scan::FrameCapacity(error, consumed)
-                                    })
-                                }
-                            };
+                            return parser::Scan::Pending;
                         }
                         Err((offset, expected, actual)) => {
-                            self.mode = Mode::Line { kind, pending };
-                            return match byte_max.next(offset) {
-                                Ok(end) => Self::consumed(buf, end.consumed(), |consumed| {
-                                    parser::Scan::Invalid(
-                                        protocol::Error::Terminator {
-                                            offset: end.count().get() - 1,
-                                            expected,
-                                            actual,
-                                        },
-                                        consumed,
-                                    )
-                                }),
+                            let end = match byte_max.next(offset) {
+                                Ok(end) => end,
                                 Err(error) => {
-                                    Self::consumed(buf, byte_max.consumed(), |consumed| {
-                                        parser::Scan::FrameCapacity(error, consumed)
-                                    })
+                                    break (Failure::FrameCapacity(error), byte_max.consumed());
                                 }
                             };
+                            let error = protocol::Error::Terminator {
+                                offset: end.count().get() - 1,
+                                expected,
+                                actual,
+                            };
+                            break (Failure::Invalid(error), end.consumed());
                         }
                     };
                     let (end, body) = match byte_max.line(line) {
                         Ok(found) => found,
-                        Err(error) => {
-                            self.mode = Mode::Line { kind, pending };
-                            return Self::consumed(buf, byte_max.consumed(), |consumed| {
-                                parser::Scan::FrameCapacity(error, consumed)
-                            });
-                        }
+                        Err(error) => break (Failure::FrameCapacity(error), byte_max.consumed()),
                     };
                     let start = pending.start;
                     let slot = pending.slot;
@@ -295,16 +247,8 @@ impl State {
                             let integer = match number::Number::new(line, body).signed() {
                                 Ok(integer) => integer,
                                 Err(cause) => {
-                                    self.mode.line(kind, start, slot);
-                                    return Self::consumed(buf, end.consumed(), |consumed| {
-                                        parser::Scan::Invalid(
-                                            protocol::Error::Number {
-                                                line: protocol::Line::Integer,
-                                                cause,
-                                            },
-                                            consumed,
-                                        )
-                                    });
+                                    let error = protocol::Error::Number { line: kind, cause };
+                                    break (Failure::Invalid(error), end.consumed());
                                 }
                             };
                             parser::Kind::Integer(integer)
@@ -314,12 +258,7 @@ impl State {
                                 .length(protocol::Line::Bulk)
                             {
                                 Ok(length) => length,
-                                Err(error) => {
-                                    self.mode.line(kind, start, slot);
-                                    return Self::consumed(buf, end.consumed(), |consumed| {
-                                        parser::Scan::Invalid(error, consumed)
-                                    });
-                                }
+                                Err(error) => break (Failure::Invalid(error), end.consumed()),
                             };
                             match length {
                                 number::Length::Nil => parser::Kind::Nil,
@@ -327,14 +266,7 @@ impl State {
                                     let finish = match byte_max.body(end, length) {
                                         Ok(finish) => finish,
                                         Err(error) => {
-                                            self.mode.line(kind, start, slot);
-                                            return Self::consumed(
-                                                buf,
-                                                end.consumed(),
-                                                |consumed| {
-                                                    parser::Scan::FrameCapacity(error, consumed)
-                                                },
-                                            );
+                                            break (Failure::FrameCapacity(error), end.consumed());
                                         }
                                     };
                                     self.mode.bulk(finish, slot);
@@ -347,12 +279,7 @@ impl State {
                                 .length(protocol::Line::Array)
                             {
                                 Ok(count) => count,
-                                Err(error) => {
-                                    self.mode.line(kind, start, slot);
-                                    return Self::consumed(buf, end.consumed(), |consumed| {
-                                        parser::Scan::Invalid(error, consumed)
-                                    });
-                                }
+                                Err(error) => break (Failure::Invalid(error), end.consumed()),
                             };
                             match count {
                                 number::Length::Nil => parser::Kind::Nil,
@@ -360,45 +287,27 @@ impl State {
                                     let count = match node_max.array(builder.len(), count) {
                                         Ok(count) => count,
                                         Err(error) => {
-                                            self.mode.line(kind, start, slot);
-                                            return Self::consumed(
-                                                buf,
-                                                end.consumed(),
-                                                |consumed| {
-                                                    parser::Scan::ValueCapacity(error, consumed)
-                                                },
-                                            );
+                                            break (Failure::ValueCapacity(error), end.consumed());
                                         }
                                     };
                                     let nested = match count.nonzero() {
                                         Some(declared) => match self.left.vacancy() {
                                             Some(vacant) => Some((vacant, declared)),
                                             None => {
-                                                self.mode.line(kind, start, slot);
-                                                return Self::consumed(
-                                                    buf,
-                                                    end.consumed(),
-                                                    |consumed| {
-                                                        parser::Scan::Invalid(
-                                                            protocol::Error::Depth {
-                                                                actual: limit::OVER_DEPTH,
-                                                                maximum: limit::DEPTH,
-                                                                declared,
-                                                            },
-                                                            consumed,
-                                                        )
-                                                    },
-                                                );
+                                                let error = protocol::Error::Depth {
+                                                    actual: limit::OVER_DEPTH,
+                                                    maximum: limit::DEPTH,
+                                                    declared,
+                                                };
+                                                break (Failure::Invalid(error), end.consumed());
                                             }
                                         },
                                         None => None,
                                     };
+                                    let value = parser::Kind::Array { len: count.get() };
                                     let stored = match Self::write(
                                         &mut self.mode,
-                                        builder.try_push(
-                                            slot,
-                                            parser::Kind::Array { len: count.get() },
-                                        ),
+                                        builder.try_push(slot, value),
                                         Restore::Line(kind, start),
                                     ) {
                                         Ok(stored) => stored,
@@ -441,22 +350,17 @@ impl State {
                         } else {
                             (offset + 1, b'\n', lf)
                         };
-                        self.mode.bulk(end, slot);
-                        return Self::consumed(buf, end.consumed(), |consumed| {
-                            parser::Scan::Invalid(
-                                protocol::Error::Terminator {
-                                    offset,
-                                    expected,
-                                    actual,
-                                },
-                                consumed,
-                            )
-                        });
+                        let error = protocol::Error::Terminator {
+                            offset,
+                            expected,
+                            actual,
+                        };
+                        break (Failure::Invalid(error), end.consumed());
                     }
-                    let span = parser::Span::terminated(end);
+                    let value = parser::Kind::Bulk(parser::Span::terminated(end));
                     let stored = match Self::write(
                         &mut self.mode,
-                        builder.try_push(slot, parser::Kind::Bulk(span)),
+                        builder.try_push(slot, value),
                         Restore::Bulk(end),
                     ) {
                         Ok(stored) => stored,
@@ -467,6 +371,10 @@ impl State {
                     }
                 }
             }
+        };
+        match buf.try_consumed(amount) {
+            Ok(consumed) => parser::Scan::Rejected(failure, consumed),
+            Err(error) => parser::Scan::Source(error),
         }
     }
 }

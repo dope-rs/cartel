@@ -7,7 +7,6 @@ use dope::{
     manifold::client::session::codec::Codec as _,
     manifold::client::session::codec::Stateful as _,
     manifold::client::session::codec::staging::{Limit, Policy},
-    manifold::client::session::codec::storage::Slot,
     manifold::client::session::response::Direct,
 };
 use o3::{
@@ -95,34 +94,8 @@ pub fn parse_chunk<'storage, 'g>(
         .ok_or(Error::Extent)?;
     try_with_budget(|budget| {
         let limit = staging_limit(codec)?;
-        let step: codec::Step<Direct> = codec.decode(&mut source, state, &budget, limit, |_| {
-            codec::Admission::Ready(|decoded, _: &mut parser::Parser<'storage, 'g>| use_(decoded))
-        });
+        let step = codec.decode(&mut source, state, &budget, limit, use_);
         Ok((source, step))
-    })
-    .map_err(Error::Budget)?
-}
-
-pub fn finish_chunk<'storage, 'g>(
-    codec: &protocol::Codec<'storage, 'g>,
-    state: parser::Parser<'storage, 'g>,
-    frame: &Shared,
-    use_: impl for<'d> FnOnce(Result<protocol::Decoded<'storage, 'd, 'g>, scope::Error>),
-) -> Result<codec::Finished<(Shared, parser::Parser<'storage, 'g>), Direct>, Error> {
-    let source = frame
-        .try_get(..)
-        .map_err(Error::Share)?
-        .ok_or(Error::Extent)?;
-    try_with_budget(|budget| {
-        let limit = staging_limit(codec)?;
-        let (input, result) = Slot::new((source, state)).run(|input| {
-            codec.finish(input, &budget, limit, |_| {
-                codec::Admission::Ready(|decoded, _: &mut parser::Parser<'storage, 'g>| {
-                    use_(decoded)
-                })
-            })
-        });
-        Ok((input.into_parts(), result))
     })
     .map_err(Error::Budget)?
 }

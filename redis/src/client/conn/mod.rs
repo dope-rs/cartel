@@ -20,9 +20,9 @@ impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Connection<'app, 's, '
     fn dispatch<'lease, R>(
         &'lease mut self,
         encode: impl FnOnce(encode::Encoder) -> Result<encode::Complete, request::Error> + 'lease,
-    ) -> impl abi::Fiber<'d, Output = Result<R, ReplyError<'b, 'c, 'd, ID>>> + 'lease
+    ) -> impl abi::Fiber<'d, Output = Result<R::Output, ReplyError<'b, 'c, 'd, ID>>> + 'lease
     where
-        R: value::Decode<'s, 'b, 'c, 'd, ID, Output = R> + 'lease,
+        R: api::decode::Decode<client::Redis<'app, 's, 'b, 'c, 'd, B, ID>> + 'lease,
     {
         let redis = self.lease.redis();
         let frame = redis.port.encode(redis.port.requests.frame(), encode);
@@ -55,7 +55,7 @@ impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> api::Connection<'d, ID
         'd,
         Output = Result<Option<value::Bytes<'b, 'c, 'd>>, ReplyError<'b, 'c, 'd, ID>>,
     > + '_ {
-        self.dispatch::<Option<value::Bytes<'b, 'c, 'd>>>(|out| {
+        self.dispatch::<api::decode::MaybeBytes>(|out| {
             out.command(&[b"CLIENT".as_slice(), b"GETNAME"])
         })
     }

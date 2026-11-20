@@ -8,10 +8,7 @@ use dope::core::{Errno, driver::result::SubmitCause};
 use o3::buffer::write::consume::scope;
 use o3::buffer::{hold, resident};
 
-use crate::api::{
-    self,
-    decode::{Adapter, Decode},
-};
+use crate::api::{self, decode::Decode};
 use crate::client::dispatch::command::{Command, Pooled};
 use crate::protocol::{self, parser};
 use crate::request::{self, encode};
@@ -383,7 +380,7 @@ impl<'app, 's, 'b, 'c: 'b, 'd: 'app + 'c, B: ?Sized, const ID: u8> api::Commands
 {
     type Client = Self;
     type Call<D: Decode<Self>> =
-        Command<'app, 's, 'b, 'c, 'd, Pooled<'app, 's, 'b, 'c, 'd, B, ID>, Adapter<Self, D>, ID>;
+        Command<'app, 's, 'b, 'c, 'd, Pooled<'app, 's, 'b, 'c, 'd, B, ID>, D, ID>;
 
     fn encode<D: Decode<Self>>(
         self,

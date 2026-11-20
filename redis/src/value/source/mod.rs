@@ -25,6 +25,8 @@ pub trait Control: Sealed {
 pub trait Bytes: Sealed + AsRef<[u8]> + ops::Deref<Target = [u8]> + Sized {
     fn as_slice(&self) -> &[u8];
     fn try_clone(&self) -> Result<Self, rc::Error>;
+    /// Transfers independent backing, returning the original owner otherwise.
+    fn try_owned(self) -> Result<o3::buffer::storage::Shared, Self>;
 }
 
 /// A command failure retaining its original cause and response owners.

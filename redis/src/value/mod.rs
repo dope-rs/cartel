@@ -1,7 +1,8 @@
 use std::mem;
 
-use crate::{client, protocol::parser};
+use crate::{Error, api::Storage, client, protocol::parser};
 use cartel_core::reply::retain;
+use list::{bulks, coords, pair};
 use parser::frame;
 use reply::Fault;
 
@@ -39,188 +40,17 @@ impl<'s, 'arena, 'credits, 'region> Reply<'s, 'arena, 'credits, 'region> {
     ) {
         (self.stored, self.keep)
     }
-}
 
-impl source::Sealed for Reply<'_, '_, '_, '_> {}
-
-impl source::Reply for Reply<'_, '_, '_, '_> {
-    fn reader(&self) -> impl source::Reader<'_> {
-        self.stored.reader()
-    }
-}
-
-/// A copyable borrowed event in the pre-order RESP tape.
-#[derive(Clone, Copy, Debug)]
-pub enum Event<'a> {
-    Nil,
-    Ok,
-    Status(&'a [u8]),
-    Integer(i64),
-    Bulk(&'a [u8]),
-    Array { len: usize },
-    Error(&'a [u8]),
-}
-
-/// Converts one retained RESP reply into a concrete result type.
-/// The reply keeps frame, tape, and credits after dispatch bookkeeping, including server errors.
-pub trait Decode<'s, 'arena, 'credits, 'region, const ID: u8 = 0> {
-    type Output;
-
-    fn decode(
-        reply: Reply<'s, 'arena, 'credits, 'region>,
+    pub(crate) fn try_pair<const ID: u8>(
+        self,
     ) -> Result<
-        Self::Output,
-        reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>,
-    >;
-}
-
-impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, 'region, ID>
-    for Reply<'s, 'arena, 'credits, 'region>
-{
-    type Output = Self;
-
-    fn decode(
-        reply: Reply<'s, 'arena, 'credits, 'region>,
-    ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
-    {
-        Ok(reply)
-    }
-}
-
-const _: () = assert!(
-    mem::size_of::<Reply<'static, 'static, 'static, 'static>>() == 8 * mem::size_of::<usize>()
-);
-
-impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, 'region, ID> for () {
-    type Output = Self;
-
-    fn decode(
-        reply: Reply<'s, 'arena, 'credits, 'region>,
-    ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
-    {
-        wire::Wire::discard(reply).map_err(reply::Failure::Server)
-    }
-}
-
-impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, 'region, ID>
-    for i64
-{
-    type Output = Self;
-
-    fn decode(
-        reply: Reply<'s, 'arena, 'credits, 'region>,
-    ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
-    {
-        wire::Wire::decode(reply, |wire| wire::Wire::signed(wire))
-    }
-}
-
-impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, 'region, ID>
-    for u64
-{
-    type Output = Self;
-
-    fn decode(
-        reply: Reply<'s, 'arena, 'credits, 'region>,
-    ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
-    {
-        wire::Wire::decode(reply, |wire| wire::Wire::unsigned(wire))
-    }
-}
-
-impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, 'region, ID>
-    for f64
-{
-    type Output = Self;
-
-    fn decode(
-        reply: Reply<'s, 'arena, 'credits, 'region>,
-    ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
-    {
-        wire::Wire::decode(reply, |wire| wire::Wire::float(wire))
-    }
-}
-
-impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, 'region, ID>
-    for client::GeoCoord
-{
-    type Output = Self;
-
-    fn decode(
-        reply: Reply<'s, 'arena, 'credits, 'region>,
-    ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
-    {
-        wire::Wire::decode(reply, |wire| wire::Wire::coordinate(wire))
-    }
-}
-
-impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, 'region, ID>
-    for bool
-{
-    type Output = Self;
-
-    fn decode(
-        reply: Reply<'s, 'arena, 'credits, 'region>,
-    ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
-    {
-        wire::Wire::decode(reply, |wire| wire::Wire::boolean(wire))
-    }
-}
-
-impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, 'region, ID>
-    for Bytes<'arena, 'credits, 'region>
-{
-    type Output = Self;
-
-    fn decode(
-        reply: Reply<'s, 'arena, 'credits, 'region>,
-    ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
-    {
-        Bytes::try_decode::<false, ID>(reply)
-    }
-}
-
-impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, 'region, ID>
-    for Option<Bytes<'arena, 'credits, 'region>>
-{
-    type Output = Self;
-
-    fn decode(
-        reply: Reply<'s, 'arena, 'credits, 'region>,
-    ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
-    {
-        wire::Wire::with(reply, |wire| {
-            let value = match wire.try_next() {
-                Ok(value) => value,
-                Err(error) => return Err(wire.failure(error)),
-            };
-            let span = match value {
-                parser::Value::Nil => None,
-                parser::Value::Bulk(span) => Some(span),
-                actual => {
-                    return Err(
-                        wire.failure(Fault::expected(reply::Expectation::BulkOrNil, actual))
-                    );
-                }
-            };
-            Ok(span.map(|span| wire.project(span)))
-        })
-    }
-}
-
-impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, 'region, ID>
-    for (
-        Bytes<'arena, 'credits, 'region>,
-        Bytes<'arena, 'credits, 'region>,
-    )
-{
-    type Output = Self;
-
-    fn decode(
-        reply: Reply<'s, 'arena, 'credits, 'region>,
-    ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
-    {
-        wire::Wire::with(reply, |wire| {
+        (
+            Bytes<'arena, 'credits, 'region>,
+            Bytes<'arena, 'credits, 'region>,
+        ),
+        reply::Failure<Error<'region, ID>, Bytes<'arena, 'credits, 'region>>,
+    > {
+        wire::Wire::with(self, |wire| {
             let array = match wire.nodes.array(wire.nodes.root()) {
                 Ok(array) => array,
                 Err(error) => {
@@ -265,28 +95,121 @@ impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, '
     }
 }
 
-impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, 'region, ID>
-    for Option<f64>
-{
-    type Output = Self;
+impl source::Sealed for Reply<'_, '_, '_, '_> {}
 
-    fn decode(
-        reply: Reply<'s, 'arena, 'credits, 'region>,
-    ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
-    {
-        wire::Wire::decode(reply, |wire| wire::Wire::opt_float(wire))
+impl source::Reply for Reply<'_, '_, '_, '_> {
+    fn reader(&self) -> impl source::Reader<'_> {
+        self.stored.reader()
     }
 }
 
-impl<'s, 'arena, 'credits, 'region, const ID: u8> Decode<'s, 'arena, 'credits, 'region, ID>
-    for Option<u64>
-{
-    type Output = Self;
+/// A copyable borrowed event in the pre-order RESP tape.
+#[derive(Clone, Copy, Debug)]
+pub enum Event<'a> {
+    Nil,
+    Ok,
+    Status(&'a [u8]),
+    Integer(i64),
+    Bulk(&'a [u8]),
+    Array { len: usize },
+    Error(&'a [u8]),
+}
 
-    fn decode(
-        reply: Reply<'s, 'arena, 'credits, 'region>,
-    ) -> Result<Self, reply::Failure<crate::Error<'region, ID>, Bytes<'arena, 'credits, 'region>>>
-    {
+const _: () = assert!(
+    mem::size_of::<Reply<'static, 'static, 'static, 'static>>() == 8 * mem::size_of::<usize>()
+);
+
+impl<'app, 's, 'b, 'c, 'd: 'app, B: ?Sized, const ID: u8> Storage
+    for client::Redis<'app, 's, 'b, 'c, 'd, B, ID>
+{
+    type DriverError = Error<'d, ID>;
+    type Bytes = Bytes<'b, 'c, 'd>;
+    type Error = reply::Failure<Error<'d, ID>, Self::Bytes>;
+    type Bulks = bulks::Array<'s, 'b, 'c, 'd>;
+    type Optional = bulks::Optional<'s, 'b, 'c, 'd>;
+    type Pairs = pair::BulkPairs<'s, 'b, 'c, 'd>;
+    type Scan = list::Scan<'s, 'b, 'c, 'd>;
+    type Reply = Reply<'s, 'b, 'c, 'd>;
+    type Text = pair::ScoredText<'s, 'b, 'c, 'd>;
+    type Scored = pair::ScoredBulks<'s, 'b, 'c, 'd>;
+    type Coordinates = coords::Coordinates<'s, 'b, 'c, 'd>;
+
+    fn unit(reply: Self::Reply) -> Result<(), Self::Error> {
+        wire::Wire::discard(reply).map_err(reply::Failure::Server)
+    }
+
+    fn signed(reply: Self::Reply) -> Result<i64, Self::Error> {
+        wire::Wire::decode(reply, |wire| wire::Wire::signed(wire))
+    }
+
+    fn unsigned(reply: Self::Reply) -> Result<u64, Self::Error> {
+        wire::Wire::decode(reply, |wire| wire::Wire::unsigned(wire))
+    }
+
+    fn boolean(reply: Self::Reply) -> Result<bool, Self::Error> {
+        wire::Wire::decode(reply, |wire| wire::Wire::boolean(wire))
+    }
+
+    fn float(reply: Self::Reply) -> Result<f64, Self::Error> {
+        wire::Wire::decode(reply, |wire| wire::Wire::float(wire))
+    }
+
+    fn optional_u64(reply: Self::Reply) -> Result<Option<u64>, Self::Error> {
         wire::Wire::decode(reply, |wire| wire::Wire::opt_unsigned(wire))
+    }
+
+    fn optional_f64(reply: Self::Reply) -> Result<Option<f64>, Self::Error> {
+        wire::Wire::decode(reply, |wire| wire::Wire::opt_float(wire))
+    }
+
+    fn coordinate(reply: Self::Reply) -> Result<client::GeoCoord, Self::Error> {
+        wire::Wire::decode(reply, |wire| wire::Wire::coordinate(wire))
+    }
+
+    fn maybe_bytes(reply: Self::Reply) -> Result<Option<Self::Bytes>, Self::Error> {
+        wire::Wire::with(reply, |wire| {
+            let value = match wire.try_next() {
+                Ok(value) => value,
+                Err(error) => return Err(wire.failure(error)),
+            };
+            let span = match value {
+                parser::Value::Nil => None,
+                parser::Value::Bulk(span) => Some(span),
+                actual => {
+                    return Err(
+                        wire.failure(Fault::expected(reply::Expectation::BulkOrNil, actual))
+                    );
+                }
+            };
+            Ok(span.map(|span| wire.project(span)))
+        })
+    }
+
+    fn bulks(reply: Self::Reply) -> Result<Self::Bulks, Self::Error> {
+        bulks::Array::try_decode::<ID>(reply)
+    }
+
+    fn optional(reply: Self::Reply) -> Result<Self::Optional, Self::Error> {
+        bulks::Optional::try_decode::<ID>(reply)
+    }
+
+    fn pairs(reply: Self::Reply) -> Result<Self::Pairs, Self::Error> {
+        pair::BulkPairs::try_decode::<ID>(reply)
+    }
+
+    fn scan(reply: Self::Reply) -> Result<Self::Scan, Self::Error> {
+        list::Scan::try_decode::<ID>(reply)
+    }
+
+    fn scored(reply: Self::Reply) -> Result<Self::Scored, Self::Error> {
+        pair::ScoredBulks::try_decode::<ID>(reply)
+    }
+
+    fn coordinates(reply: Self::Reply) -> Result<Self::Coordinates, Self::Error> {
+        coords::Coordinates::try_decode::<ID>(reply)
+    }
+
+    fn bytes<const TYPE_NAME: bool>(reply: Self::Reply) -> Result<Self::Bytes, Self::Error> {
+        Bytes::try_decode::<TYPE_NAME, ID>(reply)
     }
 }

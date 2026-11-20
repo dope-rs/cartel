@@ -24,12 +24,8 @@ impl<'s, 'arena, 'credits, 'region> source::Scan for Scan<'s, 'arena, 'credits, 
     }
 }
 
-impl<'s, 'arena, 'credits, 'region, const ID: u8> value::Decode<'s, 'arena, 'credits, 'region, ID>
-    for Scan<'s, 'arena, 'credits, 'region>
-{
-    type Output = Self;
-
-    fn decode(
+impl<'s, 'arena, 'credits, 'region> Scan<'s, 'arena, 'credits, 'region> {
+    pub(crate) fn try_decode<const ID: u8>(
         reply: value::Reply<'s, 'arena, 'credits, 'region>,
     ) -> Result<
         Self,

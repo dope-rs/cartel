@@ -1,4 +1,4 @@
-use o3::buffer::resident;
+use o3::buffer::{resident, storage};
 use o3::mem::rc;
 
 use std::ops;
@@ -66,6 +66,14 @@ impl source::Bytes for Bytes<'_, '_, '_> {
                 .map(retain::Bytes::try_clone)
                 .transpose()?,
         })
+    }
+
+    #[inline]
+    fn try_owned(self) -> Result<storage::Shared, Self> {
+        match self.inner.try_owned() {
+            Ok(bytes) => Ok(bytes),
+            Err(inner) => Err(Self { inner, ..self }),
+        }
     }
 }
 

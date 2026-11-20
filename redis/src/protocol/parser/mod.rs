@@ -257,16 +257,8 @@ pub(crate) enum Scan<'id, 'input, 'd, 'storage, 'g, R: buffer::Cursor> {
         frame::Parsed<'input, 'd, 'storage, 'g, R>,
         scope::End<'id, { transfer::MAX_BYTES as u32 }>,
     ),
-    Invalid(
-        protocol::Error,
-        scope::End<'id, { transfer::MAX_BYTES as u32 }>,
-    ),
-    FrameCapacity(
-        limit::Exceeded<limit::Frame>,
-        scope::End<'id, { transfer::MAX_BYTES as u32 }>,
-    ),
-    ValueCapacity(
-        limit::Exceeded<limit::Value>,
+    Rejected(
+        protocol::Failure,
         scope::End<'id, { transfer::MAX_BYTES as u32 }>,
     ),
     RetainCapacity,

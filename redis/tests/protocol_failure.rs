@@ -3,9 +3,8 @@ use cartel_redis::{
     value, value::source::Reader as _,
 };
 use common::{
-    protocol::config, protocol::finish_chunk, protocol::new_codec, protocol::parse_chunk,
-    protocol::staging_limit, protocol::try_with_budget, protocol::with_reply, protocol::with_state,
-    rejected,
+    protocol::config, protocol::new_codec, protocol::parse_chunk, protocol::staging_limit,
+    protocol::try_with_budget, protocol::with_reply, protocol::with_state, rejected,
 };
 use dope::manifold::client::session::codec::Stateful as _;
 use dope::manifold::client::session::{codec, response};
@@ -28,32 +27,20 @@ fn source_reuse() {
         let limit = staging_limit(&codec).expect("staging");
         let emitted = Cell::new(false);
         let step: codec::Step<response::Direct> =
-            codec.decode(&mut input, &mut state, &budget, limit, |preview| {
-                assert_eq!(preview.err(), Some(&expected));
-                codec::Admission::Ready(
-                    |decoded: Result<protocol::Decoded<'_, '_, '_>, scope::Error>,
-                     _: &mut parser::Parser<'_, '_>| {
-                        emitted.set(true);
-                        assert_eq!(decoded.err(), Some(expected));
-                    },
-                )
+            codec.decode(&mut input, &mut state, &budget, limit, |decoded| {
+                emitted.set(true);
+                assert_eq!(decoded.err(), Some(expected));
             });
         assert!(emitted.get());
         assert!(!step.has_consumed());
         assert_eq!(input.as_ref(), bytes);
         let step: codec::Step<response::Direct> =
-            codec.decode(&mut input, &mut state, &budget, limit, |_| {
-                codec::Admission::Ready(
-                    |decoded: Result<protocol::Decoded<'_, '_, '_>, scope::Error>,
-                     _: &mut parser::Parser<'_, '_>| {
-                        assert!(matches!(
-                            decoded,
-                            Ok(protocol::Decoded::Retain(hold::Error::Resident(
-                                resident::AllocError::Budget(error)
-                            ))) if error.into_parts() == (bytes.len().try_into().expect("nonempty"), 0)
-                        ));
-                    },
-                )
+            codec.decode(&mut input, &mut state, &budget, limit, |decoded| {
+                assert!(matches!(
+                    decoded,
+                    Ok(protocol::Decoded::Retain(hold::Error::Resident(resident::AllocError::Budget(error))))
+                         if error.into_parts() == (bytes.len().try_into().expect("nonempty"), 0)
+                ));
             });
         assert!(step.has_consumed());
         assert!(input.as_ref().is_empty());
@@ -276,22 +263,12 @@ fn retains_truncated_facts() {
         assert!(!step.has_consumed(), "a truncated bulk must not commit");
         assert_eq!(rest.as_slice(), bytes);
         assert!(!emitted.get(), "a truncated bulk must not decode");
-        let ((_, _state), next) = finish_chunk(&codec, state, &frame, |decoded| {
-            assert!(
-                matches!(
-                    decoded,
-                    Ok(protocol::Decoded::Rejected(protocol::Failure::Invalid(
-                        protocol::Error::Truncated(protocol::Truncated::Bulk { actual, required })
-                    ))) if actual.get() == 5 && required.get() == 9
-                ),
-                "finish must retain the exact truncated bulk extent"
-            );
-        })
-        .expect("protocol fixture");
-        assert!(
-            matches!(next, Ok(codec::Finish::Item(response::Direct::Committed))),
-            "finish must deliver one truncated item"
-        );
+        assert!(matches!(
+            codec.finish(frame.len(), &mut state),
+            Some(protocol::Failure::Invalid(protocol::Error::Truncated(
+                protocol::Truncated::Bulk { actual, required }
+            ))) if actual.get() == 5 && required.get() == 9
+        ));
     })
     .expect("protocol fixture");
 }
@@ -303,28 +280,13 @@ fn rejects_unparsed_eof() {
     let codec = new_codec(config(4, 1).expect("codec limits"), &store);
     with_state(&codec, |mut state| {
         for bytes in [b":1\r\n".as_slice(), b":12\r\n".as_slice()] {
-            let frame = Shared::try_copy(bytes).expect("input frame");
-            let ((_, parser), next) = finish_chunk(&codec, state, &frame, |decoded| {
-                assert!(match (bytes.len(), decoded) {
-                    (
-                        4,
-                        Ok(protocol::Decoded::Rejected(protocol::Failure::Invalid(
-                            protocol::Error::Unparsed { actual },
-                        ))),
-                    ) => actual.get() == 4,
-                    (
-                        5,
-                        Ok(protocol::Decoded::Rejected(protocol::Failure::FrameCapacity(error))),
-                    ) => error.required().get() == 5 && error.capacity().get() == 4,
-                    _ => false,
-                });
-            })
-            .expect("protocol fixture");
-            state = parser;
-            assert!(matches!(
-                next,
-                Ok(codec::Finish::Item(response::Direct::Committed))
-            ));
+            assert!(match (bytes.len(), codec.finish(bytes.len(), &mut state)) {
+                (4, Some(protocol::Failure::Invalid(protocol::Error::Unparsed { actual }))) =>
+                    actual.get() == 4,
+                (5, Some(protocol::Failure::FrameCapacity(error))) =>
+                    error.required().get() == 5 && error.capacity().get() == 4,
+                _ => false,
+            });
         }
     })
     .expect("protocol fixture");
@@ -344,21 +306,12 @@ fn eof_depth() {
             parse_chunk(&codec, &mut state, &input, |_| emitted.set(true)).expect("decode");
         assert!(!step.has_consumed());
         assert!(!emitted.get());
-        let ((_, _state), next) = finish_chunk(&codec, state, &input, |decoded| {
-            assert!(matches!(decoded,
-                Ok(protocol::Decoded::Rejected(protocol::Failure::Invalid(
-                    protocol::Error::Truncated(protocol::Truncated::Value {
-                        offset, depth, remaining,
-                    })
-                ))) if offset.get() as usize == input.len()
-                    && depth.get() as usize == parser::MAX_DEPTH
-                    && remaining.get() == 1
-            ));
-        })
-        .expect("finish");
         assert!(matches!(
-            next,
-            Ok(codec::Finish::Item(response::Direct::Committed))
+            codec.finish(input.len(), &mut state),
+            Some(protocol::Failure::Invalid(protocol::Error::Truncated(
+                protocol::Truncated::Value { offset, depth, remaining }
+            ))) if offset.get() as usize == input.len()
+                && depth.get() as usize == parser::MAX_DEPTH && remaining.get() == 1
         ));
     })
     .expect("state");
