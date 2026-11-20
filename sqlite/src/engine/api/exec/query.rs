@@ -1,8 +1,7 @@
-use crate::Cursor;
 use crate::api::exec;
 use crate::{api, catalogs, row, runtime};
 use dope_fiber::abi;
-use std::result;
+use std::{ops, result};
 
 pub struct Query<
     'query,
@@ -88,10 +87,11 @@ impl<'query, 'connection: 'query, 'd: 'connection, I: catalogs::Catalog>
         self,
         stmt: catalogs::Statement<I, Q>,
         params: P,
-    ) -> Cursor<'query, 'connection, 'd, R, Q, P, I>
+        visit: impl for<'row> FnMut(R::Borrowed<'row>) -> ops::ControlFlow<()>,
+    ) -> impl abi::Fiber<'d, Output = result::Result<(), crate::Error>>
     where
         I: catalogs::HasQuery<Q>,
     {
-        Cursor::new(self.start.run(stmt, params))
+        exec::Rows::<I, Q, R, P, _>::new(self.start.run(stmt, params), visit)
     }
 }

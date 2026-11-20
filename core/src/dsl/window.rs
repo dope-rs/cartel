@@ -1,23 +1,10 @@
-use crate::dsl::never::Never;
-
-pub struct Expr<T>(Never<T>);
-pub struct Spec(Never<()>);
+pub struct Expr<T>(
+    std::convert::Infallible,
+    std::marker::PhantomData<fn(T) -> T>,
+);
 
 impl<T> Expr<T> {
-    pub fn over<F>(self, plan: F) -> T
-    where
-        F: FnOnce(Spec) -> Spec,
-    {
-        self.0.infer(plan)
-    }
-}
-
-impl Spec {
-    pub fn partition_by<T>(self, key: T) -> Self {
-        self.0.infer(key)
-    }
-
-    pub fn order_by<T>(self, key: T) -> Self {
-        self.0.infer(key)
+    pub fn value(self) -> T {
+        match self.0 {}
     }
 }

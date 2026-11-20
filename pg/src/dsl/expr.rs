@@ -1,4 +1,5 @@
 use crate::dsl;
+pub use cartel_core::dsl::expr::Text;
 use std::convert::Infallible;
 
 pub struct TsVector(Infallible);
@@ -11,48 +12,8 @@ impl TsVector {
     }
 }
 
-pub trait Text: Sized {
-    fn is_like<S: AsRef<str>>(&self, scope: &dsl::Scope, _: S) -> bool {
-        match scope.0 {}
-    }
-
-    fn is_ilike<S: AsRef<str>>(&self, scope: &dsl::Scope, _: S) -> bool {
-        match scope.0 {}
-    }
-
-    fn is_not_like<S: AsRef<str>>(&self, scope: &dsl::Scope, _: S) -> bool {
-        match scope.0 {}
-    }
-
-    fn is_not_ilike<S: AsRef<str>>(&self, scope: &dsl::Scope, _: S) -> bool {
-        match scope.0 {}
-    }
-
-    fn is_regex<S: AsRef<str>>(&self, scope: &dsl::Scope, _: S) -> bool {
-        match scope.0 {}
-    }
-
-    fn is_iregex<S: AsRef<str>>(&self, scope: &dsl::Scope, _: S) -> bool {
-        match scope.0 {}
-    }
-
-    fn is_mismatch<S: AsRef<str>>(&self, scope: &dsl::Scope, _: S) -> bool {
-        match scope.0 {}
-    }
-
-    fn is_imismatch<S: AsRef<str>>(&self, scope: &dsl::Scope, _: S) -> bool {
-        match scope.0 {}
-    }
-}
-
-impl Text for String {}
-
 pub trait In<T>: Sized {
     fn is_in(&self, scope: &dsl::Scope, _: &[T]) -> bool {
-        match scope.0 {}
-    }
-
-    fn is_not_in(&self, scope: &dsl::Scope, _: &[T]) -> bool {
         match scope.0 {}
     }
 }
@@ -61,10 +22,6 @@ impl In<Self> for i64 {}
 
 pub trait Array<T>: Sized {
     fn has_all(self, scope: &dsl::Scope, _: T) -> bool {
-        match scope.0 {}
-    }
-
-    fn has_any(self, scope: &dsl::Scope, _: T) -> bool {
         match scope.0 {}
     }
 }
@@ -76,10 +33,34 @@ pub trait Ltree: Sized {
     fn is_below(&self, scope: &dsl::Scope, _: crate::Ltree) -> bool {
         match scope.0 {}
     }
-
-    fn is_above(&self, scope: &dsl::Scope, _: crate::Ltree) -> bool {
-        match scope.0 {}
-    }
 }
 
 impl Ltree for crate::Ltree {}
+
+pub fn vector<S: AsRef<str>>(scope: &dsl::Scope, _: S) -> TsVector {
+    match scope.0 {}
+}
+
+pub fn query<S: AsRef<str>>(scope: &dsl::Scope, _: S) -> TsQuery {
+    match scope.0 {}
+}
+
+pub fn rank(scope: &dsl::Scope, _: TsVector, _: TsQuery) -> f32 {
+    match scope.0 {}
+}
+
+pub fn array_len<T>(scope: &dsl::Scope, _: T, _: i32) -> i32 {
+    match scope.0 {}
+}
+
+pub fn cardinality<T>(scope: &dsl::Scope, _: T) -> i32 {
+    match scope.0 {}
+}
+
+pub fn count<T>(scope: &dsl::Scope, _: T) -> i64 {
+    match scope.0 {}
+}
+
+pub fn lag<T, R>(scope: &dsl::Scope, _: T, _: i64) -> Option<R> {
+    match scope.0 {}
+}

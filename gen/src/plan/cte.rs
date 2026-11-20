@@ -1,9 +1,10 @@
+use crate::emit::token::{FROM, SELECT, WHERE, fragment};
 use crate::plan;
 use crate::pred;
 use crate::shape;
 use crate::shape::qualify;
 
-use crate::plan::read::{Qualify, filter, join_parts, project, select};
+use crate::plan::read::{Qualify, filter, project};
 
 pub(crate) fn build(
     state: &mut plan::State<'_, '_>,
@@ -11,29 +12,25 @@ pub(crate) fn build(
 ) -> syn::Result<(syn::Path, Vec<proc_macro2::TokenStream>)> {
     let mut quals = qualify::State::default();
     let after = quals.peel(inner)?;
-    let (source, ids, pred) = shape::QuerySource::parse_chain(after, &state.cte_map)?;
+    let shape::Selection {
+        source,
+        idents,
+        predicate,
+    } = shape::Selection::parse(after, &state.cte_map)?;
+    source.single_table("cte")?;
     let path = &source.primary_path;
-    let scope = pred::RowScope::for_source(&source, &ids)?;
+    let scope = pred::RowScope::for_source(&source, &idents)?;
     let tail = Qualify::new(&quals, None, &scope, state)?;
 
-    let ons = join_parts(state, &source)?;
+    let where_ = filter::build(state, predicate, &scope, false)?;
 
-    let where_ = filter::build(state, &pred, &scope, false)?;
-
-    let cols = if source.joins.is_empty() {
-        quote::quote! { <#path>::__CARTEL_SELECT_COLS }
-    } else {
-        state
-            .dialect
-            .columns(&syn::parse_quote!(#path), source.qualifier(0))
-    };
-
-    let mut sql = vec![state.dialect.kw("SELECT_KW")];
-    sql.extend(project::distinct(state, &quals, &scope)?);
-    sql.push(cols);
-    select::from_clause(&mut sql, &source, ons, state.dialect);
-    sql.push(state.dialect.kw("WHERE_KW"));
+    let mut sql = vec![fragment(SELECT)];
+    project::distinct(state, &quals, &scope, &mut sql)?;
+    sql.push(quote::quote! { <#path>::__CARTEL_SELECT_COLS });
+    sql.push(fragment(FROM));
+    sql.extend(source.render_base());
+    sql.push(fragment(WHERE));
     sql.extend(where_);
-    sql.extend(tail.render(state));
+    tail.render_into(state, &mut sql);
     Ok((source.primary_path, sql))
 }

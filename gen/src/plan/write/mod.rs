@@ -1,3 +1,4 @@
+use crate::emit::token::{COMMA, fragment};
 mod conflict;
 pub(in crate::plan) mod insert;
 pub(in crate::plan) mod reply;
@@ -14,7 +15,7 @@ fn assignments(
 
     for (index, assign) in values.into_iter().enumerate() {
         if index > 0 {
-            sql.push(state.dialect.kw("COMMA"));
+            sql.push(fragment(COMMA));
         }
         let column = format!("{} = ", assign.column.quoted());
         sql.push(quote::quote! { #column });

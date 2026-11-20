@@ -28,26 +28,26 @@ fn reject(column: i32, expected: row::Class, actual: &Value<'_>) -> crate::Error
     }
 }
 
-fn integer(row: &mut row::raw::Reader<'_>, column: i32) -> result::Result<i64, crate::Error> {
-    let value = match row.value()? {
-        Value::Integer(value) => value,
-        actual => return Err(reject(column, row::Class::Integer, &actual)),
-    };
-    Ok(value)
+fn integer(value: Value<'_>, column: i32) -> result::Result<i64, crate::Error> {
+    match value {
+        Value::Integer(value) => Ok(value),
+        actual => Err(reject(column, row::Class::Integer, &actual)),
+    }
 }
 
-unsafe impl Decode for i32 {
+trait Scalar: Copy + 'static {
+    fn read(value: Value<'_>, column: i32) -> result::Result<Self, crate::Error>;
+}
+
+// SAFETY: read receives one admitted value and returns a scalar independent of the row.
+unsafe impl<S: Scalar> Decode for S {
     const N_COLS: usize = 1;
     type Borrowed<'row> = Self;
     type Retention = modes::Plain;
 
     fn borrow<'row>(row: &mut row::raw::Reader<'row>) -> result::Result<Self, crate::Error> {
         let column = row.column();
-        let value = integer(row, column)?;
-        if value < i64::from(Self::MIN) || value > i64::from(Self::MAX) {
-            return Err(crate::Error::ColumnI32 { column, value });
-        }
-        Ok(value as Self)
+        S::read(row.value()?, column)
     }
 
     fn retain<'source, 'arena, T: Copy + 'arena>(
@@ -58,68 +58,32 @@ unsafe impl Decode for i32 {
     }
 }
 
-unsafe impl Decode for i64 {
-    const N_COLS: usize = 1;
-    type Borrowed<'row> = Self;
-    type Retention = modes::Plain;
-
-    fn borrow<'row>(row: &mut row::raw::Reader<'row>) -> result::Result<Self, crate::Error> {
-        let column = row.column();
-        integer(row, column)
-    }
-
-    fn retain<'source, 'arena, T: Copy + 'arena>(
-        value: Self,
-        _state: &mut <Self::Retention as modes::Kind>::State<'arena, T>,
-    ) -> result::Result<Self, crate::Error> {
-        Ok(value)
+impl Scalar for i32 {
+    fn read(value: Value<'_>, column: i32) -> result::Result<Self, crate::Error> {
+        let value = integer(value, column)?;
+        Self::try_from(value).map_err(|_| crate::Error::ColumnI32 { column, value })
     }
 }
 
-unsafe impl Decode for f64 {
-    const N_COLS: usize = 1;
-    type Borrowed<'row> = Self;
-    type Retention = modes::Plain;
+impl Scalar for i64 {
+    fn read(value: Value<'_>, column: i32) -> result::Result<Self, crate::Error> {
+        integer(value, column)
+    }
+}
 
-    fn borrow<'row>(
-        row: &mut row::raw::Reader<'row>,
-    ) -> result::Result<Self::Borrowed<'row>, crate::Error> {
-        let column = row.column();
-        match row.value()? {
+impl Scalar for f64 {
+    fn read(value: Value<'_>, column: i32) -> result::Result<Self, crate::Error> {
+        match value {
             Value::Integer(value) => Ok(value as Self),
             Value::Real(value) => Ok(value),
             actual => Err(reject(column, row::Class::Number, &actual)),
         }
     }
-
-    fn retain<'source, 'arena, T: Copy + 'arena>(
-        value: Self::Borrowed<'source>,
-        _state: &mut <Self::Retention as modes::Kind>::State<'arena, T>,
-    ) -> result::Result<Self::Borrowed<'arena>, crate::Error> {
-        Ok(value)
-    }
 }
 
-unsafe impl Decode for bool {
-    const N_COLS: usize = 1;
-    type Borrowed<'row> = Self;
-    type Retention = modes::Plain;
-
-    fn borrow<'row>(
-        row: &mut row::raw::Reader<'row>,
-    ) -> result::Result<Self::Borrowed<'row>, crate::Error> {
-        let column = row.column();
-        match row.value()? {
-            Value::Integer(value) => Ok(value != 0),
-            actual => Err(reject(column, row::Class::Integer, &actual)),
-        }
-    }
-
-    fn retain<'source, 'arena, T: Copy + 'arena>(
-        value: Self::Borrowed<'source>,
-        _state: &mut <Self::Retention as modes::Kind>::State<'arena, T>,
-    ) -> result::Result<Self::Borrowed<'arena>, crate::Error> {
-        Ok(value)
+impl Scalar for bool {
+    fn read(value: Value<'_>, column: i32) -> result::Result<Self, crate::Error> {
+        Ok(integer(value, column)? != 0)
     }
 }
 
@@ -196,16 +160,23 @@ unsafe impl<R: Decode> Decode for Option<R> {
     }
 }
 
+type Joined<L, R> = <L as modes::Kind>::With<R>;
+
+fn retain_field<'source, 'arena, R: Decode, K: modes::Contains<R::Retention>, T: Copy + 'arena>(
+    value: R::Borrowed<'source>,
+    state: &mut K::State<'arena, T>,
+) -> result::Result<R::Borrowed<'arena>, crate::Error> {
+    R::retain::<T>(value, K::get::<T>(state))
+}
+
 unsafe impl<A: Decode, B: Decode> Decode for (A, B)
 where
-    <<A as Decode>::Retention as modes::Kind>::With<<B as Decode>::Retention>:
-        modes::Contains<<A as Decode>::Retention>,
-    <<A as Decode>::Retention as modes::Kind>::With<<B as Decode>::Retention>:
-        modes::Contains<<B as Decode>::Retention>,
+    Joined<A::Retention, B::Retention>:
+        modes::Contains<A::Retention> + modes::Contains<B::Retention>,
 {
     const N_COLS: usize = A::N_COLS + B::N_COLS;
     type Borrowed<'row> = (A::Borrowed<'row>, B::Borrowed<'row>);
-    type Retention = <<A as Decode>::Retention as modes::Kind>::With<<B as Decode>::Retention>;
+    type Retention = Joined<A::Retention, B::Retention>;
 
     fn borrow<'row>(
         row: &mut row::raw::Reader<'row>,
@@ -218,36 +189,26 @@ where
         state: &mut <Self::Retention as modes::Kind>::State<'arena, T>,
     ) -> result::Result<Self::Borrowed<'arena>, crate::Error> {
         Ok((
-            A::retain(
-                value.0,
-                <Self::Retention as modes::Contains<<A as Decode>::Retention>>::get(state),
-            )?,
-            B::retain(
-                value.1,
-                <Self::Retention as modes::Contains<<B as Decode>::Retention>>::get(state),
-            )?,
+            retain_field::<A, Self::Retention, T>(value.0, state)?,
+            retain_field::<B, Self::Retention, T>(value.1, state)?,
         ))
     }
 }
 
-unsafe impl<A: Decode, B: Decode, C: Decode> Decode for (A, B, C,)
+unsafe impl<A: Decode, B: Decode, C: Decode> Decode for (A, B, C)
 where
-    <<<A as Decode>::Retention as modes::Kind>::With<<B as Decode>::Retention> as modes::Kind>::With<<C as Decode>::Retention>: modes::Contains<<A as Decode>::Retention>,
-    <<<A as Decode>::Retention as modes::Kind>::With<<B as Decode>::Retention> as modes::Kind>::With<<C as Decode>::Retention>: modes::Contains<<B as Decode>::Retention>,
-    <<<A as Decode>::Retention as modes::Kind>::With<<B as Decode>::Retention> as modes::Kind>::With<<C as Decode>::Retention>: modes::Contains<<C as Decode>::Retention>,
+    Joined<Joined<A::Retention, B::Retention>, C::Retention>: modes::Contains<A::Retention>
+        + modes::Contains<B::Retention>
+        + modes::Contains<C::Retention>,
 {
     const N_COLS: usize = A::N_COLS + B::N_COLS + C::N_COLS;
-    type Borrowed<'row> = (A::Borrowed<'row>, B::Borrowed<'row>, C::Borrowed<'row>,);
-    type Retention = <<<A as Decode>::Retention as modes::Kind>::With<<B as Decode>::Retention> as modes::Kind>::With<<C as Decode>::Retention>;
+    type Borrowed<'row> = (A::Borrowed<'row>, B::Borrowed<'row>, C::Borrowed<'row>);
+    type Retention = Joined<Joined<A::Retention, B::Retention>, C::Retention>;
 
     fn borrow<'row>(
         row: &mut row::raw::Reader<'row>,
     ) -> result::Result<Self::Borrowed<'row>, crate::Error> {
-        Ok((
-            A::borrow(row)?,
-            B::borrow(row)?,
-            C::borrow(row)?,
-        ))
+        Ok((A::borrow(row)?, B::borrow(row)?, C::borrow(row)?))
     }
 
     fn retain<'source, 'arena, T: Copy + 'arena>(
@@ -255,32 +216,28 @@ where
         state: &mut <Self::Retention as modes::Kind>::State<'arena, T>,
     ) -> result::Result<Self::Borrowed<'arena>, crate::Error> {
         Ok((
-            A::retain(
-                value.0,
-                <Self::Retention as modes::Contains<<A as Decode>::Retention>>::get(state),
-            )?,
-            B::retain(
-                value.1,
-                <Self::Retention as modes::Contains<<B as Decode>::Retention>>::get(state),
-            )?,
-            C::retain(
-                value.2,
-                <Self::Retention as modes::Contains<<C as Decode>::Retention>>::get(state),
-            )?,
+            retain_field::<A, Self::Retention, T>(value.0, state)?,
+            retain_field::<B, Self::Retention, T>(value.1, state)?,
+            retain_field::<C, Self::Retention, T>(value.2, state)?,
         ))
     }
 }
 
-unsafe impl<A: Decode, B: Decode, C: Decode, D: Decode> Decode for (A, B, C, D,)
+unsafe impl<A: Decode, B: Decode, C: Decode, D: Decode> Decode for (A, B, C, D)
 where
-    <<<<A as Decode>::Retention as modes::Kind>::With<<B as Decode>::Retention> as modes::Kind>::With<<C as Decode>::Retention> as modes::Kind>::With<<D as Decode>::Retention>: modes::Contains<<A as Decode>::Retention>,
-    <<<<A as Decode>::Retention as modes::Kind>::With<<B as Decode>::Retention> as modes::Kind>::With<<C as Decode>::Retention> as modes::Kind>::With<<D as Decode>::Retention>: modes::Contains<<B as Decode>::Retention>,
-    <<<<A as Decode>::Retention as modes::Kind>::With<<B as Decode>::Retention> as modes::Kind>::With<<C as Decode>::Retention> as modes::Kind>::With<<D as Decode>::Retention>: modes::Contains<<C as Decode>::Retention>,
-    <<<<A as Decode>::Retention as modes::Kind>::With<<B as Decode>::Retention> as modes::Kind>::With<<C as Decode>::Retention> as modes::Kind>::With<<D as Decode>::Retention>: modes::Contains<<D as Decode>::Retention>,
+    Joined<Joined<Joined<A::Retention, B::Retention>, C::Retention>, D::Retention>: modes::Contains<A::Retention>
+        + modes::Contains<B::Retention>
+        + modes::Contains<C::Retention>
+        + modes::Contains<D::Retention>,
 {
     const N_COLS: usize = A::N_COLS + B::N_COLS + C::N_COLS + D::N_COLS;
-    type Borrowed<'row> = (A::Borrowed<'row>, B::Borrowed<'row>, C::Borrowed<'row>, D::Borrowed<'row>,);
-    type Retention = <<<<A as Decode>::Retention as modes::Kind>::With<<B as Decode>::Retention> as modes::Kind>::With<<C as Decode>::Retention> as modes::Kind>::With<<D as Decode>::Retention>;
+    type Borrowed<'row> = (
+        A::Borrowed<'row>,
+        B::Borrowed<'row>,
+        C::Borrowed<'row>,
+        D::Borrowed<'row>,
+    );
+    type Retention = Joined<Joined<Joined<A::Retention, B::Retention>, C::Retention>, D::Retention>;
 
     fn borrow<'row>(
         row: &mut row::raw::Reader<'row>,
@@ -298,22 +255,10 @@ where
         state: &mut <Self::Retention as modes::Kind>::State<'arena, T>,
     ) -> result::Result<Self::Borrowed<'arena>, crate::Error> {
         Ok((
-            A::retain(
-                value.0,
-                <Self::Retention as modes::Contains<<A as Decode>::Retention>>::get(state),
-            )?,
-            B::retain(
-                value.1,
-                <Self::Retention as modes::Contains<<B as Decode>::Retention>>::get(state),
-            )?,
-            C::retain(
-                value.2,
-                <Self::Retention as modes::Contains<<C as Decode>::Retention>>::get(state),
-            )?,
-            D::retain(
-                value.3,
-                <Self::Retention as modes::Contains<<D as Decode>::Retention>>::get(state),
-            )?,
+            retain_field::<A, Self::Retention, T>(value.0, state)?,
+            retain_field::<B, Self::Retention, T>(value.1, state)?,
+            retain_field::<C, Self::Retention, T>(value.2, state)?,
+            retain_field::<D, Self::Retention, T>(value.3, state)?,
         ))
     }
 }

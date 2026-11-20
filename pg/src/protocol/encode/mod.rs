@@ -23,8 +23,8 @@ pub const fn format_codes<const PARAMETERS: bool>(values: &'static [u16]) -> &'s
 }
 
 #[doc(hidden)]
-pub const fn result_formats<const N: usize>(shape: &crate::schema::desc::Formats) -> [u16; N] {
-    use crate::schema::desc::Formats;
+pub const fn result_formats<R: crate::schema::Row, const N: usize>() -> &'static [u16] {
+    use crate::schema::desc::{Formats, Validate as _};
 
     const fn write(shape: &Formats, out: &mut [u16], at: &mut usize) {
         match shape {
@@ -44,10 +44,14 @@ pub const fn result_formats<const N: usize>(shape: &crate::schema::desc::Formats
         }
     }
     // Query admission reports a custom declaration with too many or too few fields.
-    let mut codes = [1; N];
-    let mut at = 0;
-    write(shape, &mut codes, &mut at);
-    codes
+    const {
+        format_codes::<false>(&const {
+            let mut codes = [1; N];
+            let mut at = 0;
+            write(&R::Description::FORMATS, &mut codes, &mut at);
+            codes
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

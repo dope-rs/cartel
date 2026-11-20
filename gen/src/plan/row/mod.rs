@@ -1,3 +1,4 @@
+use crate::emit::token::{COMMA_TIGHT, fragment};
 use crate::backend;
 use crate::shape;
 use std::iter;
@@ -24,7 +25,7 @@ impl<'a> View<'a> {
 
     pub(in crate::plan) fn select(
         &self,
-        source: &shape::QuerySource,
+        source: &shape::QuerySource<'_>,
         dialect: &backend::Dialect,
     ) -> syn::Result<Vec<proc_macro2::TokenStream>> {
         let rows: Vec<_> = match self.0 {
@@ -32,7 +33,7 @@ impl<'a> View<'a> {
             row => vec![row],
         };
         let sources: Vec<_> = iter::once(&source.primary_path)
-            .chain(source.joins.iter().map(|join| &join.path))
+            .chain(source.joins.iter().map(|join| join.path))
             .collect();
         let matches = |row: &syn::Type, path: &syn::Path| matches!(row, syn::Type::Path(row) if row.qself.is_none() && row.path == *path);
         let ordered = rows.len() == sources.len()
@@ -63,7 +64,7 @@ impl<'a> View<'a> {
                 }
             };
             if position > 0 {
-                sql.push(dialect.kw("COMMA_TIGHT"));
+                sql.push(fragment(COMMA_TIGHT));
             }
             sql.push(dialect.columns(row, prefix));
         }
@@ -73,7 +74,7 @@ impl<'a> View<'a> {
     fn physical(
         row: &syn::Type,
         paths: &[&syn::Path],
-        source: &shape::QuerySource,
+        source: &shape::QuerySource<'_>,
         dialect: &backend::Dialect,
     ) -> proc_macro2::TokenStream {
         let rt = &dialect.rt_crate;

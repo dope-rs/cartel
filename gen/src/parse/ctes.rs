@@ -32,6 +32,7 @@ impl<'a> shape::CteBinding<'a> {
                     "CTE let-binding rhs must end in `.cte()`",
                 ));
             };
+            crate::ext::inferred(mc)?;
             if mc.method != "cte" || !mc.args.is_empty() {
                 return Err(syn::Error::new(
                     mc.method.span(),

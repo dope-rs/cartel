@@ -124,13 +124,15 @@ impl<'connection, I: catalogs::Catalog> Prepare<'connection, I> {
         let index = self.live;
         let call = guard.call(self.connection);
         let prepare = |sql, params, columns| {
-            call.check(Prepared::new(
-                call.inner(),
-                guard.work(),
-                sql,
-                params,
-                columns,
-            ))
+            call.check(
+                Prepared::new::<{ libsqlite3_sys::SQLITE_PREPARE_PERSISTENT }>(
+                    call.inner(),
+                    guard.work(),
+                    sql,
+                    params,
+                    columns,
+                ),
+            )
         };
         // Native authorization runs during preparation; transaction authority
         // belongs only to these fixed controls, never to catalog SQL.
@@ -163,17 +165,12 @@ impl<'connection, I: catalogs::Catalog> Prepare<'connection, I> {
         Ok(self.live == self.slots.len())
     }
 
-    pub(crate) fn retire_one(&mut self) -> Inventory {
-        // SAFETY: preparation advances only this backing's exact initialized prefix.
-        let live = unsafe { self.slots.get_unchecked_mut(..self.live) };
-        let Some((slot, rest)) = live.split_last_mut() else {
-            return Inventory::Empty;
-        };
-        self.live = rest.len();
-        *slot = None;
-        match self.live {
-            0 => Inventory::Empty,
-            _ => Inventory::Populated,
+    pub(crate) fn retire(&mut self) -> Retirement<'connection> {
+        let slots = mem::take(&mut self.slots);
+        let live = mem::take(&mut self.live);
+        // SAFETY: this owner alone initialized that prefix before transferring it.
+        Retirement {
+            slots: unsafe { slots.get_unchecked_mut(..live) },
         }
     }
 }
@@ -196,10 +193,7 @@ impl<I: catalogs::Catalog> Drop for Engine<'_, I> {
 
 impl<I: catalogs::Catalog> Drop for Prepare<'_, I> {
     fn drop(&mut self) {
-        let slots = mem::take(&mut self.slots);
-        // SAFETY: this owner retains precisely its initialized prefix and backing.
-        let slots = unsafe { slots.get_unchecked_mut(..self.live) };
-        Retirement { slots }.retire_all();
+        drop(self.retire());
     }
 }
 
@@ -270,7 +264,7 @@ impl<'connection> Prepared<'connection> {
         self.work
     }
 
-    pub(crate) fn new(
+    pub(crate) fn new<const FLAGS: u32>(
         db: &'connection crate::sys::Connection,
         work: &'connection work::Work,
         sql: &str,
@@ -278,31 +272,34 @@ impl<'connection> Prepared<'connection> {
         columns: usize,
     ) -> result::Result<Self, crate::Error> {
         let sql = crate::sys::Sql::new(sql)?;
-        sql.prepare(
-            db,
-            libsqlite3_sys::SQLITE_PREPARE_PERSISTENT,
-            Err,
-            |stmt, tail| {
-                let mut prepared = Self {
-                    statement: stmt,
-                    work,
-                    parameters: 0,
-                    columns: 0,
-                    connection: marker::PhantomData,
-                };
-                tail.check()?;
-                // SAFETY: this prepared owner retains the live statement and database.
-                prepared.parameters = unsafe { sys::statement_parameters(stmt, params) }?;
-                prepared.columns = unsafe { sys::statement_columns(stmt) };
-                if columns != usize::MAX && prepared.columns as usize != columns {
-                    return Err(crate::Error::ColumnCount {
-                        expected: columns,
-                        actual: prepared.columns as usize,
-                    });
-                }
-                Ok(prepared)
-            },
-        )
+        sql.prepare(db, FLAGS, Err, |stmt, tail| {
+            let mut prepared = Self {
+                statement: stmt,
+                work,
+                parameters: 0,
+                columns: 0,
+                connection: marker::PhantomData,
+            };
+            tail.check()?;
+            // SAFETY: this prepared owner retains the live statement and database.
+            prepared.parameters = unsafe { sys::statement_parameters(stmt, params) }?;
+            prepared.columns = unsafe { sys::statement_columns(stmt) };
+            if columns != usize::MAX && prepared.columns as usize != columns {
+                return Err(crate::Error::ColumnCount {
+                    expected: columns,
+                    actual: prepared.columns as usize,
+                });
+            }
+            Ok(prepared)
+        })
+    }
+
+    pub(crate) fn finish(self) -> result::Result<(), crate::Error> {
+        let stmt = mem::ManuallyDrop::new(self);
+        match sys::finalize(stmt.statement) {
+            Some(fault) => Err(fault.into_error()),
+            None => Ok(()),
+        }
     }
 
     /// Samples only fresh persistent preparations, before binding or stepping.
@@ -350,7 +347,7 @@ impl<'connection> Prepared<'connection> {
         }
     }
 
-    fn reset<A: Access>(
+    pub(in crate::engine::api) fn reset<A: Access>(
         &mut self,
         access: &A,
         txn: exec::Tx<'_>,

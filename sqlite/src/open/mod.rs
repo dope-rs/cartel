@@ -1,6 +1,7 @@
 use dope_core::driver::settings::{claim, errors};
 mod error;
 pub mod journal;
+pub(crate) mod schema;
 
 use crate::{api, catalogs, conn, runtime};
 use dope_core::driver::settings;
@@ -8,6 +9,7 @@ use dope_runtime::{executor::boot, topology};
 use std::marker;
 
 pub use error::Error;
+pub use schema::Schema;
 
 /// Owns cleanup errors delivered after an installation releases its native resources.
 #[derive(Debug, Default)]
@@ -71,6 +73,24 @@ impl<I: catalogs::Catalog> Plan<I> {
         'p: 'life,
         'life: 'scope + 'local,
     {
-        api::Open::new(stage.pinned(), report)
+        api::Open::new(stage.pinned(), report, schema::Autocommit)
+    }
+
+    /// Runs schema initialization and catalog preparation in one IMMEDIATE transaction.
+    pub fn install_immediate<'local, 'scope, 'life, 'p, 'd, Q, F, E>(
+        self,
+        stage: &topology::Boot<'_, 'scope, 'life, 'p, 'd, runtime::Layout<'_, I>, Q>,
+        report: &'local mut Completion,
+        initialize: F,
+    ) -> impl boot::Root<'d, Output = Result<conn::Installed<'local, 'd, I>, E>>
+    + use<'local, 'd, I, Q, F, E>
+    where
+        'd: 'p,
+        'p: 'life,
+        'life: 'scope + 'local,
+        F: for<'t> FnOnce(Schema<'t>) -> Result<Schema<'t>, E>,
+        E: From<Error>,
+    {
+        api::Open::new(stage.pinned(), report, schema::Immediate(initialize))
     }
 }

@@ -7,6 +7,11 @@ enum Part {
 
 pub(crate) struct Sql(Vec<Part>);
 
+pub(crate) struct Operand {
+    pub(crate) sql: Sql,
+    pub(crate) rust: proc_macro2::TokenStream,
+}
+
 pub(crate) fn intern(captures: &mut Vec<backend::Capture>, capture: backend::Capture) -> usize {
     if let Some(index) = captures.iter().position(|current| current.0 == capture.0) {
         return index;
@@ -33,7 +38,7 @@ impl Sql {
         self.0.push(Part::Capture(capture));
     }
 
-    pub(super) fn push(&mut self, token: proc_macro2::TokenStream) {
+    pub(crate) fn push(&mut self, token: proc_macro2::TokenStream) {
         self.0.push(Part::Token(token));
     }
 

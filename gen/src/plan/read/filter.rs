@@ -3,20 +3,23 @@ use crate::pred;
 
 pub(in crate::plan) fn build(
     state: &mut plan::State<'_, '_>,
-    expr: &syn::Expr,
+    expr: Option<&syn::Expr>,
     scope: &pred::RowScope<'_>,
     columns: bool,
 ) -> syn::Result<Vec<proc_macro2::TokenStream>> {
     let context = state.context();
     let sql = pred::build(expr, scope, columns, &context)?;
-    Ok(state.render(sql))
+    state.condition(scope, sql.rust);
+    Ok(state.render(sql.sql))
 }
 
 pub(in crate::plan) fn join(
-    state: &plan::State<'_, '_>,
+    state: &mut plan::State<'_, '_>,
     expr: &syn::Expr,
     scope: &pred::RowScope<'_>,
 ) -> syn::Result<Vec<proc_macro2::TokenStream>> {
     let context = state.context();
-    pred::build(expr, scope, true, &context)?.join_tokens()
+    let checked = pred::build(Some(expr), scope, true, &context)?;
+    state.condition(scope, checked.rust);
+    checked.sql.join_tokens()
 }

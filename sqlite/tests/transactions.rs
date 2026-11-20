@@ -341,8 +341,7 @@ fn cleanup_stays_failed(runtime: Runtime) -> Result<(), plan::Error> {
 
                         let seen = cell::Cell::new(false);
                         let scan = inner.query()
-                            .stream::<i64, _, _>(IntegrationDatabase::ROWS_OVER_LIMIT, ())
-                            .visit(|_| {
+                            .stream::<i64, _, _>(IntegrationDatabase::ROWS_OVER_LIMIT, (), |_| {
                                 seen.set(true);
                                 ops::ControlFlow::Continue(())
                             });
@@ -391,8 +390,7 @@ fn forgotten_client_drains(runtime: Runtime) -> Result<(), plan::Error> {
                         fibers::Yield::new().await;
                         let seen = cell::Cell::new(false);
                         let scan = tx.query()
-                            .stream::<i64, _, _>(IntegrationDatabase::ROWS_OVER_LIMIT, ())
-                            .visit(|_| {
+                            .stream::<i64, _, _>(IntegrationDatabase::ROWS_OVER_LIMIT, (), |_| {
                                 seen.set(true);
                                 ops::ControlFlow::Continue(())
                             });

@@ -42,8 +42,7 @@ impl<'connection, 'guard, 'work> Call<'connection, 'guard, 'work> {
     pub(crate) fn check<T>(&self, result: Result<T, crate::Error>) -> Result<T, crate::Error> {
         // Every preparation starts a fresh native progress interval. Charge its
         // final partial quantum against the same aggregate opening budget.
-        self.guard.work().control().tick();
-        self.guard.check(result)
+        self.guard.charge(result)
     }
 
     fn complete<T>(&self, done: sys::Completion<T>) -> Result<T, crate::Error> {

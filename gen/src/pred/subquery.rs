@@ -1,3 +1,4 @@
+use crate::emit::token::{COUNT_STAR, FROM, PAREN_CLOSE, SUBQUERY_OPEN, WHERE, fragment};
 use crate::pred;
 use crate::pred::sql;
 use crate::shape;
@@ -11,9 +12,12 @@ impl pred::RowScope<'_> {
         negate: bool,
         context: &pred::WhereContext<'_>,
         sql: &mut sql::Sql,
-    ) -> syn::Result<()> {
-        let dialect = context.dialect;
-        let (source, ids, body) = shape::QuerySource::parse_chain(input, context.cte_map)?;
+    ) -> syn::Result<proc_macro2::TokenStream> {
+        let shape::Selection {
+            source,
+            idents,
+            predicate,
+        } = shape::Selection::parse(input, context.cte_map)?;
         let source = source.nested(self.alias_depth);
         if !source.joins.is_empty() {
             return Err(syn::Error::new(
@@ -21,18 +25,18 @@ impl pred::RowScope<'_> {
                 "joined source is not yet supported inside `exists(...)` / `not_exists(...)`",
             ));
         }
-        let scope = pred::RowScope::for_source(&source, &ids)?.with_outer(self);
+        let scope = pred::RowScope::for_source(&source, &idents)?.with_outer(self);
         let head = if negate {
-            dialect.kw("NOT_EXISTS_OPEN")
+            fragment("NOT EXISTS (SELECT 1 FROM ")
         } else {
-            dialect.kw("EXISTS_OPEN")
+            fragment("EXISTS (SELECT 1 FROM ")
         };
         sql.push(head);
         sql.extend(source.render_base());
-        sql.push(dialect.kw("WHERE_KW"));
-        pred::build_into(&body, &scope, true, context, sql)?;
-        sql.push(dialect.kw("PAREN_CLOSE"));
-        Ok(())
+        sql.push(fragment(WHERE));
+        let predicate = pred::filter_into(predicate, &scope, true, context, sql)?;
+        sql.push(fragment(PAREN_CLOSE));
+        Ok(scope.local(quote::quote! { let _: bool = #predicate; true }))
     }
 
     pub(super) fn scalar_agg(
@@ -41,12 +45,12 @@ impl pred::RowScope<'_> {
         kind: pred::expr::Aggregate<'_>,
         context: &pred::WhereContext<'_>,
         sql: &mut sql::Sql,
-    ) -> syn::Result<()> {
+    ) -> syn::Result<proc_macro2::TokenStream> {
         let dialect = context.dialect;
         let (table, arg, body) = shape::QuerySource::parse_call(input)?;
         let source = shape::QuerySource::new(table).nested(self.alias_depth);
         let scope = pred::RowScope::for_primary(&source, arg).with_outer(self);
-        sql.push(dialect.kw("SUBQUERY_OPEN"));
+        sql.push(fragment(SUBQUERY_OPEN));
         // Parsing only appends deferred parts. Emit in SQL order while retaining
         // WHERE's diagnostic precedence; captures are interned later by render.
         let aggregate = (|| match kind {
@@ -54,7 +58,9 @@ impl pred::RowScope<'_> {
                 let scope = pred::RowScope::for_primary(&source, arg).with_outer(self);
                 let prefix = format!("{}(", name.upper());
                 sql.push(quote::quote! { #prefix });
-                if !scope.parse_into(body, Some(context.params), dialect, context.cte_map, sql)? {
+                let Some(value) =
+                    scope.parse_into(body, Some(context.params), dialect, context.cte_map, sql)?
+                else {
                     return Err(syn::Error::new(
                         body.span(),
                         format!(
@@ -62,21 +68,22 @@ impl pred::RowScope<'_> {
                             name.lower(),
                         ),
                     ));
-                }
-                sql.push(dialect.kw("PAREN_CLOSE"));
-                Ok(())
+                };
+                sql.push(fragment(PAREN_CLOSE));
+                Ok(scope.local(quote::quote! { let _ = #value; ::core::option::Option::None }))
             }
             pred::expr::Aggregate::Count => {
-                sql.push(dialect.kw("COUNT_STAR"));
-                Ok(())
+                sql.push(fragment(COUNT_STAR));
+                Ok(quote::quote!(0i64))
             }
         })();
-        sql.push(dialect.kw("FROM_KW"));
+        sql.push(fragment(FROM));
         sql.extend(source.render_base());
-        sql.push(dialect.kw("WHERE_KW"));
-        pred::build_into(body, &scope, true, context, sql)?;
-        aggregate?;
-        sql.push(dialect.kw("PAREN_CLOSE"));
-        Ok(())
+        sql.push(fragment(WHERE));
+        let predicate = pred::build_into(body, &scope, true, context, sql)?;
+        let checked = scope.local(quote::quote! { let _: bool = #predicate; });
+        let value = aggregate?;
+        sql.push(fragment(PAREN_CLOSE));
+        Ok(quote::quote! {{ #checked; #value }})
     }
 }

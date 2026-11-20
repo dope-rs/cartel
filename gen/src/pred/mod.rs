@@ -1,3 +1,4 @@
+use crate::emit::token::{EQ, PAREN_CLOSE, PAREN_OPEN, fragment};
 use crate::{
     backend,
     ext::{FnParamsExt as _, SqlIdent as _},
@@ -47,14 +48,28 @@ impl SqlColRef {
 }
 
 pub(super) fn build(
-    expr: &syn::Expr,
+    expr: Option<&syn::Expr>,
     scope: &RowScope<'_>,
     columns: bool,
     context: &WhereContext<'_>,
-) -> syn::Result<sql::Sql> {
+) -> syn::Result<sql::Operand> {
     let mut sql = sql::Sql::new();
-    build_into(expr, scope, columns, context, &mut sql)?;
-    Ok(sql)
+    let rust = filter_into(expr, scope, columns, context, &mut sql)?;
+    Ok(sql::Operand { sql, rust })
+}
+
+fn filter_into(
+    expr: Option<&syn::Expr>,
+    scope: &RowScope<'_>,
+    columns: bool,
+    context: &WhereContext<'_>,
+    sql: &mut sql::Sql,
+) -> syn::Result<proc_macro2::TokenStream> {
+    if let Some(expr) = expr {
+        return build_into(expr, scope, columns, context, sql);
+    }
+    sql.push(context.dialect.boolean(true));
+    Ok(quote::quote!(true))
 }
 
 fn build_into(
@@ -63,7 +78,7 @@ fn build_into(
     columns: bool,
     context: &WhereContext<'_>,
     sql: &mut sql::Sql,
-) -> syn::Result<()> {
+) -> syn::Result<proc_macro2::TokenStream> {
     let params = context.params;
     let dialect = context.dialect;
     let cte_map = context.cte_map;
@@ -106,36 +121,43 @@ fn build_into(
             match op {
                 Op::And | Op::Or => {
                     let keyword = if let Op::And = op {
-                        "AND_PAREN_WRAP"
+                        ") AND ("
                     } else {
-                        "OR_PAREN_WRAP"
+                        ") OR ("
                     };
-                    sql.push(dialect.kw("PAREN_OPEN"));
-                    build_into(left, scope, columns, context, sql)?;
-                    sql.push(dialect.kw(keyword));
-                    build_into(right, scope, columns, context, sql)?;
-                    sql.push(dialect.kw("PAREN_CLOSE"));
-                    Ok(())
+                    sql.push(fragment(PAREN_OPEN));
+                    let lhs = build_into(left, scope, columns, context, sql)?;
+                    sql.push(fragment(keyword));
+                    let rhs = build_into(right, scope, columns, context, sql)?;
+                    sql.push(fragment(PAREN_CLOSE));
+                    let operator = &syntax.op;
+                    Ok(quote::quote! { (#lhs #operator #rhs) })
                 }
                 Op::Compare(op) => {
-                    if !scope.parse_into(left, Some(params), dialect, cte_map, sql)? {
+                    let Some(lhs) = scope.parse_into(left, Some(params), dialect, cte_map, sql)?
+                    else {
                         return Err(syn::Error::new(
                             syntax.span(),
                             "expected at least one side of the comparison to be a column / arithmetic / function expression",
                         ));
-                    }
-                    sql.push(op.sql_ref(dialect));
-                    if scope.parse_into(right, None, dialect, cte_map, sql)? {
+                    };
+                    sql.push(op.sql_ref());
+                    let rhs = if let Some(value) =
+                        scope.parse_into(right, None, dialect, cte_map, sql)?
+                    {
                         if !columns && scope.has_column(left) && scope.has_column(right) {
                             return Err(syn::Error::new(
                                 syntax.span(),
                                 "both sides reference the row scope; column-to-column compare is only allowed in JOIN ON clauses",
                             ));
                         }
+                        value
                     } else {
-                        op.capture(params.resolve(right)?, sql, dialect);
-                    }
-                    Ok(())
+                        op.capture(params.resolve(right)?, sql);
+                        quote::quote!(#right)
+                    };
+                    let operator = &syntax.op;
+                    Ok(quote::quote! { (#lhs #operator #rhs) })
                 }
                 Op::Unsupported(operator) => Err(syn::Error::new(
                     operator.span(),
@@ -150,9 +172,8 @@ fn build_into(
                     "attributes are not supported on a boolean predicate",
                 ));
             }
-            let keyword = if value.value() { "TRUE" } else { "FALSE" };
-            sql.push(dialect.kw(keyword));
-            Ok(())
+            sql.push(dialect.boolean(value.value()));
+            Ok(quote::quote!(#value))
         }
         Input::Field { expr, syntax } => {
             if let Some(attr) = syntax.attrs.first() {
@@ -161,15 +182,15 @@ fn build_into(
                     "attributes are not supported on a boolean column predicate",
                 ));
             }
-            if !scope.parse_into(expr, None, dialect, cte_map, sql)? {
+            let Some(value) = scope.parse_into(expr, None, dialect, cte_map, sql)? else {
                 return Err(syn::Error::new(
                     syntax.span(),
                     "boolean predicate must reference a column",
                 ));
-            }
-            sql.push(dialect.kw("EQ"));
-            sql.push(dialect.kw("TRUE"));
-            Ok(())
+            };
+            sql.push(fragment(EQ));
+            sql.push(dialect.boolean(true));
+            Ok(value)
         }
         Input::Not(syntax) => {
             if let Some(attr) = syntax.attrs.first() {
@@ -178,15 +199,15 @@ fn build_into(
                     "attributes are not supported on a negated predicate",
                 ));
             }
-            if !scope.parse_into(&syntax.expr, None, dialect, cte_map, sql)? {
+            let Some(value) = scope.parse_into(&syntax.expr, None, dialect, cte_map, sql)? else {
                 return Err(syn::Error::new(
                     syntax.expr.span(),
                     "negated boolean predicate must reference a column",
                 ));
-            }
-            sql.push(dialect.kw("EQ"));
-            sql.push(dialect.kw("FALSE"));
-            Ok(())
+            };
+            sql.push(fragment(EQ));
+            sql.push(dialect.boolean(false));
+            Ok(quote::quote! { !(#value) })
         }
         Input::Paren(syntax) => {
             if let Some(attr) = syntax.attrs.first() {
@@ -260,40 +281,56 @@ fn build_into(
                     format!("method `.{name}(arg)` requires exactly one argument"),
                 ));
             }
-            if !scope.parse_into(&syntax.receiver, Some(params), dialect, cte_map, sql)? {
+            let Some(receiver) =
+                scope.parse_into(&syntax.receiver, Some(params), dialect, cte_map, sql)?
+            else {
                 return Err(syn::Error::new(
                     syntax.receiver.span(),
                     format!(
                         "`.{name}(arg)` receiver must be a column or column-derived expression"
                     ),
                 ));
-            }
+            };
             dialect.reject_op(&name, syntax.method.span())?;
-            match kind {
+            let (method, value) = match kind {
                 Method::In | Method::NotIn => {
                     let capture = params.resolve_ref(arg)?;
                     let keyword = if matches!(kind, Method::In) {
-                        "EQ_ANY_OPEN"
+                        " = ANY("
                     } else {
-                        "NE_ALL_OPEN"
+                        " <> ALL("
                     };
-                    sql.push(dialect.kw(keyword));
+                    sql.push(fragment(keyword));
                     sql.capture(capture);
-                    sql.push(dialect.kw("PAREN_CLOSE"));
+                    sql.push(fragment(PAREN_CLOSE));
+                    ("is_in", quote::quote!(#arg))
                 }
                 Method::Fts => {
-                    sql.push(cmp::Cmp::FtsMatch.sql_ref(dialect));
-                    if !scope.parse_into(arg, Some(params), dialect, cte_map, sql)? {
-                        sql.capture(params.resolve_ref(arg)?);
-                    }
+                    sql.push(cmp::Cmp::FtsMatch.sql_ref());
+                    let value = match scope.parse_into(arg, Some(params), dialect, cte_map, sql)? {
+                        Some(value) => value,
+                        None => {
+                            sql.capture(params.resolve_ref(arg)?);
+                            quote::quote!(#arg)
+                        }
+                    };
+                    ("is_match", value)
                 }
                 Method::Compare(op) => {
                     let capture = params.resolve_ref(arg)?;
-                    sql.push(op.sql_ref(dialect));
-                    op.capture(capture, sql, dialect);
+                    sql.push(op.sql_ref());
+                    op.capture(capture, sql);
+                    let method = match op {
+                        cmp::Cmp::Contains | cmp::Cmp::Overlaps => "has_all",
+                        cmp::Cmp::LtreeDescOf | cmp::Cmp::LtreeAncOf => "is_below",
+                        _ => "is_like",
+                    };
+                    (method, quote::quote!(#arg))
                 }
-            }
-            Ok(())
+            };
+            let method = syn::Ident::new(method, syntax.method.span());
+            let scope = backend::scope();
+            Ok(quote::quote! { (#receiver).#method(#scope, #value) })
         }
         Input::UnsupportedMethod(syntax) => Err(syn::Error::new(
             syntax.method.span(),
@@ -315,15 +352,21 @@ pub(super) struct RowScope<'a> {
     pub(super) outer: Option<&'a Self>,
     pub(super) alias_depth: Option<usize>,
     pub(super) unnest_cols: &'a [syn::Ident],
+    pub(super) unnest_data: &'a [syn::Ident],
 }
 
 impl RowScope<'_> {
-    fn for_bindings(source: &shape::QuerySource, idents: &[syn::Ident]) -> Self {
+    fn for_bindings(source: &shape::QuerySource<'_>, idents: &[syn::Ident]) -> Self {
+        let tables =
+            std::iter::once(&source.primary_path).chain(source.joins.iter().map(|j| j.path));
         let vars = idents
             .iter()
+            .zip(tables)
             .enumerate()
-            .map(|(index, ident)| Var {
+            .map(|(index, (ident, table))| Var {
+                referenced: Default::default(),
                 ident: ident.clone(),
+                ty: quote::quote!(#table),
                 table_const: Some(source.qualifier(index)),
             })
             .collect();
@@ -333,11 +376,12 @@ impl RowScope<'_> {
             outer: None,
             alias_depth: Some(source.alias_depth),
             unnest_cols: &[],
+            unnest_data: &[],
         }
     }
 
     pub(super) fn for_outer(
-        source: &shape::QuerySource,
+        source: &shape::QuerySource<'_>,
         idents: &[syn::Ident],
         index: usize,
     ) -> syn::Result<Self> {

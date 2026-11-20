@@ -50,7 +50,7 @@ impl<'query, 'connection, 'd, P, A: Access> Active<'query, 'connection, 'd, P, A
         &mut self,
         bytes: num::NonZero<u32>,
         policy: &mut M,
-    ) -> result::Result<ops::ControlFlow<M::Output>, crate::Error> {
+    ) -> result::Result<ops::ControlFlow<M::Break>, crate::Error> {
         policy.row(self.bound.read::<R>(bytes)?)
     }
 

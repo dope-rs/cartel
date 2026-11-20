@@ -1,6 +1,6 @@
 use crate::backend;
 use crate::backend::Backend as _;
-use crate::dialect::{ScopeCalls, name, param};
+use crate::dialect::{name, param};
 use crate::emit;
 
 use crate::dialect::sqlite::{Backend, params};
@@ -19,20 +19,20 @@ impl Query {
     pub(crate) fn expand(f: syn::ItemFn) -> syn::Result<(syn::Ident, proc_macro2::TokenStream)> {
         f.modifiers.require_empty()?;
         backend::Compiled::validate(&f.sig, &f.attrs, "#[query] functions")?;
-        let mut names = backend::Names::default();
-        names.visit_item_fn(&f);
         let backend::Compiled {
             mut params,
             captures,
             nonnegative: nonneg,
             plan,
-            block,
+            proof,
+            mut names,
         } = backend::Compiled::build::<Backend>(
             &f.sig.generics,
             f.sig.inputs.into_iter().map(backend::Compiled::fn_arg),
             *f.block,
             &f.sig.output,
         )?;
+        names.visit_ident(&f.sig.ident);
         let source = names.fresh("source");
         let query = names.fresh("query");
         let catalog = names.fresh("I");
@@ -41,27 +41,8 @@ impl Query {
         let conn = names.lifetime("connection");
         let driver = names.lifetime("d");
         let region = names.lifetime("params");
-        let proof = {
-            let p_body = ScopeCalls::sqlite(block);
-            let output = &plan.output;
-            let scope = crate::backend::scope();
-            let ids = params.iter().map(|(id, _)| id);
-            let tys = params.iter().map(|(_, ty)| ty);
-            let decl_tys = params.iter().map(|(_, ty)| ty);
-            quote::quote! {
-                const _: fn(
-                    &::cartel_sqlite::dsl::Scope,
-                    #( #tys, )*
-                ) #output = |
-                    #scope: &::cartel_sqlite::dsl::Scope,
-                    #( #ids: #decl_tys, )*
-                | {
-                    #p_body
-                };
-            }
-        };
         param::Param::<true>::apply(params.iter_mut().map(|(_, ty)| ty), &region);
-        let bound = params::Params::new(&params, &captures, &nonneg);
+        let bound = params::bind(&params, &captures, &nonneg);
         let ids = params.iter().map(|(id, _)| id);
         let run_tys = params.iter().map(|(_, ty)| ty);
         let n_params = captures.len();
@@ -79,57 +60,41 @@ impl Query {
         let fn_name = &f.sig.ident;
         let attrs = &f.attrs;
         let marker = Self::marker(fn_name);
-        let p_ty = bound.ty;
-        let p_val = bound.value;
-
         let parts = &plan.sql_parts;
         let sql = Backend::dialect().text(quote::quote! { &[#(#parts),*] });
 
-        let method = match &plan.dispatch {
-            emit::Kind::NoRows(_) => quote::quote! { run_no_rows },
-            emit::Kind::One(t) | emit::Kind::Aggregate(t) => quote::quote! { run_one::<#t, _, _> },
-            emit::Kind::First(t) => quote::quote! { run_first::<#t, _, _> },
-            emit::Kind::All(t) => quote::quote! { run_all::<#t, _, _> },
-            emit::Kind::Stream(t) => quote::quote! { stream::<#t, _, _> },
-        };
-        let body = quote::quote! {
-            #query.#method(
-                ::cartel_sqlite::Statement::<#catalog, #marker>::of(),
-                #p_val,
-            )
-        };
-
-        let ret = match &plan.dispatch {
-            emit::Kind::NoRows(_) => quote::quote! { () },
-            emit::Kind::One(t) | emit::Kind::Aggregate(t) => quote::quote! {
-                <#t as ::cartel_sqlite::row::raw::Decode>::Borrowed<#row>
-            },
-            emit::Kind::First(t) => quote::quote! {
-                ::core::option::Option<<#t as ::cartel_sqlite::row::raw::Decode>::Borrowed<#row>>
-            },
-            emit::Kind::All(t) => quote::quote! {
-                &#row [<#t as ::cartel_sqlite::row::raw::Decode>::Borrowed<#row>]
-            },
-            emit::Kind::Stream(t) => quote::quote! {
-                ::cartel_sqlite::Cursor<
-                    #row,
-                    #conn,
-                    #driver,
-                    #t,
-                    #marker,
-                    #p_ty,
-                    #catalog,
-                >
-            },
-        };
-        let ret = match &plan.dispatch {
-            emit::Kind::Stream(_) => ret,
-            _ => quote::quote! {
-                impl ::cartel_sqlite::Fiber<
-                    #driver,
-                    Output = ::core::result::Result<#ret, ::cartel_sqlite::Error>,
-                > + use<#row, #conn, #region, #driver, #catalog, #input>
-            },
+        let mut types = quote::quote! { #catalog, #input, };
+        let mut arguments = quote::quote! { #( #ids: #run_tys, )* };
+        let mut values = quote::quote! { #bound, };
+        let mut visitor_bound = None;
+        let (method, ret) = match &plan.dispatch {
+            emit::Kind::NoRows(_) => (quote::quote! { run_no_rows }, quote::quote! { () }),
+            emit::Kind::One(t) | emit::Kind::Aggregate(t) => (
+                quote::quote! { run_one::<#t, _, _> },
+                quote::quote! { <#t as ::cartel_sqlite::row::raw::Decode>::Borrowed<#row> },
+            ),
+            emit::Kind::First(t) => (
+                quote::quote! { run_first::<#t, _, _> },
+                quote::quote! { ::core::option::Option<<#t as ::cartel_sqlite::row::raw::Decode>::Borrowed<#row>> },
+            ),
+            emit::Kind::All(t) => (
+                quote::quote! { run_all::<#t, _, _> },
+                quote::quote! { &#row [<#t as ::cartel_sqlite::row::raw::Decode>::Borrowed<#row>] },
+            ),
+            emit::Kind::Stream(t) => {
+                let visitor = names.fresh("Visitor");
+                let visit = names.fresh("visit");
+                let item = names.lifetime("item");
+                types.extend(quote::quote! { #visitor, });
+                arguments.extend(quote::quote! { #visit: #visitor, });
+                values.extend(quote::quote! { #visit, });
+                visitor_bound = Some(quote::quote! {
+                    #visitor: for<#item> ::core::ops::FnMut(
+                        <#t as ::cartel_sqlite::row::raw::Decode>::Borrowed<#item>
+                    ) -> ::core::ops::ControlFlow<()>,
+                });
+                (quote::quote! { stream::<#t, _, _> }, quote::quote! { () })
+            }
         };
 
         let tokens = quote::quote! {
@@ -148,12 +113,14 @@ impl Query {
                 #conn: #row,
                 #driver: #conn,
                 #region,
-                #catalog,
-                #input,
+                #types
             >(
                 #source: #input,
-                #( #ids: #run_tys, )*
-            ) -> #ret
+                #arguments
+            ) -> impl ::cartel_sqlite::Fiber<
+                #driver,
+                Output = ::core::result::Result<#ret, ::cartel_sqlite::Error>,
+            > + use<#row, #conn, #region, #driver, #types>
             where
                 #catalog: ::cartel_sqlite::Catalog
                     + ::cartel_sqlite::HasQuery<#marker>
@@ -164,9 +131,10 @@ impl Query {
                     #driver,
                     #catalog,
                 >,
+                #visitor_bound
             {
                 let #query = ::cartel_sqlite::IntoQuery::into_query(#source);
-                #body
+                #query.#method(::cartel_sqlite::Statement::<#catalog, #marker>::of(), #values)
             }
 
             #proof

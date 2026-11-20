@@ -2,7 +2,7 @@ use crate::api::exec;
 use crate::row::modes::{self, Kind as _};
 use crate::{config, row, runtime};
 use exec::{Create, Policy};
-use std::{ops, result};
+use std::{convert, ops, result};
 
 pub(crate) struct Single<'query, R: row::raw::Decode, M> {
     init: <R::Retention as modes::Kind>::Init<'query>,
@@ -47,11 +47,12 @@ where
     M: FnOnce(Option<R::Borrowed<'query>>) -> result::Result<O, crate::Error>,
 {
     type Output = O;
+    type Break = convert::Infallible;
 
     fn row<'row>(
         &mut self,
         value: R::Borrowed<'row>,
-    ) -> result::Result<ops::ControlFlow<Self::Output>, crate::Error> {
+    ) -> result::Result<ops::ControlFlow<Self::Break>, crate::Error> {
         if self.value.is_none() {
             self.value = Some(R::retain(value, &mut self.state)?);
         }

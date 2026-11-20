@@ -6,17 +6,18 @@ use syn::spanned::Spanned as _;
 
 use crate::ext::ExprExt as _;
 
-impl shape::SelectBranch {
-    pub(super) fn parse_set(
-        expr: &syn::Expr,
+impl<'a> shape::SetQuery<'a> {
+    pub(super) fn parse(
+        expr: &'a syn::Expr,
         cte_map: &collections::BTreeMap<String, syn::Path>,
-    ) -> syn::Result<shape::SetQuery> {
+    ) -> syn::Result<Self> {
         let mut links = Vec::new();
         let mut current = expr;
         while let syn::Expr::MethodCall(call) = current {
             let Some(op) = shape::SetOpKind::from_method(&call.method.to_string()) else {
                 break;
             };
+            crate::ext::inferred(call)?;
             if call.args.len() != 1 {
                 return Err(syn::Error::new(
                     call.args.span(),
@@ -30,34 +31,18 @@ impl shape::SelectBranch {
             current = call.receiver.as_ref();
         }
 
-        links.reverse();
-        let (source, idents, pred) = shape::QuerySource::parse_chain(current, cte_map)?;
-        let first = Self {
-            source,
-            pred_idents: idents,
-            predicate: pred,
-        };
-        let mut parsed = Vec::with_capacity(links.len());
-        for (op, operand) in links {
-            let (source, idents, pred) = shape::QuerySource::parse_chain(operand, cte_map)?;
-            parsed.push((
-                op,
-                Self {
-                    source,
-                    pred_idents: idents,
-                    predicate: pred,
-                },
-            ));
-        }
-        Ok(shape::SetQuery {
-            first,
-            links: parsed,
-        })
+        let first = shape::Selection::parse(current, cte_map)?;
+        let links = links
+            .into_iter()
+            .rev()
+            .map(|(op, operand)| Ok((op, shape::Selection::parse(operand, cte_map)?)))
+            .collect::<syn::Result<_>>()?;
+        Ok(Self { first, links })
     }
 }
 
-impl qualify::State {
-    pub(crate) fn peel<'a>(&mut self, expr: &'a syn::Expr) -> syn::Result<&'a syn::Expr> {
+impl<'a> qualify::State<'a> {
+    pub(crate) fn peel(&mut self, expr: &'a syn::Expr) -> syn::Result<&'a syn::Expr> {
         enum Method {
             Order(qualify::Dir),
             Limit,
@@ -67,7 +52,7 @@ impl qualify::State {
             Lock(lock::Lock),
         }
 
-        let mut parsed = Self::default();
+        let order_start = self.order_by.len();
         let mut current = expr.unbrace();
         while let syn::Expr::MethodCall(mc) = current {
             let method = if mc.method == "order_by" {
@@ -89,6 +74,7 @@ impl qualify::State {
             } else {
                 break;
             };
+            crate::ext::inferred(mc)?;
             match method {
                 Method::Order(dir) => {
                     if mc.args.len() != 1 {
@@ -97,39 +83,13 @@ impl qualify::State {
                             format!("`.{}(...)` takes exactly one closure argument", mc.method),
                         ));
                     }
-                    parsed.order_by.push(qualify::Order {
-                        closure: mc.args[0].clone(),
+                    self.order_by.push(qualify::Order {
+                        closure: &mc.args[0],
                         dir,
                     });
                 }
-                Method::Limit => {
-                    if mc.args.len() != 1 {
-                        return Err(syn::Error::new(
-                            mc.args.span(),
-                            "`.limit(n)` takes exactly one int / fn-param argument",
-                        ));
-                    }
-                    parsed.limit = parsed.limit.add(
-                        &self.limit,
-                        mc.args[0].clone(),
-                        mc.method.span(),
-                        "limit",
-                    )?;
-                }
-                Method::Offset => {
-                    if mc.args.len() != 1 {
-                        return Err(syn::Error::new(
-                            mc.args.span(),
-                            "`.offset(n)` takes exactly one int / fn-param argument",
-                        ));
-                    }
-                    parsed.offset = parsed.offset.add(
-                        &self.offset,
-                        mc.args[0].clone(),
-                        mc.method.span(),
-                        "offset",
-                    )?;
-                }
+                Method::Limit => set_bound(&mut self.limit, mc, "limit")?,
+                Method::Offset => set_bound(&mut self.offset, mc, "offset")?,
                 Method::Distinct => {
                     if !mc.args.is_empty() {
                         return Err(syn::Error::new(
@@ -137,15 +97,13 @@ impl qualify::State {
                             "`.distinct()` takes no arguments",
                         ));
                     }
-                    if !matches!(self.distinct, qualify::Distinct::None)
-                        || !matches!(parsed.distinct, qualify::Distinct::None)
-                    {
+                    if !matches!(self.distinct, qualify::Distinct::None) {
                         return Err(syn::Error::new(
                             mc.method.span(),
                             "duplicate `.distinct(...)`",
                         ));
                     }
-                    parsed.distinct = qualify::Distinct::All;
+                    self.distinct = qualify::Distinct::All;
                 }
                 Method::DistinctOn => {
                     if mc.args.len() != 1 {
@@ -154,16 +112,14 @@ impl qualify::State {
                             "`.distinct_on(...)` takes one closure argument",
                         ));
                     }
-                    if !matches!(self.distinct, qualify::Distinct::None)
-                        || !matches!(parsed.distinct, qualify::Distinct::None)
-                    {
+                    if !matches!(self.distinct, qualify::Distinct::None) {
                         return Err(syn::Error::new(
                             mc.method.span(),
                             "duplicate `.distinct(...)`",
                         ));
                     }
                     let (arg, body) = mc.args[0].closure_one("distinct_on")?;
-                    parsed.distinct = qualify::Distinct::On(arg.clone(), body.clone());
+                    self.distinct = qualify::Distinct::On(arg, body);
                 }
                 Method::Lock(lock) => {
                     if !mc.args.is_empty() {
@@ -172,29 +128,38 @@ impl qualify::State {
                             format!("`.{}()` takes no arguments", mc.method),
                         ));
                     }
-                    if !matches!(self.lock, lock::Lock::None)
-                        || !matches!(parsed.lock, lock::Lock::None)
-                    {
+                    if !matches!(self.lock, lock::Lock::None) {
                         return Err(syn::Error::new(
                             mc.method.span(),
                             "duplicate row-lock qualifier",
                         ));
                     }
-                    parsed.lock = lock;
+                    self.lock = lock;
                 }
             }
             current = mc.receiver.as_ref();
         }
-        parsed.order_by.reverse();
-        self.order_by.extend(parsed.order_by);
-        parsed.limit.merge(&mut self.limit);
-        parsed.offset.merge(&mut self.offset);
-        if !matches!(parsed.distinct, qualify::Distinct::None) {
-            self.distinct = parsed.distinct;
-        }
-        if !matches!(parsed.lock, lock::Lock::None) {
-            self.lock = parsed.lock;
-        }
+        self.order_by[order_start..].reverse();
         Ok(current)
     }
+}
+
+fn set_bound<'a>(
+    bound: &mut Option<&'a syn::Expr>,
+    call: &'a syn::ExprMethodCall,
+    name: &str,
+) -> syn::Result<()> {
+    if call.args.len() != 1 {
+        return Err(syn::Error::new(
+            call.args.span(),
+            format!("`.{name}(n)` takes exactly one int / fn-param argument"),
+        ));
+    }
+    if let Some(prior) = bound {
+        let mut error = syn::Error::new(call.method.span(), format!("duplicate `.{name}(...)`"));
+        error.combine(syn::Error::new(prior.span(), "first qualifier is here"));
+        return Err(error);
+    }
+    *bound = Some(&call.args[0]);
+    Ok(())
 }

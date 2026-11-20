@@ -23,15 +23,14 @@ fn stream_visits_rows(runtime: Runtime) -> Result<(), plan::Error> {
             driver,
             dope_fiber::fiber!('_ => async move {
                 let mut ids = Vec::new();
-                users(conn.query())
-                    .visit(|user| {
-                        ids.push(user.0);
-                        if user.0 == 1 {
-                            assert_eq!(user.1, "alice");
-                        }
-                        ::core::ops::ControlFlow::Continue(())
-                    })
-                    .await?;
+                users(conn.query(), |user| {
+                    ids.push(user.0);
+                    if user.0 == 1 {
+                        assert_eq!(user.1, "alice");
+                    }
+                    ::core::ops::ControlFlow::Continue(())
+                })
+                .await?;
                 ::core::assert_eq!(ids, vec![1, 2, 3, 4, 5]);
                 Ok(())
             }),
@@ -45,24 +44,22 @@ fn stream_stop_releases(runtime: Runtime) -> Result<(), plan::Error> {
             driver,
             dope_fiber::fiber!('_ => async move {
                 let mut ids = Vec::new();
-                users(conn.query())
-                    .visit(|user| {
-                        ids.push(user.0);
-                        if ids.len() == 2 {
-                            ::core::ops::ControlFlow::Break(())
-                        } else {
-                            ::core::ops::ControlFlow::Continue(())
-                        }
-                    })
-                    .await?;
+                users(conn.query(), |user| {
+                    ids.push(user.0);
+                    if ids.len() == 2 {
+                        ::core::ops::ControlFlow::Break(())
+                    } else {
+                        ::core::ops::ControlFlow::Continue(())
+                    }
+                })
+                .await?;
                 ::core::assert_eq!(ids, vec![1, 2]);
                 ::core::assert_eq!(user_by_id(&mut conn, 3).await?.name, "carol");
 
                 fibers::Yield::new().await;
                 let seen = Cell::new(0_usize);
                 let scan = conn.query()
-                    .stream::<i64, _, _>(IntegrationDatabase::ROWS_OVER_LIMIT, ())
-                    .visit(|_| {
+                    .stream::<i64, _, _>(IntegrationDatabase::ROWS_OVER_LIMIT, (), |_| {
                         seen.set(seen.get() + 1);
                         ::core::ops::ControlFlow::Continue(())
                     });
@@ -73,8 +70,7 @@ fn stream_stop_releases(runtime: Runtime) -> Result<(), plan::Error> {
 
                 let mut first = None;
                 conn.query()
-                    .stream::<i64, _, _>(IntegrationDatabase::ROWS_OVER_LIMIT, ())
-                    .visit(|row| {
+                    .stream::<i64, _, _>(IntegrationDatabase::ROWS_OVER_LIMIT, (), |row| {
                         first = Some(row);
                         ::core::ops::ControlFlow::Break(())
                     })

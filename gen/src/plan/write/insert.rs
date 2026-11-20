@@ -1,3 +1,6 @@
+use crate::emit::token::{
+    COMMA, COMMA_TIGHT, FROM, INSERT_INTO, PAREN_CLOSE, PAREN_OPEN_LEADING_SPACE, WHERE, fragment,
+};
 use crate::emit;
 use crate::parse::assign;
 use crate::plan;
@@ -5,13 +8,14 @@ use crate::pred;
 use crate::shape;
 
 use crate::ext::SqlIdent as _;
+use syn::spanned::Spanned as _;
 
 use crate::plan::write::reply::Op;
 use crate::plan::write::{Conflict, reply};
 
 pub(in crate::plan) fn build<'a>(
     state: &mut plan::State<'_, 'a>,
-    insert: &shape::mutation::Insert,
+    insert: &shape::mutation::Insert<'_>,
     ret: shape::Returning,
 ) -> syn::Result<emit::Plan<'a>> {
     use shape::mutation::{Input, Values};
@@ -19,23 +23,32 @@ pub(in crate::plan) fn build<'a>(
     let (Values { table, arg, body }, keyword, empty) = match &insert.input {
         Input::One(values) => (
             values,
-            "VALUES_OPEN",
+            fragment(") VALUES ("),
             "`Table::insert(...)` body must assign at least one column",
         ),
         Input::Each(values) => (
             values,
-            "UNNEST_OPEN",
+            state.dialect.pg_clause(
+                ") SELECT * FROM UNNEST(",
+                "insert_each",
+                values.table.span(),
+            ),
             "`Table::insert_each(...)` body must assign at least one column",
         ),
         Input::From(source) => return from(state, source, ret, &insert.conflict),
     };
     let output = reply::validate(state, Op::Insert, ret, table)?;
 
-    let assigns = assign::Assign::collect(
+    let ty = match insert.input {
+        Input::Each(_) => quote::quote!(<#table as ::cartel_pg::dsl::shape::Batch>::Columns<'_>),
+        _ => quote::quote!(#table),
+    };
+    let assigns = assign::Assign::collect::<false>(
         body,
         arg,
-        &pred::RowScope::single(arg.clone()),
-        &state.context(),
+        &pred::RowScope::single((*arg).clone(), ty.clone()),
+        ty,
+        state,
         empty,
     )?;
     let target = shape::QuerySource::new(table.clone());
@@ -49,57 +62,52 @@ pub(in crate::plan) fn build<'a>(
         cols_str.push_str(&a.column.quoted());
     }
 
-    let mut sql = vec![state.dialect.kw("INSERT_INTO_KW")];
+    let mut sql = vec![fragment(INSERT_INTO)];
     sql.extend(target.render_base());
     sql.extend([
-        state.dialect.kw("PAREN_OPEN_LEADING_SPACE"),
+        fragment(PAREN_OPEN_LEADING_SPACE),
         quote::quote! { #cols_str },
-        state.dialect.kw(keyword),
+        keyword,
     ]);
     for (index, assign) in assigns.into_iter().enumerate() {
         if index > 0 {
-            sql.push(state.dialect.kw("COMMA_TIGHT"));
+            sql.push(fragment(COMMA_TIGHT));
         }
         state.render_into(assign.value, &mut sql);
     }
-    sql.push(state.dialect.kw("PAREN_CLOSE"));
+    sql.push(fragment(PAREN_CLOSE));
     action.append(state, &mut sql);
     Ok(reply::build(state, sql, table, target.qualifier(0), output))
 }
 
 fn from<'a>(
     state: &mut plan::State<'_, 'a>,
-    input: &shape::mutation::From,
+    input: &shape::mutation::From<'_>,
     ret: shape::Returning,
-    conflict: &shape::Conflict,
+    conflict: &shape::Conflict<'_>,
 ) -> syn::Result<emit::Plan<'a>> {
     let shape::mutation::From {
         table,
-        source: query,
-        pred_idents: preds,
-        predicate: pred,
+        selection,
         target,
-        source_idents: idents,
+        source,
         body,
     } = input;
     let output = reply::validate(state, Op::Insert, ret, table)?;
 
-    let scope = pred::RowScope::for_source(query, idents)?;
-    let selected = assign::Assign::collect(
+    let query = &selection.source;
+    let scope = pred::RowScope::for_source(query, &selection.idents)?;
+    let where_ = pred::build(selection.predicate, &scope, false, &state.context())?;
+    state.condition(&scope, where_.rust);
+    let scope = pred::RowScope::for_primary(query, source);
+    let selected = assign::Assign::collect::<false>(
         body,
         target,
         &scope,
-        &state.context(),
+        quote::quote!(#table),
+        state,
         "`Table::insert_from(...)` body must assign at least one column",
     )?;
-    let scope = pred::RowScope::for_source(query, preds)?;
-    let context = state.context();
-    let where_ = pred::build(pred, &scope, false, &context)?;
-    let mut ons = Vec::with_capacity(query.joins.len());
-    for (index, join) in query.joins.iter().enumerate() {
-        let scope = pred::RowScope::for_join_on(query, index)?;
-        ons.push(pred::build(&join.cond, &scope, true, &context)?.join_tokens()?);
-    }
     let target = shape::QuerySource::new(table.clone());
     let action = Conflict::new(conflict, &target, state)?;
 
@@ -108,30 +116,24 @@ fn from<'a>(
     for (index, assign) in selected.into_iter().enumerate() {
         if index > 0 {
             cols_str.push(',');
-            select.push(state.dialect.kw("COMMA"));
+            select.push(fragment(COMMA));
         }
         cols_str.push_str(&assign.column.quoted());
         state.render_into(assign.value, &mut select);
     }
-    let where_ = state.render(where_);
+    let where_ = state.render(where_.sql);
 
-    let mut sql = vec![state.dialect.kw("INSERT_INTO_KW")];
+    let mut sql = vec![fragment(INSERT_INTO)];
     sql.extend(target.render_base());
     sql.extend([
-        state.dialect.kw("PAREN_OPEN_LEADING_SPACE"),
+        fragment(PAREN_OPEN_LEADING_SPACE),
         quote::quote! { #cols_str },
-        state.dialect.kw("INSERT_FROM_SELECT"),
+        fragment(") SELECT "),
     ]);
     sql.extend(select);
-    sql.push(state.dialect.kw("FROM_KW"));
+    sql.push(fragment(FROM));
     sql.extend(query.render_base());
-    for (i, (j, on)) in query.joins.iter().zip(ons).enumerate() {
-        sql.push(j.kind.sql_ref(state.dialect));
-        sql.extend(query.render_join(i, j));
-        sql.push(state.dialect.kw("ON_KW"));
-        sql.extend(on);
-    }
-    sql.push(state.dialect.kw("WHERE_KW"));
+    sql.push(fragment(WHERE));
     sql.extend(where_);
     action.append(state, &mut sql);
     Ok(reply::build(state, sql, table, target.qualifier(0), output))

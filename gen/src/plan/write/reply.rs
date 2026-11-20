@@ -1,9 +1,9 @@
+use crate::emit::token::fragment;
 use crate::backend;
 use crate::emit;
 use crate::plan;
 use crate::plan::row;
 use crate::shape;
-use std::borrow::Cow;
 
 use syn::spanned::Spanned as _;
 
@@ -14,7 +14,7 @@ pub(in crate::plan) enum Op {
 }
 
 pub(in crate::plan) struct Output<'a> {
-    output: Cow<'a, syn::ReturnType>,
+    output: &'a syn::ReturnType,
     cols: proc_macro2::TokenStream,
     dispatch: emit::Kind<'a>,
 }
@@ -27,7 +27,7 @@ pub(in crate::plan) fn build<'a>(
     output: Output<'a>,
 ) -> emit::Plan<'a> {
     if !matches!(output.dispatch, emit::Kind::NoRows(_)) {
-        sql.push(state.dialect.kw("RETURNING_KW"));
+        sql.push(fragment(" RETURNING "));
         let columns = match state.dialect.kind {
             backend::Kind::Pg => {
                 let ty = syn::parse_quote!(#table);
@@ -37,12 +37,20 @@ pub(in crate::plan) fn build<'a>(
         };
         sql.push(columns);
     }
+    let witness = backend::scope();
+    let value = quote::quote! { #witness.value::<#table>() };
+    let result = match output.dispatch {
+        emit::Kind::One(_) => value,
+        emit::Kind::First(_) => shape::Terminator::First.result(value),
+        emit::Kind::All(_) => shape::Terminator::All.result(value),
+        _ => quote::quote!(()),
+    };
     emit::Plan {
         output: output.output,
         sql_parts: sql,
         n_result_cols: output.cols,
         dispatch: output.dispatch,
-        probe_override: None,
+        result,
     }
 }
 
@@ -59,11 +67,20 @@ pub(in crate::plan) fn validate<'a>(
             "`.required()` requires a PostgreSQL UPDATE",
         ));
     }
-    let rt = &state.dialect.rt_crate;
-    let (op, command) = match op {
-        Op::Insert => ("INSERT", "Insert"),
-        Op::Update => ("UPDATE", "Update"),
-        Op::Delete => ("DELETE", "Delete"),
+    if matches!(
+        (&op, ret),
+        (Op::Delete, shape::Returning::One)
+            | (Op::Update, shape::Returning::First | shape::Returning::All)
+    ) {
+        return Err(syn::Error::new(
+            table.span(),
+            "unsupported mutation outcome",
+        ));
+    }
+    let op = match op {
+        Op::Insert => "INSERT",
+        Op::Update => "UPDATE",
+        Op::Delete => "DELETE",
     };
     let output = shape::ReturnShape::parse(state.return_type);
     Ok(match ret.expected() {
@@ -76,9 +93,8 @@ pub(in crate::plan) fn validate<'a>(
                     ),
                 ));
             }
-            let command = syn::Ident::new(command, proc_macro2::Span::call_site());
             Output {
-                output: Cow::Owned(syn::parse_quote!(-> #rt::dsl::write::#command<#table>)),
+                output: state.return_type,
                 cols: quote::quote! { 0u16 },
                 dispatch: emit::Kind::NoRows(required),
             }

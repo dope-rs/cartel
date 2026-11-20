@@ -26,16 +26,6 @@ impl Group {
             fun.modifiers.require_empty()?;
             backend::Compiled::validate(&fun.sig, &fun.attrs, "#[query_group] methods")?;
             let name = fun.sig.ident;
-            let text = name.to_string();
-            let text = text.trim_start_matches("r#");
-            if Group::DSL_BUILDER_METHODS.contains(&text) {
-                return Err(syn::Error::new(
-                    name.span(),
-                    format!(
-                        "query method name `{text}` collides with a DSL builder method on the table type — rename it"
-                    ),
-                ));
-            }
             let code = backend::Compiled::build::<pg::PgBackend>(
                 &fun.sig.generics,
                 fun.sig.inputs.into_iter().map(backend::Compiled::fn_arg),
@@ -76,21 +66,6 @@ impl Group {
         }
         syn::Ident::new(&name, span)
     }
-
-    const DSL_BUILDER_METHODS: &[&str] = &[
-        "filter",
-        "join",
-        "left_join",
-        "right_join",
-        "full_join",
-        "lateral_join",
-        "lateral_left",
-        "lateral_left_join",
-        "filter_each",
-        "insert",
-        "insert_each",
-        "insert_from",
-    ];
 
     pub(crate) fn expand(block: syn::ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
         block.modifiers.require_empty()?;

@@ -3,7 +3,6 @@ use sealed::Sealed;
 
 pub mod raw;
 mod sealed;
-pub mod tokens;
 
 /// The exact field type carried only by generated, uninhabited query checks.
 pub struct Target<T>(convert::Infallible, marker::PhantomData<fn(T) -> T>);

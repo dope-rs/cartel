@@ -5,7 +5,10 @@ use syn::visit::{self, Visit as _};
 use syn::visit_mut::{self, VisitMut as _};
 
 /// Both SQL planning and the Rust proof consume this same lowered block.
-pub(super) fn lower(mut block: syn::Block, params: &[super::Param]) -> syn::Result<syn::Block> {
+pub(super) fn lower(
+    mut block: syn::Block,
+    params: &[super::Param],
+) -> syn::Result<(syn::Block, Names)> {
     let mut names = Names(params.iter().map(|(id, _)| crate::ext::name(id)).collect());
     names.visit_block(&block);
     for stmt in &mut block.stmts {
@@ -17,85 +20,79 @@ pub(super) fn lower(mut block: syn::Block, params: &[super::Param]) -> syn::Resu
             },
             _ => continue,
         };
-        if let Some(chain) = Chain::parse(expr)? {
-            for argument in chain.arguments {
-                if matches!(argument, syn::Expr::Closure(_)) {
-                    continue;
-                }
-                let row = names.fresh("row");
-                Fields {
-                    table: &chain.table,
-                    row: &row,
-                }
-                .visit_expr_mut(argument);
-                *argument = syn::parse_quote!(|#row| #argument);
-            }
-        }
+        lower_chain(expr, &mut names)?;
     }
-    Ok(block)
+    Ok((block, names))
 }
 
 /// A complete chain whose row arguments all have one known table owner.
 /// Joins, CTE references, sets, bulk input and windows retain explicit row bindings.
-struct Chain<'a> {
-    table: syn::Path,
-    arguments: Vec<&'a mut syn::Expr>,
+fn lower_chain(expr: &mut syn::Expr, names: &mut Names) -> syn::Result<Option<syn::Path>> {
+    match expr {
+        syn::Expr::Call(call) => {
+            let syn::Expr::Path(function) = call.func.as_ref() else {
+                return Ok(None);
+            };
+            if function.qself.is_some()
+                || !function.path.segments.last().is_some_and(|segment| {
+                    matches!(segment.ident.to_string().as_str(), "filter" | "insert")
+                })
+                || call.args.len() != 1
+            {
+                return Ok(None);
+            }
+            let table = function.path.without_last()?;
+            for argument in &mut call.args {
+                bind(argument, &table, names);
+            }
+            Ok(Some(table))
+        }
+        syn::Expr::MethodCall(call) => {
+            let row_arg = match call.method.to_string().as_str() {
+                "select" | "order_by" | "order_by_desc" | "update" | "sum" | "avg" | "min"
+                | "max" | "group_by" => true,
+                "one"
+                | "first"
+                | "all"
+                | "stream"
+                | "rows"
+                | "limit"
+                | "offset"
+                | "distinct"
+                | "for_update"
+                | "for_share"
+                | "count"
+                | "cte"
+                | "delete"
+                | "returning_one"
+                | "returning_first"
+                | "returning_all"
+                | "on_conflict_do_nothing" => false,
+                _ => return Ok(None),
+            };
+            let Some(table) = lower_chain(&mut call.receiver, names)? else {
+                return Ok(None);
+            };
+            if row_arg && call.args.len() == 1 {
+                for argument in &mut call.args {
+                    bind(argument, &table, names);
+                }
+            }
+            Ok(Some(table))
+        }
+        _ => Ok(None),
+    }
 }
 
-impl<'a> Chain<'a> {
-    fn parse(expr: &'a mut syn::Expr) -> syn::Result<Option<Self>> {
-        match expr {
-            syn::Expr::Call(call) => {
-                let syn::Expr::Path(function) = call.func.as_ref() else {
-                    return Ok(None);
-                };
-                if function.qself.is_some()
-                    || !function.path.segments.last().is_some_and(|segment| {
-                        matches!(segment.ident.to_string().as_str(), "filter" | "insert")
-                    })
-                    || call.args.len() != 1
-                {
-                    return Ok(None);
-                }
-                Ok(Some(Self {
-                    table: function.path.without_last()?,
-                    arguments: call.args.iter_mut().collect(),
-                }))
-            }
-            syn::Expr::MethodCall(call) => {
-                let row_arg = match call.method.to_string().as_str() {
-                    "select" | "order_by" | "order_by_desc" | "update" | "sum" | "avg" | "min"
-                    | "max" | "group_by" => true,
-                    "one"
-                    | "first"
-                    | "all"
-                    | "stream"
-                    | "rows"
-                    | "limit"
-                    | "offset"
-                    | "distinct"
-                    | "for_update"
-                    | "for_share"
-                    | "count"
-                    | "cte"
-                    | "delete"
-                    | "returning_one"
-                    | "returning_first"
-                    | "returning_all"
-                    | "on_conflict_do_nothing" => false,
-                    _ => return Ok(None),
-                };
-                let Some(mut chain) = Self::parse(&mut call.receiver)? else {
-                    return Ok(None);
-                };
-                if row_arg && call.args.len() == 1 {
-                    chain.arguments.extend(call.args.iter_mut());
-                }
-                Ok(Some(chain))
-            }
-            _ => Ok(None),
-        }
+fn bind(argument: &mut syn::Expr, table: &syn::Path, names: &mut Names) {
+    if matches!(argument, syn::Expr::Closure(_)) {
+        return;
     }
+    let row = names.fresh("row");
+    Fields { table, row: &row }.visit_expr_mut(argument);
+    let mut closure: syn::ExprClosure = syn::parse_quote!(|#row| ());
+    std::mem::swap(argument, &mut *closure.body);
+    *argument = syn::Expr::Closure(closure);
 }
 
 #[derive(Default)]

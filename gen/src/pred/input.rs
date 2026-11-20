@@ -1,3 +1,4 @@
+use crate::emit::token::fragment;
 use crate::pred::{self, cmp, expr, sql};
 use syn::spanned::Spanned as _;
 
@@ -91,10 +92,10 @@ impl Null<'_> {
         scope: &pred::RowScope<'_>,
         context: &pred::WhereContext<'_>,
         sql: &mut sql::Sql,
-    ) -> syn::Result<()> {
+    ) -> syn::Result<proc_macro2::TokenStream> {
         let (syntax, keyword) = match self {
-            Self::Present(syntax) => (syntax, "IS_NOT_NULL"),
-            Self::Absent(syntax) => (syntax, "IS_NULL"),
+            Self::Present(syntax) => (syntax, " IS NOT NULL"),
+            Self::Absent(syntax) => (syntax, " IS NULL"),
         };
         if let Some(attr) = syntax.attrs.first() {
             return Err(syn::Error::new(
@@ -114,20 +115,22 @@ impl Null<'_> {
                 "null predicates do not take arguments",
             ));
         }
-        if !scope.parse_into(
+        let Some(value) = scope.parse_into(
             &syntax.receiver,
             None,
             context.dialect,
             context.cte_map,
             sql,
-        )? {
+        )?
+        else {
             return Err(syn::Error::new(
                 syntax.receiver.span(),
                 "null predicate receiver must be a column or column-derived expression",
             ));
-        }
-        sql.push(context.dialect.kw(keyword));
-        Ok(())
+        };
+        sql.push(fragment(keyword));
+        let method = &syntax.method;
+        Ok(quote::quote! { (#value).#method() })
     }
 }
 

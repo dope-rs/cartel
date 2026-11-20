@@ -88,11 +88,11 @@ impl Work {
     /// The admitted connection remains open until its exclusive owner drops.
     /// The native setter only rejects an invalid handle; registration and
     /// advisory statement expiration cannot allocate or invoke callbacks.
-    pub(crate) fn authorizer(&self, db: &sys::Connection) {
+    pub(crate) fn authorizer<const SCHEMA: bool>(&self, db: &sys::Connection) {
         unsafe {
             libsqlite3_sys::sqlite3_set_authorizer(
                 db.as_ptr(),
-                Some(authorize),
+                Some(authorize::<SCHEMA>),
                 ptr::from_ref(self).cast_mut().cast(),
             );
         }
@@ -101,7 +101,7 @@ impl Work {
     /// Refreshes callbacks before a forgotten borrow is reclaimed by its pinned owner.
     pub(crate) fn refresh(&self, db: &sys::Connection) {
         self.progress(db, config::Budget::PROGRESS_INTERVAL);
-        self.authorizer(db);
+        self.authorizer::<false>(db);
     }
 }
 
@@ -121,16 +121,21 @@ unsafe extern "C" fn progress(context: *mut std::ffi::c_void) -> std::ffi::c_int
     }
 }
 
-unsafe extern "C" fn authorize(
+unsafe extern "C" fn authorize<const SCHEMA: bool>(
     context: *mut std::ffi::c_void,
     action: std::ffi::c_int,
-    _: *const std::ffi::c_char,
+    first: *const std::ffi::c_char,
     second: *const std::ffi::c_char,
     _: *const std::ffi::c_char,
     _: *const std::ffi::c_char,
 ) -> std::ffi::c_int {
     let work = unsafe { &*context.cast::<work::Work>() };
     let denied = match action {
+        libsqlite3_sys::SQLITE_PRAGMA if SCHEMA && !first.is_null() => {
+            // SQLite supplies the pragma name as a NUL-terminated string for this call.
+            let name = unsafe { std::ffi::CStr::from_ptr(first) }.to_bytes();
+            !name.eq_ignore_ascii_case(b"user_version") && !name.eq_ignore_ascii_case(b"table_info")
+        }
         libsqlite3_sys::SQLITE_PRAGMA
         | libsqlite3_sys::SQLITE_ATTACH
         | libsqlite3_sys::SQLITE_DETACH

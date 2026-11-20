@@ -1,3 +1,4 @@
+use crate::emit::token::{COMMA, PAREN_CLOSE, SPACE, fragment};
 use crate::emit;
 use crate::ext::SqlIdent as _;
 use crate::plan;
@@ -38,7 +39,8 @@ pub(super) struct Compiled<'a> {
     pub(super) captures: Vec<Capture>,
     pub(super) nonnegative: Vec<(usize, plan::Bound)>,
     pub(super) plan: emit::Plan<'a>,
-    pub(super) block: syn::Block,
+    pub(super) proof: proc_macro2::TokenStream,
+    pub(super) names: Names,
 }
 
 impl<'a> Compiled<'a> {
@@ -106,12 +108,17 @@ impl<'a> Compiled<'a> {
             params.push(input?);
         }
 
-        let block = names::lower(block, &params)?;
-
+        let (block, mut names) = names::lower(block, &params)?;
+        syn::visit::Visit::visit_return_type(&mut names, output);
+        for (_, ty) in &params {
+            syn::visit::Visit::visit_type(&mut names, ty);
+        }
         let (ctes, body) = shape::CteBinding::extract_from(&block)?;
 
         let dialect = B::dialect();
         let mut state = plan::State {
+            names: &mut names,
+            checks: proc_macro2::TokenStream::new(),
             params: &params,
             captures: Vec::new(),
             nonnegative: Vec::new(),
@@ -121,15 +128,15 @@ impl<'a> Compiled<'a> {
         };
         let mut prefix: Vec<proc_macro2::TokenStream> = Vec::new();
         if !ctes.is_empty() {
-            prefix.push(dialect.kw("WITH_KW"));
+            prefix.push(fragment("WITH "));
             for (i, cte) in ctes.iter().enumerate() {
                 if i > 0 {
-                    prefix.push(dialect.kw("COMMA"));
+                    prefix.push(fragment(COMMA));
                 }
                 let name = crate::ext::name(cte.name);
                 let name_str = name.quoted();
                 prefix.push(quote::quote! { #name_str });
-                prefix.push(dialect.kw("AS_OPEN"));
+                prefix.push(fragment(" AS ("));
                 let (path, sql) = plan::cte::build(&mut state, cte.inner_chain)?;
                 if state.cte_map.insert(name, path).is_some() {
                     return Err(syn::Error::new(
@@ -138,9 +145,9 @@ impl<'a> Compiled<'a> {
                     ));
                 }
                 prefix.extend(sql);
-                prefix.push(dialect.kw("PAREN_CLOSE"));
+                prefix.push(fragment(PAREN_CLOSE));
             }
-            prefix.push(dialect.kw("SPACE"));
+            prefix.push(fragment(SPACE));
         }
 
         let shape = shape::QueryShape::parse(body, &state.cte_map)?;
@@ -149,6 +156,16 @@ impl<'a> Compiled<'a> {
             prefix.append(&mut plan.sql_parts);
             plan.sql_parts = prefix;
         }
+        let rt = &dialect.rt_crate;
+        let scope = scope();
+        let tys = params.iter().map(|(_, ty)| ty);
+        let ids = params.iter().map(|(id, _)| id);
+        let result = &plan.result;
+        let checks = state.checks;
+        let proof = quote::quote! {
+            const _: fn(&#rt::dsl::Scope, #(#tys),*) #output =
+                |#scope, #(#ids),*| { #checks #result };
+        };
         let captures = state.captures;
         let nonneg = state.nonnegative;
         Ok(Self {
@@ -156,7 +173,8 @@ impl<'a> Compiled<'a> {
             captures,
             nonnegative: nonneg,
             plan,
-            block,
+            proof,
+            names,
         })
     }
 
@@ -303,10 +321,26 @@ impl Dialect {
         self.text(quote::quote! { &<#ty>::__cartel_select_cols(#prefix) })
     }
 
-    pub(super) fn kw(&self, name: &str) -> proc_macro2::TokenStream {
-        let id = quote::format_ident!("{name}");
-        let rt = &self.rt_crate;
-        quote::quote! { #rt::dsl::sql::#id }
+    pub(super) fn boolean(&self, value: bool) -> proc_macro2::TokenStream {
+        fragment(match (self.kind, value) {
+            (Kind::Pg, true) => "TRUE",
+            (Kind::Pg, false) => "FALSE",
+            (Kind::Sqlite, true) => "1",
+            (Kind::Sqlite, false) => "0",
+        })
+    }
+
+    pub(super) fn pg_clause(
+        &self,
+        text: &str,
+        operation: &str,
+        span: proc_macro2::Span,
+    ) -> proc_macro2::TokenStream {
+        match self.kind {
+            Kind::Pg => fragment(text),
+            Kind::Sqlite => syn::Error::new(span, format!("SQLite does not support `{operation}`"))
+                .to_compile_error(),
+        }
     }
 
     pub(super) fn placeholder(&self, idx0: usize, ty: &syn::Type) -> proc_macro2::TokenStream {

@@ -15,9 +15,22 @@ pub(super) fn name(ident: &syn::Ident) -> String {
 
 pub(super) trait PathExt {
     fn without_last(&self) -> syn::Result<syn::Path>;
+    fn table(&self) -> syn::Result<syn::Path>;
 }
 
 impl PathExt for syn::Path {
+    fn table(&self) -> syn::Result<syn::Path> {
+        if let Some(last) = self.segments.last()
+            && !last.arguments.is_none()
+        {
+            return Err(syn::Error::new_spanned(
+                &last.arguments,
+                "this table operation infers its argument types",
+            ));
+        }
+        self.without_last()
+    }
+
     fn without_last(&self) -> syn::Result<syn::Path> {
         let mut t = self.clone();
         if t.segments.pop().is_none() || t.segments.is_empty() {
@@ -31,32 +44,33 @@ impl PathExt for syn::Path {
     }
 }
 
-pub(super) trait ExprExt {
-    fn column(&self, row_var: &syn::Ident) -> Option<String>;
-    fn is_true(&self) -> bool;
-    fn unbrace(&self) -> &syn::Expr;
-    fn closure<'a>(&'a self, arity: Option<usize>, method: &str) -> syn::Result<Closure<'a>>;
-    fn closure_n(&self, n: usize, method: &str) -> syn::Result<(Vec<syn::Ident>, syn::Expr)>;
-    fn closure_args(&self, method: &str) -> syn::Result<(Vec<syn::Ident>, syn::Expr)>;
-    fn closure_one(&self, method: &str) -> syn::Result<(&syn::Ident, &syn::Expr)>;
-    fn closure_same(&self, names: &[syn::Ident], method: &str) -> syn::Result<syn::Expr>;
-}
-
-pub(super) struct Closure<'a>(&'a syn::ExprClosure);
-
-impl Closure<'_> {
-    fn parts(self) -> syn::Result<(Vec<syn::Ident>, syn::Expr)> {
-        let mut idents = Vec::with_capacity(self.0.inputs.len());
-        for input in &self.0.inputs {
-            idents.push(input.ident()?.clone());
-        }
-        let body = self.0.body.unbrace().clone();
-        Ok((idents, body))
+pub(super) fn inferred(call: &syn::ExprMethodCall) -> syn::Result<()> {
+    match &call.turbofish {
+        Some(args) => Err(syn::Error::new_spanned(
+            args,
+            "this operation infers its argument types",
+        )),
+        None => Ok(()),
     }
 }
 
+pub(super) trait ExprExt {
+    fn column(&self, row_var: &syn::Ident) -> Option<&syn::Ident>;
+    fn is_true(&self) -> bool;
+    fn unbrace(&self) -> &syn::Expr;
+    fn closure(&self, arity: Option<usize>, method: &str) -> syn::Result<&syn::ExprClosure>;
+    fn binding(&self, arity: Option<usize>, method: &str) -> syn::Result<Binding<'_>>;
+    fn closure_one(&self, method: &str) -> syn::Result<(&syn::Ident, &syn::Expr)>;
+    fn closure_same(&self, names: &[syn::Ident], method: &str) -> syn::Result<&syn::Expr>;
+}
+
+pub(super) struct Binding<'a> {
+    pub(super) idents: Vec<syn::Ident>,
+    pub(super) body: &'a syn::Expr,
+}
+
 impl ExprExt for syn::Expr {
-    fn column(&self, row_var: &syn::Ident) -> Option<String> {
+    fn column(&self, row_var: &syn::Ident) -> Option<&syn::Ident> {
         let syn::Expr::Field(field) = self else {
             return None;
         };
@@ -76,7 +90,7 @@ impl ExprExt for syn::Expr {
         let syn::Member::Named(col) = &field.member else {
             return None;
         };
-        Some(name(col))
+        Some(col)
     }
 
     fn is_true(&self) -> bool {
@@ -104,7 +118,7 @@ impl ExprExt for syn::Expr {
         self
     }
 
-    fn closure<'a>(&'a self, arity: Option<usize>, method: &str) -> syn::Result<Closure<'a>> {
+    fn closure(&self, arity: Option<usize>, method: &str) -> syn::Result<&syn::ExprClosure> {
         let syn::Expr::Closure(closure) = self else {
             return Err(syn::Error::new(
                 self.span(),
@@ -156,35 +170,44 @@ impl ExprExt for syn::Expr {
                 format!("`{method}` closure must take exactly {n} parameter(s)"),
             ));
         }
-        Ok(Closure(closure))
+        Ok(closure)
     }
 
-    fn closure_n(&self, n: usize, method: &str) -> syn::Result<(Vec<syn::Ident>, syn::Expr)> {
-        let closure = self.closure(Some(n), method)?;
-        closure.parts()
-    }
-
-    fn closure_args(&self, method: &str) -> syn::Result<(Vec<syn::Ident>, syn::Expr)> {
-        let closure = self.closure(None, method)?;
-        closure.parts()
+    fn binding(&self, arity: Option<usize>, method: &str) -> syn::Result<Binding<'_>> {
+        let closure = self.closure(arity, method)?;
+        let mut idents = Vec::with_capacity(closure.inputs.len());
+        for input in &closure.inputs {
+            let id = input.ident()?;
+            if idents
+                .iter()
+                .any(|prev: &syn::Ident| prev.unraw() == id.unraw())
+            {
+                return Err(syn::Error::new(id.span(), "duplicate row binding"));
+            }
+            idents.push(id.clone());
+        }
+        Ok(Binding {
+            idents,
+            body: closure.body.unbrace(),
+        })
     }
 
     fn closure_one(&self, method: &str) -> syn::Result<(&syn::Ident, &syn::Expr)> {
         let closure = self.closure(None, method)?;
-        let mut inputs = closure.0.inputs.iter();
+        let mut inputs = closure.inputs.iter();
         let (Some(input), None) = (inputs.next(), inputs.next()) else {
             return Err(syn::Error::new(
-                closure.0.inputs.span(),
+                closure.inputs.span(),
                 format!("`{method}` closure must take exactly 1 parameter(s)"),
             ));
         };
-        Ok((input.ident()?, closure.0.body.unbrace()))
+        Ok((input.ident()?, closure.body.unbrace()))
     }
 
-    fn closure_same(&self, names: &[syn::Ident], method: &str) -> syn::Result<syn::Expr> {
+    fn closure_same(&self, names: &[syn::Ident], method: &str) -> syn::Result<&syn::Expr> {
         let closure = self.closure(Some(names.len()), method)?;
         let mut mismatch = None;
-        for (input, name) in closure.0.inputs.iter().zip(names) {
+        for (input, name) in closure.inputs.iter().zip(names) {
             if input.ident()?.unraw() != name.unraw() && mismatch.is_none() {
                 mismatch = Some(input.span());
             }
@@ -195,7 +218,7 @@ impl ExprExt for syn::Expr {
                 "`filter_each` and `.update` closures must use the same parameter names",
             ));
         }
-        Ok(closure.0.body.unbrace().clone())
+        Ok(closure.body.unbrace())
     }
 }
 

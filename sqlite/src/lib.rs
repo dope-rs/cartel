@@ -8,7 +8,7 @@ pub mod row;
 pub mod runtime;
 mod settings;
 
-use engine::{api, catalogs, conn, cursor, retry, sys};
+use engine::{api, catalogs, conn, retry, sys};
 use settings::{config, limits, memory, options};
 
 #[doc(hidden)]
@@ -26,7 +26,6 @@ pub use catalogs::{Catalog, Shape};
 pub use catalogs::{Entry, HasQuery, Statement, TypedQuery};
 pub use conn::Connection;
 pub use conn::Installed;
-pub use cursor::Cursor;
 pub use dope_fiber::abi::Fiber;
 pub use error::Error;
 pub use limits::{Budget, Busy, Limits, Parameters, Program, Progress, Scan, Work};

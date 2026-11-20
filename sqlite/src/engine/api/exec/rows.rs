@@ -1,7 +1,7 @@
 use crate::{api, catalogs, row};
 use api::{exec, stmt};
 use dope_fiber::{abi, context};
-use exec::Policy as _;
+use exec::{Policy as _, policy::Break as _};
 use exec::machine::{self, State};
 use std::{num, ops, pin, result, task};
 use stmt::access;
@@ -69,7 +69,7 @@ impl<
 {
     type Output = result::Result<<C::Policy as exec::Policy<R>>::Output, crate::Error>;
     type Ready =
-        Option<result::Result<Option<<C::Policy as exec::Policy<R>>::Output>, crate::Error>>;
+        Option<result::Result<Option<<C::Policy as exec::Policy<R>>::Break>, crate::Error>>;
 
     fn poll<'slot, 'id>(
         live: &mut abi::Live<'slot, 'id, Self>,
@@ -128,7 +128,7 @@ impl<
         let active = active.into_parts().0;
         let result = match result {
             Ok(None) => policy.done(),
-            Ok(Some(output)) => Ok(output),
+            Ok(Some(output)) => Ok(output.complete()),
             Err(error) => Err(error),
         };
         vacant.complete(active.finish(result))
@@ -138,7 +138,7 @@ impl<
 fn poll_rows<'d, R: row::raw::Decode, P, M: exec::Policy<R>>(
     active: &mut Active<'_, '_, 'd, P, M>,
     mut context: pin::Pin<&mut context::Context<'_, 'd>>,
-) -> task::Poll<result::Result<Option<M::Output>, crate::Error>> {
+) -> task::Poll<result::Result<Option<M::Break>, crate::Error>> {
     let (active, policy, remaining, byte_capacity) = active;
     let active = active.parts_mut().0;
     let mut polled = active.poll(byte_capacity.is_none(), context.as_mut());

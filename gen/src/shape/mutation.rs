@@ -4,70 +4,60 @@ use crate::shape;
 
 use syn::spanned::Spanned as _;
 
-pub(crate) struct Query {
-    pub(crate) kind: Mutation,
+pub(crate) struct Query<'a> {
+    pub(crate) kind: Mutation<'a>,
     pub(crate) returning: shape::Returning,
 }
 
-pub(crate) enum Mutation {
-    Insert(Insert),
-    Update(Update),
-    Delete(Delete),
-    Each(Each),
+pub(crate) enum Mutation<'a> {
+    Insert(Insert<'a>),
+    Update(Update<'a>),
+    Delete(shape::Selection<'a>),
+    Each(Each<'a>),
 }
 
-pub(crate) struct Insert {
-    pub(crate) input: Input,
-    pub(crate) conflict: shape::Conflict,
+pub(crate) struct Insert<'a> {
+    pub(crate) input: Input<'a>,
+    pub(crate) conflict: shape::Conflict<'a>,
 }
 
-pub(crate) enum Input {
-    One(Values),
-    Each(Values),
-    From(Box<From>),
+pub(crate) enum Input<'a> {
+    One(Values<'a>),
+    Each(Values<'a>),
+    From(Box<From<'a>>),
 }
 
-pub(crate) struct Values {
+pub(crate) struct Values<'a> {
     pub(crate) table: syn::Path,
-    pub(crate) arg: syn::Ident,
-    pub(crate) body: Box<syn::Expr>,
+    pub(crate) arg: &'a syn::Ident,
+    pub(crate) body: &'a syn::Expr,
 }
 
-pub(crate) struct From {
+pub(crate) struct From<'a> {
     pub(crate) table: syn::Path,
-    pub(crate) source: shape::QuerySource,
-    pub(crate) pred_idents: Vec<syn::Ident>,
-    pub(crate) predicate: Box<syn::Expr>,
-    pub(crate) target: syn::Ident,
-    pub(crate) source_idents: Vec<syn::Ident>,
-    pub(crate) body: Box<syn::Expr>,
+    pub(crate) selection: shape::Selection<'a>,
+    pub(crate) target: &'a syn::Ident,
+    pub(crate) source: &'a syn::Ident,
+    pub(crate) body: &'a syn::Expr,
 }
 
-pub(crate) struct Update {
-    pub(crate) source: shape::QuerySource,
-    pub(crate) pred_idents: Vec<syn::Ident>,
-    pub(crate) predicate: Box<syn::Expr>,
-    pub(crate) set_arg: syn::Ident,
-    pub(crate) body: Box<syn::Expr>,
+pub(crate) struct Update<'a> {
+    pub(crate) selection: shape::Selection<'a>,
+    pub(crate) set_arg: &'a syn::Ident,
+    pub(crate) body: &'a syn::Expr,
 }
 
-pub(crate) struct Delete {
-    pub(crate) source: shape::QuerySource,
-    pub(crate) pred_idents: Vec<syn::Ident>,
-    pub(crate) predicate: Box<syn::Expr>,
-}
-
-pub(crate) struct Each {
-    pub(crate) source: shape::QuerySource,
-    pub(crate) data: Vec<syn::Expr>,
+pub(crate) struct Each<'a> {
+    pub(crate) source: shape::QuerySource<'a>,
+    pub(crate) data: Vec<&'a syn::Expr>,
     pub(crate) row: syn::Ident,
     pub(crate) cols: Vec<syn::Ident>,
-    pub(crate) predicate: Box<syn::Expr>,
-    pub(crate) body: Box<syn::Expr>,
+    pub(crate) predicate: &'a syn::Expr,
+    pub(crate) body: &'a syn::Expr,
 }
 
-impl Query {
-    pub(crate) fn new(kind: Mutation) -> Self {
+impl<'a> Query<'a> {
+    pub(crate) fn new(kind: Mutation<'a>) -> Self {
         Self {
             kind,
             returning: shape::Returning::None,
@@ -91,7 +81,7 @@ impl Query {
 
     pub(crate) fn conflict(
         mut self,
-        conflict: shape::Conflict,
+        conflict: shape::Conflict<'a>,
         span: proc_macro2::Span,
     ) -> syn::Result<Self> {
         let Mutation::Insert(insert) = &mut self.kind else {
@@ -100,14 +90,23 @@ impl Query {
                 "ON CONFLICT clause follows `Table::insert(...)` / `Table::insert_each(...)` / `Table::insert_from(...)` only",
             ));
         };
-        if insert.conflict != shape::Conflict::None {
+        if self.returning != shape::Returning::None {
+            return Err(syn::Error::new(
+                span,
+                "ON CONFLICT precedes the mutation outcome",
+            ));
+        }
+        if !matches!(insert.conflict, shape::Conflict::None) {
             return Err(syn::Error::new(span, "duplicate ON CONFLICT clause"));
         }
         insert.conflict = conflict;
         Ok(self)
     }
 
-    pub(crate) fn try_each(receiver: &syn::Expr, update: &syn::Expr) -> syn::Result<Option<Self>> {
+    pub(crate) fn try_each(
+        receiver: &'a syn::Expr,
+        update: &'a syn::Expr,
+    ) -> syn::Result<Option<Self>> {
         let syn::Expr::Call(call) = receiver else {
             return Ok(None);
         };
@@ -145,7 +144,7 @@ impl Query {
                 "`Table::filter_each((cols...), |row, c0...| pred)` takes exactly two arguments",
             ));
         }
-        let table = function.path.without_last()?;
+        let table = function.path.table()?;
         let count = if let syn::Expr::Tuple(tuple) = &args[0] {
             tuple.elems.len()
         } else {
@@ -158,22 +157,22 @@ impl Query {
             ));
         }
         let arity = 1 + count;
-        let (pred_ids, pred) = args[1].closure_n(arity, "filter_each")?;
-        let body = update.closure_same(&pred_ids, "update")?;
+        let pred = args[1].binding(Some(arity), "filter_each")?;
+        let body = update.closure_same(&pred.idents, "update")?;
         let source = shape::QuerySource::new(table);
         let data = match &args[0] {
-            syn::Expr::Tuple(tuple) => tuple.elems.iter().cloned().collect(),
-            single => vec![single.clone()],
+            syn::Expr::Tuple(tuple) => tuple.elems.iter().collect(),
+            single => vec![single],
         };
-        let row = pred_ids[0].clone();
-        let cols = pred_ids[1..].to_vec();
+        let row = pred.idents[0].clone();
+        let cols = pred.idents[1..].to_vec();
         Ok(Some(Self::new(Mutation::Each(Each {
             source,
             data,
             row,
             cols,
-            predicate: Box::new(pred),
-            body: Box::new(body),
+            predicate: pred.body,
+            body,
         }))))
     }
 }

@@ -35,6 +35,70 @@ pub enum Failure {
 }
 
 #[derive(Debug)]
+pub enum SchemaError {
+    Open(open::Error),
+    Rejected(i64),
+}
+
+impl From<open::Error> for SchemaError {
+    fn from(error: open::Error) -> Self {
+        Self::Open(error)
+    }
+}
+
+impl From<cartel_sqlite::Error> for SchemaError {
+    fn from(error: cartel_sqlite::Error) -> Self {
+        Self::Open(open::Error::Step(error))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum SchemaAttempt {
+    MissingTable,
+    Refusal,
+    EarlyCommit,
+    CommitFailure,
+    Success,
+}
+
+impl SchemaAttempt {
+    pub fn initialize(self, schema: open::Schema<'_>) -> Result<open::Schema<'_>, SchemaError> {
+        let (schema, version) = schema.integer("PRAGMA user_version")?;
+        assert_eq!(version, 0);
+        let schema = schema
+            .execute("CREATE TABLE draft(value BLOB)", ())?
+            .execute("PRAGMA user_version=3", ())?;
+        match self {
+            Self::Refusal => Err(SchemaError::Rejected(3)),
+            Self::MissingTable => Ok(schema),
+            Self::EarlyCommit => Ok(schema.execute("COMMIT", ())?),
+            Self::CommitFailure => Ok(schema
+                .execute("CREATE TABLE items(id INTEGER PRIMARY KEY)", ())?
+                .execute(
+                    "CREATE TABLE child(id REFERENCES items DEFERRABLE INITIALLY DEFERRED)",
+                    (),
+                )?
+                .execute("INSERT INTO child VALUES(1)", ())?),
+            Self::Success => {
+                let (schema, empty) = schema.first_blob("SELECT value FROM draft")?;
+                assert_eq!(empty, None);
+                let bytes = [3, 0, 7];
+                let schema = schema.execute("INSERT INTO draft VALUES(?1)", (&bytes[..], ()))?;
+                let (schema, stored) = schema.first_blob("SELECT value FROM draft")?;
+                assert_eq!(stored.as_deref(), Some(bytes.as_slice()));
+                let (schema, found) = schema.integer(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('draft') WHERE name='value')",
+                )?;
+                assert_eq!(found, 1);
+                Ok(schema
+                    .execute("CREATE TABLE items(id INTEGER PRIMARY KEY)", ())?
+                    .execute("INSERT INTO items VALUES(11)", ())?)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum Cause<'a, R> {
     Enter(error::Kind<'a, runtime::Error, &'a Output<'a, R>>),
     Session(session::Error<'a, R>),

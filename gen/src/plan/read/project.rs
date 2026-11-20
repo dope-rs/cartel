@@ -1,3 +1,4 @@
+use crate::emit::token::{FROM, PAREN_CLOSE_SPACE, SUBQUERY_OPEN, WHERE, fragment};
 use crate::plan;
 use crate::pred::{self, var};
 use crate::shape::{self, qualify};
@@ -14,7 +15,7 @@ pub(in crate::plan) fn element(
     scope: &pred::RowScope<'_>,
     lock: shape::lock::Lock,
     output: &mut Vec<proc_macro2::TokenStream>,
-) -> syn::Result<()> {
+) -> syn::Result<proc_macro2::TokenStream> {
     if let syn::Expr::MethodCall(mc) = elem
         && mc.method == "over"
     {
@@ -30,75 +31,84 @@ pub(in crate::plan) fn element(
                 "`.select(...)` element must be a column / arithmetic / function expression or a window expression `<fn>().over(|w| ...)`",
             ),
         )?;
-    state.render_into(parsed, output);
-    Ok(())
+    state.render_into(parsed.sql, output);
+    Ok(parsed.rust)
 }
 
 pub(in crate::plan) fn lateral(
     state: &mut plan::State<'_, '_>,
-    j: &join::Join,
+    j: &join::Join<'_>,
     index: usize,
-    source: &shape::QuerySource,
+    source: &shape::QuerySource<'_>,
 ) -> syn::Result<Vec<proc_macro2::TokenStream>> {
-    let outer = pred::RowScope::for_outer(source, &j.on_idents, index)?;
+    if matches!(state.dialect.kind, crate::backend::Kind::Sqlite) {
+        return Err(syn::Error::new(
+            j.path.span(),
+            "SQLite does not support lateral joins",
+        ));
+    }
+    let outer = pred::RowScope::for_outer(source, &j.on.idents, index)?;
     let mut quals = qualify::State::default();
-    let body = quals.peel(&j.cond)?;
-    let (inner, ids, pred) = shape::QuerySource::parse_chain(body, &state.cte_map)?;
+    let body = quals.peel(j.on.body)?;
+    let shape::Selection {
+        source: inner,
+        idents,
+        predicate,
+    } = shape::Selection::parse(body, &state.cte_map)?;
     let inner = inner.nested(Some(source.alias_depth));
     if !inner.joins.is_empty() {
         return Err(syn::Error::new(
-            j.cond.span(),
+            j.on.body.span(),
             "joined source not yet supported as a lateral subquery body",
         ));
     }
     let table = &inner.primary_path;
-    let scope = pred::RowScope::for_source(&inner, &ids)?.with_outer(&outer);
+    let joined = j.path;
+    state
+        .checks
+        .extend(quote::quote! { let _: fn(#joined) -> #joined = |row: #table| -> #table { row }; });
+    let scope = pred::RowScope::for_source(&inner, &idents)?.with_outer(&outer);
     let qual = Qualify::new(&quals, None, &scope, state)?;
-    let filter = filter::build(state, &pred, &scope, true)?;
+    let filter = filter::build(state, predicate, &scope, true)?;
 
     let columns = state
         .dialect
         .columns(&syn::parse_quote!(#table), inner.qualifier(0));
-    let mut sql = vec![state.dialect.kw("SUBQUERY_OPEN")];
-    sql.extend(distinct(state, &quals, &scope)?);
-    sql.extend([columns, state.dialect.kw("FROM_KW")]);
+    let mut sql = vec![fragment(SUBQUERY_OPEN)];
+    distinct(state, &quals, &scope, &mut sql)?;
+    sql.extend([columns, fragment(FROM)]);
     sql.extend(inner.render_base());
-    sql.push(state.dialect.kw("WHERE_KW"));
+    sql.push(fragment(WHERE));
     sql.extend(filter);
-    sql.extend(qual.render(state));
-    sql.push(state.dialect.kw("PAREN_CLOSE_SPACE"));
+    qual.render_into(state, &mut sql);
+    sql.push(fragment(PAREN_CLOSE_SPACE));
     sql.push(source.qualifier(index + 1));
-    sql.push(state.dialect.kw("ON_TRUE"));
+    sql.push(fragment(" ON true"));
     Ok(sql)
 }
 
 pub(in crate::plan) fn distinct(
     state: &mut plan::State<'_, '_>,
-    quals: &qualify::State,
+    quals: &qualify::State<'_>,
     scope: &pred::RowScope<'_>,
-) -> syn::Result<Vec<proc_macro2::TokenStream>> {
-    Ok(match &quals.distinct {
-        qualify::Distinct::None => Vec::new(),
-        qualify::Distinct::All => vec![state.dialect.kw("DISTINCT_KW")],
+    output: &mut Vec<proc_macro2::TokenStream>,
+) -> syn::Result<()> {
+    match quals.distinct {
+        qualify::Distinct::None => {}
+        qualify::Distinct::All => output.push(fragment("DISTINCT ")),
         qualify::Distinct::On(arg, expr) => {
-            let mut vars = Vec::with_capacity(scope.vars.len().max(1));
-            if let Some(first) = scope.vars.first() {
-                vars.push(var::Var {
-                    ident: arg.clone(),
-                    table_const: first.table_const.clone(),
-                });
-            } else {
-                vars.push(var::Var {
-                    ident: arg.clone(),
-                    table_const: None,
-                });
-            }
             let local = pred::RowScope {
-                vars,
+                vars: vec![var::Var {
+                    referenced: Default::default(),
+                    ident: arg.clone(),
+                    table_const: scope.vars[0].table_const.clone(),
+                    ty: scope.vars[0].ty.clone(),
+                }],
                 agg_var: None,
                 outer: scope.outer,
                 alias_depth: scope.alias_depth,
                 unnest_cols: &[],
+                unnest_data: &[],
             };
             let parsed = state.parse(&local, expr, || {
                 syn::Error::new(
@@ -106,11 +116,16 @@ pub(in crate::plan) fn distinct(
                     "`.distinct_on(...)` body must be a column / arithmetic / function expression",
                 )
             })?;
-            let inner = state.render(parsed);
-            let mut parts = vec![state.dialect.kw("DISTINCT_ON_OPEN")];
-            parts.extend(inner);
-            parts.push(state.dialect.kw("PAREN_CLOSE_SPACE"));
-            parts
+            output.push(
+                state
+                    .dialect
+                    .pg_clause("DISTINCT ON (", "DISTINCT ON", expr.span()),
+            );
+            let rust = local.bound(parsed.rust);
+            state.checks.extend(quote::quote! { let _ = #rust; });
+            state.render_into(parsed.sql, output);
+            output.push(fragment(PAREN_CLOSE_SPACE));
         }
-    })
+    }
+    Ok(())
 }

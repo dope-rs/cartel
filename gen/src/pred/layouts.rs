@@ -6,14 +6,14 @@ use std::slice;
 use syn::{ext::IdentExt as _, punctuated, spanned::Spanned as _, token};
 
 struct Rows<'a> {
-    source: &'a shape::QuerySource,
+    source: &'a shape::QuerySource<'a>,
     idents: &'a [syn::Ident],
 }
 
 impl<'a> Rows<'a> {
     fn new(
-        source: &'a shape::QuerySource,
-        joins: &'a [join::Join],
+        source: &'a shape::QuerySource<'a>,
+        joins: &'a [join::Join<'a>],
         idents: &'a [syn::Ident],
     ) -> syn::Result<Self> {
         let (primary, joined) = idents.split_first().ok_or_else(|| {
@@ -37,28 +37,34 @@ impl<'a> Rows<'a> {
 }
 
 impl<'a> pred::RowScope<'a> {
-    pub(crate) fn single(ident: syn::Ident) -> Self {
+    pub(crate) fn single(ident: syn::Ident, ty: proc_macro2::TokenStream) -> Self {
         Self {
             vars: vec![var::Var {
+                referenced: Default::default(),
                 ident,
+                ty,
                 table_const: None,
             }],
             agg_var: None,
             outer: None,
             alias_depth: None,
             unnest_cols: &[],
+            unnest_data: &[],
         }
     }
 
-    pub(crate) fn for_source(src: &shape::QuerySource, idents: &[syn::Ident]) -> syn::Result<Self> {
+    pub(crate) fn for_source(
+        src: &shape::QuerySource<'_>,
+        idents: &[syn::Ident],
+    ) -> syn::Result<Self> {
         Ok(Rows::new(src, &src.joins, idents)?.scope())
     }
 
-    pub(crate) fn for_primary(src: &shape::QuerySource, ident: &syn::Ident) -> Self {
+    pub(crate) fn for_primary(src: &shape::QuerySource<'_>, ident: &syn::Ident) -> Self {
         Self::for_bindings(src, slice::from_ref(ident))
     }
 
-    pub(crate) fn for_join_on(src: &shape::QuerySource, index: usize) -> syn::Result<Self> {
+    pub(crate) fn for_join_on(src: &shape::QuerySource<'_>, index: usize) -> syn::Result<Self> {
         let (j, joins) = src
             .joins
             .get(..=index)
@@ -69,7 +75,7 @@ impl<'a> pred::RowScope<'a> {
                     "join scope index exceeds the source",
                 )
             })?;
-        let idents = &j.on_idents;
+        let idents = &j.on.idents;
         Ok(Rows::new(src, joins, idents)?.scope())
     }
 
@@ -89,7 +95,9 @@ impl<'a> pred::RowScope<'a> {
         let mut vars = Vec::with_capacity(inputs.len());
         for (input, row) in inputs.iter().zip(&parent.vars) {
             vars.push(var::Var {
+                referenced: Default::default(),
                 ident: input.ident()?.clone(),
+                ty: row.ty.clone(),
                 table_const: row.table_const.clone(),
             });
         }
@@ -99,6 +107,7 @@ impl<'a> pred::RowScope<'a> {
             outer: parent.outer,
             alias_depth: parent.alias_depth,
             unnest_cols: &[],
+            unnest_data: &[],
         })
     }
 
@@ -107,19 +116,55 @@ impl<'a> pred::RowScope<'a> {
         self
     }
 
-    pub(crate) fn with_unnest(mut self, cols: &'a [syn::Ident]) -> Self {
+    pub(crate) fn with_unnest(mut self, cols: &'a [syn::Ident], data: &'a [syn::Ident]) -> Self {
         self.unnest_cols = cols;
+        self.unnest_data = data;
         self
     }
 
-    pub(super) fn unnest_ref(&self, expr: &syn::Expr) -> Option<proc_macro2::TokenStream> {
+    pub(crate) fn bindings(&self, target: Option<&syn::Ident>) -> proc_macro2::TokenStream {
+        let mut tokens = proc_macro2::TokenStream::new();
+        let scope = crate::backend::scope();
+        for var in self
+            .vars
+            .iter()
+            .filter(|var| var.referenced.replace(false) && Some(&var.ident) != target)
+        {
+            let id = &var.ident;
+            let ty = &var.ty;
+            tokens.extend(quote::quote! { let #id: #ty = #scope.value(); });
+        }
+        let data = self.unnest_data;
+        tokens.extend(
+            quote::quote! { #(let #data = ::cartel_pg::dsl::shape::element(#scope, &#data);)* },
+        );
+        tokens
+    }
+
+    pub(crate) fn local(&self, value: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+        let bindings = self.bindings(None);
+        quote::quote! {{ #bindings #value }}
+    }
+
+    pub(crate) fn bound(&self, value: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+        let value = self.local(value);
+        match self.outer {
+            Some(parent) => parent.bound(value),
+            None => value,
+        }
+    }
+
+    pub(super) fn unnest_ref(
+        &self,
+        expr: &syn::Expr,
+    ) -> Option<(proc_macro2::TokenStream, &syn::Ident)> {
         let id = expr::Path::new(expr)?.single()?;
         let pos = self
             .unnest_cols
             .iter()
             .position(|column| column.unraw() == id.unraw())?;
         let col = format!("__d.f{pos}");
-        Some(quote::quote! { #col })
+        Some((quote::quote! { #col }, &self.unnest_data[pos]))
     }
 
     pub(crate) fn with_outer(mut self, outer: &'a Self) -> Self {
@@ -149,6 +194,7 @@ impl<'a> pred::RowScope<'a> {
             .vars
             .iter()
             .find(|var| var.ident.unraw() == base.unraw())?;
+        var.referenced.set(true);
         let col_str = crate::ext::name(col);
         match &var.table_const {
             None => Some(pred::SqlColRef::Bare(col_str)),

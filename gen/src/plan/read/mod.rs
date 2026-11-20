@@ -10,7 +10,7 @@ pub(in crate::plan) use qualify::Qualify;
 
 pub(in crate::plan) fn join_parts(
     state: &mut super::State<'_, '_>,
-    source: &crate::shape::QuerySource,
+    source: &crate::shape::QuerySource<'_>,
 ) -> syn::Result<Vec<Vec<proc_macro2::TokenStream>>> {
     let mut parts = Vec::with_capacity(source.joins.len());
     for (index, join) in source.joins.iter().enumerate() {
@@ -18,7 +18,7 @@ pub(in crate::plan) fn join_parts(
             project::lateral(state, join, index, source)?
         } else {
             let scope = crate::pred::RowScope::for_join_on(source, index)?;
-            filter::join(state, &join.cond, &scope)?
+            filter::join(state, join.on.body, &scope)?
         };
         parts.push(on);
     }

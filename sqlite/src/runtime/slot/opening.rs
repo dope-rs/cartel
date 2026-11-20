@@ -36,8 +36,29 @@ impl<'slot, 'd, I: catalogs::Catalog> Opening<'slot, 'd, I> {
         self.guard.call(db)
     }
 
-    pub(crate) fn authorize(&self) {
-        self.guard.work().authorizer(self.connection)
+    pub(crate) fn authorize<const SCHEMA: bool>(&self) {
+        self.guard.work().authorizer::<SCHEMA>(self.connection)
+    }
+
+    pub(crate) fn parameters(&self) {
+        self.connection.limit(
+            libsqlite3_sys::SQLITE_LIMIT_VARIABLE_NUMBER,
+            self.config().param_limit(),
+        );
+    }
+
+    pub(crate) fn begin_immediate(
+        &self,
+        _: crate::open::schema::Transaction,
+    ) -> Result<(), crate::Error> {
+        self.guard
+            .work()
+            .control()
+            .run(|| self.call().exec("BEGIN IMMEDIATE"))
+    }
+
+    pub(crate) fn schema(&self) -> crate::open::Schema<'_> {
+        crate::open::Schema::new(self.connection, &self.guard, self.config())
     }
 
     pub(crate) fn install(&mut self) -> Result<(), crate::Error> {
@@ -51,16 +72,16 @@ impl<'slot, 'd, I: catalogs::Catalog> Opening<'slot, 'd, I> {
 
     pub(crate) fn prepare(self) -> Prepare<'slot, 'd, I> {
         let config = self.config();
-        let params = config.param_limit();
         let db = self.connection;
-        db.limit(libsqlite3_sys::SQLITE_LIMIT_VARIABLE_NUMBER, params);
         Prepare {
             // SAFETY: the one-time Local grant retains this catalog's empty
             // storage and its original live connection through the lease.
-            prepare: unsafe { stmt::Prepare::new(db, self.statements, config.stmt_bytes()) },
-            arena: self.arena,
-            guard: self.guard,
-            lease: self.lease,
+            statements: unsafe { stmt::Prepare::new(db, self.statements, config.stmt_bytes()) },
+            opening: super::prepare::Owner {
+                arena: self.arena,
+                guard: self.guard,
+                lease: self.lease,
+            },
         }
     }
 }

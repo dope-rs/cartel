@@ -187,45 +187,12 @@ impl<A: Validate, B: Validate> Validate for (A, B) {
     }
 }
 
-impl<A: Validate, B: Validate, C: Validate> Validate for (A, B, C) {
-    const DYNAMIC_TYPES: u8 = A::DYNAMIC_TYPES | B::DYNAMIC_TYPES | C::DYNAMIC_TYPES;
-    const FORMATS: Formats = Formats::Row(&[A::FORMATS, B::FORMATS, C::FORMATS]);
-
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        A::validate(types)?;
-        B::validate(types)?;
-        C::validate(types)
-    }
-}
-
-impl<A: Validate, B: Validate, C: Validate, D: Validate> Validate for (A, B, C, D) {
-    const DYNAMIC_TYPES: u8 =
-        A::DYNAMIC_TYPES | B::DYNAMIC_TYPES | C::DYNAMIC_TYPES | D::DYNAMIC_TYPES;
-    const FORMATS: Formats = Formats::Row(&[A::FORMATS, B::FORMATS, C::FORMATS, D::FORMATS]);
-
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        A::validate(types)?;
-        B::validate(types)?;
-        C::validate(types)?;
-        D::validate(types)
-    }
-}
-
 impl<T: schema::Field> Validate for T {
     const DYNAMIC_TYPES: u8 = T::DYNAMIC_TYPES;
     const FORMAT: u16 = T::FORMAT;
 
     fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
         types.match_type(T::TARGET)
-    }
-}
-
-impl<T: schema::Field + schema::row::Nullable> Validate for Option<T> {
-    const DYNAMIC_TYPES: u8 = T::DYNAMIC_TYPES;
-    const FORMAT: u16 = T::FORMAT;
-
-    fn validate(types: &mut Types<'_>) -> Result<(), crate::Error> {
-        T::validate(types)
     }
 }
 
@@ -289,7 +256,7 @@ impl Types<'_> {
             return Err(crate::Error::DescriptionUnexpectedRows);
         }
         let mut types = Types::new(payload, Q::N_RESULT_COLS, registry)?;
-        <Q::Row as Validate>::validate(&mut types)?;
+        <Q::Row as schema::Row>::Description::validate(&mut types)?;
         types.finish()
     }
 }

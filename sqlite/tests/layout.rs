@@ -137,10 +137,12 @@ fn bounded_fiber_state() -> Result<(), plan::Error> {
                     &["value"]
                 );
 
-                let scan = database
-                    .query()
-                    .stream::<i64, _, _>(LayoutDatabase::SELECT_ITEM, ())
-                    .visit(|_| ops::ControlFlow::Continue(()));
+                let scan =
+                    database
+                        .query()
+                        .stream::<i64, _, _>(LayoutDatabase::SELECT_ITEM, (), |_| {
+                            ops::ControlFlow::Continue(())
+                        });
                 let scan_len = mem::size_of_val(&scan);
                 assert!(scan_len <= SCAN_WORDS * mem::size_of::<usize>());
                 fibers::TEST

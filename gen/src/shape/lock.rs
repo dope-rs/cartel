@@ -1,4 +1,5 @@
 use crate::backend;
+use crate::emit::token::fragment;
 
 #[derive(Default, Clone, Copy)]
 pub(crate) enum Lock {
@@ -22,12 +23,12 @@ impl Lock {
     ) -> syn::Result<Option<proc_macro2::TokenStream>> {
         let keyword = match self {
             Self::None => return Ok(None),
-            Self::ForUpdate(_) => "FOR_UPDATE",
-            Self::ForShare(_) => "FOR_SHARE",
+            Self::ForUpdate(_) => " FOR UPDATE",
+            Self::ForShare(_) => " FOR SHARE",
         };
         if matches!(dialect.kind, backend::Kind::Sqlite) {
             self.reject("this backend does not support row locking")?;
         }
-        Ok(Some(dialect.kw(keyword)))
+        Ok(Some(fragment(keyword)))
     }
 }

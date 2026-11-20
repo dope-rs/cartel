@@ -70,8 +70,6 @@ impl backend::TableBackend for Backend {
         let row_lt = names.lifetime("__cartel_row");
         let src_lt = names.lifetime("__cartel_source");
         let slot_ty = names.fresh("__Slot");
-        let join_ty = names.fresh("__CartelJoin");
-        let input_ty = names.fresh("__CartelSource");
         let mut row_g = input.generics.clone();
         owner.visit_generics_mut(&mut row_g);
         for ty in &types {
@@ -176,46 +174,6 @@ impl backend::TableBackend for Backend {
 
                 #[doc(hidden)]
                 pub const __CARTEL_TABLE: &'static str = #tbl_sql;
-            }
-
-            impl #impl_g #name #type_g #where_g {
-                pub fn filter(
-                    scope: &#rt::dsl::Scope,
-                    pred: impl ::core::ops::FnOnce(#name #type_g) -> bool,
-                )
-                    -> #rt::dsl::query::Query<#name #type_g>
-                {
-                    match (scope.0, pred) {}
-                }
-
-                pub fn join<#join_ty>(
-                    scope: &#rt::dsl::Scope,
-                    pred: impl ::core::ops::FnOnce(#name #type_g, #join_ty) -> bool,
-                ) -> #rt::dsl::query::join::Plan2<#name #type_g, #join_ty> {
-                    match (scope.0, pred) {}
-                }
-                pub fn left_join<#join_ty>(
-                    scope: &#rt::dsl::Scope,
-                    pred: impl ::core::ops::FnOnce(#name #type_g, #join_ty) -> bool,
-                ) -> #rt::dsl::query::join::Plan2<#name #type_g, #join_ty> {
-                    match (scope.0, pred) {}
-                }
-
-                pub fn insert(
-                    scope: &#rt::dsl::Scope,
-                    init: impl ::core::ops::FnOnce(&mut #name #type_g),
-                )
-                    -> #rt::dsl::write::Insert<#name #type_g>
-                {
-                    match (scope.0, init) {}
-                }
-                pub fn insert_from<#input_ty>(
-                    scope: &#rt::dsl::Scope,
-                    source: #rt::dsl::query::Query<#input_ty>,
-                    init: impl ::core::ops::FnOnce(&mut #name #type_g, #input_ty),
-                ) -> #rt::dsl::write::Insert<#name #type_g> {
-                    match (scope.0, source, init) {}
-                }
             }
         })
     }

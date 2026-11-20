@@ -1,3 +1,4 @@
+use crate::emit::token::{COMMA, COUNT_STAR, PAREN_CLOSE, PAREN_OPEN, fragment};
 use crate::backend;
 use crate::pred;
 use crate::pred::literal::Literal;
@@ -235,26 +236,27 @@ impl pred::RowScope<'_> {
         params: Option<&[backend::Param]>,
         dialect: &backend::Dialect,
         cte_map: &collections::BTreeMap<String, syn::Path>,
-    ) -> syn::Result<Option<sql::Sql>> {
+    ) -> syn::Result<Option<sql::Operand>> {
         let mut sql = sql::Sql::new();
-        let parsed = self.parse_into(expr, params, dialect, cte_map, &mut sql)?;
-        Ok(parsed.then_some(sql))
+        Ok(self
+            .parse_into(expr, params, dialect, cte_map, &mut sql)?
+            .map(|rust| sql::Operand { sql, rust }))
     }
 
-    pub(super) fn parse_into(
+    pub(crate) fn parse_into(
         &self,
         expr: &syn::Expr,
         params: Option<&[backend::Param]>,
         dialect: &backend::Dialect,
         cte_map: &collections::BTreeMap<String, syn::Path>,
         sql: &mut sql::Sql,
-    ) -> syn::Result<bool> {
+    ) -> syn::Result<Option<proc_macro2::TokenStream>> {
         let start = sql.len();
-        let parsed = self.write_expr(expr, params, dialect, cte_map, sql)?;
-        if !parsed {
+        let rust = self.write_expr(expr, params, dialect, cte_map, sql)?;
+        if rust.is_none() {
             sql.truncate(start);
         }
-        Ok(parsed)
+        Ok(rust)
     }
 
     fn write_expr(
@@ -264,37 +266,35 @@ impl pred::RowScope<'_> {
         dialect: &backend::Dialect,
         cte_map: &collections::BTreeMap<String, syn::Path>,
         sql: &mut sql::Sql,
-    ) -> syn::Result<bool> {
-        if let Some(token) = self.unnest_ref(expr) {
+    ) -> syn::Result<Option<proc_macro2::TokenStream>> {
+        if let Some((token, column)) = self.unnest_ref(expr) {
             sql.push(token);
-            return Ok(true);
-        }
-        if let Some(column) = self.column_ref(expr) {
+            return Ok(Some(quote::quote! { #column }));
+        } else if let Some(column) = self.column_ref(expr) {
             sql.extend(column.into_parts());
-            return Ok(true);
-        }
-        if let Some(params) = params
+        } else if let Some(params) = params
             && let Some(ident) = Path::new(expr).and_then(|path| path.single())
             && let Some(index) = params
                 .iter()
                 .position(|(param, _)| param.unraw() == ident.unraw())
         {
             sql.capture((index, ident.span()));
-            return Ok(true);
-        }
-        if let Some(binary) = Binary::new(expr) {
-            sql.push(dialect.kw("PAREN_OPEN"));
-            if !self.write_expr(&binary.syntax.left, params, dialect, cte_map, sql)? {
-                return Ok(false);
-            }
+        } else if let Some(binary) = Binary::new(expr) {
+            sql.push(fragment(PAREN_OPEN));
+            let Some(left) = self.write_expr(&binary.syntax.left, params, dialect, cte_map, sql)?
+            else {
+                return Ok(None);
+            };
+            let op = &binary.syntax.op;
             sql.push(binary.operator.tokens());
-            if !self.write_expr(&binary.syntax.right, params, dialect, cte_map, sql)? {
-                return Ok(false);
-            }
-            sql.push(dialect.kw("PAREN_CLOSE"));
-            return Ok(true);
-        }
-        if let Some(call) = Call::new(expr) {
+            let Some(right) =
+                self.write_expr(&binary.syntax.right, params, dialect, cte_map, sql)?
+            else {
+                return Ok(None);
+            };
+            sql.push(fragment(PAREN_CLOSE));
+            return Ok(Some(quote::quote! { (#left #op #right) }));
+        } else if let Some(call) = Call::new(expr) {
             let arity = match call.function {
                 Function::Vector
                 | Function::Query
@@ -303,77 +303,69 @@ impl pred::RowScope<'_> {
                 Function::Rank | Function::ArrayLength => 2,
             };
             if call.syntax.args.len() != arity {
-                return Ok(false);
+                return Ok(None);
             }
             let prefix = format!("{}(", call.function.name());
             sql.push(quote::quote! { #prefix });
-            for (index, arg) in call.syntax.args.iter().enumerate() {
-                if index > 0 {
-                    sql.push(dialect.kw("COMMA"));
+            let mut args = Vec::with_capacity(arity);
+            for arg in &call.syntax.args {
+                if !args.is_empty() {
+                    sql.push(fragment(COMMA));
                 }
-                if !self.write_expr(arg, params, dialect, cte_map, sql)? {
-                    return Ok(false);
-                }
+                let Some(value) = self.write_expr(arg, params, dialect, cte_map, sql)? else {
+                    return Ok(None);
+                };
+                args.push(value);
             }
-            sql.push(dialect.kw("PAREN_CLOSE"));
-            return Ok(true);
-        }
-        if let syn::Expr::Paren(paren) = expr {
+            sql.push(fragment(PAREN_CLOSE));
+            let method = syn::Ident::new(
+                match call.function {
+                    Function::Vector => "vector",
+                    Function::Query | Function::PlainQuery => "query",
+                    Function::Rank => "rank",
+                    Function::ArrayLength => "array_len",
+                    Function::Cardinality => "cardinality",
+                },
+                call.syntax.paren_token.span.open(),
+            );
+            let scope = backend::scope();
+            let rt = &dialect.rt_crate;
+            return Ok(Some(
+                quote::quote! { #rt::dsl::expr::#method(#scope, #(#args),*) },
+            ));
+        } else if let syn::Expr::Paren(paren) = expr {
             if !paren.attrs.is_empty() {
-                return Ok(false);
+                return Ok(None);
             }
             return self.write_expr(&paren.expr, params, dialect, cte_map, sql);
-        }
-        if let Some(method) = Method::new(expr) {
+        } else if let Some(method) = Method::new(expr) {
             if let syn::Expr::Call(receiver) = method.syntax.receiver.as_ref() {
-                let Some(kind) = method.shape()? else {
-                    return Ok(false);
-                };
-                let Some(params) = params else {
-                    return Ok(false);
+                let (Some(kind), Some(params)) = (method.shape()?, params) else {
+                    return Ok(None);
                 };
                 let context = pred::WhereContext {
                     params,
                     dialect,
                     cte_map,
                 };
-                self.scalar_agg(receiver, kind, &context, sql)?;
-                return Ok(true);
+                return self.scalar_agg(receiver, kind, &context, sql).map(Some);
             }
-            if let Some(agg_var) = &self.agg_var
+            if let Some(agg) = &self.agg_var
                 && let Some(receiver) =
                     Path::new(&method.syntax.receiver).and_then(|path| path.single())
-                && receiver.unraw() == agg_var.unraw()
+                && receiver.unraw() == agg.unraw()
+                && method.function.is_none()
+                && method.syntax.args.is_empty()
             {
-                let function = match method.function {
-                    None => {
-                        if !method.syntax.args.is_empty() {
-                            return Ok(false);
-                        }
-                        sql.push(dialect.kw("COUNT_STAR"));
-                        return Ok(true);
-                    }
-                    Some(function) => function,
-                };
-                let Some(arg) = method.one() else {
-                    return Ok(false);
-                };
-                let prefix = format!("{}(", function.upper());
-                sql.push(quote::quote! { #prefix });
-                if !self.write_expr(arg, None, dialect, cte_map, sql)? {
-                    return Ok(false);
-                }
-                sql.push(dialect.kw("PAREN_CLOSE"));
-                return Ok(true);
+                sql.push(fragment(COUNT_STAR));
+                return Ok(Some(quote::quote! { 0i64 }));
             }
-            return Ok(false);
+            return Ok(None);
+        } else if let Some(literal) = Literal::new(expr) {
+            sql.push(literal.render(dialect));
+        } else {
+            return Ok(None);
         }
-        match Literal::new(expr) {
-            Some(literal) => {
-                sql.push(literal.render(dialect));
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+        Ok(Some(quote::quote! { #expr }))
     }
 }

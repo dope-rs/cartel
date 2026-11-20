@@ -1,14 +1,12 @@
 use crate::backend;
 use crate::backend::Backend as _;
 use crate::dialect::param;
-use crate::dialect::pg::types::TypeExt as _;
 use crate::emit;
 use syn::visit::Visit as _;
 
 pub(crate) mod group;
 pub(crate) mod row;
 pub(crate) mod table;
-mod types;
 
 pub(crate) struct PgBackend;
 
@@ -53,15 +51,9 @@ impl PgBackend {
         let plan = code.plan;
         let stmt = format!("{ident}.{method}");
         let query = &marker;
-        let mut names = backend::Names::default();
+        let mut names = code.names;
         names.visit_type(&group);
         names.visit_ident(query);
-        names.visit_return_type(&plan.output);
-        names.visit_block(&code.block);
-        for (id, ty) in &params {
-            names.visit_ident(id);
-            names.visit_type(ty);
-        }
         let caller = names.fresh("__CartelClient");
         let route_id = names.fresh("__CARTEL_ROUTE_");
         let driver = names.lifetime("__cartel_driver_");
@@ -86,7 +78,11 @@ impl PgBackend {
         let count = caps.len() as i16;
         let single = params.len() == 1;
         let input_shape = |fields: proc_macro2::TokenStream| {
-            if single { fields } else { quote::quote! { (#fields) } }
+            if single {
+                fields
+            } else {
+                quote::quote! { (#fields) }
+            }
         };
 
         let mut oids = Vec::new();
@@ -94,7 +90,10 @@ impl PgBackend {
         let mut fmts = Vec::new();
         for &(fn_idx, _) in caps {
             let (_, ty) = &params[fn_idx];
-            let meta = ty.param()?;
+            let meta = match ty {
+                syn::Type::Reference(reference) => reference.elem.as_ref(),
+                ty => ty,
+            };
             oids.push(
                 quote::quote! { <#meta as ::cartel_pg::protocol::value::encode::Param>::OID },
             );
@@ -169,7 +168,7 @@ impl PgBackend {
             )
         };
         let (row_ty, shape) = match row {
-            Some(ty) => match (&plan.dispatch, plan.output.as_ref()) {
+            Some(ty) => match (&plan.dispatch, plan.output) {
                 (emit::Kind::Aggregate(_), syn::ReturnType::Type(_, declared)) => (
                     quote::quote! { <#declared as ::core::iter::IntoIterator>::Item },
                     quote::quote! { ::cartel_pg::schema::result::Rows<true> },
@@ -195,26 +194,7 @@ impl PgBackend {
             .map(|(id, ty)| quote::quote! { #id: #ty })
             .collect();
 
-        let proof = {
-            let body = match (plan.probe_override, code.block) {
-                (Some(block), _) => super::ScopeCalls::pg_assign(block),
-                (None, block) => super::ScopeCalls::pg(block),
-            };
-            let output = &plan.output;
-            let scope = backend::scope();
-            let tys = params.iter().map(|(_, ty)| ty);
-            quote::quote! {
-                const _: fn(
-                    &::cartel_pg::dsl::Scope,
-                    #( #tys, )*
-                ) #output = |
-                    #scope: &::cartel_pg::dsl::Scope,
-                    #( #decls, )*
-                | {
-                    #body
-                };
-            }
-        };
+        let proof = code.proof;
         param::Param::<false>::apply(params.iter_mut().map(|(_, ty)| ty), &input);
         let bound = params.iter().map(|(_, ty)| ty);
         let params = input_shape(quote::quote! { #(#bound),* });
@@ -234,11 +214,8 @@ impl PgBackend {
                 const N_RESULT_COLS: u16 = #cols;
                 const PARAM_FORMAT_CODES: &[u16] =
                     ::cartel_pg::protocol::encode::format_codes::<true>(&[#(#fmts,)*]);
-                const RESULT_FORMAT_CODES: &[u16] = {
-                    const CODES: [u16; <#query as ::cartel_pg::schema::TypedQuery>::N_RESULT_COLS as usize] =
-                        ::cartel_pg::protocol::encode::result_formats(&<#row_ty as ::cartel_pg::schema::desc::Validate>::FORMATS);
-                    ::cartel_pg::protocol::encode::format_codes::<false>(&CODES)
-                };
+                const RESULT_FORMAT_CODES: &[u16] =
+                    ::cartel_pg::protocol::encode::result_formats::<Self::Row, { Self::N_RESULT_COLS as usize }>();
 
                 #[inline(always)]
                 fn bind(

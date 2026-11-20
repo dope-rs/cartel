@@ -1,22 +1,17 @@
-use crate::{
-    backend,
-    ext::{ExprExt as _, PathExt as _},
-};
+use crate::emit::token::fragment;
+use crate::ext::{Binding, ExprExt as _, PathExt as _};
 use syn::spanned::Spanned as _;
 
-pub(crate) struct Join {
+pub(crate) struct Join<'a> {
     pub(crate) kind: Kind,
-    pub(crate) path: syn::Path,
-    pub(crate) on_idents: Vec<syn::Ident>,
-    pub(crate) cond: syn::Expr,
+    pub(crate) path: &'a syn::Path,
+    pub(crate) on: Binding<'a>,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum Kind {
     Inner,
     Left,
-    Right,
-    Full,
     LateralInner,
     LateralLeft,
 }
@@ -26,44 +21,28 @@ impl Kind {
         Some(match name {
             "join" => Self::Inner,
             "left_join" => Self::Left,
-            "right_join" => Self::Right,
-            "full_join" => Self::Full,
             "lateral_join" => Self::LateralInner,
             "lateral_left_join" => Self::LateralLeft,
             _ => return None,
         })
     }
 
-    pub(crate) fn sql_ref(self, dialect: &backend::Dialect) -> proc_macro2::TokenStream {
-        match self {
-            Self::Inner => dialect.kw("INNER_JOIN"),
-            Self::Left => dialect.kw("LEFT_OUTER_JOIN"),
-            Self::Right => dialect.kw("RIGHT_OUTER_JOIN"),
-            Self::Full => dialect.kw("FULL_OUTER_JOIN"),
-            Self::LateralInner => dialect.kw("INNER_JOIN_LATERAL"),
-            Self::LateralLeft => dialect.kw("LEFT_JOIN_LATERAL"),
-        }
+    pub(crate) fn sql_ref(self) -> proc_macro2::TokenStream {
+        fragment(match self {
+            Self::Inner => " INNER JOIN ",
+            Self::Left => " LEFT OUTER JOIN ",
+            Self::LateralInner => " INNER JOIN LATERAL ",
+            Self::LateralLeft => " LEFT JOIN LATERAL ",
+        })
     }
 
     pub(crate) fn is_lateral(self) -> bool {
         matches!(self, Self::LateralInner | Self::LateralLeft)
     }
-
-    pub(crate) fn from_method(method: &syn::Ident) -> syn::Result<Self> {
-        let name = method.to_string();
-        Self::new(&name).ok_or_else(|| {
-            syn::Error::new(
-                method.span(),
-                format!(
-                    "expected `.join` / `.left_join` / `.right_join` / `.full_join` / `.lateral_join` / `.lateral_left_join`, got `.{name}`",
-                ),
-            )
-        })
-    }
 }
 
-impl Join {
-    pub(crate) fn parse_type(mc: &syn::ExprMethodCall) -> syn::Result<syn::Path> {
+impl<'a> Join<'a> {
+    pub(crate) fn parse_type(mc: &'a syn::ExprMethodCall) -> syn::Result<&'a syn::Path> {
         let Some(generic) = &mc.turbofish else {
             return Err(syn::Error::new(
                 mc.method.span(),
@@ -73,9 +52,7 @@ impl Join {
         Self::parse_table(generic)
     }
 
-    pub(crate) fn parse_call(
-        call: &syn::ExprCall,
-    ) -> syn::Result<(syn::Path, syn::Path, Kind, Vec<syn::Ident>, syn::Expr)> {
+    pub(crate) fn parse_call(call: &'a syn::ExprCall) -> syn::Result<(syn::Path, Self)> {
         let syn::Expr::Path(function) = call.func.as_ref() else {
             return Err(syn::Error::new(
                 call.func.span(),
@@ -104,7 +81,7 @@ impl Join {
             syn::Error::new(
                 last.ident.span(),
                 format!(
-                    "expected `::join` / `::left_join` / `::right_join` / `::full_join` / `::lateral_join` / `::lateral_left_join`, got `::{method}`"
+                    "expected `::join` / `::left_join` / `::lateral_join` / `::lateral_left_join`, got `::{method}`"
                 ),
             )
         })?;
@@ -123,11 +100,18 @@ impl Join {
             ));
         }
         let n = if kind.is_lateral() { 1 } else { 2 };
-        let (idents, body) = call.args[0].closure_n(n, &method)?;
-        Ok((primary, joined, kind, idents, body))
+        let on = call.args[0].binding(Some(n), &method)?;
+        Ok((
+            primary,
+            Self {
+                kind,
+                path: joined,
+                on,
+            },
+        ))
     }
 
-    fn parse_table(generic: &syn::AngleBracketedGenericArguments) -> syn::Result<syn::Path> {
+    fn parse_table(generic: &'a syn::AngleBracketedGenericArguments) -> syn::Result<&'a syn::Path> {
         if generic.args.len() != 1 {
             return Err(syn::Error::new(
                 generic.span(),
@@ -152,6 +136,6 @@ impl Join {
                 "`.join` turbofish argument cannot use a qualified-self type",
             ));
         }
-        Ok(table.path.clone())
+        Ok(&table.path)
     }
 }

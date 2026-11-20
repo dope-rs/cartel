@@ -62,6 +62,23 @@ pub struct Blocker<'app> {
     _scope: marker::PhantomData<(&'app (), ThreadBound)>,
 }
 
+pub struct LockOnDrop<'a, 'app> {
+    pub peer: &'a mut Blocker<'app>,
+    pub result: &'a mut Option<Result<(), Error>>,
+}
+
+impl LockOnDrop<'_, '_> {
+    pub fn pending(&self) -> bool {
+        self.result.is_none()
+    }
+}
+
+impl Drop for LockOnDrop<'_, '_> {
+    fn drop(&mut self) {
+        *self.result = Some(self.peer.lock_again());
+    }
+}
+
 impl<'app> Blocker<'app> {
     pub fn try_new<I: Catalog>(
         _: &Connection<'app, '_, '_, I>,

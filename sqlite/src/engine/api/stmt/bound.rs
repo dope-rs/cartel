@@ -1,6 +1,5 @@
-use crate::api::stmt::{Binder, Prepared, access::Access};
+use crate::api::stmt::{Binder, Prepared};
 use crate::{api, config, row};
-use api::exec;
 use std::{marker, mem, num, result};
 
 pub(crate) struct Bound<'statement, 'connection, P> {
@@ -78,13 +77,5 @@ impl<'connection, P> Bound<'_, 'connection, P> {
         let layout = mem::size_of::<R::Borrowed<'row>>();
         let mut reader = row::raw::Reader::new(self.statement, bytes, layout)?;
         R::borrow(&mut reader)
-    }
-
-    pub(crate) fn finish<A: Access>(
-        &mut self,
-        access: &A,
-        txn: exec::Tx<'_>,
-    ) -> result::Result<(), crate::Error> {
-        self.statement.reset(access, txn)
     }
 }

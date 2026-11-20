@@ -66,11 +66,13 @@ fn busy_failure_is_causal(runtime: Runtime) -> Result<(), plan::Error> {
                     blocker.read().map_err(plan::Error::Call)?;
                     let mut rows = 0;
                     let query = db.query().stream::<i64, _, _>(
-                        ContentionDatabase::INSERT_RETURNING, (2_i64, ()),
-                    ).visit(|_| {
-                        rows += 1;
-                        std::ops::ControlFlow::Continue(())
-                    });
+                        ContentionDatabase::INSERT_RETURNING,
+                        (2_i64, ()),
+                        |_| {
+                            rows += 1;
+                            std::ops::ControlFlow::Continue(())
+                        },
+                    );
                     let result = fibers::TEST.try_run(driver, query);
                     assert_eq!(rows, 1);
                     assert!(matches!(result, Ok(Err(Error::Busy { action: Action::Step, code })) if code.primary() == 5));
@@ -80,7 +82,21 @@ fn busy_failure_is_causal(runtime: Runtime) -> Result<(), plan::Error> {
                         .map_err(plan::Error::Run)?
                         .map_err(plan::Error::Call)?;
 
-                    blocker.lock_again().map_err(plan::Error::Call)?;
+                    let mut locked = None;
+                    let probe = LockOnDrop { peer: &mut blocker, result: &mut locked };
+                    let write = db.query().stream::<i64, _, _>(
+                        ContentionDatabase::INSERT_RETURNING,
+                        (5_i64, ()),
+                        move |id| {
+                            assert_eq!(id, 5);
+                            assert!(probe.pending());
+                            std::ops::ControlFlow::Break(())
+                        },
+                    );
+                    fibers::TEST.try_run(driver, write)
+                        .map_err(plan::Error::Run)?
+                        .map_err(plan::Error::Call)?;
+                    assert!(matches!(locked, Some(Ok(()))), "peer write after early reset: {locked:?}");
                     let mut tx = fibers::TEST
                         .try_run(driver, db.transaction())
                         .map_err(plan::Error::Run)?
@@ -119,7 +135,7 @@ fn busy_failure_is_causal(runtime: Runtime) -> Result<(), plan::Error> {
                         )
                         .map_err(plan::Error::Run)?
                         .map_err(plan::Error::Call)?;
-                    assert_eq!(count, 3);
+                    assert_eq!(count, 4);
                     Ok(())
                 },
                 Policy::new(assert_reclaimed, assert_retirement),

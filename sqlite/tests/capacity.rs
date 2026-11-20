@@ -88,13 +88,11 @@ fn scan_row_limit(runtime: Runtime) -> Result<(), plan::Error> {
                 plan::Plan::<CapacityDatabase>::try_new(open(runtime)?, limits, memory)?.try_run(
                     |driver, mut database| {
                         try_seed(&mut database, &["a".into(), "b".into(), "c".into()], driver)?;
-                        let scan = scan_entries(&mut database);
+                        let scan =
+                            scan_entries(&mut database, |_| ::core::ops::ControlFlow::Continue(()));
                         assert!(matches!(
                             fibers::TEST
-                                .try_run(
-                                    driver,
-                                    scan.visit(|_| ::core::ops::ControlFlow::Continue(()))
-                                )
+                                .try_run(driver, scan)
                                 .map_err(plan::Error::Run)?,
                             Err(Error::ScanRows { capacity: 2 })
                         ));

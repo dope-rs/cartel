@@ -16,6 +16,7 @@ impl desc::Validate for Reject {
 }
 
 impl Row for Reject {
+    type Description = Self;
     type View<'row> = Self;
 
     fn decode<'row>(_: &mut RowReader<'row>) -> Result<Self, cartel_pg::Error> {

@@ -9,7 +9,6 @@ mod tx;
 pub(crate) use command::Command;
 pub(crate) use machine::Machine;
 pub(crate) use policy::single::Single;
-pub(crate) use policy::visit::Visit;
 pub(crate) use policy::{Create, Policy};
 pub use query::Query;
 pub(crate) use rows::Rows;

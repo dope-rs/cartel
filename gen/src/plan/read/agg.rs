@@ -1,3 +1,4 @@
+use crate::emit::token::{COMMA, COUNT_STAR, PAREN_CLOSE, SELECT, WHERE, fragment};
 use crate::emit;
 use crate::plan;
 use crate::pred;
@@ -9,7 +10,7 @@ use crate::plan::read::{Qualify, filter, join_parts, select};
 
 pub(in crate::plan) fn build<'a>(
     state: &mut plan::State<'_, 'a>,
-    agg: &shape::Aggregate,
+    agg: &shape::Aggregate<'_>,
 ) -> syn::Result<emit::Plan<'a>> {
     agg.qualifiers
         .lock
@@ -53,24 +54,26 @@ pub(in crate::plan) fn build<'a>(
         ));
     }
 
-    let source = &agg.source;
-    let scope = pred::RowScope::for_source(source, &agg.pred_idents)?;
+    let source = &agg.selection.source;
+    let scope = pred::RowScope::for_source(source, &agg.selection.idents)?;
     let group = match &agg.group_by {
         Some(group) => {
-            let scope = pred::RowScope::for_source(source, &group.args)?;
-            Some(state.parse(&scope, &group.body, || {
+            let scope = pred::RowScope::for_source(source, &group.idents)?;
+            let mut operand = state.parse(&scope, group.body, || {
                 syn::Error::new(
                     group.body.span(),
                     "`.group_by(...)` body must be a column / arithmetic / function expression",
                 )
-            })?)
+            })?;
+            operand.rust = scope.bound(operand.rust);
+            Some(operand)
         }
         None => None,
     };
     let value = match agg.kind.function() {
         Some((name, column)) => {
-            let scope = pred::RowScope::for_source(source, &column.args)?;
-            let sql = state.parse(&scope, &column.body, || {
+            let scope = pred::RowScope::for_source(source, &column.idents)?;
+            let mut sql = state.parse(&scope, column.body, || {
                 syn::Error::new(
                     column.body.span(),
                     format!(
@@ -79,6 +82,7 @@ pub(in crate::plan) fn build<'a>(
                     ),
                 )
             })?;
+            sql.rust = scope.bound(sql.rust);
             Some((name, sql))
         }
         None => None,
@@ -87,52 +91,71 @@ pub(in crate::plan) fn build<'a>(
         Some(having) => {
             let scope = pred::RowScope::for_source(source, &having.row_args)?
                 .with_agg(having.agg_arg.clone());
-            Some(pred::build(&having.pred, &scope, false, &state.context())?)
+            let predicate = pred::build(Some(having.pred), &scope, false, &state.context())?;
+            state.condition(&scope, predicate.rust);
+            Some(predicate.sql)
         }
         None => None,
     };
     let quals = Qualify::new(&agg.qualifiers, None, &scope, state)?;
     let joins = join_parts(state, source)?;
 
-    let pred = filter::build(state, &agg.predicate, &scope, false)?;
+    let pred = filter::build(state, agg.selection.predicate, &scope, false)?;
 
-    let group = group.map(|sql| state.render(sql));
-    let mut sql = vec![state.dialect.kw("SELECT_KW")];
+    let witness = crate::backend::scope();
+    let result = match (&group, &value) {
+        (Some(key), Some((_, operand))) => {
+            let key = &key.rust;
+            let operand = &operand.rust;
+            quote::quote! { #witness.rows((#key, ::core::option::Option::Some(#operand))) }
+        }
+        (Some(key), None) => {
+            let key = &key.rust;
+            quote::quote! { #witness.rows((#key, 0i64)) }
+        }
+        (None, Some((_, operand))) => {
+            let operand = &operand.rust;
+            quote::quote! {{ let _ = #operand; ::core::option::Option::None }}
+        }
+        (None, None) => quote::quote!(0i64),
+    };
+    let group = group.map(|operand| state.render(operand.sql));
+    let mut sql = vec![fragment(SELECT)];
     if let Some(parts) = &group {
         sql.extend(parts.iter().cloned());
-        sql.push(state.dialect.kw("COMMA"));
+        sql.push(fragment(COMMA));
     }
     match value {
-        None => sql.push(state.dialect.kw("COUNT_STAR")),
+        None => sql.push(fragment(COUNT_STAR)),
         Some((name, value)) => {
             let prefix = format!("{}(", name.upper());
             sql.push(quote::quote! { #prefix });
-            sql.extend(state.render(value));
-            sql.push(state.dialect.kw("PAREN_CLOSE"));
+            sql.extend(state.render(value.sql));
+            sql.push(fragment(PAREN_CLOSE));
         }
     }
-    select::from_clause(&mut sql, source, joins, state.dialect);
-    sql.push(state.dialect.kw("WHERE_KW"));
+    select::from_clause(&mut sql, source, joins);
+    sql.push(fragment(WHERE));
     sql.extend(pred);
     let columns = match group {
         None => 1u16,
         Some(parts) => {
-            sql.push(state.dialect.kw("GROUP_BY_KW"));
+            sql.push(fragment(" GROUP BY "));
             sql.extend(parts);
             2u16
         }
     };
     if let Some(having) = having {
-        sql.push(state.dialect.kw("HAVING_KW"));
+        sql.push(fragment(" HAVING "));
         sql.extend(state.render(having));
     }
-    sql.extend(quals.render(state));
+    quals.render_into(state, &mut sql);
 
     Ok(emit::Plan {
         output,
         sql_parts: sql,
         n_result_cols: quote::quote! { #columns },
         dispatch,
-        probe_override: None,
+        result,
     })
 }

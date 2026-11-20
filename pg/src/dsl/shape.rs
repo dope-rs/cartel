@@ -10,3 +10,15 @@ impl<A> ColSlice for [A] {
 impl<A> ColSlice for Vec<A> {
     type Elem = A;
 }
+
+pub fn element<S: ColSlice>(scope: &crate::dsl::Scope, _: &S) -> S::Elem {
+    match scope.0 {}
+}
+
+pub trait Batch {
+    type Columns<'data>;
+}
+
+pub trait BatchColumn: crate::schema::Field {
+    type Item<'data>;
+}

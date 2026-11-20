@@ -1,3 +1,6 @@
+use crate::emit::token::{
+    COMMA, DESC, FROM, ORDER_BY, PAREN_CLOSE, PAREN_OPEN, SELECT, SUBQUERY_OPEN, WHERE, fragment,
+};
 use crate::backend;
 use crate::emit;
 use crate::plan;
@@ -11,10 +14,10 @@ use syn::spanned::Spanned as _;
 
 use crate::ext::ExprExt as _;
 use crate::ext::PatExt as _;
-use crate::plan::read::{Qualify, filter};
+use crate::plan::read::{filter, qualify::Bounds};
 
 struct Output<'a> {
-    ty: std::borrow::Cow<'a, syn::ReturnType>,
+    ty: &'a syn::ReturnType,
     row: &'a syn::Type,
     kind: shape::Terminator,
 }
@@ -26,57 +29,70 @@ struct Order {
 
 pub(in crate::plan) fn build<'a>(
     state: &mut plan::State<'_, 'a>,
-    set: &shape::SetQuery,
+    set: &shape::SetQuery<'_>,
     end: shape::Terminator,
-    outer: &qualify::State,
+    outer: &qualify::State<'_>,
 ) -> syn::Result<emit::Plan<'a>> {
     let output = Output::new(state, set, end)?;
-    let qual = Qualify::bounds(outer, end, state)?;
-    let groups = match state.dialect.kind {
-        backend::Kind::Pg => set.links.len().saturating_sub(1),
-        backend::Kind::Sqlite => 0,
+    outer
+        .lock
+        .reject("row locking is not supported on set-operation queries")?;
+    if !matches!(outer.distinct, qualify::Distinct::None) {
+        return Err(syn::Error::new(
+            state.return_type.span(),
+            "DISTINCT qualifiers are not supported on set-operation queries",
+        ));
+    }
+    let bounds = Bounds::new(outer, Some(end), state)?;
+    let (groups, start, end_branch) = match state.dialect.kind {
+        backend::Kind::Pg => (
+            set.links.len().saturating_sub(1),
+            SUBQUERY_OPEN,
+            Some(PAREN_CLOSE),
+        ),
+        backend::Kind::Sqlite => (0, SELECT, None),
     };
-    let mut sql: Vec<_> = iter::repeat_n(state.dialect.kw("PAREN_OPEN"), groups).collect();
+    let mut sql: Vec<_> = iter::repeat_n(fragment(PAREN_OPEN), groups).collect();
     for (index, (op, branch)) in iter::once((None, &set.first))
         .chain(set.links.iter().map(|(op, branch)| (Some(*op), branch)))
         .enumerate()
     {
-        let scope = pred::RowScope::for_source(&branch.source, &branch.pred_idents)?;
-        let filter = if branch.predicate.is_true() {
+        let scope = pred::RowScope::for_source(&branch.source, &branch.idents)?;
+        let filter = if branch.predicate.is_none_or(syn::Expr::is_true) {
             None
         } else {
-            Some(filter::build(state, &branch.predicate, &scope, false)?)
+            Some(filter::build(state, branch.predicate, &scope, false)?)
         };
         if let Some(op) = op {
-            sql.push(op.sql_ref(state.dialect));
+            sql.push(op.sql_ref(state.dialect, branch.source.primary_path.span()));
         }
         let path = &branch.source.primary_path;
-        sql.push(state.dialect.kw("SETOP_BRANCH_OPEN"));
+        sql.push(fragment(start));
         sql.push(quote::quote! { <#path>::__CARTEL_SELECT_COLS });
-        sql.push(state.dialect.kw("FROM_KW"));
+        sql.push(fragment(FROM));
         sql.extend(branch.source.render_base());
         if let Some(filter) = filter {
-            sql.push(state.dialect.kw("WHERE_KW"));
+            sql.push(fragment(WHERE));
             sql.extend(filter);
         }
-        sql.push(state.dialect.kw("SETOP_BRANCH_CLOSE"));
+        sql.extend(end_branch.map(fragment));
         if index > 0 && index <= groups {
-            sql.push(state.dialect.kw("PAREN_CLOSE"));
+            sql.push(fragment(PAREN_CLOSE));
         }
     }
     for (index, clause) in outer.order_by.iter().enumerate() {
-        let order = Order::new(clause)?;
+        let order = Order::new(clause, &set.first.source, state)?;
         let key = match index {
-            0 => "ORDER_BY_KW",
-            1.. => "COMMA",
+            0 => ORDER_BY,
+            1.. => COMMA,
         };
-        sql.push(state.dialect.kw(key));
+        sql.push(fragment(key));
         sql.extend(order.col.into_parts());
         if matches!(order.dir, qualify::Dir::Desc) {
-            sql.push(state.dialect.kw("DESC"));
+            sql.push(fragment(DESC));
         }
     }
-    sql.extend(qual.render(state));
+    bounds.render_into(state, &mut sql);
 
     let cols = row::View::new(output.row).cols();
     Ok(emit::Plan {
@@ -84,14 +100,18 @@ pub(in crate::plan) fn build<'a>(
         sql_parts: sql,
         n_result_cols: cols,
         dispatch: emit::Kind::rows(output.kind, output.row),
-        probe_override: None,
+        result: end.result({
+            let table = &set.first.source.primary_path;
+            let scope = backend::scope();
+            quote::quote! { #scope.value::<#table>() }
+        }),
     })
 }
 
 impl<'a> Output<'a> {
     fn new(
         state: &plan::State<'_, 'a>,
-        set: &shape::SetQuery,
+        set: &shape::SetQuery<'_>,
         end: shape::Terminator,
     ) -> syn::Result<Self> {
         let explicit = match shape::ReturnShape::parse(state.return_type) {
@@ -122,7 +142,7 @@ impl<'a> Output<'a> {
     }
 }
 
-fn validate_branches(set: &shape::SetQuery) -> syn::Result<()> {
+fn validate_branches(set: &shape::SetQuery<'_>) -> syn::Result<()> {
     let first = &set.first.source.primary_path;
     validate_branch(first, &set.first, 1)?;
     for (index, (_, branch)) in set.links.iter().enumerate() {
@@ -133,7 +153,7 @@ fn validate_branches(set: &shape::SetQuery) -> syn::Result<()> {
 
 fn validate_branch(
     first: &syn::Path,
-    branch: &shape::SelectBranch,
+    branch: &shape::Selection<'_>,
     index: usize,
 ) -> syn::Result<()> {
     let path = &branch.source.primary_path;
@@ -157,8 +177,12 @@ fn validate_branch(
 }
 
 impl Order {
-    fn new(clause: &qualify::Order) -> syn::Result<Self> {
-        let syn::Expr::Closure(closure) = &clause.closure else {
+    fn new(
+        clause: &qualify::Order<'_>,
+        source: &shape::QuerySource<'_>,
+        state: &mut plan::State<'_, '_>,
+    ) -> syn::Result<Self> {
+        let syn::Expr::Closure(closure) = clause.closure else {
             return Err(syn::Error::new(
                 clause.closure.span(),
                 "set-op `.order_by(...)` argument must be a closure `|u| u.col`",
@@ -171,13 +195,17 @@ impl Order {
             ));
         }
         let arg = closure.inputs[0].ident()?.clone();
-        let scope = pred::RowScope::single(arg);
+        let table = &source.primary_path;
+        let scope = pred::RowScope::single(arg, quote::quote!(#table));
         let col = scope.column_ref(&closure.body).ok_or_else(|| {
             syn::Error::new(
                 closure.body.span(),
                 "set-op `.order_by(...)` body must be a single column reference like `u.col`",
             )
         })?;
+        let body = &closure.body;
+        let value = scope.bound(quote::quote!(#body));
+        state.checks.extend(quote::quote! { let _ = #value; });
         Ok(Self {
             col,
             dir: clause.dir,

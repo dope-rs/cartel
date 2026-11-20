@@ -7,11 +7,34 @@ use crate::ext::ExprExt as _;
 use crate::ext::PathExt as _;
 use shape::join;
 
-impl shape::QuerySource {
-    pub(crate) fn parse_chain(
-        expr: &syn::Expr,
+impl shape::QuerySource<'_> {
+    pub(crate) fn single_table(&self, method: &str) -> syn::Result<()> {
+        if let Some(join) = self.joins.first() {
+            return Err(syn::Error::new(
+                join.path.span(),
+                format!("{method} requires a single source table"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn cte(path: &syn::Path, tables: &collections::BTreeMap<String, syn::Path>) -> Option<Self> {
+        let id = path.get_ident()?;
+        let table = tables.get(crate::ext::unraw(&id.to_string()))?;
+        Some(Self {
+            primary_path: table.clone(),
+            primary_alias: Some(id.clone()),
+            joins: Vec::new(),
+            alias_depth: 0,
+        })
+    }
+}
+
+impl<'a> shape::Selection<'a> {
+    pub(crate) fn parse(
+        expr: &'a syn::Expr,
         cte_map: &collections::BTreeMap<String, syn::Path>,
-    ) -> syn::Result<(Self, Vec<syn::Ident>, syn::Expr)> {
+    ) -> syn::Result<Self> {
         let expr = expr.unbrace();
 
         if let syn::Expr::Path(source) = expr {
@@ -27,39 +50,35 @@ impl shape::QuerySource {
                     "a query source must be an unqualified CTE name or Table path",
                 ));
             }
-            if let Some(id) = source.path.get_ident()
-                && let Some(table) = cte_map.get(crate::ext::unraw(&id.to_string()))
-            {
-                let dummy = syn::Ident::new("__cte", id.span());
-                let pred: syn::Expr = syn::parse_quote!(true);
-                return Ok((
-                    Self {
-                        primary_path: table.clone(),
-                        primary_alias: Some(id.clone()),
-                        joins: Vec::new(),
-                        alias_depth: 0,
-                    },
-                    vec![dummy],
-                    pred,
-                ));
+            if let Some(cte) = shape::QuerySource::cte(&source.path, cte_map) {
+                let dummy = syn::Ident::new("__cte", source.path.span());
+                return Ok(Self {
+                    source: cte,
+                    idents: vec![dummy],
+                    predicate: None,
+                });
             }
         }
 
         if let syn::Expr::Call(call) = expr {
-            let (table, arg, pred) = Self::parse_call(call)?;
-            let source = Self::new(table);
-            return Ok((source, vec![arg.clone()], pred.clone()));
+            let (table, arg, pred) = shape::QuerySource::parse_call(call)?;
+            return Ok(Self {
+                source: shape::QuerySource::new(table),
+                idents: vec![arg.clone()],
+                predicate: Some(pred),
+            });
         }
         if let syn::Expr::MethodCall(mc) = expr
             && mc.method == "filter"
         {
+            crate::ext::inferred(mc)?;
             if mc.args.len() != 1 {
                 return Err(syn::Error::new(
                     mc.args.span(),
                     "`.filter(...)` takes one closure argument",
                 ));
             }
-            if let syn::Expr::Path(source) = mc.receiver.as_ref() {
+            let cte = if let syn::Expr::Path(source) = mc.receiver.as_ref() {
                 if let Some(attr) = source.attrs.first() {
                     return Err(syn::Error::new(
                         attr.span(),
@@ -72,34 +91,31 @@ impl shape::QuerySource {
                         "a filtered query source must be an unqualified CTE name or Table path",
                     ));
                 }
-                if let Some(id) = source.path.get_ident()
-                    && let Some(table) = cte_map.get(crate::ext::unraw(&id.to_string()))
-                {
-                    let (ids, body) = mc.args[0].closure_n(1, "filter")?;
-                    return Ok((
-                        Self {
-                            primary_path: table.clone(),
-                            primary_alias: Some(id.clone()),
-                            joins: Vec::new(),
-                            alias_depth: 0,
-                        },
-                        ids,
-                        body,
-                    ));
-                }
-            }
-            let source = Self::parse_joins(mc.receiver.as_ref())?;
+                shape::QuerySource::cte(&source.path, cte_map)
+            } else {
+                None
+            };
+            let source = match cte {
+                Some(source) => source,
+                None => shape::QuerySource::parse_joins(&mc.receiver)?,
+            };
             let n = 1 + source.joins.len();
-            let (ids, body) = mc.args[0].closure_n(n, "filter")?;
-            return Ok((source, ids, body));
+            let binding = mc.args[0].binding(Some(n), "filter")?;
+            return Ok(Self {
+                source,
+                idents: binding.idents,
+                predicate: Some(binding.body),
+            });
         }
         Err(syn::Error::new(
             expr.span(),
             "expected `Table::filter(|t| ...)`, `Table::join::<X>(|p,u| ...).filter(|p,u| ...)`, or a CTE name",
         ))
     }
+}
 
-    fn parse_joins(expr: &syn::Expr) -> syn::Result<Self> {
+impl<'a> shape::QuerySource<'a> {
+    fn parse_joins(expr: &'a syn::Expr) -> syn::Result<Self> {
         let mut chain = Vec::new();
         let mut current = expr;
         loop {
@@ -109,16 +125,16 @@ impl shape::QuerySource {
                     current = mc.receiver.as_ref();
                 }
                 syn::Expr::Call(call) => {
-                    let (primary, joined, kind, ids, cond) = join::Join::parse_call(call)?;
-                    let mut joins = vec![join::Join {
-                        kind,
-                        path: joined,
-                        on_idents: ids,
-                        cond,
-                    }];
+                    let (primary, join) = join::Join::parse_call(call)?;
+                    let mut joins = vec![join];
                     chain.reverse();
                     for (count, mc) in (2..).zip(chain) {
-                        let kind = join::Kind::from_method(&mc.method)?;
+                        if mc.method != "join" || count >= 4 {
+                            return Err(syn::Error::new(
+                                mc.method.span(),
+                                "only inner joins through four tables can be chained",
+                            ));
+                        }
                         let joined = join::Join::parse_type(mc)?;
                         if mc.args.len() != 1 {
                             return Err(syn::Error::new(
@@ -126,13 +142,12 @@ impl shape::QuerySource {
                                 format!("`.{}(...)` takes one closure argument", mc.method),
                             ));
                         }
-                        let arity = if kind.is_lateral() { count } else { count + 1 };
-                        let (idents, body) = mc.args[0].closure_n(arity, &mc.method.to_string())?;
+                        let arity = count + 1;
+                        let on = mc.args[0].binding(Some(arity), &mc.method.to_string())?;
                         joins.push(join::Join {
-                            kind,
+                            kind: join::Kind::Inner,
                             path: joined,
-                            on_idents: idents,
-                            cond: body,
+                            on,
                         });
                     }
                     return Ok(Self {
@@ -145,7 +160,7 @@ impl shape::QuerySource {
                 other => {
                     return Err(syn::Error::new(
                         other.span(),
-                        "join chain must start with `Table::join::<X>(...)` (or `left_join` / `right_join` / `full_join`)",
+                        "join chain must start with `Table::join::<X>(...)` (or `left_join`)",
                     ));
                 }
             }
@@ -186,7 +201,7 @@ impl shape::QuerySource {
                 "expected `Table::filter` (last segment must be `filter`)",
             ));
         }
-        let table = filter.without_last()?;
+        let table = filter.table()?;
         if call.args.len() != 1 {
             return Err(syn::Error::new(
                 call.args.span(),
@@ -198,17 +213,18 @@ impl shape::QuerySource {
     }
 }
 
-impl shape::Target {
+impl<'a> shape::Target<'a> {
     pub(super) fn parse_shape(
-        expr: &syn::Expr,
+        expr: &'a syn::Expr,
         cte_map: &collections::BTreeMap<String, syn::Path>,
-    ) -> syn::Result<(Self, shape::QueryShape)> {
+    ) -> syn::Result<(Self, shape::QueryShape<'a>)> {
         let syn::Expr::MethodCall(mc) = expr else {
             return Err(syn::Error::new(
                 expr.span(),
                 "`.do_nothing()` / `.do_update(...)` must follow `.on_conflict(|u| u.col)`",
             ));
         };
+        crate::ext::inferred(mc)?;
         if mc.method != "on_conflict" {
             return Err(syn::Error::new(
                 mc.method.span(),
@@ -227,7 +243,7 @@ impl shape::Target {
         Ok((Self { cols }, inner))
     }
 
-    fn parse_cols(arg: &syn::Ident, body: &syn::Expr) -> syn::Result<Vec<String>> {
+    fn parse_cols(arg: &syn::Ident, body: &'a syn::Expr) -> syn::Result<Vec<&'a syn::Ident>> {
         match body {
             syn::Expr::Tuple(t) => {
                 let mut columns = Vec::with_capacity(t.elems.len());

@@ -1,35 +1,33 @@
+use crate::emit::token::fragment;
 use crate::{
     backend,
-    ext::{ExprExt as _, SqlIdent as _},
+    ext::{Binding, ExprExt as _, SqlIdent as _},
 };
-use std::borrow::Cow;
 use syn::spanned::Spanned as _;
 
-pub(super) mod bound;
 pub(super) mod join;
 pub(super) mod lock;
 pub(super) mod mutation;
 pub(super) mod qualify;
 
-pub(super) enum QueryShape {
+pub(super) enum QueryShape<'a> {
     Select {
-        source: QuerySource,
-        pred_idents: Vec<syn::Ident>,
-        predicate: syn::Expr,
-        projection: Option<Projection>,
+        selection: Selection<'a>,
+        projection: Option<Binding<'a>>,
+        row: Option<&'a syn::Type>,
         terminator: Terminator,
-        qualifiers: qualify::State,
+        qualifiers: qualify::State<'a>,
     },
-    Mutation(mutation::Query),
-    Aggregate(Box<Aggregate>),
+    Mutation(mutation::Query<'a>),
+    Aggregate(Box<Aggregate<'a>>),
     SetOp {
-        set: SetQuery,
+        set: SetQuery<'a>,
         terminator: Terminator,
-        outer_qualifiers: qualify::State,
+        outer_qualifiers: qualify::State<'a>,
     },
 }
 
-impl QueryShape {
+impl<'a> QueryShape<'a> {
     pub(super) fn returning(self, ret: Returning, span: proc_macro2::Span) -> syn::Result<Self> {
         let Self::Mutation(query) = self else {
             return Err(syn::Error::new(
@@ -40,7 +38,11 @@ impl QueryShape {
         Ok(Self::Mutation(query.returning(ret, span)?))
     }
 
-    pub(super) fn conflict(self, conflict: Conflict, span: proc_macro2::Span) -> syn::Result<Self> {
+    pub(super) fn conflict(
+        self,
+        conflict: Conflict<'a>,
+        span: proc_macro2::Span,
+    ) -> syn::Result<Self> {
         let Self::Mutation(query) = self else {
             return Err(syn::Error::new(
                 span,
@@ -51,25 +53,23 @@ impl QueryShape {
     }
 }
 
-pub(super) struct Aggregate {
-    pub(super) source: QuerySource,
-    pub(super) pred_idents: Vec<syn::Ident>,
-    pub(super) predicate: syn::Expr,
-    pub(super) kind: Aggregation,
-    pub(super) group_by: Option<AggCol>,
-    pub(super) having: Option<HavingClause>,
-    pub(super) qualifiers: qualify::State,
+pub(super) struct Aggregate<'a> {
+    pub(super) selection: Selection<'a>,
+    pub(super) kind: Aggregation<'a>,
+    pub(super) group_by: Option<Binding<'a>>,
+    pub(super) having: Option<HavingClause<'a>>,
+    pub(super) qualifiers: qualify::State<'a>,
 }
 
-pub(super) struct SelectBranch {
-    pub(super) source: QuerySource,
-    pub(super) pred_idents: Vec<syn::Ident>,
-    pub(super) predicate: syn::Expr,
+pub(super) struct Selection<'a> {
+    pub(super) source: QuerySource<'a>,
+    pub(super) idents: Vec<syn::Ident>,
+    pub(super) predicate: Option<&'a syn::Expr>,
 }
 
-pub(super) struct SetQuery {
-    pub(super) first: SelectBranch,
-    pub(super) links: Vec<(SetOpKind, SelectBranch)>,
+pub(super) struct SetQuery<'a> {
+    pub(super) first: Selection<'a>,
+    pub(super) links: Vec<(SetOpKind, Selection<'a>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -83,14 +83,18 @@ pub(super) enum SetOpKind {
 }
 
 impl SetOpKind {
-    pub(super) fn sql_ref(self, dialect: &backend::Dialect) -> proc_macro2::TokenStream {
+    pub(super) fn sql_ref(
+        self,
+        dialect: &backend::Dialect,
+        span: proc_macro2::Span,
+    ) -> proc_macro2::TokenStream {
         match self {
-            Self::Union => dialect.kw("UNION_KW"),
-            Self::UnionAll => dialect.kw("UNION_ALL_KW"),
-            Self::Intersect => dialect.kw("INTERSECT_KW"),
-            Self::IntersectAll => dialect.kw("INTERSECT_ALL_KW"),
-            Self::Except => dialect.kw("EXCEPT_KW"),
-            Self::ExceptAll => dialect.kw("EXCEPT_ALL_KW"),
+            Self::Union => fragment(" UNION "),
+            Self::UnionAll => fragment(" UNION ALL "),
+            Self::Intersect => fragment(" INTERSECT "),
+            Self::IntersectAll => dialect.pg_clause(" INTERSECT ALL ", "INTERSECT ALL", span),
+            Self::Except => fragment(" EXCEPT "),
+            Self::ExceptAll => dialect.pg_clause(" EXCEPT ALL ", "EXCEPT ALL", span),
         }
     }
 
@@ -107,14 +111,14 @@ impl SetOpKind {
     }
 }
 
-pub(super) struct QuerySource {
+pub(super) struct QuerySource<'a> {
     pub(super) primary_path: syn::Path,
     pub(super) primary_alias: Option<syn::Ident>,
-    pub(super) joins: Vec<join::Join>,
+    pub(super) joins: Vec<join::Join<'a>>,
     pub(super) alias_depth: usize,
 }
 
-impl QuerySource {
+impl QuerySource<'_> {
     pub(super) fn new(path: syn::Path) -> Self {
         Self {
             primary_path: path,
@@ -154,9 +158,9 @@ impl QuerySource {
     pub(super) fn render_join(
         &self,
         index: usize,
-        join: &join::Join,
+        join: &join::Join<'_>,
     ) -> [proc_macro2::TokenStream; 3] {
-        let path = &join.path;
+        let path = join.path;
         self.declaration(quote::quote! { <#path>::__CARTEL_TABLE }, index + 1)
     }
 
@@ -171,29 +175,19 @@ pub(super) struct CteBinding<'a> {
     pub(super) inner_chain: &'a syn::Expr,
 }
 
-pub(super) struct Projection {
-    pub(super) idents: Vec<syn::Ident>,
-    pub(super) elems: Vec<syn::Expr>,
-}
-
-pub(super) struct HavingClause {
+pub(super) struct HavingClause<'a> {
     pub(super) row_args: Vec<syn::Ident>,
     pub(super) agg_arg: syn::Ident,
-    pub(super) pred: syn::Expr,
+    pub(super) pred: &'a syn::Expr,
 }
 
-pub(super) enum Aggregation {
+pub(super) enum Aggregation<'a> {
     Count,
-    Column(AggregateFn, AggCol),
+    Column(AggregateFn, Binding<'a>),
 }
 
-pub(super) struct AggCol {
-    pub(super) args: Vec<syn::Ident>,
-    pub(super) body: syn::Expr,
-}
-
-impl Aggregation {
-    pub(super) fn parse(top: &syn::ExprMethodCall) -> syn::Result<Self> {
+impl<'a> Aggregation<'a> {
+    pub(super) fn parse(top: &'a syn::ExprMethodCall) -> syn::Result<Self> {
         if top.method == "count" {
             if !top.args.is_empty() {
                 return Err(syn::Error::new(
@@ -215,11 +209,13 @@ impl Aggregation {
                 format!("`.{}(...)` takes one closure argument", top.method),
             ));
         }
-        let (args, body) = top.args[0].closure_args(&top.method.to_string())?;
-        Ok(Self::Column(function, AggCol { args, body }))
+        Ok(Self::Column(
+            function,
+            top.args[0].binding(None, &top.method.to_string())?,
+        ))
     }
 
-    pub(super) fn function(&self) -> Option<(AggregateFn, &AggCol)> {
+    pub(super) fn function(&self) -> Option<(AggregateFn, &Binding<'a>)> {
         match self {
             Self::Count => None,
             Self::Column(function, column) => Some((*function, column)),
@@ -298,23 +294,20 @@ impl Returning {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub(super) enum Conflict {
+pub(super) enum Conflict<'a> {
     None,
     DoNothing,
-    TargetDoNothing(Target),
-    TargetDoUpdate(Target, Update),
+    TargetDoNothing(Target<'a>),
+    TargetDoUpdate(Target<'a>, Update<'a>),
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub(super) struct Target {
-    pub(super) cols: Vec<String>,
+pub(super) struct Target<'a> {
+    pub(super) cols: Vec<&'a syn::Ident>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub(super) struct Update {
-    pub(super) set_arg: syn::Ident,
-    pub(super) set_body: syn::Expr,
+pub(super) struct Update<'a> {
+    pub(super) set_arg: &'a syn::Ident,
+    pub(super) set_body: &'a syn::Expr,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -326,6 +319,16 @@ pub(super) enum Terminator {
 }
 
 impl Terminator {
+    pub(crate) fn result(self, row: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+        let scope = backend::scope();
+        match self {
+            Self::One => row,
+            Self::First => quote::quote! { ::core::option::Option::Some(#row) },
+            Self::All => quote::quote! { #scope.rows(#row) },
+            Self::Stream => quote::quote! { #scope.stream(#row) },
+        }
+    }
+
     pub(super) fn method(&self) -> &str {
         match self {
             Self::One => "one",
@@ -372,8 +375,8 @@ impl<'a> Explicit<'a> {
         self.row = self.ty;
     }
 
-    pub(super) fn into_parts(self) -> (Cow<'a, syn::ReturnType>, &'a syn::Type, Terminator) {
-        (Cow::Borrowed(self.output), self.row, self.kind)
+    pub(super) fn into_parts(self) -> (&'a syn::ReturnType, &'a syn::Type, Terminator) {
+        (self.output, self.row, self.kind)
     }
 }
 

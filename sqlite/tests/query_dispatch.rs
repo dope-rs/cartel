@@ -1,6 +1,6 @@
 use crate::common::plan;
 use crate::{common::database::IntegrationDatabase, common::schema::Keyword};
-use cartel_sqlite::Error;
+use cartel_sqlite::{Action, Error};
 use cartel_sqlite::row;
 use cartel_sqlite::runtime::{self, Runtime};
 use common::{query::dispatch::*, schema};
@@ -48,6 +48,21 @@ fn dispatch_kinds(runtime: Runtime) -> Result<(), plan::Error> {
                         expected: 0,
                         minimum: 1
                     })
+                ));
+
+                assert!(matches!(
+                    conn.query()
+                        .run_all::<common::query::StepError, _, _>(IntegrationDatabase::MULTIPLE_ROWS, ())
+                        .await,
+                    Err(Error::RowLayout { required: 128, available: 64 })
+                ));
+
+                assert!(matches!(
+                    conn.query()
+                        .run_one::<common::query::StepError, _, _>(IntegrationDatabase::MULTIPLE_ROWS, ())
+                        .await,
+                    Err(Error::Sqlite { action: Action::Step, code })
+                        if code.get() == libsqlite3_sys::SQLITE_CONSTRAINT
                 ));
 
                 let first = conn

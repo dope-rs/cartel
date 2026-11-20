@@ -131,8 +131,7 @@ impl<'mark, 'local, 'life, 'd: 'local + 'life, Q: executor::Startup>
             fibers::Yield::new().await;
             let seen = cell::Cell::new(false);
             let scan = tx.query()
-                .stream::<i64, _, _>(IntegrationDatabase::ROWS_OVER_LIMIT, ())
-                .visit(|_| {
+                .stream::<i64, _, _>(IntegrationDatabase::ROWS_OVER_LIMIT, (), |_| {
                     seen.set(true);
                     ops::ControlFlow::Continue(())
                 });

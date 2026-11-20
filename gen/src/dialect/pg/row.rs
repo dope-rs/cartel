@@ -1,5 +1,4 @@
 use crate::backend;
-use crate::dialect::pg::types::TypeExt as _;
 use syn::visit::Visit as _;
 
 pub(crate) struct Row<'a>(pub(crate) &'a syn::DeriveInput);
@@ -44,26 +43,22 @@ impl Row<'_> {
                 let ty = &field.ty;
                 quote::quote! { (#ty, #tail) }
             });
-        let mut owned = Vec::new();
-        for field in fields.clone() {
-            let name = &field.ident;
-            let read = field.ty.row_read()?;
-            owned.push(quote::quote! { #name: #read, });
-        }
         let row = quote::format_ident!("{name}View");
         let mut reserved = backend::Names::default();
         reserved.visit_derive_input(input);
         let lease = reserved.fresh("__cartel_lease_");
         let vis = &input.vis;
-        let mut decls = Vec::new();
-        for field in fields.clone() {
+        let decls = fields.clone().map(|field| {
             let name = &field.ident;
             let vis = &field.vis;
             let ty = &field.ty;
-            decls.push(quote::quote! {
-                #vis #name: <#ty as ::cartel_pg::schema::Row>::View<'row>
-            });
-        }
+            quote::quote! { #vis #name: <#ty as ::cartel_pg::schema::Field>::View<'row> }
+        });
+        let owned = fields.clone().map(|field| {
+            let name = &field.ident;
+            let ty = &field.ty;
+            quote::quote! { #name: <#ty as ::cartel_pg::schema::Row>::decode_owned(row)? }
+        });
         let names = fields.map(|field| &field.ident);
         let pattern = names
             .clone()
@@ -88,6 +83,7 @@ impl Row<'_> {
             }
 
             impl ::cartel_pg::schema::Row for #name {
+                type Description = <Self as ::cartel_pg::schema::Project>::Fields;
                 type View<'row> = #row<'row>;
 
                 #[inline(always)]
@@ -97,18 +93,7 @@ impl Row<'_> {
                 }
 
                 fn decode_owned(row: &mut ::cartel_pg::protocol::value::decode::RowReader<'_>) -> ::core::result::Result<Self, ::cartel_pg::Error> {
-                    ::core::result::Result::Ok(Self { #(#owned)* })
-                }
-            }
-
-            impl ::cartel_pg::schema::desc::Validate for #name {
-                const DYNAMIC_TYPES: u8 =
-                    <#shape as ::cartel_pg::schema::desc::Validate>::DYNAMIC_TYPES;
-                const FORMATS: ::cartel_pg::schema::desc::Formats =
-                    <#shape as ::cartel_pg::schema::desc::Validate>::FORMATS;
-
-                fn validate(types: &mut ::cartel_pg::schema::desc::Types<'_>) -> ::core::result::Result<(), ::cartel_pg::Error> {
-                    <#shape as ::cartel_pg::schema::desc::Validate>::validate(types)
+                    ::core::result::Result::Ok(Self { #(#owned,)* })
                 }
             }
         })

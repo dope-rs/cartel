@@ -4,23 +4,26 @@ use std::collections;
 
 use syn::spanned::Spanned as _;
 
-use crate::ext::{ExprExt as _, PathExt as _};
+use crate::ext::{ExprExt as _, PatExt as _, PathExt as _};
+use syn::ext::IdentExt as _;
 
 pub(super) mod assign;
 pub(super) mod branches;
 pub(super) mod ctes;
 pub(super) mod sources;
 
-impl shape::QueryShape {
+impl<'a> shape::QueryShape<'a> {
     pub(crate) fn parse(
-        expr: &syn::Expr,
+        expr: &'a syn::Expr,
         cte_map: &collections::BTreeMap<String, syn::Path>,
     ) -> syn::Result<Self> {
-        use mutation::{Delete, From, Input, Insert, Mutation, Query, Update, Values};
+        use mutation::{From, Input, Insert, Mutation, Query, Update, Values};
 
         if let syn::Expr::MethodCall(top) = expr {
             let method = top.method.to_string();
-
+            if method != "all" {
+                crate::ext::inferred(top)?;
+            }
             if let Some(ret) = shape::Returning::from_method(&method) {
                 if !top.args.is_empty() {
                     return Err(syn::Error::new(
@@ -60,10 +63,7 @@ impl shape::QueryShape {
                 }
                 let (set_arg, set_body) = top.args[0].closure_one("do_update")?;
                 let (target, inner) = shape::Target::parse_shape(top.receiver.as_ref(), cte_map)?;
-                let upd = shape::Update {
-                    set_arg: set_arg.clone(),
-                    set_body: set_body.clone(),
-                };
+                let upd = shape::Update { set_arg, set_body };
                 return inner.conflict(
                     shape::Conflict::TargetDoUpdate(target, upd),
                     top.method.span(),
@@ -104,13 +104,9 @@ impl shape::QueryShape {
                         format!("`{method}` takes exactly one closure argument"),
                     ));
                 }
-                let table = path.without_last()?;
+                let table = path.table()?;
                 let (arg, body) = args[0].closure_one(method)?;
-                let values = Values {
-                    table,
-                    arg: arg.clone(),
-                    body: Box::new(body.clone()),
-                };
+                let values = Values { table, arg, body };
                 let input = if each {
                     Input::Each(values)
                 } else {
@@ -128,21 +124,31 @@ impl shape::QueryShape {
                         "`Table::insert_from(source, |t, src| { ... })` takes exactly two arguments",
                     ));
                 }
-                let table = path.without_last()?;
-                let (source, ids, pred) = shape::QuerySource::parse_chain(&args[0], cte_map)?;
-                let arity = 2 + source.joins.len();
-                let (idents, body) = args[1].closure_n(arity, "insert_from")?;
-                let target = idents[0].clone();
-                let sources = idents[1..].to_vec();
+                let table = path.table()?;
+                let selection = shape::Selection::parse(&args[0], cte_map)?;
+                selection.source.single_table("insert_from")?;
+                let binding = args[1].closure(None, "insert_from")?;
+                let mut inputs = binding.inputs.iter();
+                let (Some(target), Some(source), None) =
+                    (inputs.next(), inputs.next(), inputs.next())
+                else {
+                    return Err(syn::Error::new(
+                        binding.inputs.span(),
+                        "`insert_from` closure must take exactly 2 parameter(s)",
+                    ));
+                };
+                let target = target.ident()?;
+                let source = source.ident()?;
+                if target.unraw() == source.unraw() {
+                    return Err(syn::Error::new(source.span(), "duplicate row binding"));
+                }
                 return Ok(Self::Mutation(Query::new(Mutation::Insert(Insert {
                     input: Input::From(Box::new(From {
                         table,
-                        source,
-                        pred_idents: ids,
-                        predicate: Box::new(pred),
+                        selection,
                         target,
-                        source_idents: sources,
-                        body: Box::new(body),
+                        source,
+                        body: binding.body.unbrace(),
                     })),
                     conflict: shape::Conflict::None,
                 }))));
@@ -167,19 +173,13 @@ impl shape::QueryShape {
             if let Some(query) = Query::try_each(top.receiver.as_ref(), &top.args[0])? {
                 return Ok(Self::Mutation(query));
             }
-            let (source, ids, pred) =
-                shape::QuerySource::parse_chain(top.receiver.as_ref(), cte_map)?;
-            let n = 1 + source.joins.len();
-            let (set_ids, set_body) = top.args[0].closure_n(n, "update")?;
-            let set_arg = set_ids.into_iter().next().ok_or_else(|| {
-                syn::Error::new(top.args[0].span(), "update closure needs a row parameter")
-            })?;
+            let selection = shape::Selection::parse(&top.receiver, cte_map)?;
+            selection.source.single_table("update")?;
+            let (set_arg, body) = top.args[0].closure_one("update")?;
             return Ok(Self::Mutation(Query::new(Mutation::Update(Update {
-                source,
-                pred_idents: ids,
-                predicate: Box::new(pred),
+                selection,
                 set_arg,
-                body: Box::new(set_body),
+                body,
             }))));
         }
 
@@ -190,61 +190,81 @@ impl shape::QueryShape {
                     "`.delete()` takes no arguments",
                 ));
             }
-            let (source, ids, pred) =
-                shape::QuerySource::parse_chain(top.receiver.as_ref(), cte_map)?;
-            return Ok(Self::Mutation(Query::new(Mutation::Delete(Delete {
-                source,
-                pred_idents: ids,
-                predicate: Box::new(pred),
-            }))));
+            let selection = shape::Selection::parse(&top.receiver, cte_map)?;
+            selection.source.single_table("delete")?;
+            return Ok(Self::Mutation(Query::new(Mutation::Delete(selection))));
         }
 
         if matches!(method.as_str(), "count" | "sum" | "avg" | "min" | "max") {
             let kind = shape::Aggregation::parse(top)?;
             let mut quals = qualify::State::default();
             let mut current = quals.peel(top.receiver.as_ref())?;
-            let mut having: Option<shape::HavingClause> = None;
+            let mut having = None;
             if let syn::Expr::MethodCall(mc) = current
                 && mc.method == "having"
             {
+                crate::ext::inferred(mc)?;
                 if mc.args.len() != 1 {
                     return Err(syn::Error::new(
                         mc.args.span(),
                         "`.having(...)` takes one closure argument",
                     ));
                 }
-                let (idents, body) = mc.args[0].closure_args("having")?;
-                let Some((agg_arg, row_args)) = idents.split_last() else {
+                let mut binding = mc.args[0].binding(None, "having")?;
+                let Some(agg_arg) = binding.idents.pop() else {
                     return Err(syn::Error::new(
                         mc.args[0].span(),
                         "`.having(...)` closure must take at least 2 args (row vars + agg handle)",
                     ));
                 };
                 having = Some(shape::HavingClause {
-                    row_args: row_args.to_vec(),
-                    agg_arg: agg_arg.clone(),
-                    pred: body,
+                    row_args: binding.idents,
+                    agg_arg,
+                    pred: binding.body,
                 });
                 current = mc.receiver.as_ref();
             }
-            let mut group_by: Option<shape::AggCol> = None;
+            let mut group_by = None;
             if let syn::Expr::MethodCall(mc) = current
                 && mc.method == "group_by"
             {
+                crate::ext::inferred(mc)?;
                 if mc.args.len() != 1 {
                     return Err(syn::Error::new(
                         mc.args.span(),
                         "`.group_by(...)` takes one closure argument",
                     ));
                 }
-                let (args, body) = mc.args[0].closure_args("group_by")?;
-                group_by = Some(shape::AggCol { args, body });
+                group_by = Some(mc.args[0].binding(None, "group_by")?);
                 current = mc.receiver.as_ref();
             }
-            let (source, ids, pred) = shape::QuerySource::parse_chain(current, cte_map)?;
+            let selection = shape::Selection::parse(current, cte_map)?;
+            let source = &selection.source;
+            if group_by.is_some() {
+                source.single_table("group_by")?;
+                quals.ordered(top.method.span())?;
+                if matches!(
+                    kind.function(),
+                    Some((shape::AggregateFn::Avg | shape::AggregateFn::Min, _))
+                ) {
+                    return Err(syn::Error::new(
+                        top.method.span(),
+                        "grouped aggregates support count, sum and max",
+                    ));
+                }
+            }
+            if !source.joins.is_empty() {
+                quals.ordered(top.method.span())?;
+                if source.joins.len() != 1 || kind.function().is_some() {
+                    return Err(syn::Error::new(
+                        top.method.span(),
+                        "joined aggregates support count on two tables",
+                    ));
+                }
+            }
             let n = 1 + source.joins.len();
             if let Some(gb) = &group_by
-                && gb.args.len() != n
+                && gb.idents.len() != n
             {
                 return Err(syn::Error::new(
                     gb.body.span(),
@@ -265,7 +285,7 @@ impl shape::QueryShape {
                 ));
             }
             if let Some((_, column)) = kind.function()
-                && column.args.len() != n
+                && column.idents.len() != n
             {
                 return Err(syn::Error::new(
                     column.body.span(),
@@ -275,9 +295,7 @@ impl shape::QueryShape {
                 ));
             }
             return Ok(Self::Aggregate(Box::new(shape::Aggregate {
-                source,
-                pred_idents: ids,
-                predicate: pred,
+                selection,
                 kind,
                 group_by,
                 having,
@@ -305,13 +323,64 @@ impl shape::QueryShape {
                 "terminator method must take no arguments",
             ));
         }
+        let row = match &top.turbofish {
+            None => None,
+            Some(args) => match args.args.first() {
+                Some(syn::GenericArgument::Type(row)) if args.args.len() == 1 => Some(row),
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        args,
+                        "joined all expects one row type",
+                    ));
+                }
+            },
+        };
+        let receiver = top.receiver.unbrace();
         let mut quals = qualify::State::default();
-        let input = quals.peel(top.receiver.as_ref())?;
+        if let syn::Expr::MethodCall(mc) = receiver
+            && mc.method == "select"
+        {
+            crate::ext::inferred(mc)?;
+            if mc.args.len() != 1 {
+                return Err(syn::Error::new(
+                    mc.args.span(),
+                    "`.select(...)` takes one closure argument",
+                ));
+            }
+            if let Some(row) = row {
+                return Err(syn::Error::new_spanned(
+                    row,
+                    "a projection fixes its result type",
+                ));
+            }
+            let peeled = quals.peel(mc.receiver.as_ref())?;
+            let selection = shape::Selection::parse(peeled, cte_map)?;
+            let n = 1 + selection.source.joins.len();
+            if n > 2 {
+                return Err(syn::Error::new_spanned(
+                    &mc.method,
+                    "select supports up to two source rows",
+                ));
+            }
+            let projection = mc.args[0].binding(Some(n), "select")?;
+            return Ok(Self::Select {
+                selection,
+                projection: Some(projection),
+                row: None,
+                terminator: term,
+                qualifiers: quals,
+            });
+        }
+
+        let input = quals.peel(receiver)?;
 
         if let syn::Expr::MethodCall(mc) = input
             && shape::SetOpKind::from_method(&mc.method.to_string()).is_some()
         {
-            let set = shape::SelectBranch::parse_set(input, cte_map)?;
+            if let Some(row) = row {
+                return Err(syn::Error::new_spanned(row, "a set fixes its result type"));
+            }
+            let set = shape::SetQuery::parse(input, cte_map)?;
             return Ok(Self::SetOp {
                 set,
                 terminator: term,
@@ -319,38 +388,18 @@ impl shape::QueryShape {
             });
         }
 
-        if let syn::Expr::MethodCall(mc) = input
-            && mc.method == "select"
+        let selection = shape::Selection::parse(input, cte_map)?;
+        if let Some(row) = row
+            && selection.source.joins.is_empty()
         {
-            if mc.args.len() != 1 {
-                return Err(syn::Error::new(
-                    mc.args.span(),
-                    "`.select(...)` takes one closure argument",
-                ));
-            }
-            let peeled = quals.peel(mc.receiver.as_ref())?;
-            let (source, ids, pred) = shape::QuerySource::parse_chain(peeled, cte_map)?;
-            let n = 1 + source.joins.len();
-            let (idents, body) = mc.args[0].closure_n(n, "select")?;
-            let elems = match body {
-                syn::Expr::Tuple(t) => t.elems.into_iter().collect(),
-                single => vec![single],
-            };
-            return Ok(Self::Select {
-                source,
-                pred_idents: ids,
-                predicate: pred,
-                projection: Some(shape::Projection { idents, elems }),
-                terminator: term,
-                qualifiers: quals,
-            });
+            return Err(syn::Error::new_spanned(
+                row,
+                "only joined all takes an explicit row type",
+            ));
         }
-
-        let (source, ids, pred) = shape::QuerySource::parse_chain(input, cte_map)?;
         Ok(Self::Select {
-            source,
-            pred_idents: ids,
-            predicate: pred,
+            row,
+            selection,
             projection: None,
             terminator: term,
             qualifiers: quals,

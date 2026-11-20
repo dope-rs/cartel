@@ -40,10 +40,7 @@ impl<'a> Literal<'a> {
                 let value = literal.base10_digits();
                 quote::quote! { #value }
             }
-            Self::Bool(literal) => {
-                let keyword = if literal.value { "TRUE" } else { "FALSE" };
-                dialect.kw(keyword)
-            }
+            Self::Bool(literal) => dialect.boolean(literal.value),
             Self::String(literal) => {
                 let value = format!("'{}'", literal.value().replace('\'', "''"));
                 quote::quote! { #value }

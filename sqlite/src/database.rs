@@ -101,7 +101,7 @@ impl<'sql> Target<'sql> {
     }
 
     /// Runs parameterless, columnless commands before catalog preparation.
-    /// Each runs in autocommit mode; later failure preserves earlier changes.
+    /// Ordinary installation uses autocommit. Immediate installation runs them after initialization in its transaction.
     /// Attaching validates only SQL text and does not open the database.
     pub fn commands(mut self, sql: &'sql [&'sql str]) -> Result<Self, crate::Error> {
         self.commands = sys::Commands::try_new(sql)?;

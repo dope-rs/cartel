@@ -83,7 +83,7 @@ impl<'query, 'd> State<'query, 'd> {
     ) -> result::Result<(), crate::Error> {
         // Fixed controls never yield rows; step halts or resets them while authorized.
         // Plain reset retains its denied authority.
-        match bound.finish(access, self.transaction) {
+        match bound.prepared().reset(access, self.transaction) {
             Ok(()) => Ok(()),
             Err(error) => self.guard.check(Err(error)),
         }

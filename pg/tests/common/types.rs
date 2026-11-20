@@ -1,8 +1,10 @@
 use cartel_pg::{PgRow, PgTable};
 
+type Id = i64;
+
 #[derive(PgRow, PgTable)]
 pub struct User {
-    pub id: i64,
+    pub id: Id,
     pub name: String,
     pub age: i32,
 }
@@ -23,7 +25,7 @@ pub struct UserId {
 #[table(batch)]
 #[table_name("한\"글.select")]
 pub struct BatchKeyword {
-    pub r#select: i64,
+    pub r#select: Id,
 }
 
 type UserAlias = User;
@@ -44,7 +46,7 @@ pub enum Projection {}
 
 #[cartel_gen::query_group]
 impl Projection {
-    pub fn insert_batch(values: &[i64]) {
+    pub fn insert_batch(values: &[Id]) {
         BatchKeyword::insert_each(|row| row.r#select = values)
     }
 

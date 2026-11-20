@@ -5,7 +5,7 @@ use runtime::{local, slot};
 use std::pin;
 
 pub(super) struct Opening<'local, 'd: 'local, I: catalogs::Catalog> {
-    resources: slot::Opening<'local, 'd, I>,
+    pub(super) resources: slot::Opening<'local, 'd, I>,
     value_bytes: i32,
     statement_sql_bytes: i32,
     storage: database::Kind,
@@ -18,7 +18,6 @@ enum Phase {
     Configure(Configure),
     Settings(Settings),
     Verify(Verify),
-    Commands,
 }
 
 #[derive(Clone, Copy)]
@@ -94,13 +93,15 @@ impl<'local, 'd: 'local, I: catalogs::Catalog> Opening<'local, 'd, I> {
         self.resources.retry()
     }
 
-    pub(super) fn advance(&mut self) -> Result<Progress, crate::open::Error> {
+    pub(super) fn configure_next(&mut self) -> Result<Progress, crate::Error> {
         match self.phase {
-            Phase::Configure(step) => return Ok(self.configure(step)?),
-            Phase::Settings(step) => return Ok(self.settings(step)?),
-            Phase::Verify(step) => return Ok(self.verify(step)?),
-            Phase::Commands => {}
+            Phase::Configure(step) => self.configure(step),
+            Phase::Settings(step) => self.settings(step),
+            Phase::Verify(step) => self.verify(step),
         }
+    }
+
+    pub(super) fn command(&mut self) -> Result<Progress, crate::Error> {
         let Some((sql, tail)) = self.commands.split_first() else {
             return Ok(Progress::Ready);
         };
@@ -213,8 +214,7 @@ impl<'local, 'd: 'local, I: catalogs::Catalog> Opening<'local, 'd, I> {
                 if actual != expected {
                     return Err(crate::Error::TemporaryCache { expected, actual });
                 }
-                self.resources.authorize();
-                self.phase = Phase::Commands;
+                return Ok(Progress::Ready);
             }
         }
         Ok(Progress::Pending)

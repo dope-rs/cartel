@@ -48,6 +48,14 @@ impl<'work, R> Guard<'work, R> {
 }
 
 impl<'work> Guard<'work, open::Open> {
+    pub(crate) fn charge<T>(
+        &self,
+        result: result::Result<T, crate::Error>,
+    ) -> result::Result<T, crate::Error> {
+        self.work.control().tick();
+        self.check(result)
+    }
+
     pub(crate) const fn call<'connection, 'guard>(
         &'guard self,
         db: &'connection sys::Connection,

@@ -1,3 +1,4 @@
+use crate::dsl::shape::BatchColumn;
 use crate::protocol::{Reason, value::decode, value::encode::Param};
 use crate::schema::{array, desc};
 use o3::base::marker::ThreadBound;
@@ -6,7 +7,8 @@ fn own<T>(value: &str, make: fn(crate::TextStorage) -> T) -> Result<T, crate::Er
     Ok(make((crate::Error::try_string(value)?, ThreadBound::NEW)))
 }
 
-pub trait Row: desc::Validate + Sized {
+pub trait Row: Sized {
+    type Description: desc::Validate;
     type View<'row>;
 
     fn decode<'row>(reader: &mut decode::RowReader<'row>)
@@ -16,6 +18,7 @@ pub trait Row: desc::Validate + Sized {
 }
 
 impl Row for () {
+    type Description = Self;
     type View<'row> = ();
 
     fn decode<'row>(_: &mut decode::RowReader<'row>) -> Result<Self::View<'row>, crate::Error> {
@@ -28,6 +31,7 @@ impl Row for () {
 }
 
 impl<A: Row, B: Row> Row for (A, B) {
+    type Description = (A::Description, B::Description);
     type View<'row> = (A::View<'row>, B::View<'row>);
 
     #[inline(always)]
@@ -43,6 +47,7 @@ impl<A: Row, B: Row> Row for (A, B) {
 }
 
 impl<A: Row, B: Row, C: Row> Row for (A, B, C) {
+    type Description = (A::Description, <(B, C) as Row>::Description);
     type View<'row> = (A::View<'row>, B::View<'row>, C::View<'row>);
 
     fn decode<'row>(
@@ -61,6 +66,7 @@ impl<A: Row, B: Row, C: Row> Row for (A, B, C) {
 }
 
 impl<A: Row, B: Row, C: Row, D: Row> Row for (A, B, C, D) {
+    type Description = (<(A, B) as Row>::Description, <(C, D) as Row>::Description);
     type View<'row> = (A::View<'row>, B::View<'row>, C::View<'row>, D::View<'row>);
 
     fn decode<'row>(
@@ -95,13 +101,12 @@ pub trait Field: sealed::Sealed + Sized {
     fn into_owned<'row>(value: Self::View<'row>) -> Result<Self, crate::Error>;
 }
 
-pub(crate) use sealed::Nullable;
-
 pub(crate) mod sealed {
     pub trait Sealed {}
     pub(crate) trait Nullable {}
 
     impl<T: Nullable> Sealed for T {}
+    impl<T: super::Field + Nullable> Sealed for Option<T> {}
     impl Sealed for Vec<i32> {}
     impl Sealed for Vec<i64> {}
     impl Sealed for Vec<String> {}
@@ -115,6 +120,7 @@ pub(crate) mod sealed {
 }
 
 impl<T: Field> Row for T {
+    type Description = Self;
     type View<'row> = T::View<'row>;
 
     #[inline]
@@ -128,28 +134,45 @@ impl<T: Field> Row for T {
     }
 }
 
-impl<T: Field + Nullable> Row for Option<T> {
+impl<T: Field + sealed::Nullable> Field for Option<T> {
     type View<'row> = Option<T::View<'row>>;
+    const TARGET: desc::Target = T::TARGET;
+    const FORMAT: u16 = T::FORMAT;
+    const DYNAMIC_TYPES: u8 = T::DYNAMIC_TYPES;
 
     #[inline]
-    fn decode<'row>(
-        reader: &mut decode::RowReader<'row>,
-    ) -> Result<Self::View<'row>, crate::Error> {
+    fn read<'row>(reader: &mut decode::RowReader<'row>) -> Result<Self::View<'row>, Reason> {
         match T::read(reader) {
             Ok(value) => Ok(Some(value)),
             Err(Reason::ColumnNull { .. }) => Ok(None),
-            Err(reason) => Err(crate::Error::Protocol(reason)),
+            Err(reason) => Err(reason),
         }
     }
 
     #[inline]
-    fn decode_owned(reader: &mut decode::RowReader<'_>) -> Result<Self, crate::Error> {
-        Self::decode(reader)?.map(T::into_owned).transpose()
+    fn into_owned<'row>(value: Self::View<'row>) -> Result<Self, crate::Error> {
+        value.map(T::into_owned).transpose()
     }
 }
 
 trait Scalar: Copy {
     fn read(reader: &mut decode::RowReader<'_>) -> Result<Self, Reason>;
+}
+
+impl<T: Scalar + Param> BatchColumn for T {
+    type Item<'data> = T;
+}
+
+impl BatchColumn for String {
+    type Item<'data> = &'data str;
+}
+
+impl BatchColumn for Vec<u8> {
+    type Item<'data> = &'data [u8];
+}
+
+impl BatchColumn for crate::Ltree {
+    type Item<'data> = Self;
 }
 
 impl<T: Scalar + Param> Field for T {

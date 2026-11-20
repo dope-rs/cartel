@@ -1,5 +1,4 @@
 use crate::backend;
-use crate::dialect::pg::types::TypeExt as _;
 use crate::ext::SqlIdent as _;
 
 impl backend::TableBackend for super::PgBackend {
@@ -52,14 +51,6 @@ impl backend::TableBackend for super::PgBackend {
                 })?;
             }
         }
-        let filter = quote::quote! {
-            pub fn filter(
-                scope: &#rt::dsl::Scope,
-                pred: impl ::core::ops::FnOnce(Self) -> bool,
-            ) -> #rt::dsl::query::Query<Self> {
-                match (scope.0, pred) {}
-            }
-        };
         let sql = table.quoted();
         if fields.is_empty() {
             if batch {
@@ -69,33 +60,21 @@ impl backend::TableBackend for super::PgBackend {
                 impl #name {
                     #[doc(hidden)]
                     pub const __CARTEL_TABLE: &'static str = #sql;
-
-                    #filter
                 }
             });
         }
         let emit = if batch {
             let slices = quote::format_ident!("{name}Slices");
             let vis = &input.vis;
-            let mut slice = Vec::new();
-            for f in &fields {
-                let fname = f.name;
-                let vis = f.vis;
-                let ty = f.ty.slice_type().ok_or_else(|| {
-                    syn::Error::new_spanned(f.ty, "batch column has no slice representation")
-                })?;
-                slice.push(quote::quote! { #vis #fname: #ty });
-            }
+            let slice = fields.iter().map(|field| {
+                let (vis, name, ty) = (field.vis, field.name, field.ty);
+                quote::quote! { #vis #name: &'data [<#ty as #rt::dsl::shape::BatchColumn>::Item<'data>] }
+            });
             quote::quote! {
                 #vis struct #slices<'data> { #(#slice,)* }
 
-                impl #name {
-                    pub fn insert_each<'data>(
-                        scope: &#rt::dsl::Scope,
-                        init: impl ::core::ops::FnOnce(&mut #slices<'data>),
-                    ) -> #rt::dsl::write::Insert<Self> {
-                        match (scope.0, init) {}
-                    }
+                impl #rt::dsl::shape::Batch for #name {
+                    type Columns<'data> = #slices<'data>;
                 }
             }
         } else {
@@ -110,51 +89,6 @@ impl backend::TableBackend for super::PgBackend {
 
                 #[doc(hidden)]
                 pub const __CARTEL_TABLE: &'static str = #sql;
-            }
-
-            impl #name {
-                #filter
-
-                pub fn join<T>(
-                    scope: &#rt::dsl::Scope,
-                    pred: impl ::core::ops::FnOnce(Self, T) -> bool,
-                ) -> #rt::dsl::query::join::Plan2<Self, T> {
-                    match (scope.0, pred) {}
-                }
-                pub fn left_join<T>(
-                    scope: &#rt::dsl::Scope,
-                    pred: impl ::core::ops::FnOnce(Self, T) -> bool,
-                ) -> #rt::dsl::query::join::Plan2<Self, T> {
-                    match (scope.0, pred) {}
-                }
-                pub fn lateral_join<T>(
-                    scope: &#rt::dsl::Scope,
-                    plan: impl ::core::ops::FnOnce(Self) -> #rt::dsl::query::Query<T>,
-                ) -> #rt::dsl::query::join::Plan2<Self, T> {
-                    match (scope.0, plan) {}
-                }
-                pub fn lateral_left<T>(
-                    scope: &#rt::dsl::Scope,
-                    plan: impl ::core::ops::FnOnce(Self) -> #rt::dsl::query::Query<T>,
-                ) -> #rt::dsl::query::join::Plan2<Self, T> {
-                    match (scope.0, plan) {}
-                }
-
-                pub fn insert(
-                    scope: &#rt::dsl::Scope,
-                    init: impl ::core::ops::FnOnce(&mut Self),
-                )
-                    -> #rt::dsl::write::Insert<Self>
-                {
-                    match (scope.0, init) {}
-                }
-                pub fn insert_from<S>(
-                    scope: &#rt::dsl::Scope,
-                    source: #rt::dsl::query::Query<S>,
-                    init: impl ::core::ops::FnOnce(&mut Self, S),
-                ) -> #rt::dsl::write::Insert<Self> {
-                    match (scope.0, source, init) {}
-                }
             }
         })
     }

@@ -1,4 +1,5 @@
 use crate::protocol::{encode::Error, value::encode};
+use desc::Validate as _;
 use std::{any::Any, marker::PhantomData, mem};
 
 pub mod array;
@@ -61,7 +62,7 @@ impl QueryMeta<'_> {
             param_oids: Q::PARAM_OIDS,
             result_columns: Q::N_RESULT_COLS,
             result,
-            dynamic_types: <Q::Row as desc::Validate>::DYNAMIC_TYPES,
+            dynamic_types: <Q::Row as Row>::Description::DYNAMIC_TYPES,
         })
     }
 
@@ -69,7 +70,7 @@ impl QueryMeta<'_> {
         const {
             match Self::check::<Q>() {
                 Err(error) => Err(error),
-                Ok(()) => <Q::Row as desc::Validate>::FORMATS
+                Ok(()) => <Q::Row as Row>::Description::FORMATS
                     .validate(Q::RESULT_FORMAT_CODES, Q::N_RESULT_COLS),
             }
         }?;
@@ -157,7 +158,7 @@ impl QueryMeta<'_> {
             && self.param_oids == Q::PARAM_OIDS
             && self.result_columns == Q::N_RESULT_COLS
             && self.result == <Q::Result as result::Shape>::KIND
-            && self.dynamic_types == <Q::Row as desc::Validate>::DYNAMIC_TYPES
+            && self.dynamic_types == <Q::Row as Row>::Description::DYNAMIC_TYPES
     }
 }
 
