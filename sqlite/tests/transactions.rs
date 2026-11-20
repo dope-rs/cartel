@@ -432,8 +432,7 @@ fn tail_transaction_drains(runtime: Runtime) -> Result<(), plan::Error> {
         .with_config(settings::Config::for_profile::<Throughput>())
         .map_err(plan::Error::Claim)?;
     let entered = cell::Cell::new(false);
-    plan.try_create(
-        (),
+    plan.try_scoped(
         |worker| {
             let mut cleanup = open::Completion::new();
             let mut complete = session::Completion::new();

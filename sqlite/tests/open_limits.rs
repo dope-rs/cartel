@@ -232,8 +232,7 @@ fn startup_timeout_releases(runtime: Runtime) -> Result<(), plan::Error> {
                         .expect("yielding contention plan")
                         .for_profile::<Throughput>()
                         .expect("yielding contention resources")
-                        .try_create(
-                            (),
+                        .try_scoped(
                             |worker| {
                                 let mut cleanup = open::Completion::new();
                                 let mut polls = 0;

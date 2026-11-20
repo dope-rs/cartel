@@ -32,8 +32,7 @@ fn forgotten_app_retires() -> Result<(), plan::Error> {
             .map_err(plan::Error::Plan)?
             .for_profile::<Throughput>()
             .map_err(plan::Error::Claim)?
-            .try_create(
-                (),
+            .try_scoped(
                 |worker| {
                     let mut cleanup = open::Completion::new();
                     let result = worker.install_with(|open, stage| {

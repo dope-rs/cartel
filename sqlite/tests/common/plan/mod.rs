@@ -203,8 +203,7 @@ impl<'sql, I: Catalog> Plan<'sql, I> {
     {
         let mut complete = session::Completion::new();
         let complete = &mut complete;
-        self.ready.try_create(
-            (),
+        self.ready.try_scoped(
             move |worker| {
                 let mut cleanup = open::Completion::new();
                 let output =

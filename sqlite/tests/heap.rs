@@ -37,8 +37,7 @@ fn empty_scope_keeps_heap(runtime: Runtime) -> Result<(), plan::Error> {
                     .map_err(plan::Error::Plan)?
                     .with_config(layout)
                     .map_err(plan::Error::Claim)?
-                    .try_create(
-                        (),
+                    .try_scoped(
                         |worker| {
                             if attempt {
                                 let mut cleanup = open::Completion::new();
@@ -298,7 +297,7 @@ fn heaps_are_isolated(runtime: Runtime) -> Result<(), plan::Error> {
                         .map_err(plan::Error::Plan)?
                         .with_config(layout)
                         .map_err(plan::Error::Claim)?
-                        .try_create(
+                        .try_with(
                             source,
                             |worker| {
                                 let mut cleanup = open::Completion::new();

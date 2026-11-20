@@ -33,8 +33,7 @@ fn catalog_and_schema_commit_together() -> Result<(), plan::Error> {
             .map_err(plan::Error::Plan)?
             .for_profile::<Throughput>()
             .map_err(plan::Error::Claim)?;
-        plan.try_create(
-            (),
+        plan.try_scoped(
             |worker| {
                 let mut report = open::Completion::new();
                 match worker.install_with(|plan, stage| {

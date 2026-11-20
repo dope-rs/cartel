@@ -6,14 +6,11 @@ use codec::mode;
 use codec::staging::Limit;
 use dope::{
     core::{Errno, driver, driver::route, io::socket},
-    manifold::{
-        client::{
-            app::{self, admit::Registered, connect::Full, failure, request},
-            attempt::{self, ConnectFault},
-            close, conn,
-            session::{self, app::drain::Application, codec, policy, protocol, response, turns},
-        },
-        service::bindings::endpoint::State,
+    manifold::client::{
+        app::{self, admit::Registered, connect::Full, failure, request},
+        attempt::{self, ConnectFault},
+        close, conn,
+        session::{self, app::drain::Application, codec, policy, protocol, response, turns},
     },
     net::{
         link::{egress, pool::change::opening},
@@ -25,8 +22,7 @@ use o3::{
     base::{Call, cell::region, time::Positive},
     buffer::{self, hold, resident},
 };
-use output::{Cancel, Sent};
-use policy::{admit, output};
+use policy::admit;
 
 use crate::{
     Owner, Port,
@@ -177,13 +173,13 @@ where
     'd: 'c,
     P: Root<'d, ID, Port = Port<'s, 'storage, 'b, 'c, 'd, ID>>,
 {
-    fn sent() -> impl for<'a, 'x> Call<(
-        &'a mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
-        conn::Id<'d, route::KeyTag<ID>>,
-        egress::Pending,
-        &'x mut region::Token<region::Identity<'d, 1>>,
-    )> {
-        Sent::<_>::Ready(|owner: &mut State<P, _, _, _>| owner.root().port().activity.wake_send())
+    fn sent(
+        owner: &mut Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
+        _: conn::Id<'d, route::KeyTag<ID>>,
+        _: egress::Pending,
+        _: &mut region::Token<region::Identity<'d, 1>>,
+    ) {
+        owner.root().port().activity.wake_send();
     }
 
     fn flush<'w, W: wire::Spec + 'w>(
@@ -222,15 +218,13 @@ where
         )
     }
 
-    fn cancel() -> impl for<'a, 'x> Call<(
-        &'a Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
-        Self::Send,
-        &'x mut region::Token<region::Identity<'d, 1>>,
-    )> {
-        Cancel::<Infallible, Infallible, Infallible, _, _>::Ready(
-            drop,
-            |owner: &State<P, _, _, _>| owner.root().port().activity.wake_send(),
-        )
+    fn cancel(
+        owner: &Owner<'r, 's, 'd, P, ID, I, EXPECTED, COUNT>,
+        payload: Self::Send,
+        _: &mut region::Token<region::Identity<'d, 1>>,
+    ) {
+        drop(payload);
+        owner.root().port().activity.wake_send();
     }
 }
 
