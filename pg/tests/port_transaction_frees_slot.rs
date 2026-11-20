@@ -1,7 +1,6 @@
 use cartel_pg::api::traits::Connection as _;
 use cartel_pg::api::traits::{
     Begin as _, Client as _, Notify as _, Query as _, Status as _, Stream as _, Transaction as _,
-    Unchecked as _,
 };
 use dope::core::driver::life::recovery;
 use dope_test::harness::peer;
@@ -40,49 +39,30 @@ pub mod common;
 fn transaction_does_not_join_open_stream() {
     fn run<P: Policy>() {
         peer::AcceptScript::with(common::transaction::streamed, |server| {
-            let prepared = topology::try_new::<_, Env>(
-                port::Port::<(Database, P)>::plan(
-                    Queries::try_config().expect("database config"),
-                    config::Configuration::new(Queries::cancel_capacity()).expect("two in-flight replies"),
-                ),
-                server.addr(),
-                Duration::from_millis(1),
-                Duration::from_secs(1),
-            )
-            .expect("transaction topology");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared.with_local(
-                |worker| {
-                    worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
-                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                let client = runtime.root_client();
-                                assert!(matches!(
-                                    runtime.block_on(client.status().wait_ready()),
-                                    Ok(Ok(()))
-                                ));
-                                runtime
-                                    .block_on(dope_fiber::fiber!('_ => async move {
-                                        let mut stream = client.run_stream::<TextQuery>(());
-                                        ::core::assert!(
-                                            fibers::TEST.poll_once(stream.next_row()).await.is_none()
-                                        );
-                                        let tx = client.transaction().begin().await.ok().expect("independent transaction");
-                                        let error = stream.next_row().await.err().expect("stream error");
-                                        ::core::assert!(tx.rollback().await.is_ok());
-                                        let fields = error.as_server().expect("retained stream error").fields();
-                                        ::core::assert_eq!((fields.code().as_str(), fields.message()), ("23505", "duplicate"));
-                                    }))
-                                    .expect("stream and transaction driver");
-                            })
-                        })
-                    })
-                },
-                recovery::Policy::new(|event| reports.push(event), common::recover),
-                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "transaction scope"),
+            let plan = port::Port::<(Database, P)>::plan(
+                Queries::try_config().expect("database config"),
+                config::Configuration::new(Queries::cancel_capacity()).expect("two in-flight replies"),
             );
-            assert!(reports.events().expect("reclamation").is_empty());
+            topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+                let client = runtime.root_client();
+                assert!(matches!(
+                    runtime.block_on(client.status().wait_ready()),
+                    Ok(Ok(()))
+                ));
+                runtime
+                    .block_on(dope_fiber::fiber!('_ => async move {
+                        let mut stream = client.run_stream::<TextQuery>(());
+                        ::core::assert!(
+                            fibers::TEST.poll_once(stream.next_row()).await.is_none()
+                        );
+                        let tx = client.transaction().begin().await.ok().expect("independent transaction");
+                        let error = stream.next_row().await.err().expect("stream error");
+                        ::core::assert!(tx.rollback().await.is_ok());
+                        let fields = error.as_server().expect("retained stream error").fields();
+                        ::core::assert_eq!((fields.code().as_str(), fields.message()), ("23505", "duplicate"));
+                    }))
+                    .expect("stream and transaction driver");
+            });
             assert!(matches!(server.finish(), Ok(Ok(()))), "stream transaction peer");
         })
         .expect("spawn transaction peer");
@@ -100,55 +80,36 @@ fn throttled_query_cannot_enter_later_transaction() {
             capacity.inflight = 1;
             capacity.requests.frames = 3;
             capacity.admission_waiters = 1;
-            let prepared = topology::try_new::<_, Env>(
-                port::Port::<Queries>::plan(
-                    Queries::try_config().expect("database config"),
-                    config::Config::new(capacity).expect("single reply"),
-                ),
-                server.addr(),
-                Duration::from_millis(1),
-                Duration::from_secs(1),
-            )
-            .expect("transaction topology");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared.with_local(
-                |worker| {
-                    worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
-                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                let client = runtime.root_client();
-                                assert!(matches!(
-                                    runtime.block_on(client.status().wait_ready()),
-                                    Ok(Ok(()))
-                                ));
-                                let mut first =
-                                    pin!(Task::new(client.command("SELECT 1")));
-                                let mut waiting =
-                                    pin!(Task::new(client.command("SELECT 2")));
-                                runtime
-                                    .block_on(dope_fiber::fiber!('_ => async move {
-                                        ::core::assert!(fibers::TEST.poll_once(first.as_mut()).await.is_none());
-                                        ::core::assert!(fibers::TEST.poll_once(waiting.as_mut()).await.is_none());
-                                        ::core::assert!(matches!(first.as_mut().await, Ok(())));
-                                        let tx = client.transaction().begin().await
-                                            .ok().expect("exclusive transaction");
-                                        ::core::assert!(matches!(
-                                            waiting.as_mut().await,
-                                            Err(reply::Error::Driver(cartel_pg::Error::Backpressure { .. }))
-                                        ));
-                                        ::core::assert!(matches!(tx.commit().await, Ok(())));
-                                        ::core::assert!(matches!(client.command("SELECT 1").await, Ok(())));
-                                    }))
-                                    .expect("throttled transaction driver");
-                            })
-                        })
-                    })
-                },
-                recovery::Policy::new(|event| reports.push(event), common::recover),
-                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "transaction scope"),
+            let plan = port::Port::<Queries>::plan(
+                Queries::try_config().expect("database config"),
+                config::Config::new(capacity).expect("single reply"),
             );
-            assert!(reports.events().expect("reclamation").is_empty());
+            topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+                let client = runtime.root_client();
+                assert!(matches!(
+                    runtime.block_on(client.status().wait_ready()),
+                    Ok(Ok(()))
+                ));
+                let mut first =
+                    pin!(Task::new(client.command("SELECT 1")));
+                let mut waiting =
+                    pin!(Task::new(client.command("SELECT 2")));
+                runtime
+                    .block_on(dope_fiber::fiber!('_ => async move {
+                        ::core::assert!(fibers::TEST.poll_once(first.as_mut()).await.is_none());
+                        ::core::assert!(fibers::TEST.poll_once(waiting.as_mut()).await.is_none());
+                        ::core::assert!(matches!(first.as_mut().await, Ok(())));
+                        let tx = client.transaction().begin().await
+                            .ok().expect("exclusive transaction");
+                        ::core::assert!(matches!(
+                            waiting.as_mut().await,
+                            Err(reply::Error::Driver(cartel_pg::Error::Backpressure { .. }))
+                        ));
+                        ::core::assert!(matches!(tx.commit().await, Ok(())));
+                        ::core::assert!(matches!(client.command("SELECT 1").await, Ok(())));
+                    }))
+                    .expect("throttled transaction driver");
+            });
             assert!(matches!(server.finish(), Ok(Ok(()))), "transaction peer");
         },
     )
@@ -219,45 +180,26 @@ fn pinned_queries_wait_for_request_capacity() {
         |server| {
             let mut capacity = Queries::try_cancel().expect("PG capacity").capacities();
             capacity.connections = 2;
-            let prepared = topology::try_new::<_, Env>(
-                port::Port::<Queries>::plan(
-                    Queries::try_config().expect("database config"),
-                    config::Config::new(capacity).expect("one request slot per lane"),
-                ),
-                server.addr(),
-                Duration::from_millis(1),
-                Duration::from_secs(1),
-            )
-            .expect("transaction topology");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared.with_local(
-                |worker| {
-                    worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
-                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                let client = runtime.root_client();
-                                assert!(matches!(
-                                    runtime.block_on(client.status().wait_ready()),
-                                    Ok(Ok(()))
-                                ));
-                                runtime.block_on(dope_fiber::fiber!('_ => async move {
-                            let tx = client.transaction().begin().await.ok().expect("transaction");
-                            let (first, second) = Join::new(
-                                tx.query().command("SELECT 1"),
-                                tx.query().command("SELECT 1"),
-                            ).await;
-                            assert!(first.is_ok() && second.is_ok());
-                            assert!(tx.commit().await.is_ok());
-                        })).expect("pipelined transaction driver");
-                            })
-                        })
-                    })
-                },
-                recovery::Policy::new(|event| reports.push(event), common::recover),
-                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "transaction scope"),
+            let plan = port::Port::<Queries>::plan(
+                Queries::try_config().expect("database config"),
+                config::Config::new(capacity).expect("one request slot per lane"),
             );
-            assert!(reports.events().expect("reclamation").is_empty());
+            topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+                let client = runtime.root_client();
+                assert!(matches!(
+                    runtime.block_on(client.status().wait_ready()),
+                    Ok(Ok(()))
+                ));
+                runtime.block_on(dope_fiber::fiber!('_ => async move {
+                let tx = client.transaction().begin().await.ok().expect("transaction");
+                let (first, second) = Join::new(
+                tx.query().command("SELECT 1"),
+                tx.query().command("SELECT 1"),
+                ).await;
+                assert!(first.is_ok() && second.is_ok());
+                assert!(tx.commit().await.is_ok());
+                })).expect("pipelined transaction driver");
+            });
             server.finish().expect("transaction peer");
         },
     )
@@ -270,78 +212,59 @@ fn transaction_status_rejects_stale_guard() {
         peer::AcceptScript::with(
             move |listener| common::transaction::ended(listener, invalid_begin, unmanaged_begin),
             |server| {
-                let prepared = topology::try_new::<_, Env>(
-                    port::Port::<Queries>::plan(
-                        Queries::try_config().expect("database config"),
-                        Queries::try_cancel().expect("two in-flight replies"),
-                    ),
-                    server.addr(),
-                    Duration::from_millis(1),
-                    Duration::from_secs(1),
-                )
-                .expect("transaction topology");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let client = runtime.root_client();
-                                    assert!(matches!(
-                                        runtime.block_on(client.status().wait_ready()),
-                                        Ok(Ok(()))
-                                    ));
-                                    assert!(matches!(
-                                        runtime.block_on(fibers::TEST.poll_once(client.command(
-                                            if unmanaged_begin { "BEGIN" } else { "SELECT 1" }
-                                        ))),
-                                        Ok(None)
-                                    ));
-                                    let started = runtime
-                                        .block_on(client.transaction().begin())
-                                        .expect("begin driver");
-                                    let stale = if invalid_begin || unmanaged_begin {
-                                        assert!(matches!(
-                                            started,
-                                            Err(reply::Error::Driver(cartel_pg::Error::Protocol(
-                                                cartel_pg::protocol::Reason::TransactionLease
-                                            )))
-                                        ));
-                                        None
-                                    } else {
-                                        let tx = started.ok().expect("pipelined transaction");
-                                        assert!(matches!(
-                                            runtime.block_on(tx.query().command("ROLLBACK")),
-                                            Ok(Err(reply::Error::Driver(
-                                                cartel_pg::Error::Protocol(
-                                                    cartel_pg::protocol::Reason::TransactionLease
-                                                )
-                                            )))
-                                        ));
-                                        assert!(matches!(
-                                            runtime.block_on(tx.query().command("SELECT 1")),
-                                            Ok(Err(reply::Error::Pinned(_)))
-                                        ));
-                                        Some(tx)
-                                    };
-                                    assert!(matches!(
-                                        runtime.block_on(client.command("SELECT 1")),
-                                        Ok(Ok(()))
-                                    ));
-                                    drop(stale);
-                                    assert!(matches!(
-                                        runtime.block_on(client.command("SELECT 1")),
-                                        Ok(Ok(()))
-                                    ));
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), common::recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "transaction scope"),
+                let plan = port::Port::<Queries>::plan(
+                    Queries::try_config().expect("database config"),
+                    Queries::try_cancel().expect("two in-flight replies"),
                 );
-                assert!(reports.events().expect("reclamation").is_empty());
+                topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+                    let client = runtime.root_client();
+                    assert!(matches!(
+                        runtime.block_on(client.status().wait_ready()),
+                        Ok(Ok(()))
+                    ));
+                    assert!(matches!(
+                        runtime.block_on(fibers::TEST.poll_once(client.command(
+                            if unmanaged_begin { "BEGIN" } else { "SELECT 1" }
+                        ))),
+                        Ok(None)
+                    ));
+                    let started = runtime
+                        .block_on(client.transaction().begin())
+                        .expect("begin driver");
+                    let stale = if invalid_begin || unmanaged_begin {
+                        assert!(matches!(
+                            started,
+                            Err(reply::Error::Driver(cartel_pg::Error::Protocol(
+                                cartel_pg::protocol::Reason::TransactionLease
+                            )))
+                        ));
+                        None
+                    } else {
+                        let tx = started.ok().expect("pipelined transaction");
+                        assert!(matches!(
+                            runtime.block_on(tx.query().command("ROLLBACK")),
+                            Ok(Err(reply::Error::Driver(
+                                cartel_pg::Error::Protocol(
+                                    cartel_pg::protocol::Reason::TransactionLease
+                                )
+                            )))
+                        ));
+                        assert!(matches!(
+                            runtime.block_on(tx.query().command("SELECT 1")),
+                            Ok(Err(reply::Error::Pinned(_)))
+                        ));
+                        Some(tx)
+                    };
+                    assert!(matches!(
+                        runtime.block_on(client.command("SELECT 1")),
+                        Ok(Ok(()))
+                    ));
+                    drop(stale);
+                    assert!(matches!(
+                        runtime.block_on(client.command("SELECT 1")),
+                        Ok(Ok(()))
+                    ));
+                });
                 assert!(matches!(server.finish(), Ok(Ok(()))), "transaction peer");
             },
         )
@@ -355,62 +278,43 @@ fn finalizer_preserves_status_error() {
         peer::AcceptScript::with(
             move |listener| common::transaction::unfinished(listener, rejected),
             |server| {
-                let prepared = topology::try_new::<_, Env>(
-                    port::Port::<Queries>::plan(
-                        Queries::try_config().expect("database config"),
-                        Queries::try_cancel().expect("transaction capacity"),
-                    ),
-                    server.addr(),
-                    Duration::from_millis(1),
-                    Duration::from_secs(1),
-                )
-                .expect("transaction topology");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let client = runtime.root_client();
-                                    let tx = runtime
-                                        .block_on(client.transaction().begin())
-                                        .expect("begin driver")
-                                        .ok()
-                                        .expect("transaction");
-                                    let error = runtime
-                                        .block_on(tx.commit())
-                                        .expect("commit driver")
-                                        .expect_err("transaction remained open");
-                                    if rejected {
-                                        let fields = error
-                                            .as_server()
-                                            .expect("original server error")
-                                            .fields();
-                                        assert_eq!(
-                                            (fields.code().as_str(), fields.message()),
-                                            ("23505", "duplicate")
-                                        );
-                                    } else {
-                                        assert!(matches!(
-                                            error,
-                                            reply::Error::Driver(cartel_pg::Error::Protocol(
-                                                cartel_pg::protocol::Reason::TransactionOpen
-                                            ))
-                                        ));
-                                    }
-                                    assert!(matches!(
-                                        runtime.block_on(client.command("SELECT 1")),
-                                        Ok(Ok(()))
-                                    ));
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), common::recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "transaction scope"),
+                let plan = port::Port::<Queries>::plan(
+                    Queries::try_config().expect("database config"),
+                    Queries::try_cancel().expect("transaction capacity"),
                 );
-                assert!(reports.events().expect("reclamation").is_empty());
+                topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+                    let client = runtime.root_client();
+                    let tx = runtime
+                        .block_on(client.transaction().begin())
+                        .expect("begin driver")
+                        .ok()
+                        .expect("transaction");
+                    let error = runtime
+                        .block_on(tx.commit())
+                        .expect("commit driver")
+                        .expect_err("transaction remained open");
+                    if rejected {
+                        let fields = error
+                            .as_server()
+                            .expect("original server error")
+                            .fields();
+                        assert_eq!(
+                            (fields.code().as_str(), fields.message()),
+                            ("23505", "duplicate")
+                        );
+                    } else {
+                        assert!(matches!(
+                            error,
+                            reply::Error::Driver(cartel_pg::Error::Protocol(
+                                cartel_pg::protocol::Reason::TransactionOpen
+                            ))
+                        ));
+                    }
+                    assert!(matches!(
+                        runtime.block_on(client.command("SELECT 1")),
+                        Ok(Ok(()))
+                    ));
+                });
                 assert!(matches!(server.finish(), Ok(Ok(()))), "transaction peer");
             },
         )
@@ -430,104 +334,82 @@ fn finalizer_keeps_error() {
                 capacity.inflight = 1;
                 let config = config::Config::with_window(capacity, Positive::from_millis::<100>())
                     .expect("finalizer deadline");
-                let prepared = topology::try_new::<_, Env>(
-                    port::Port::<Queries>::plan(
-                        Queries::try_config().expect("database config"),
-                        config,
-                    ),
-                    server.addr(),
-                    Duration::from_millis(1),
-                    Duration::from_secs(1),
-                )
-                .expect("finalizer topology");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared
-                    .with_local(
-                        |worker| {
-                            worker.lend(|node, stage| {
-                                node.install(stage, |host, stage| {
-                                    stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                let client = runtime.root_client();
-                                runtime
-                                    .block_on(client.status().wait_ready())
-                                    .expect("ready driver")
-                                    .ok()
-                                    .expect("PostgreSQL ready");
-                                let tx = runtime
-                                    .block_on(client.transaction().begin())
-                                    .expect("begin driver")
-                                    .ok()
-                                    .expect("transaction");
-                                let cause = String::from("operation rejected");
-                                let outcome = if reject { Err(cause.as_str()) } else { Ok(()) };
-                                let mut finish = pin!(Task::new(tx.finish(outcome)));
-                                assert!(
-                                    runtime
-                                        .block_on(fibers::TEST.poll_once(finish.as_mut()))
-                                        .expect("finalizer admission driver")
-                                        .is_none()
-                                );
-                                let marker = runtime
-                                    .block_on(client.next())
-                                    .expect("notification driver")
-                                    .ok()
-                                    .expect("finalizer error marker");
-                                assert_eq!(marker.channel(), "finalizer");
-                                assert!(
-                                    runtime
-                                        .block_on(fibers::TEST.poll_once(finish.as_mut()))
-                                        .expect("settlement driver")
-                                        .is_none(),
-                                    "the received finalizer error still awaits ReadyForQuery"
-                                );
-                                let failure = runtime
-                                    .block_on(finish.as_mut())
-                                    .expect("finalizer driver")
-                                    .expect_err("finalizer failure");
-                                let error = match (reject, failure) {
-                                    (false, FinishError::Commit(error)) => Some(error),
-                                    (
-                                        true,
-                                        FinishError::Rollback {
-                                            operation: prior,
-                                            rollback,
-                                        },
-                                    ) => {
-                                        assert_eq!(prior, cause);
-                                        Some(rollback)
-                                    }
-                                    _ => None,
-                                }
-                                .expect("matching finalizer failure");
-                                let fields =
-                                    error.as_server().expect("retained server error").fields();
-                                assert_eq!(
-                                    (fields.code().as_str(), fields.message()),
-                                    ("23505", "finish rejected")
-                                );
-                                assert!(matches!(
-                                    runtime.block_on(client.command("SELECT 1")),
-                                    Ok(Ok(()))
-                                ));
-                                let fields = error
-                                    .as_server()
-                                    .expect("error survives reconnect")
-                                    .fields();
-                                assert_eq!(
-                                    (fields.code().as_str(), fields.message()),
-                                    ("23505", "finish rejected")
-                                );
-                            })
-                                })
-                            })
-                        },
-                        recovery::Policy::new(|event| reports.push(event), common::recover),
-                        |outcome| outcome.map_err(common::entry_error).expect("application entry"),
-                    )
-                    .expect("finalizer installation")
-                    .expect("finalizer session");
-                assert!(reports.events().expect("native reclamation").is_empty());
+                let plan = port::Port::<Queries>::plan(
+                    Queries::try_config().expect("database config"),
+                    config,
+                );
+                topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+                    let client = runtime.root_client();
+                    runtime
+                        .block_on(client.status().wait_ready())
+                        .expect("ready driver")
+                        .ok()
+                        .expect("PostgreSQL ready");
+                    let tx = runtime
+                        .block_on(client.transaction().begin())
+                        .expect("begin driver")
+                        .ok()
+                        .expect("transaction");
+                    let cause = String::from("operation rejected");
+                    let outcome = if reject { Err(cause.as_str()) } else { Ok(()) };
+                    let mut finish = pin!(Task::new(tx.finish(outcome)));
+                    assert!(
+                        runtime
+                            .block_on(fibers::TEST.poll_once(finish.as_mut()))
+                            .expect("finalizer admission driver")
+                            .is_none()
+                    );
+                    let marker = runtime
+                        .block_on(client.next())
+                        .expect("notification driver")
+                        .ok()
+                        .expect("finalizer error marker");
+                    assert_eq!(marker.channel(), "finalizer");
+                    assert!(
+                        runtime
+                            .block_on(fibers::TEST.poll_once(finish.as_mut()))
+                            .expect("settlement driver")
+                            .is_none(),
+                        "the received finalizer error still awaits ReadyForQuery"
+                    );
+                    let failure = runtime
+                        .block_on(finish.as_mut())
+                        .expect("finalizer driver")
+                        .expect_err("finalizer failure");
+                    let error = match (reject, failure) {
+                        (false, FinishError::Commit(error)) => Some(error),
+                        (
+                            true,
+                            FinishError::Rollback {
+                                operation: prior,
+                                rollback,
+                            },
+                        ) => {
+                            assert_eq!(prior, cause);
+                            Some(rollback)
+                        }
+                        _ => None,
+                    }
+                    .expect("matching finalizer failure");
+                    let fields =
+                        error.as_server().expect("retained server error").fields();
+                    assert_eq!(
+                        (fields.code().as_str(), fields.message()),
+                        ("23505", "finish rejected")
+                    );
+                    assert!(matches!(
+                        runtime.block_on(client.command("SELECT 1")),
+                        Ok(Ok(()))
+                    ));
+                    let fields = error
+                        .as_server()
+                        .expect("error survives reconnect")
+                        .fields();
+                    assert_eq!(
+                        (fields.code().as_str(), fields.message()),
+                        ("23505", "finish rejected")
+                    );
+                });
                 server
                     .finish()
                     .expect("finalizer peer")
@@ -546,65 +428,46 @@ fn completed_query_deadline_keeps_next_transaction() {
             Positive::from_millis::<100>(),
         )
         .expect("response deadline");
-        let prepared = topology::try_new::<_, Env>(
-            port::Port::<Queries>::plan(
-                Queries::try_config().expect("database config"),
-                config,
-            ),
-            server.addr(),
-            Duration::from_millis(1),
-            Duration::from_secs(1),
-        )
-        .expect("transaction topology");
-        let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-        let mut report = Completion::new();
-        prepared.with_local(
-            |worker| {
-                worker.lend(|node, stage| {
-                    node.install(stage, |host, stage| {
-                        stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                            let client = runtime.root_client();
-                            assert!(matches!(
-                                runtime.block_on(client.status().wait_ready()),
-                                Ok(Ok(()))
-                            ));
-                            let mut old =
-                                pin!(Task::new(client.command("SELECT 1")));
-                            assert!(
-                                runtime
-                                    .block_on(fibers::TEST.poll_once(old.as_mut()))
-                                    .expect("query admission driver")
-                                    .is_none()
-                            );
-                            let next = runtime
-                                .block_on(client.transaction().begin())
-                                .expect("begin driver")
-                                .ok()
-                                .expect("transaction after old ReadyForQuery");
-                            fibers::TEST
-                                .try_pause(&mut runtime, Duration::from_millis(150))
-                                .expect("old response deadline");
-                            assert!(matches!(
-                                runtime.block_on(old.as_mut()),
-                                Ok(Err(reply::Error::Driver(cartel_pg::Error::RequestTimeout(timeout))))
-                                    if timeout.phase() == cartel_pg::RequestPhase::Response
-                            ));
-                            assert!(
-                                matches!(runtime.block_on(next.commit()), Ok(Ok(()))),
-                                "the completed old query must not close the next transaction"
-                            );
-                            assert!(matches!(
-                                runtime.block_on(client.command("SELECT 1")),
-                                Ok(Ok(()))
-                            ));
-                        })
-                    })
-                })
-            },
-            recovery::Policy::new(|event| reports.push(event), common::recover),
-            |result| assert!(matches!(result, Ok(Ok(Ok(())))), "transaction scope"),
+        let plan = port::Port::<Queries>::plan(
+            Queries::try_config().expect("database config"),
+            config,
         );
-        assert!(reports.events().expect("reclamation").is_empty());
+        topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+            let client = runtime.root_client();
+            assert!(matches!(
+                runtime.block_on(client.status().wait_ready()),
+                Ok(Ok(()))
+            ));
+            let mut old =
+                pin!(Task::new(client.command("SELECT 1")));
+            assert!(
+                runtime
+                    .block_on(fibers::TEST.poll_once(old.as_mut()))
+                    .expect("query admission driver")
+                    .is_none()
+            );
+            let next = runtime
+                .block_on(client.transaction().begin())
+                .expect("begin driver")
+                .ok()
+                .expect("transaction after old ReadyForQuery");
+            fibers::TEST
+                .try_pause(&mut runtime, Duration::from_millis(150))
+                .expect("old response deadline");
+            assert!(matches!(
+                runtime.block_on(old.as_mut()),
+                Ok(Err(reply::Error::Driver(cartel_pg::Error::RequestTimeout(timeout))))
+                    if timeout.phase() == cartel_pg::RequestPhase::Response
+            ));
+            assert!(
+                matches!(runtime.block_on(next.commit()), Ok(Ok(()))),
+                "the completed old query must not close the next transaction"
+            );
+            assert!(matches!(
+                runtime.block_on(client.command("SELECT 1")),
+                Ok(Ok(()))
+            ));
+        });
         assert!(matches!(server.finish(), Ok(Ok(()))), "transaction peer");
     })
     .expect("spawn transaction peer");
@@ -619,73 +482,51 @@ fn retains_next_owner() {
             retire::finalize(&socket)
         },
         |server| {
-            let prepared = topology::try_new::<_, Env>(
-                port::Port::<Queries>::plan(
-                    Queries::try_config().expect("database config"),
-                    Queries::try_cancel().expect("two in-flight replies on one connection"),
-                ),
-                server.addr(),
-                Duration::from_millis(1),
-                Duration::from_secs(1),
-            )
-            .expect("finalizer topology");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared
-                .with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let client = runtime.root_client();
-                                    assert!(matches!(
-                                        runtime.block_on(client.status().wait_ready()),
-                                        Ok(Ok(()))
-                                    ));
-                                    let next = {
-                                        let tx = runtime
-                                            .block_on(client.transaction().begin())
-                                            .expect("begin driver")
-                                            .ok()
-                                            .expect("first transaction");
-                                        let mut old = pin!(Task::new(tx.commit()));
-                                        assert!(
-                                            runtime
-                                                .block_on(fibers::TEST.poll_once(old.as_mut()))
-                                                .expect("finalizer admission driver")
-                                                .is_none()
-                                        );
-                                        runtime
-                                            .block_on(client.transaction().begin())
-                                            .expect("next begin driver")
-                                            .ok()
-                                            .expect("next transaction after ReadyForQuery")
-                                    };
-                                    let result = runtime
-                                        .block_on(next.query().command("SELECT 1"))
-                                        .expect("query driver");
-                                    assert!(
-                                        result.is_ok(),
-                                        "late finalizer closed the new transaction: {:?}",
-                                        result.as_ref().err().map(Reply::from)
-                                    );
-                                    let result =
-                                        runtime.block_on(next.commit()).expect("commit driver");
-                                    assert!(
-                                        result.is_ok(),
-                                        "new transaction commit: {:?}",
-                                        result.as_ref().err().map(Reply::from)
-                                    );
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), common::recover),
-                    |outcome| outcome.map_err(common::entry_error).expect("application entry"),
-                )
-                .expect("finalizer installation")
-                .expect("finalizer session");
-            assert!(reports.events().expect("native reclamation").is_empty());
+            let plan = port::Port::<Queries>::plan(
+                Queries::try_config().expect("database config"),
+                Queries::try_cancel().expect("two in-flight replies on one connection"),
+            );
+            topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+                let client = runtime.root_client();
+                assert!(matches!(
+                    runtime.block_on(client.status().wait_ready()),
+                    Ok(Ok(()))
+                ));
+                let next = {
+                    let tx = runtime
+                        .block_on(client.transaction().begin())
+                        .expect("begin driver")
+                        .ok()
+                        .expect("first transaction");
+                    let mut old = pin!(Task::new(tx.commit()));
+                    assert!(
+                        runtime
+                            .block_on(fibers::TEST.poll_once(old.as_mut()))
+                            .expect("finalizer admission driver")
+                            .is_none()
+                    );
+                    runtime
+                        .block_on(client.transaction().begin())
+                        .expect("next begin driver")
+                        .ok()
+                        .expect("next transaction after ReadyForQuery")
+                };
+                let result = runtime
+                    .block_on(next.query().command("SELECT 1"))
+                    .expect("query driver");
+                assert!(
+                    result.is_ok(),
+                    "late finalizer closed the new transaction: {:?}",
+                    result.as_ref().err().map(Reply::from)
+                );
+                let result =
+                    runtime.block_on(next.commit()).expect("commit driver");
+                assert!(
+                    result.is_ok(),
+                    "new transaction commit: {:?}",
+                    result.as_ref().err().map(Reply::from)
+                );
+            });
             server
                 .finish()
                 .expect("finalizer peer")

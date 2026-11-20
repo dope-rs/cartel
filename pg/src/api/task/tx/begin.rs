@@ -49,7 +49,11 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + '
 
 mod raw {
     use super::{Begin, Instance, State, api, deadline};
-    use crate::{api::task::tx::Held, port::requests, reply::Error};
+    use crate::{
+        api::task::tx::Held,
+        port::{replies, requests},
+        reply::Error,
+    };
     use cartel_core::reply::recv::{Extract as _, attach::Attach};
     use dope_fiber::{abi, context};
     use std::{
@@ -119,10 +123,16 @@ mod raw {
                                     requests::Boundary::Begin,
                                     ctx.as_mut().region_token(),
                                 );
-                                match client.port.request().try_reply(
-                                    hold,
-                                    this.reply,
+                                match client.port.request().try_with(
                                     context,
+                                    hold,
+                                    |region, lane, batch, boundary, hold| {
+                                        let tag = replies::Tag::new(batch, boundary);
+                                        match this.reply.try_ordered(region, lane, tag) {
+                                            Ok(depth) => Ok((depth, hold)),
+                                            Err(cause) => Err((cause, hold)),
+                                        }
+                                    },
                                     |hold, _| {
                                         let admitted =
                                             State::Admitted(Held::new(client, hold.commit()), ());

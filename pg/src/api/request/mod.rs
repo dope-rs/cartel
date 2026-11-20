@@ -4,7 +4,7 @@ use crate::{api, port, protocol, schema};
 use cartel_core::deadline;
 use dope::core::driver::schedule::clock::timer;
 use o3::buffer::{pool, write::Sink as _};
-use port::requests;
+use port::{replies::groups::Draft, requests};
 use protocol::encode;
 use std::marker::PhantomData;
 
@@ -197,6 +197,13 @@ pub(super) struct Pending<'d, S = (), M = requests::Boundary> {
     pub(in crate::api) state: S,
 }
 
+pub(super) type GroupRequest<'g, 'r, 's, 'b, 'c, 'd> =
+    Pending<'d, Draft<'g, 'r, 's, 'b, 'c, 'd>, PhantomData<Draft<'g, 'r, 's, 'b, 'c, 'd>>>;
+
+impl api::Sync for Draft<'_, '_, '_, '_, '_, '_> {
+    const BOUNDARY: requests::Boundary = requests::Boundary::Group;
+}
+
 impl<'d, S, M> Pending<'d, S, M> {
     pub(in crate::api) fn map_state<R>(self, map: impl FnOnce(S) -> R) -> Pending<'d, R, M> {
         Pending {
@@ -235,10 +242,7 @@ impl<'d> Pending<'d> {
         port: &'app port::Port<'app, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
         params: [Q::Params<'_>; N],
         frame: impl FnOnce(&pool::Pool) -> Option<pool::Span>,
-    ) -> Result<
-        Pending<'d, crate::port::replies::groups::Draft<'g, 'r, 's, 'b, 'c, 'd>>,
-        crate::Error,
-    >
+    ) -> Result<GroupRequest<'g, 'r, 's, 'b, 'c, 'd>, crate::Error>
     where
         Q: schema::TypedQuery,
         I: Instance,
@@ -257,7 +261,7 @@ impl<'d> Pending<'d> {
         })?;
         Ok(Pending {
             frame,
-            boundary: requests::Boundary::Group,
+            boundary: PhantomData,
             state: ready,
         })
     }

@@ -94,7 +94,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + '
         let begin = request::Begin::new(self.isolation, self.access_mode, self.deferral);
         let timeout = self.timeout;
         dope_fiber::fiber!('d => async move {
-            let guard = Guard { lease: Begin::new(client, begin).await? };
+            let guard = Guard { lease: Begin::new(client, begin).await?, name: () };
             if let Some(time) = timeout {
                 guard.query().raw(request::Request::timeout(time)).await?;
             }
@@ -105,11 +105,13 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + '
 
 /// An exclusive transaction lease. Every operation view borrows this guard,
 /// so a pinned query cannot survive commit, rollback, or guard drop.
-pub struct Guard<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0>
+#[must_use = "finish the transaction or savepoint to preserve its connection"]
+pub struct Guard<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0, N = ()>
 where
     I: Instance<Queries: 'd> + 'd,
 {
     lease: Held<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
+    name: N,
 }
 
 /// The operation or transaction finalization failed, retaining both causes
@@ -124,13 +126,13 @@ pub enum FinishError<E, F> {
 const _: () = assert!(mem::size_of::<Deferral>() == mem::size_of::<bool>());
 const _: () = assert!(mem::align_of::<Deferral>() == mem::align_of::<bool>());
 
-impl<B: ?Sized, I: Instance, const ID: u8> sealed::Sealed
-    for Guard<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
+impl<B: ?Sized, I: Instance, const ID: u8, N> sealed::Sealed
+    for Guard<'_, '_, '_, '_, '_, '_, '_, B, I, ID, N>
 {
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
-    traits::Connection<'d, ID> for Guard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8, N>
+    traits::Connection<'d, ID> for Guard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, N>
 {
     type Schema = I::Queries;
     type Payload = replies::Payload<'b, 'c, 'd>;
@@ -153,7 +155,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + '
     traits::Transaction<'d, ID> for Guard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     type Savepoint<'tx>
-        = control::Savepoint<'tx, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+        = Guard<'tx, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, crate::Identifier>
     where
         Self: 'tx;
 
@@ -189,10 +191,6 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + '
         })
     }
 
-    fn cancel(self) {
-        drop(self.lease);
-    }
-
     fn savepoint<'tx>(
         &'tx mut self,
         name: crate::Identifier,
@@ -203,10 +201,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + '
             let lease = ops::Query::from_parts(client, api::Target::from_tx(target)).stateful(request::Request::savepoint(&name))
             .await?
             .retarget(target)?;
-            Ok(control::Savepoint {
-                lease,
-                name,
-            })
+            Ok(Guard { lease, name })
         })
     }
 

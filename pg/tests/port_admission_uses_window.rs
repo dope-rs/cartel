@@ -1,5 +1,4 @@
-use cartel_pg::api::traits::{Query as _, Unchecked as _};
-use dope::core::driver::life::recovery;
+use cartel_pg::api::traits::Query as _;
 use std::{
     net::{SocketAddr, TcpListener},
     pin::pin,
@@ -8,25 +7,14 @@ use std::{
 
 use cartel_pg::{api, port, port::config, reply};
 use common::{port::*, postgres::startup::Stream as _, topology};
-use dope::{
-    core::driver::route::Id,
-    manifold::{app::env::Bundle, timing::Throughput},
-    net::{tcp::Tcp, wire::Identity},
-    runtime::executor::session::Completion,
-};
+use dope::manifold::timing::Throughput;
 use dope_fiber::{
     BlockOn as _,
     abi::{Task, poll_fn},
     context::raw::Live,
 };
-use dope_test::{
-    fibers,
-    harness::{GUARD, peer::AcceptScript},
-    reclaim::Reports,
-};
+use dope_test::{fibers, harness::peer::AcceptScript};
 use o3::base::time::Positive;
-
-type Env = Bundle<Tcp, Identity, Throughput>;
 
 pub mod common;
 
@@ -42,41 +30,22 @@ fn full_request_pool_allows_startup() {
             let mut capacity = Queries::try_cancel().expect("PG capacity").capacities();
             capacity.inflight = 1;
             capacity.requests.frames = 1;
-            let prepared = topology::try_new::<_, Env>(
-                port::Port::<Queries>::plan(
-                    Queries::try_config().expect("database config"),
-                    config::Config::new(capacity).expect("single request frame"),
-                ),
-                server.addr(),
-                Duration::from_millis(1),
-                Duration::from_secs(1),
-            )
-            .expect("PG topology");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared.with_local(
-                |worker| {
-                    worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
-                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                let client = runtime.root_client();
-                                let query = client.command("SELECT 1");
-                                let result = fibers::TEST
-                                    .try_run(&mut runtime, query)
-                                    .expect("admission driver");
-                                assert!(
-                                    result.is_ok(),
-                                    "startup with full request pool: {:?}",
-                                    result.as_ref().err().map(reply::Error::kind)
-                                );
-                            })
-                        })
-                    })
-                },
-                recovery::Policy::new(|event| reports.push(event), common::recover),
-                |result| assert!(matches!(result, Ok(Ok(Ok(()))))),
+            let plan = port::Port::<Queries>::plan(
+                Queries::try_config().expect("database config"),
+                config::Config::new(capacity).expect("single request frame"),
             );
-            assert!(reports.events().expect("native reclamation").is_empty());
+            topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+                let client = runtime.root_client();
+                let query = client.command("SELECT 1");
+                let result = fibers::TEST
+                    .try_run(&mut runtime, query)
+                    .expect("admission driver");
+                assert!(
+                    result.is_ok(),
+                    "startup with full request pool: {:?}",
+                    result.as_ref().err().map(reply::Error::kind)
+                );
+            });
             server
                 .finish()
                 .expect("PG peer worker")
@@ -110,68 +79,41 @@ fn admission_uses_window() {
     };
     let config = config::Config::with_window(capacity, Positive::from_millis::<5>());
     let config = config.expect("valid pg configuration");
-    let ((), events) = {
-        let prepared = topology::try_new::<_, Env>(
-            port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config),
-            addr,
-            Duration::from_millis(1),
-            Duration::from_millis(1_024),
-        )
-        .expect("topology fixture completed");
-        let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-        let mut report = Completion::new();
-        let scoped = prepared.with_local(
-            |worker| {
-                worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
+    {
+        let plan = port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config);
+        topology::run(plan, addr, (1, 1_024), Throughput, |mut runtime| {
+            let client: api::Client<api::Context<'_, '_, '_, '_, '_, '_, '_, _, _>> = runtime.root_client();
 
-                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                let client: api::Client<api::Context<'_, '_, '_, '_, '_, '_, '_, _, _>> = runtime.root_client();
-
-                let mut held = Some(client.command("SELECT 1"));
-                let mut waiting = pin!(client.acquire());
-                let acquired = runtime.block_on(poll_fn(|context| {
-                    // SAFETY: waiting stays pinned; Ready ends polling authority.
-                    let poll = unsafe { Live::new(waiting.as_mut()) }.poll(context);
-                    if held.is_some() {
-                        assert!(poll.is_pending());
-                        drop(held.take());
-                    }
-                    poll
-                })).expect("frame drive").ok().expect("released frame wakes acquisition");
-                fibers::TEST.try_pause(&mut runtime, Duration::from_millis(10)).expect("original deadline fires");
-                let mut query = pin!(Task::new(acquired.command("SELECT 1")));
-                assert!(
-                    matches!(
-                        runtime.block_on(fibers::TEST.poll_once(query.as_mut())),
-                        Ok(Some(Err(reply::Error::Driver(cartel_pg::Error::RequestTimeout(timeout)))))
-                            if timeout.phase() == cartel_pg::RequestPhase::Admission
-                    ),
-                    "request admission must time out"
-                );
-                let acquired = runtime.block_on(client.acquire())
-                    .expect("frame drive").ok().expect("request frame");
-                fibers::TEST.try_pause(&mut runtime, Duration::from_millis(10))
-                    .expect("failed request deadline fires");
-                assert!(matches!(runtime.block_on(acquired.command("SELECT\0")),
-                    Ok(Err(reply::Error::Driver(cartel_pg::Error::Request(
-                        cartel_pg::protocol::encode::Error::StatementSqlNul { position: 6 }
-                    ))))
-                ));
-
-                            })
-                        })
-                    })
-            },
-            recovery::Policy::new(|event| reports.push(event), common::recover),
-|outcome| outcome.map_err(common::entry_error).expect("application entry"),
-        );
-
-        let result = scoped.expect("application installation completed");
-        (result.expect("application session completed"), reports)
-    };
-    assert!(
-        events.events().expect("native reclamation").is_empty(),
-        "unexpected events PostgreSQL operations: {events:?}"
-    );
+            let mut held = Some(client.command("SELECT 1"));
+            let mut waiting = pin!(client.acquire());
+            let acquired = runtime.block_on(poll_fn(|context| {
+            // SAFETY: waiting stays pinned; Ready ends polling authority.
+            let poll = unsafe { Live::new(waiting.as_mut()) }.poll(context);
+            if held.is_some() {
+            assert!(poll.is_pending());
+            drop(held.take());
+            }
+            poll
+            })).expect("frame drive").ok().expect("released frame wakes acquisition");
+            fibers::TEST.try_pause(&mut runtime, Duration::from_millis(10)).expect("original deadline fires");
+            let mut query = pin!(Task::new(acquired.command("SELECT 1")));
+            assert!(
+            matches!(
+            runtime.block_on(fibers::TEST.poll_once(query.as_mut())),
+            Ok(Some(Err(reply::Error::Driver(cartel_pg::Error::RequestTimeout(timeout)))))
+            if timeout.phase() == cartel_pg::RequestPhase::Admission
+            ),
+            "request admission must time out"
+            );
+            let acquired = runtime.block_on(client.acquire())
+            .expect("frame drive").ok().expect("request frame");
+            fibers::TEST.try_pause(&mut runtime, Duration::from_millis(10))
+            .expect("failed request deadline fires");
+            assert!(matches!(runtime.block_on(acquired.command("SELECT\0")),
+            Ok(Err(reply::Error::Driver(cartel_pg::Error::Request(
+            cartel_pg::protocol::encode::Error::StatementSqlNul { position: 6 }
+            ))))
+            ));
+        });
+    }
 }

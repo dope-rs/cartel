@@ -3,9 +3,8 @@ use crate::{
     common::external::runtime::fixtures::try_suffix,
     common::{external::Db, port::Queries},
 };
-use cartel_pg::api::traits::{Client as _, Status as _, Unchecked as _};
+use cartel_pg::api::traits::{Client as _, Query as _, Status as _};
 use common::env::{self, Env};
-use common::{external::runtime::check, recover};
 use dope_fiber::BlockOn as _;
 use dope_test::fibers;
 use std::env::var_os;
@@ -65,7 +64,7 @@ fn deferred_commit_fails() {
             reused.as_ref().err().map(cartel_pg::reply::Error::kind),
         );
         Ok(())
-    }, recover, check).expect("PostgreSQL runtime");
+    }).expect("PostgreSQL runtime");
 }
 
 #[test]
@@ -83,21 +82,17 @@ fn failure_stops_retry() {
         schema,
         false,
     )
-    .try_run(
-        |rt| {
-            let client = rt.client();
-            let ready = fibers::TEST
-                .try_run(&mut rt.runtime, client.status().wait_ready())
-                .expect("PostgreSQL startup driver");
-            assert!(
-                client.status().is_failed(),
-                "pool with missing schema must reach is_failed(): {:?}",
-                ready.as_ref().err().map(common::port::Reply::from),
-            );
-            Ok(())
-        },
-        recover,
-        check,
-    )
+    .try_run(|rt| {
+        let client = rt.client();
+        let ready = fibers::TEST
+            .try_run(&mut rt.runtime, client.status().wait_ready())
+            .expect("PostgreSQL startup driver");
+        assert!(
+            client.status().is_failed(),
+            "pool with missing schema must reach is_failed(): {:?}",
+            ready.as_ref().err().map(common::port::Reply::from),
+        );
+        Ok(())
+    })
     .expect("PostgreSQL runtime");
 }

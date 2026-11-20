@@ -155,12 +155,12 @@ fn bind_prefix_exhaustion_is_exact() {
                                 for attempt in 1..=2 {
                                     let failure = if frame_bytes == 47 {
                                         // Bind and Execute fit; the final Sync length is short.
-                                        let query = client.run_first::<CountedBind>((&calls, &ordinal));
+                                        let query = client.run_first::<CountedBind, _>((&calls, &ordinal));
                                         assert_eq!(ordinal.get(), attempt);
                                         runtime.block_on(query).expect("fixed request driver").err()
                                     } else {
                                         runtime
-                                            .block_on(client.run_no_rows::<Bind>((7, "ok", &["x"])))
+                                            .block_on(client.run_command::<Bind, false>((7, "ok", &["x"])))
                                             .expect("prefix driver")
                                             .err()
                                     }
@@ -234,7 +234,7 @@ fn bind_failures_recover() {
                                 .expect("ready");
                             let calls = Cell::new(0);
                             let single = Cell::new(0);
-                            drop(client.run_first::<CountedBind>((&calls, &single)));
+                            drop(client.run_first::<CountedBind, _>((&calls, &single)));
                             assert_eq!(single.get(), 1);
                             let order = [const { Cell::new(0) }; 13];
                             let params = order.each_ref().map(|ordinal| (&calls, ordinal));
@@ -256,13 +256,13 @@ fn bind_failures_recover() {
                                 (&OVERSIZED[..456], &[][..], (2, 1)),
                             ] {
                                 let failure = runtime
-                                    .block_on(client.run_no_rows::<Bind>((7, text, array)))
+                                    .block_on(client.run_command::<Bind, false>((7, text, array)))
                                     .expect("bind driver")
                                     .expect_err("short request frame");
                                 assert_eq!(request_capacity(&failure), expected);
                             }
                             runtime
-                                .block_on(client.run_no_rows::<Bind>((7, "ok", &["x"])))
+                                .block_on(client.run_command::<Bind, false>((7, "ok", &["x"])))
                                 .expect("bind driver")
                                 .as_ref()
                                 .map_err(reply::Error::kind)

@@ -1,5 +1,5 @@
 use cartel_pg::{
-    api::traits::{Client as _, Notify as _, Status as _, Unchecked as _},
+    api::traits::{Client as _, Notify as _, Query as _, Status as _},
     port::{self, config},
 };
 use common::{

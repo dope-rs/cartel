@@ -1,10 +1,10 @@
-use crate::common::external::runtime::Plan;
+use crate::common::external::runtime::fixtures;
 use crate::common::external::runtime::fixtures::try_suffix;
+use crate::common::external::runtime::limits::Limits;
 use cartel_pg::Identifier;
 use cartel_pg::api::traits::Connection as _;
-use cartel_pg::api::traits::{Listener as _, Notify as _, Unchecked as _};
-use common::env::{self, Env};
-use common::{external::runtime::check, recover};
+use cartel_pg::api::traits::{Listener as _, Notify as _, Query as _};
+use common::env;
 use dope_fiber::BlockOn as _;
 use std::env::var_os;
 use std::num::NonZero;
@@ -16,46 +16,34 @@ pub mod common;
 #[test]
 #[ignore = "requires CARTEL_PG_TEST and PostgreSQL"]
 fn listen_unlisten_api() {
-    let input = Env::try_load(env::NAMES.map(var_os)).expect("PostgreSQL environment");
-    Plan::try_new(&input)
-        .expect("external PostgreSQL fixture")
-        .try_conns(
-            NonZero::<usize>::MIN,
-            |rt| {
-                let client = rt.client();
+    fixtures::run(env::NAMES.map(var_os), Default::default(), |rt| {
+        let client = rt.client();
 
-                let suffix = try_suffix().expect("fixture suffix");
-                let channel = ::std::format!("cartel_test_\"{suffix}");
-                let guard = rt.runtime.block_on(client.listen(
-                    Identifier::try_from(&mut channel.clone()).expect("channel identifier"),
-                ))?;
-                let guard = guard.ok().expect("LISTEN succeeds");
-                ::core::assert_eq!(guard.channel(), channel);
-                assert!(
-                    rt.runtime.block_on(guard.unlisten())?.is_ok(),
-                    "UNLISTEN succeeds"
-                );
-                Ok(())
-            },
-            recover,
-            check,
-        )
-        .expect("PostgreSQL runtime");
+        let suffix = try_suffix().expect("fixture suffix");
+        let channel = ::std::format!("cartel_test_\"{suffix}");
+        let guard = rt.runtime.block_on(
+            client.listen(Identifier::try_from(&mut channel.clone()).expect("channel identifier")),
+        )?;
+        let guard = guard.ok().expect("LISTEN succeeds");
+        ::core::assert_eq!(guard.channel(), channel);
+        assert!(
+            rt.runtime.block_on(guard.unlisten())?.is_ok(),
+            "UNLISTEN succeeds"
+        );
+        Ok(())
+    });
 }
 
 #[test]
 #[ignore = "requires CARTEL_PG_TEST and PostgreSQL"]
 fn listen_cancel() {
-    let input = Env::try_load(env::NAMES.map(var_os)).expect("PostgreSQL environment");
-    Plan::try_new(&input)
-        .expect("external PostgreSQL fixture")
-        .try_conns(NonZero::<usize>::MIN, |rt| {
-            let client = rt.client();
-            let channel = ::std::format!(
-                "cartel_cancel_open_{}",
-                try_suffix().expect("fixture suffix")
-            );
-            rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
+    fixtures::run(env::NAMES.map(var_os), Default::default(), |rt| {
+        let client = rt.client();
+        let channel = ::std::format!(
+            "cartel_cancel_open_{}",
+            try_suffix().expect("fixture suffix")
+        );
+        rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
                 ::core::assert!(
                     fibers::TEST
                         .poll_once(client.listen(Identifier::try_from(&mut channel.clone()).expect("channel identifier")))
@@ -74,66 +62,55 @@ fn listen_cancel() {
                         .is_none()
                 );
             }))?;
-            Ok(())
-        }, recover, check).expect("PostgreSQL runtime");
+        Ok(())
+    });
 }
 
 #[test]
 #[ignore = "requires CARTEL_PG_TEST and PostgreSQL"]
 fn unlisten_cancel() {
-    let input = Env::try_load(env::NAMES.map(var_os)).expect("PostgreSQL environment");
-    Plan::try_new(&input)
-        .expect("external PostgreSQL fixture")
-        .try_conns(
-            NonZero::<usize>::MIN,
-            |rt| {
-                let client = rt.client();
-                let channel = ::std::format!(
-                    "cartel_cancel_close_{}",
-                    try_suffix().expect("fixture suffix")
-                );
-                rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
-                let guard = client
-                    .listen(Identifier::try_from(&mut channel.clone()).expect("channel identifier"))
-                    .await;
-                let guard = guard.ok().expect("LISTEN succeeds");
-                ::core::assert!(fibers::TEST.poll_once(guard.unlisten()).await.is_none());
+    fixtures::run(env::NAMES.map(var_os), Default::default(), |rt| {
+        let client = rt.client();
+        let channel = ::std::format!(
+            "cartel_cancel_close_{}",
+            try_suffix().expect("fixture suffix")
+        );
+        rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
+            let guard = client
+                .listen(Identifier::try_from(&mut channel.clone()).expect("channel identifier"))
+                .await;
+            let guard = guard.ok().expect("LISTEN succeeds");
+            ::core::assert!(fibers::TEST.poll_once(guard.unlisten()).await.is_none());
 
-                let sql = ::std::format!("NOTIFY \"{}\"", channel.replace('"', "\"\""));
-                ::core::assert!(client
-                    .command(&sql)
+            let sql = ::std::format!("NOTIFY \"{}\"", channel.replace('"', "\"\""));
+            ::core::assert!(client
+                .command(&sql)
+                .await
+                .is_ok(), "NOTIFY succeeds");
+            ::core::assert!(
+                fibers::TEST
+                    .poll_once(client.next())
                     .await
-                    .is_ok(), "NOTIFY succeeds");
-                ::core::assert!(
-                    fibers::TEST
-                        .poll_once(client.next())
-                        .await
-                        .is_none()
-                );
-            }))?;
-                Ok(())
-            },
-            recover,
-            check,
-        )
-        .expect("PostgreSQL runtime");
+                    .is_none()
+            );
+        }))?;
+        Ok(())
+    });
 }
 
 #[test]
 #[ignore = "requires CARTEL_PG_TEST and PostgreSQL"]
 fn listen_notify_delivery() {
-    let input = Env::try_load(env::NAMES.map(var_os)).expect("PostgreSQL environment");
-    Plan::try_new(&input)
-        .expect("external PostgreSQL fixture")
-        .try_conns(
-            NonZero::<usize>::MIN.saturating_add(1),
-            |rt| {
-                let client = rt.client();
+    fixtures::run(
+        env::NAMES.map(var_os),
+        Limits::new(NonZero::<usize>::MIN.saturating_add(1)),
+        |rt| {
+            let client = rt.client();
 
-                let suffix = try_suffix().expect("fixture suffix");
-                let channel = ::std::format!("cartel_notify_{suffix}");
-                let payload = "hello world";
-                rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
+            let suffix = try_suffix().expect("fixture suffix");
+            let channel = ::std::format!("cartel_notify_{suffix}");
+            let payload = "hello world";
+            rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
             let guard = client
                 .listen(Identifier::try_from(&mut channel.clone()).expect("channel identifier"))
                 .await;
@@ -152,10 +129,7 @@ fn listen_notify_delivery() {
             ::core::assert!(n.pid() > 0);
             ::core::assert!(guard.unlisten().await.is_ok(), "UNLISTEN succeeds");
         }))?;
-                Ok(())
-            },
-            recover,
-            check,
-        )
-        .expect("PostgreSQL runtime");
+            Ok(())
+        },
+    );
 }

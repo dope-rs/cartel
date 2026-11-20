@@ -115,6 +115,7 @@ where
 
     type Schema = I::Queries;
     type Payload = replies::Payload<'b, 'c, 'd>;
+    type Chunk = Chunk<'b, 'c, 'd>;
     type Batch = Batch<'app, 'b, 'c, 'd, replies::Row<'d>>;
     type Diagnostics = group::Ledger<'r, 's>;
     type Stream<Q>
@@ -130,7 +131,6 @@ where
     where
         Q: schema::TypedQuery<Result = result::Rows>,
         I::Queries: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
     {
         self.typed::<Q, api::ExtractFirst<_, ID>, _>(params, results::Row::<_, Q>::required)
     }
@@ -145,39 +145,22 @@ where
     where
         Q: schema::TypedQuery<Result = result::Rows>,
         I::Queries: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
     {
         let (client, target, frame, clock) = self.into_parts();
         let next = api::Pending::group::<Q, I, ID, N>(client.port, params, frame);
         task::group::Group::new(client, target, next, clock(client.port.lifecycle.deadline))
     }
 
-    fn run_first<Q>(
+    fn run_first<Q, const SCALAR: bool>(
         self,
         params: Q::Params<'_>,
-    ) -> impl abi::Fiber<'d, Output = Result<Option<results::Row<Self::Payload, Q>>, Error<'d, ID>>>
-    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
+    ) -> impl abi::Fiber<'d, Output = results::FirstResult<'d, Self::Payload, Q, ID, SCALAR>>
+    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S, SCALAR>
     where
-        Q: schema::TypedQuery<Result = result::Rows>,
+        Q: schema::TypedQuery<Result = result::Rows<SCALAR>>,
         I::Queries: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
     {
-        self.typed::<Q, api::ExtractFirst<_, ID>, _>(params, results::Row::<_, Q>::optional)
-    }
-
-    fn run_scalar<Q>(
-        self,
-        params: Q::Params<'_>,
-    ) -> impl abi::Fiber<
-        'd,
-        Output = Result<Option<results::Row<Self::Payload, Q, true>>, Error<'d, ID>>,
-    > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
-    where
-        Q: schema::TypedQuery<Result = result::Rows<true>>,
-        I::Queries: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
-    {
-        self.typed::<Q, api::ExtractFirst<_, ID>, _>(params, results::Row::<_, Q, true>::optional)
+        self.typed::<Q, api::ExtractFirst<_, ID>, _>(params, results::Row::<_, Q, SCALAR>::optional)
     }
 
     fn run_all<Q>(
@@ -188,42 +171,26 @@ where
     where
         Q: schema::TypedQuery<Result = result::Rows>,
         I::Queries: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
     {
         self.typed::<Q, api::ExtractAll<Q, ID>, _>(params, ())
     }
 
-    fn run_no_rows<Q>(
+    fn run_command<Q, const REQUIRED: bool>(
         self,
         params: Q::Params<'_>,
     ) -> impl abi::Fiber<'d, Output = Result<(), Error<'d, ID>>>
-    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
+    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S, REQUIRED>
     where
         Q: schema::TypedQuery<Row = (), Result = result::Command>,
         I::Queries: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
     {
-        self.typed::<Q, api::ExtractUnit<ID>, _>(params, ())
+        self.typed::<Q, api::ExtractUnit<ID, REQUIRED>, _>(params, ())
     }
 
-    fn run_required<Q>(
-        self,
-        params: Q::Params<'_>,
-    ) -> impl abi::Fiber<'d, Output = Result<(), Error<'d, ID>>>
-    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
-    where
-        Q: schema::TypedQuery<Row = (), Result = result::Command>,
-        I::Queries: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
-    {
-        self.typed::<Q, api::ExtractUnit<ID, true>, _>(params, ())
-    }
-
-    fn run_stream<Q>(self, params: Q::Params<'_>) -> <Self as traits::Query<'d, ID>>::Stream<Q>
+    fn run_stream<Q>(self, params: Q::Params<'_>) -> Self::Stream<Q>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
         I::Queries: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
     {
         let (client, target, frame, clock) = self.into_parts();
         let next = api::Pending::typed::<Q, I, api::ExtractOne<ID>, ID>(client.port, params, frame);
@@ -235,26 +202,7 @@ where
             marker: marker::PhantomData,
         }
     }
-}
 
-impl<
-    'app,
-    'g,
-    'r,
-    's,
-    'b,
-    'c,
-    'd: 'app,
-    B: ?Sized,
-    I: Instance<Queries: 'd> + 'd,
-    const ID: u8,
-    R,
-    S,
-> traits::Unchecked<'d, ID> for Query<api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
-where
-    R: Copy + Into<Option<api::Target<'d, ID>>>,
-    S: request::Input<'d>,
-{
     fn command(
         self,
         sql: &str,
@@ -262,29 +210,6 @@ where
     + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R, S> {
         self.raw(request::Request::raw(sql))
     }
-}
-
-impl<
-    'app,
-    'g,
-    'r,
-    's,
-    'b,
-    'c,
-    'd: 'app,
-    B: ?Sized,
-    I: Instance<Queries: 'd> + 'd,
-    const ID: u8,
-    R,
-    S,
-> copy::Transfer<'d, ID> for Query<api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
-where
-    R: Copy + Into<Option<api::Target<'d, ID>>>,
-    S: request::Input<'d>,
-{
-    type Chunk = Chunk<'b, 'c, 'd>;
-    type Sink = Sink<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R>;
-    type Stream = Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R>;
 
     fn copy_in(
         self,
@@ -298,7 +223,10 @@ where
         ))
     }
 
-    fn copy_stream(self, sql: &str) -> Self::Sink {
+    fn copy_stream(
+        self,
+        sql: &str,
+    ) -> impl copy::Sink<'d, ID> + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R, S> {
         let (dispatched, budget) = self.raw_core::<api::ExtractUnit<ID>, lease::Recover>(
             request::Request::raw_extra(sql, request::Extra::CopyInOpen),
         );
@@ -308,7 +236,11 @@ where
         }
     }
 
-    fn copy_out(self, sql: &str) -> <Self as copy::Transfer<'d, ID>>::Stream {
+    fn copy_out(
+        self,
+        sql: &str,
+    ) -> impl copy::Stream<'d, ID, Chunk = Self::Chunk>
+    + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, R, S> {
         let (core, clock) =
             self.raw_core::<api::ExtractOne<ID>, lease::Detached>(request::Request::raw(sql));
         Stream::new(task::stream::Stream::new(core, clock))

@@ -1,4 +1,4 @@
-use crate::common::external::runtime::Plan;
+use crate::common::external::runtime::fixtures;
 use crate::{
     common::external::own, common::external::own::Convert as _,
     common::external::reports::Aggregate, common::external::user::Lookup,
@@ -6,11 +6,10 @@ use crate::{
 };
 use cartel_pg::api::traits::Connection as _;
 use cartel_pg::api::traits::{
-    Begin as _, Client as _, Savepoint as _, Transaction as _, Unchecked as _,
+    Begin as _, Client as _, Query as _, Savepoint as _, Transaction as _,
 };
 use cartel_pg::{Identifier, api::sql, api::tx::Isolation};
-use common::env::{self, Env};
-use common::{external::runtime::check, recover};
+use common::env;
 use dope_fiber::BlockOn as _;
 use std::env::var_os;
 use std::time::Duration;
@@ -20,12 +19,9 @@ pub mod common;
 #[test]
 #[ignore = "requires CARTEL_PG_TEST and PostgreSQL"]
 fn cancels_close() {
-    let input = Env::try_load(env::NAMES.map(var_os)).expect("PostgreSQL environment");
-    Plan::try_new(&input)
-        .expect("external PostgreSQL fixture")
-        .try_run(|rt| {
-            let client = rt.client();
-            let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
+    fixtures::run(env::NAMES.map(var_os), Default::default(), |rt| {
+        let client = rt.client();
+        let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
                 let mut tx = client
                     .transaction()
                     .begin()
@@ -35,7 +31,7 @@ fn cancels_close() {
                     .savepoint(Identifier::try_from(&mut String::from("cancel_close")).expect("identifier storage"))
                     .await
                     .map_err(own::Error::Query)?;
-                save.cancel();
+                drop(save);
                 ::core::assert_eq!(
                     Lookup::by_id(client, 1)
                         .await
@@ -43,129 +39,109 @@ fn cancels_close() {
                         .name,
                     "alice"
                 );
-                tx.cancel();
+                drop(tx);
                 Ok::<(), own::Error<'_>>(())
             }))?;
-            assert!(
-                result.is_ok(),
-                "cancelled save closes must release the route"
-            );
-            Ok(())
-        }, recover, check).expect("PostgreSQL runtime");
+        assert!(
+            result.is_ok(),
+            "cancelled save closes must release the route"
+        );
+        Ok(())
+    });
 }
 
 #[test]
 #[ignore = "requires CARTEL_PG_TEST and PostgreSQL"]
 fn drop_rolls_back() {
-    let input = Env::try_load(env::NAMES.map(var_os)).expect("PostgreSQL environment");
-    Plan::try_new(&input)
-        .expect("external PostgreSQL fixture")
-        .try_run(
-            |rt| {
-                let client = rt.client();
-                let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
-                    {
-                        let tx = client
-                            .transaction()
-                            .begin()
-                            .await
-                            .map_err(own::Error::Query)?;
-                        Write::rename(&tx, 1, "drop-rollback".into())
-                            .await
-                            .try_own()?;
-                    }
-                    let u = Lookup::by_id(client, 1)
-                        .await
-                        .try_own()?;
-                    ::core::assert_eq!(u.name, "alice");
-                    Ok::<(), own::Error<'_>>(())
-                }))?;
-                assert!(result.is_ok(), "dropped transactions must roll back");
-                Ok(())
-            },
-            recover,
-            check,
-        )
-        .expect("PostgreSQL runtime");
+    fixtures::run(env::NAMES.map(var_os), Default::default(), |rt| {
+        let client = rt.client();
+        let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
+            {
+                let tx = client
+                    .transaction()
+                    .begin()
+                    .await
+                    .map_err(own::Error::Query)?;
+                Write::rename(&tx, 1, "drop-rollback".into())
+                    .await
+                    .try_own()?;
+            }
+            let u = Lookup::by_id(client, 1)
+                .await
+                .try_own()?;
+            ::core::assert_eq!(u.name, "alice");
+            Ok::<(), own::Error<'_>>(())
+        }))?;
+        assert!(result.is_ok(), "dropped transactions must roll back");
+        Ok(())
+    });
 }
 
 #[test]
 #[ignore = "requires CARTEL_PG_TEST and PostgreSQL"]
 fn isolation() {
-    let input = Env::try_load(env::NAMES.map(var_os)).expect("PostgreSQL environment");
-    Plan::try_new(&input)
-        .expect("external PostgreSQL fixture")
-        .try_run(
-            |rt| {
-                let client = rt.client();
-                let result = (|| -> Result<(), own::Error<'_>> {
-                    for level in [
-                        Isolation::ReadCommitted,
-                        Isolation::RepeatableRead,
-                        Isolation::Serializable,
-                    ] {
-                        let tx = rt
-                            .runtime
-                            .block_on(client.transaction().isolation(level).begin())
-                            .expect("runtime drive")
-                            .map_err(own::Error::Query)?;
-                        ::core::assert_eq!(
-                            rt.runtime
-                                .block_on(Lookup::by_id(&tx, 1))
-                                .expect("runtime drive")
-                                .try_own()?
-                                .id,
-                            1
-                        );
-                        rt.runtime
-                            .block_on(tx.commit())
-                            .expect("runtime drive")
-                            .map_err(own::Error::Query)?;
-                    }
-                    let tx = rt
-                        .runtime
-                        .block_on(
-                            client
-                                .transaction()
-                                .isolation(Isolation::Serializable)
-                                .read_only()
-                                .deferrable()
-                                .begin(),
-                        )
-                        .expect("runtime drive")
-                        .map_err(own::Error::Query)?;
-                    ::core::assert_eq!(
-                        rt.runtime
-                            .block_on(Aggregate::count_all(&tx))
-                            .expect("runtime drive")
-                            .try_own()?,
-                        5
-                    );
+    fixtures::run(env::NAMES.map(var_os), Default::default(), |rt| {
+        let client = rt.client();
+        let result = (|| -> Result<(), own::Error<'_>> {
+            for level in [
+                Isolation::ReadCommitted,
+                Isolation::RepeatableRead,
+                Isolation::Serializable,
+            ] {
+                let tx = rt
+                    .runtime
+                    .block_on(client.transaction().isolation(level).begin())
+                    .expect("runtime drive")
+                    .map_err(own::Error::Query)?;
+                ::core::assert_eq!(
                     rt.runtime
-                        .block_on(tx.commit())
+                        .block_on(Lookup::by_id(&tx, 1))
                         .expect("runtime drive")
-                        .map_err(own::Error::Query)?;
-                    Ok(())
-                })();
-                assert!(result.is_ok(), "tx isolation modes must commit");
-                Ok(())
-            },
-            recover,
-            check,
-        )
-        .expect("PostgreSQL runtime");
+                        .try_own()?
+                        .id,
+                    1
+                );
+                rt.runtime
+                    .block_on(tx.commit())
+                    .expect("runtime drive")
+                    .map_err(own::Error::Query)?;
+            }
+            let tx = rt
+                .runtime
+                .block_on(
+                    client
+                        .transaction()
+                        .isolation(Isolation::Serializable)
+                        .read_only()
+                        .deferrable()
+                        .begin(),
+                )
+                .expect("runtime drive")
+                .map_err(own::Error::Query)?;
+            ::core::assert_eq!(
+                rt.runtime
+                    .block_on(Aggregate::count_all(&tx))
+                    .expect("runtime drive")
+                    .try_own()?,
+                5
+            );
+            rt.runtime
+                .block_on(tx.commit())
+                .expect("runtime drive")
+                .map_err(own::Error::Query)?;
+            Ok(())
+        })();
+        assert!(result.is_ok(), "tx isolation modes must commit");
+        Ok(())
+    });
 }
 
 #[test]
 #[ignore = "requires CARTEL_PG_TEST and PostgreSQL"]
 fn timeout() {
-    let input = Env::try_load(env::NAMES.map(var_os)).expect("PostgreSQL environment");
-    Plan::try_new(&input)
-        .expect("external PostgreSQL fixture")
-        .try_run(
-            |rt| {
-                let client = rt.client();
-                let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
+    fixtures::run(env::NAMES.map(var_os), Default::default(), |rt| {
+        let client = rt.client();
+        let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
             let tx = client
                 .transaction()
                 .timeout(
@@ -183,24 +159,17 @@ fn timeout() {
             tx.commit().await.map_err(own::Error::Query)?;
             Ok::<(), own::Error<'_>>(())
         }))?;
-                assert!(result.is_ok(), "tx statement timeout must permit the query");
-                Ok(())
-            },
-            recover,
-            check,
-        )
-        .expect("PostgreSQL runtime");
+        assert!(result.is_ok(), "tx statement timeout must permit the query");
+        Ok(())
+    });
 }
 
 #[test]
 #[ignore = "requires CARTEL_PG_TEST and PostgreSQL"]
 fn savepoint_end() {
-    let input = Env::try_load(env::NAMES.map(var_os)).expect("PostgreSQL environment");
-    Plan::try_new(&input)
-        .expect("external PostgreSQL fixture")
-        .try_run(|rt| {
-            let client = rt.client();
-            let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
+    fixtures::run(env::NAMES.map(var_os), Default::default(), |rt| {
+        let client = rt.client();
+        let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
                 let mut tx = client
                     .transaction()
                     .begin()
@@ -283,20 +252,17 @@ fn savepoint_end() {
                 );
                 Ok::<(), own::Error<'_>>(())
             }))?;
-            assert!(result.is_ok(), "nested save ends must preserve values");
-            Ok(())
-        }, recover, check).expect("PostgreSQL runtime");
+        assert!(result.is_ok(), "nested save ends must preserve values");
+        Ok(())
+    });
 }
 
 #[test]
 #[ignore = "requires CARTEL_PG_TEST and PostgreSQL"]
 fn releases_server() {
-    let input = Env::try_load(env::NAMES.map(var_os)).expect("PostgreSQL environment");
-    Plan::try_new(&input)
-        .expect("external PostgreSQL fixture")
-        .try_run(|rt| {
-            let client = rt.client();
-            let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
+    fixtures::run(env::NAMES.map(var_os), Default::default(), |rt| {
+        let client = rt.client();
+        let result = rt.runtime.block_on(dope_fiber::fiber!('_ => async move {
                 let mut tx = client
                     .transaction()
                     .begin()
@@ -319,7 +285,7 @@ fn releases_server() {
                 tx.rollback().await.map_err(own::Error::Query)?;
                 Ok::<(), own::Error<'_>>(())
             }))?;
-            assert!(result.is_ok(), "rollback must release the server save");
-            Ok(())
-        }, recover, check).expect("PostgreSQL runtime");
+        assert!(result.is_ok(), "rollback must release the server save");
+        Ok(())
+    });
 }

@@ -193,7 +193,7 @@ pub trait TypedQuery: Any {
     type Params<'p>;
     type Row: Row;
     type Result: result::Shape;
-    type Group;
+    type Group: QueryGroup;
 
     const STATEMENT_NAME: &str;
     const SQL: &str;

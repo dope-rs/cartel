@@ -108,7 +108,6 @@ where
         Q: schema::TypedQuery,
         X: task::Read<'app, 'b, 'c, 'd, Output = Result<T, Error<'d, ID>>> + api::Sync,
         I::Queries: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup,
     {
         let (client, target, frame, clock) = self.into_parts();
         let next = api::Pending::typed::<Q, I, X, ID>(client.port, params, frame);

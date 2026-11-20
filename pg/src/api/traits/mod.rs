@@ -11,7 +11,6 @@ use std::ops::Deref;
 pub mod copy;
 pub(crate) mod sealed;
 
-use copy::Transfer;
 use sealed::Sealed;
 
 /// One exact runtime-issued client, with its storage details carried by its type.
@@ -44,9 +43,7 @@ impl<'a, 'd, T: Connection<'d, ID>, const ID: u8> IntoQuery<'d, ID> for &'a T {
 }
 
 /// A query view whose result owners retain the admitted storage and route.
-pub trait Query<'d, const ID: u8 = 0>:
-    Sealed + IntoQuery<'d, ID, Query = Self> + Unchecked<'d, ID> + Transfer<'d, ID>
-{
+pub trait Query<'d, const ID: u8 = 0>: Sealed + IntoQuery<'d, ID, Query = Self> {
     type Acquired: Query<
             'd,
             ID,
@@ -61,6 +58,7 @@ pub trait Query<'d, const ID: u8 = 0>:
         Self: Copy;
     type Schema: schema::QuerySet + 'd;
     type Payload: source::Payload;
+    type Chunk: AsRef<[u8]> + Deref<Target = [u8]>;
     type Batch: source::Batch;
     type Diagnostics: group::Diagnostics;
     type Stream<Q>: Stream<'d, Q, ID, Payload = Self::Payload>
@@ -74,8 +72,7 @@ pub trait Query<'d, const ID: u8 = 0>:
     + use<'d, Self, Q, ID>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
-        Self::Schema: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup;
+        Self::Schema: schema::HasGroup<Q::Group>;
 
     /// Encodes a nonempty group now and runs it with one connection, Sync, and deadline.
     /// Success waits for ReadyForQuery; later commands may be skipped after an error.
@@ -89,27 +86,16 @@ pub trait Query<'d, const ID: u8 = 0>:
     > + use<'d, Self, Q, ID, N>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
-        Self::Schema: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup;
+        Self::Schema: schema::HasGroup<Q::Group>;
 
-    fn run_first<Q>(
+    fn run_first<Q, const SCALAR: bool>(
         self,
         params: Q::Params<'_>,
-    ) -> impl Fiber<'d, Output = results::FirstResult<'d, Self::Payload, Q, ID>> + use<'d, Self, Q, ID>
+    ) -> impl Fiber<'d, Output = results::FirstResult<'d, Self::Payload, Q, ID, SCALAR>>
+    + use<'d, Self, Q, ID, SCALAR>
     where
-        Q: schema::TypedQuery<Result = result::Rows>,
-        Self::Schema: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup;
-
-    fn run_scalar<Q>(
-        self,
-        params: Q::Params<'_>,
-    ) -> impl Fiber<'d, Output = results::FirstResult<'d, Self::Payload, Q, ID, true>>
-    + use<'d, Self, Q, ID>
-    where
-        Q: schema::TypedQuery<Result = result::Rows<true>>,
-        Self::Schema: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup;
+        Q: schema::TypedQuery<Result = result::Rows<SCALAR>>,
+        Self::Schema: schema::HasGroup<Q::Group>;
 
     fn run_all<Q>(
         self,
@@ -118,42 +104,41 @@ pub trait Query<'d, const ID: u8 = 0>:
     + use<'d, Self, Q, ID>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
-        Self::Schema: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup;
+        Self::Schema: schema::HasGroup<Q::Group>;
 
-    fn run_no_rows<Q>(
+    fn run_command<Q, const REQUIRED: bool>(
         self,
         params: Q::Params<'_>,
-    ) -> impl Fiber<'d, Output = Result<(), Error<'d, ID>>> + use<'d, Self, Q, ID>
+    ) -> impl Fiber<'d, Output = Result<(), Error<'d, ID>>> + use<'d, Self, Q, ID, REQUIRED>
     where
         Q: schema::TypedQuery<Row = (), Result = result::Command>,
-        Self::Schema: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup;
+        Self::Schema: schema::HasGroup<Q::Group>;
 
-    /// Completes an UPDATE without rows; zero affected rows returns `NotFound`.
-    fn run_required<Q>(
-        self,
-        params: Q::Params<'_>,
-    ) -> impl Fiber<'d, Output = Result<(), Error<'d, ID>>> + use<'d, Self, Q, ID>
-    where
-        Q: schema::TypedQuery<Row = (), Result = result::Command>,
-        Self::Schema: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup;
-
-    fn run_stream<Q>(self, params: Q::Params<'_>) -> <Self as Query<'d, ID>>::Stream<Q>
+    fn run_stream<Q>(self, params: Q::Params<'_>) -> Self::Stream<Q>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
-        Self::Schema: schema::HasGroup<Q::Group>,
-        Q::Group: schema::QueryGroup;
-}
+        Self::Schema: schema::HasGroup<Q::Group>;
 
-/// Unchecked SQL on the exact connection and owner carried by this view.
-pub trait Unchecked<'d, const ID: u8 = 0>: Sealed + Sized {
+    /// Unchecked SQL on the exact connection and owner carried by this view.
     /// Encodes the SQL before returning the future.
     fn command(
         self,
         sql: &str,
     ) -> impl Fiber<'d, Output = Result<(), Error<'d, ID>>> + use<'d, Self, ID>;
+
+    /// COPY operations retaining their original client or transaction borrow.
+    /// Encodes both inputs before returning the future.
+    fn copy_in(
+        self,
+        sql: &str,
+        data: &[u8],
+    ) -> impl Fiber<'d, Output = Result<(), Error<'d, ID>>> + use<'d, Self, ID>;
+
+    fn copy_stream(self, sql: &str) -> impl copy::Sink<'d, ID> + use<'d, Self, ID>;
+    fn copy_out(
+        self,
+        sql: &str,
+    ) -> impl copy::Stream<'d, ID, Chunk = Self::Chunk> + use<'d, Self, ID>;
 }
 
 /// Streaming rows retain their payload independently of the next-row borrow.
@@ -219,7 +204,6 @@ pub trait Transaction<'d, const ID: u8 = 0>: Connection<'d, ID> + Sized {
         self,
         outcome: Result<T, E>,
     ) -> impl Fiber<'d, Output = Result<T, tx::FinishError<E, Error<'d, ID>>>>;
-    fn cancel(self);
 }
 
 /// A savepoint and every nested operation retain their exact parent lease.
@@ -236,7 +220,6 @@ pub trait Savepoint<'d, const ID: u8 = 0>: Connection<'d, ID> + Sized {
         Self: 'parent;
 
     fn name(&self) -> &str;
-    fn cancel(self);
     fn release(self) -> impl Fiber<'d, Output = Result<(), Error<'d, ID>>>;
     fn rollback(self) -> impl Fiber<'d, Output = Result<(), Error<'d, ID>>>;
     fn savepoint<'parent>(

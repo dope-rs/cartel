@@ -1,21 +1,17 @@
-use crate::common::external::runtime::Plan;
+use crate::common::external::runtime::fixtures;
 use crate::{
     common::external::own::Convert as _, common::external::user::Lookup,
     common::external::user::Write,
 };
 use cartel_pg::api::traits::Connection as _;
 use cartel_pg::api::traits::{
-    Begin as _, Client as _, Status as _, Transaction as _, Unchecked as _,
+    Begin as _, Client as _, Status as _, Query as _, Transaction as _,
 };
 use cartel_pg::api::tx::control::error::Kind;
 use cartel_pg::port;
 use common::env::{self, Env};
 use common::external::{Observer, own};
-use common::{
-    external::runtime::{check, limits::Limits},
-    port::Queries,
-    recover,
-};
+use common::{external::runtime::limits::Limits, port::Queries, recover};
 use dope::{
     core::driver::{life::recovery, route::Id},
     manifold::{app::env::Bundle, service, timing::Throughput},
@@ -33,57 +29,49 @@ pub mod common;
 #[test]
 #[ignore = "requires CARTEL_PG_TEST and PostgreSQL"]
 fn quarantines_transaction() {
-    let input = Env::try_load(env::NAMES.map(var_os)).expect("PostgreSQL environment");
-    Plan::try_new(&input)
-        .expect("external PostgreSQL fixture")
-        .try_run(
-            |rt| {
-                let client = rt.client();
-                let mut tx = rt
-                    .runtime
-                    .block_on(client.transaction().begin())?
-                    .ok()
-                    .expect("tx begins");
-                assert!(
-                    matches!(
-                        rt.runtime.block_on(Write::rename(&tx, 1, "outer".into()))?,
-                        Ok(())
-                    ),
-                    "outer update succeeds"
-                );
-                {
-                    let name = cartel_pg::Identifier::try_from(&mut String::from("drop_me"))
-                        .expect("identifier storage must allocate");
-                    let point = rt
-                        .runtime
-                        .block_on(tx.savepoint(name))?
-                        .ok()
-                        .expect("save opens");
-                    assert!(
-                        matches!(
-                            rt.runtime
-                                .block_on(Write::rename(&point, 1, "inner".into()))?,
-                            Ok(())
-                        ),
-                        "inner update succeeds"
-                    );
-                }
-                tx.cancel();
-                ::core::assert_eq!(
-                    rt.runtime
-                        .block_on(Lookup::by_id(client, 1))?
-                        .try_own()
-                        .ok()
-                        .expect("successful typed query")
-                        .name,
-                    "alice"
-                );
+    fixtures::run(env::NAMES.map(var_os), Default::default(), |rt| {
+        let client = rt.client();
+        let mut tx = rt
+            .runtime
+            .block_on(client.transaction().begin())?
+            .ok()
+            .expect("tx begins");
+        assert!(
+            matches!(
+                rt.runtime.block_on(Write::rename(&tx, 1, "outer".into()))?,
                 Ok(())
-            },
-            recover,
-            check,
-        )
-        .expect("PostgreSQL runtime");
+            ),
+            "outer update succeeds"
+        );
+        {
+            let name = cartel_pg::Identifier::try_from(&mut String::from("drop_me"))
+                .expect("identifier storage must allocate");
+            let point = rt
+                .runtime
+                .block_on(tx.savepoint(name))?
+                .ok()
+                .expect("save opens");
+            assert!(
+                matches!(
+                    rt.runtime
+                        .block_on(Write::rename(&point, 1, "inner".into()))?,
+                    Ok(())
+                ),
+                "inner update succeeds"
+            );
+        }
+        drop(tx);
+        ::core::assert_eq!(
+            rt.runtime
+                .block_on(Lookup::by_id(client, 1))?
+                .try_own()
+                .ok()
+                .expect("successful typed query")
+                .name,
+            "alice"
+        );
+        Ok(())
+    });
 }
 
 #[test]
@@ -93,7 +81,7 @@ fn bounded_cancel_slots() {
     for reused in [false, true] {
         let address = input.address();
         let settings = Limits::new(NonZero::<usize>::MIN)
-            .try_config::<()>()
+            .try_config()
             .expect("PostgreSQL limits");
         let snapshot = || {
             service::Snapshot::from_one(

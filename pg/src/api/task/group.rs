@@ -80,7 +80,7 @@ where
 type Admit<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, const ID: u8, R> = State<
     api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     R,
-    api::Pending<'d, groups::Draft<'g, 'r, 's, 'b, 'c, 'd>>,
+    api::request::GroupRequest<'g, 'r, 's, 'b, 'c, 'd>,
     lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, conn::Id<'d, KeyTag<ID>>, lease::Detached, ID>,
     groups::Owner<'g, 'r, 's, 'b, 'c, 'd>,
 >;
@@ -153,7 +153,7 @@ where
     pub(in crate::api) fn new(
         client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
         target: R,
-        next: Result<api::Pending<'d, groups::Draft<'g, 'r, 's, 'b, 'c, 'd>>, crate::Error>,
+        next: Result<api::request::GroupRequest<'g, 'r, 's, 'b, 'c, 'd>, crate::Error>,
         clock: impl Into<Result<deadline::Guard<'d>, timer::Exhausted>>,
     ) -> Self {
         const { assert!(N > 0 && N < u32::MAX as usize) };

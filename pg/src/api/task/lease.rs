@@ -170,17 +170,6 @@ where
     }
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, const ID: u8>
-    Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, T, Recover, ID>
-where
-    I: Instance<Queries: 'd> + 'd,
-    T: Target<'d, ID>,
-{
-    pub(in crate::api) fn quarantine(self) {
-        self.abort(crate::Error::Closed);
-    }
-}
-
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, P, const ID: u8> mem::Return
     for Owner<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, T, P, ID>
 where

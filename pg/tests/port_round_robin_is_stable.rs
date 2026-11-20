@@ -1,4 +1,4 @@
-use cartel_pg::api::traits::{Client as _, Status as _, Unchecked as _};
+use cartel_pg::api::traits::{Client as _, Query as _, Status as _};
 use cartel_pg::{api, port, port::config};
 use common::{
     port::*,
@@ -7,20 +7,12 @@ use common::{
     topology,
 };
 use dope::core::dope_sys::io::poll::Poll as _;
-use dope::core::driver::life::recovery;
-use dope::runtime::executor::session::Completion;
-use dope::{
-    core::driver::route::Id, manifold::app::env::Bundle, manifold::timing::Throughput,
-    net::tcp::Tcp, net::wire::Identity,
-};
+use dope::manifold::timing::Throughput;
 use dope_fiber::{BlockOn as _, abi, context::PollResult, task::batch};
 use dope_test::harness::peer::AcceptScript;
-use dope_test::{harness::GUARD, reclaim::Reports};
 use std::os::fd::AsFd as _;
 use std::time::Duration;
 use std::{pin::pin, task::Poll};
-
-type Env = Bundle<Tcp, Identity, Throughput>;
 
 pub mod common;
 
@@ -102,80 +94,55 @@ fn round_robin_and_shared_admission_progress() {
             };
             let config = config::Config::new(capacity);
             let config = config.expect("valid pg configuration");
-            let ((), events) = {
-                let prepared = topology::try_new::<_, Env>(
-                    port::Port::<Queries>::plan(
-                        Queries::try_config().expect("database config"),
-                        config,
-                    ),
-                    server.addr(),
-                    Duration::from_millis(1),
-                    Duration::from_millis(1_024),
-                )
-                .expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                let scoped = prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let client: api::Client<api::Context<'_, '_, '_, '_, '_, '_, '_, _, _>> =
-                                        runtime.root_client();
-
-                                    assert!(
-                                        matches!(
-                                            runtime.block_on(client.status().wait_ready()),
-                                            Ok(Ok(()))
-                                        ),
-                                        "all PostgreSQL connections ready"
-                                    );
-
-                                    let mut pool = runtime.block_on(batch::Pool::<4>::acquire())
-                                        .expect("batch driver").expect("batch slots");
-                                    let queries = batch::Join::from_map(&mut pool, [0, 1, 2, 3], |index| {
-                                        dope_fiber::fiber!('_ => async move {
-                                            let sql = ["SELECT 0", "SELECT 1", "SELECT 2", "SELECT 3"][index];
-                                            assert!(client.command(sql).await.is_ok());
-                                            if index == 2 {
-                                                let (waiting, marker) = abi::Join::new(
-                                                    client.command("SELECT 4"),
-                                                    client.command("SELECT 5"),
-                                                ).await;
-                                                assert!(waiting.is_ok() && marker.is_ok());
-                                            }
-                                        })
-                                    });
-                                    let mut queries = pin!(abi::Task::new(queries));
-                                    runtime.block_on(abi::poll_fn(|mut context| {
-                                        let result = context.as_mut().try_poll(queries.as_mut());
-                                        let work = context.as_ref().work();
-                                        while work.remaining() > 1 {
-                                            let _ = work.permit();
-                                        }
-                                        match result {
-                                            PollResult::Polled(Poll::Ready(output)) => Poll::Ready(output),
-                                            PollResult::Polled(Poll::Pending) | PollResult::Exhausted => {
-                                                context.as_ref().waker().wake();
-                                                Poll::Pending
-                                            }
-                                        }
-                                    })).expect("saturated driver").expect("independent query wakes");
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), common::recover),
-                    |outcome| outcome.map_err(common::entry_error).expect("application entry"),
+            {
+                let plan = port::Port::<Queries>::plan(
+                    Queries::try_config().expect("database config"),
+                    config,
                 );
+                topology::run(plan, server.addr(), (1, 1_024), Throughput, |mut runtime| {
+                    let client: api::Client<api::Context<'_, '_, '_, '_, '_, '_, '_, _, _>> =
+                        runtime.root_client();
 
-                let result = scoped.expect("application installation completed");
-                (result.expect("application session completed"), reports)
-            };
-            assert!(
-                events.events().expect("native reclamation").is_empty(),
-                "unexpected events PostgreSQL operations: {events:?}"
-            );
+                    assert!(
+                        matches!(
+                            runtime.block_on(client.status().wait_ready()),
+                            Ok(Ok(()))
+                        ),
+                        "all PostgreSQL connections ready"
+                    );
+
+                    let mut pool = runtime.block_on(batch::Pool::<4>::acquire())
+                        .expect("batch driver").expect("batch slots");
+                    let queries = batch::Join::from_map(&mut pool, [0, 1, 2, 3], |index| {
+                        dope_fiber::fiber!('_ => async move {
+                            let sql = ["SELECT 0", "SELECT 1", "SELECT 2", "SELECT 3"][index];
+                            assert!(client.command(sql).await.is_ok());
+                            if index == 2 {
+                                let (waiting, marker) = abi::Join::new(
+                                    client.command("SELECT 4"),
+                                    client.command("SELECT 5"),
+                                ).await;
+                                assert!(waiting.is_ok() && marker.is_ok());
+                            }
+                        })
+                    });
+                    let mut queries = pin!(abi::Task::new(queries));
+                    runtime.block_on(abi::poll_fn(|mut context| {
+                        let result = context.as_mut().try_poll(queries.as_mut());
+                        let work = context.as_ref().work();
+                        while work.remaining() > 1 {
+                            let _ = work.permit();
+                        }
+                        match result {
+                            PollResult::Polled(Poll::Ready(output)) => Poll::Ready(output),
+                            PollResult::Polled(Poll::Pending) | PollResult::Exhausted => {
+                                context.as_ref().waker().wake();
+                                Poll::Pending
+                            }
+                        }
+                    })).expect("saturated driver").expect("independent query wakes");
+                });
+            }
             server.finish().expect("server");
         },
     )

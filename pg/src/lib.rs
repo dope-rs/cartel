@@ -16,8 +16,6 @@ pub use cartel_core::deadline::RequestPhase;
 #[doc(hidden)]
 pub use cartel_core::sql;
 pub use cartel_gen::{PgRow, PgTable, pg_instance, query_group};
-#[doc(hidden)]
-pub use dope_fiber;
 pub use dope_fiber::abi::Fiber;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]

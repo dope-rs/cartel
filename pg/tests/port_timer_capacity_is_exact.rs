@@ -1,6 +1,6 @@
-use cartel_pg::api::traits::copy::{Sink as _, Stream as _, Transfer as _};
+use cartel_pg::api::traits::copy::{Sink as _, Stream as _};
 use cartel_pg::api::traits::{
-    Begin as _, Client as _, Notify as _, Query as _, Status as _, Stream as _, Unchecked as _,
+    Begin as _, Client as _, Notify as _, Query as _, Status as _, Stream as _,
 };
 use cartel_pg::{api, port, port::config, protocol::encode, reply};
 use common::wire::checked::{Database, TextQuery, TextRow};
@@ -250,7 +250,7 @@ fn typed_queries_free_timer() {
                                     drop(row);
                                     drop(alarm);
 
-                                    let mut first = pin!(client.run_first::<TextQuery>(()));
+                                    let mut first = pin!(client.run_first::<TextQuery, _>(()));
                                     let mut all = pin!(None);
                                     assert!(matches!(timer.try_alarm(), Err(Exhausted::Slots)));
                                     runtime
@@ -328,7 +328,7 @@ fn typed_queries_free_timer() {
                                     drop(rows);
                                     drop(alarm);
                                     let failure = runtime
-                                        .block_on(client.run_first::<TextQuery>(()))
+                                        .block_on(client.run_first::<TextQuery, _>(()))
                                         .expect("late failure driver")
                                         .err()
                                         .expect("late Sync failure");

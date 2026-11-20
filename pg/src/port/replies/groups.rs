@@ -34,8 +34,7 @@ pub(crate) type Owner<'g, 'r, 's, 'b, 'c, 'd> = Shared<'g, State<'r, 's, 'b, 'c,
 
 /// The sole admission authority for a newly initialized, unpublished collector.
 pub(crate) struct Draft<'g, 'r, 's, 'b, 'c, 'd> {
-    owner: Owner<'g, 'r, 's, 'b, 'c, 'd>,
-    sync: Owner<'g, 'r, 's, 'b, 'c, 'd>,
+    owner: Unique<'g, shared::Resident<State<'r, 's, 'b, 'c, 'd>>, (), shared::Initialized>,
 }
 
 pub(crate) struct Access<'g, 'r, 's, 'b, 'c, 'd> {
@@ -75,15 +74,13 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Access<'g, 'r, 's, 'b, 'c, 'd> {
             .ok_or(crate::Error::GroupBytesCapacity)?;
         records.get_mut().get_mut().clear();
         let active = Cell::new(Some(Active { records, bytes }));
-        let (owner, sync) = owner
-            .reserve()
-            .begin(State {
+        Ok(Draft {
+            owner: owner.reserve().begin(State {
                 limits: self.limits,
                 active,
                 reservation: Cell::new(None),
-            })
-            .freeze_pair();
-        Ok(Draft { owner, sync })
+            }),
+        })
     }
 }
 
@@ -100,8 +97,9 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Draft<'g, 'r, 's, 'b, 'c, 'd> {
         self,
         permit: retain::Reservation<'b, 'c, 'd>,
     ) -> (Owner<'g, 'r, 's, 'b, 'c, 'd>, Owner<'g, 'r, 's, 'b, 'c, 'd>) {
-        self.owner.reservation.set(Some(permit));
-        (self.owner, self.sync)
+        // This exclusive draft was initialized with None and is consumed here.
+        std::mem::forget(self.owner.reservation.replace(Some(permit)));
+        self.owner.freeze_pair()
     }
 }
 

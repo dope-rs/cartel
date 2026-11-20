@@ -130,7 +130,7 @@ where
             }
             Poll::Ready(Err(error)) => Err(error),
             Poll::Ready(Ok((next, commit))) => {
-                commit.quarantine();
+                drop(commit);
                 match next {
                     Ok(()) => Err(crate::Error::Closed.into()),
                     Err(error) => Err(error),
@@ -192,7 +192,7 @@ where
             Poll::Ready(Err(error)) => Err(error),
             Poll::Ready(Ok((next, commit))) => {
                 if matches!(*this.state, Finishing::Opening) {
-                    commit.quarantine();
+                    drop(commit);
                 } else {
                     commit.settle();
                 }

@@ -8,15 +8,10 @@ use cartel_pg::{
 use common::port::Reply;
 use common::topology::{self, with_row};
 use common::wire::checked::{ArrayQuery, Database, MixedQuery, MixedRow, TextQuery, TextRow};
-use dope::core::driver::life::recovery;
-use dope::{
-    core::driver::route::Id, manifold::app::env::Bundle, manifold::timing::Throughput,
-    net::tcp::Tcp, net::wire::Identity, runtime::executor::session::Completion,
-};
+use dope::manifold::timing::Throughput;
 use dope_fiber::BlockOn as _;
 use dope_test::alloc::Tracker;
-use dope_test::{harness::GUARD, harness::peer::TcpScript, reclaim::Reports};
-use std::time::Duration;
+use dope_test::harness::peer::TcpScript;
 
 pub mod common;
 
@@ -69,148 +64,123 @@ fn collects_multiple_rows() {
             caps.responses.items = 2;
             caps.responses.bytes = 65536;
             let config = port::config::Config::new(caps).expect("two retained rows");
-            let ready = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
-                port::Port::<Database>::plan(login, config),
-                server.addr(),
-                Duration::from_millis(1),
-                Duration::from_secs(1),
-            )
-            .expect("prepared PostgreSQL topology");
-            let mut reports = Reports::<_>::new(ready.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            ready
-                .with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut app| {
-                                    let client: Client<cartel_pg::api::Context<'_, '_, '_, '_, '_, '_, '_, _, Database>> =
-                                        app.root_client();
-                                    app.block_on(client.status().wait_ready())
-                                        .expect("driver ready")
-                                        .ok()
-                                        .expect("PostgreSQL ready");
-                                    let (rows, allocations) = Tracker::count(|| {
-                                        app.block_on(dope_fiber::fiber!('_ => async move {
-                                            let query = traits::Query::acquire(client).await?;
-                                            traits::Query::run_all::<MixedQuery>(query, ()).await
-                                        }))
-                                        .expect("driver query")
-                                    });
-                                    assert_eq!(allocations, 0);
-                                    let rows = rows
-                                        .map_err(|error| format!("{:?}", Reply::from(&error)))
-                                        .expect("query rows");
-                                    let usage = rows.usage();
-                                    let count = usage.values().get();
-                                    assert_eq!(count, 2);
-                                    assert_eq!(usage.bytes().get(), payload_bytes);
-                                    let (projected, allocations) = Tracker::count(|| {
-                                        let mut values = Vec::new();
-                                        values.try_reserve_exact(count).expect("reserved views");
-                                        rows.visit(|row| values.push((row.low, row.tags)))
-                                            .expect("decoded rows");
-                                        values
-                                    });
-                                    assert_eq!(allocations, 1);
-                                    assert_eq!(projected, [(3, "[]"), (7, "{}")]);
-                                    drop(projected);
-                                    let (rows, count) = Tracker::count(|| rows.validate());
-                                    let retained = rows.expect("validated rows");
-                                    let mut rows = retained.iter();
-                                    let (first, read) = Tracker::count(|| rows.next());
-                                    let first = first.expect("first row");
-                                    assert_eq!((count, read), (0, 0));
-                                    assert_eq!(
-                                        (
-                                            first.low,
-                                            first.middle,
-                                            first.active,
-                                            first.tags,
-                                            first.high
-                                        ),
-                                        (3, 4, false, "[]", 5)
-                                    );
-                                    let second = rows.next().expect("second row");
-                                    assert_eq!(
-                                        (
-                                            second.low,
-                                            second.middle,
-                                            second.active,
-                                            second.tags,
-                                            second.high
-                                        ),
-                                        (7, 8, true, "{}", 9)
-                                    );
-                                    assert!(rows.next().is_none());
-                                    drop(retained);
-                                    for expected in [
-                                        Ok(Some((1, Some("value")))),
-                                        Ok(Some((0, None))),
-                                        Ok(None),
-                                        Err(()),
-                                    ] {
-                                        let row = app
-                                            .block_on(traits::Query::run_scalar::<ArrayQuery<true>>(
-                                                client,
-                                                (),
-                                            ))
-                                            .expect("driver scalar")
-                                            .map_err(|error| format!("{:?}", Reply::from(&error)))
-                                            .expect("scalar query")
-                                            .expect("scalar row");
-                                        match expected {
-                                            Ok(expected) => {
-                                                let view = row.decode().expect("scalar decode");
-                                                assert_eq!(
-                                                    view.map(|array| array.len()),
-                                                    expected.map(|value| value.0),
-                                                );
-                                                let owned = row.into_owned().expect("owned scalar");
-                                                assert_eq!(
-                                                    owned.as_ref().map(|array| (
-                                                        array.len(),
-                                                        array.first().map(String::as_str),
-                                                    )),
-                                                    expected,
-                                                );
-                                            }
-                                            Err(()) => {
-                                                for error in [row.decode().err(), row.into_owned().err()] {
-                                                    assert!(matches!(
-                                                        error,
-                                                        Some(cartel_pg::Error::Protocol(Reason::RowTrailing { actual }))
-                                                            if actual.get() == 1
-                                                    ));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    let (row, allocations) = Tracker::count(|| app
-                                        .block_on(traits::Query::run_one::<TextQuery>(client, ())));
-                                    let row = row.expect("driver tiny row")
-                                        .unwrap_or_else(|error| panic!("{:?}", Reply::from(&error)));
-                                    assert_eq!(allocations, 0);
-                                    assert!(matches!(
-                                        row.validate(),
-                                        Err(cartel_pg::Error::Protocol(Reason::ColumnCount {
-                                            actual: 0,
-                                            expected: 2,
-                                        }))
-                                    ));
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), common::recover),
-                    |outcome| outcome.map_err(common::entry_error).expect("application entry"),
-                )
-                .expect("scoped PostgreSQL")
-                .expect("application scope");
-            assert!(
-                reports.events().expect("native reclamation").is_empty(),
-                "unexpected native recovery"
-            );
+            let plan = port::Port::<Database>::plan(login, config);
+            topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut app| {
+                let client: Client<cartel_pg::api::Context<'_, '_, '_, '_, '_, '_, '_, _, Database>> =
+                    app.root_client();
+                app.block_on(client.status().wait_ready())
+                    .expect("driver ready")
+                    .ok()
+                    .expect("PostgreSQL ready");
+                let (rows, allocations) = Tracker::count(|| {
+                    app.block_on(dope_fiber::fiber!('_ => async move {
+                        let query = traits::Query::acquire(client).await?;
+                        traits::Query::run_all::<MixedQuery>(query, ()).await
+                    }))
+                    .expect("driver query")
+                });
+                assert_eq!(allocations, 0);
+                let rows = rows
+                    .map_err(|error| format!("{:?}", Reply::from(&error)))
+                    .expect("query rows");
+                let usage = rows.usage();
+                let count = usage.values().get();
+                assert_eq!(count, 2);
+                assert_eq!(usage.bytes().get(), payload_bytes);
+                let (projected, allocations) = Tracker::count(|| {
+                    let mut values = Vec::new();
+                    values.try_reserve_exact(count).expect("reserved views");
+                    rows.visit(|row| values.push((row.low, row.tags)))
+                        .expect("decoded rows");
+                    values
+                });
+                assert_eq!(allocations, 1);
+                assert_eq!(projected, [(3, "[]"), (7, "{}")]);
+                drop(projected);
+                let (rows, count) = Tracker::count(|| rows.validate());
+                let retained = rows.expect("validated rows");
+                let mut rows = retained.iter();
+                let (first, read) = Tracker::count(|| rows.next());
+                let first = first.expect("first row");
+                assert_eq!((count, read), (0, 0));
+                assert_eq!(
+                    (
+                        first.low,
+                        first.middle,
+                        first.active,
+                        first.tags,
+                        first.high
+                    ),
+                    (3, 4, false, "[]", 5)
+                );
+                let second = rows.next().expect("second row");
+                assert_eq!(
+                    (
+                        second.low,
+                        second.middle,
+                        second.active,
+                        second.tags,
+                        second.high
+                    ),
+                    (7, 8, true, "{}", 9)
+                );
+                assert!(rows.next().is_none());
+                drop(retained);
+                for expected in [
+                    Ok(Some((1, Some("value")))),
+                    Ok(Some((0, None))),
+                    Ok(None),
+                    Err(()),
+                ] {
+                    let row = app
+                        .block_on(traits::Query::run_first::<ArrayQuery<true>, _>(
+                            client,
+                            (),
+                        ))
+                        .expect("driver scalar")
+                        .map_err(|error| format!("{:?}", Reply::from(&error)))
+                        .expect("scalar query")
+                        .expect("scalar row");
+                    match expected {
+                        Ok(expected) => {
+                            let view = row.decode().expect("scalar decode");
+                            assert_eq!(
+                                view.map(|array| array.len()),
+                                expected.map(|value| value.0),
+                            );
+                            let owned = row.into_owned().expect("owned scalar");
+                            assert_eq!(
+                                owned.as_ref().map(|array| (
+                                    array.len(),
+                                    array.first().map(String::as_str),
+                                )),
+                                expected,
+                            );
+                        }
+                        Err(()) => {
+                            for error in [row.decode().err(), row.into_owned().err()] {
+                                assert!(matches!(
+                                    error,
+                                    Some(cartel_pg::Error::Protocol(Reason::RowTrailing { actual }))
+                                        if actual.get() == 1
+                                ));
+                            }
+                        }
+                    }
+                }
+                let (row, allocations) = Tracker::count(|| app
+                    .block_on(traits::Query::run_one::<TextQuery>(client, ())));
+                let row = row.expect("driver tiny row")
+                    .unwrap_or_else(|error| panic!("{:?}", Reply::from(&error)));
+                assert_eq!(allocations, 0);
+                assert!(matches!(
+                    row.validate(),
+                    Err(cartel_pg::Error::Protocol(Reason::ColumnCount {
+                        actual: 0,
+                        expected: 2,
+                    }))
+                ));
+            });
             server
                 .finish()
                 .expect("script execution")
@@ -231,79 +201,54 @@ fn owned_batch_failure() {
             let login = cartel_pg::Config::new("user".into(), "password".into(), "database".into())
                 .expect("database credentials");
             let config = Database::config().expect("bounded PostgreSQL config");
-            let ready = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
-                port::Port::<Database>::plan(login, config),
-                server.addr(),
-                Duration::from_millis(1),
-                Duration::from_secs(1),
-            )
-            .expect("prepared PostgreSQL topology");
-            let mut reports = Reports::<_>::new(ready.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            ready
-                .with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut app| {
-                                    let client: Client<
-                                        cartel_pg::api::Context<
-                                            '_,
-                                            '_,
-                                            '_,
-                                            '_,
-                                            '_,
-                                            '_,
-                                            '_,
-                                            _,
-                                            Database,
-                                        >,
-                                    > = app.root_client();
-                                    app.block_on(client.status().wait_ready())
-                                        .expect("driver ready")
-                                        .ok()
-                                        .expect("PostgreSQL ready");
-                                    let (rows, receive) = Tracker::measure(|| {
-                                        app.block_on(traits::Query::run_all::<TextQuery>(
-                                            client,
-                                            (),
-                                        ))
-                                        .expect("driver query")
-                                    });
-                                    let rows = rows.ok().expect("query rows");
-                                    let mut name = None;
-                                    let failure = rows.visit(|row| name = Some(row.name));
-                                    assert_eq!(name, Some("first"));
-                                    assert!(matches!(
-                                        failure,
-                                        Err(cartel_pg::Error::Protocol(Reason::RowTrailing {
-                                            actual
-                                        })) if actual.get() == 1
-                                    ));
-                                    let (result, counts) = Tracker::measure(|| rows.into_owned());
-                                    assert!(matches!(
-                                        result,
-                                        Err(cartel_pg::Error::Protocol(Reason::RowTrailing {
-                                            actual
-                                        })) if actual.get() == 1
-                                    ));
-                                    let bytes = 2 * size_of::<TextRow>() + 11;
-                                    assert_eq!(counts[..2], [3, bytes]);
-                                    assert_eq!(receive[0] + counts[0], receive[2] + counts[2]);
-                                    assert_eq!(receive[1] + counts[1], receive[3] + counts[3]);
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), common::recover),
-                    |outcome| outcome.ok().expect("application entry"),
-                )
-                .expect("scoped PostgreSQL")
-                .expect("application scope");
-            assert!(
-                reports.events().expect("native reclamation").is_empty(),
-                "unexpected native recovery"
-            );
+            let plan = port::Port::<Database>::plan(login, config);
+            topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut app| {
+                let client: Client<
+                    cartel_pg::api::Context<
+                        '_,
+                        '_,
+                        '_,
+                        '_,
+                        '_,
+                        '_,
+                        '_,
+                        _,
+                        Database,
+                    >,
+                > = app.root_client();
+                app.block_on(client.status().wait_ready())
+                    .expect("driver ready")
+                    .ok()
+                    .expect("PostgreSQL ready");
+                let (rows, receive) = Tracker::measure(|| {
+                    app.block_on(traits::Query::run_all::<TextQuery>(
+                        client,
+                        (),
+                    ))
+                    .expect("driver query")
+                });
+                let rows = rows.ok().expect("query rows");
+                let mut name = None;
+                let failure = rows.visit(|row| name = Some(row.name));
+                assert_eq!(name, Some("first"));
+                assert!(matches!(
+                    failure,
+                    Err(cartel_pg::Error::Protocol(Reason::RowTrailing {
+                        actual
+                    })) if actual.get() == 1
+                ));
+                let (result, counts) = Tracker::measure(|| rows.into_owned());
+                assert!(matches!(
+                    result,
+                    Err(cartel_pg::Error::Protocol(Reason::RowTrailing {
+                        actual
+                    })) if actual.get() == 1
+                ));
+                let bytes = 2 * size_of::<TextRow>() + 11;
+                assert_eq!(counts[..2], [3, bytes]);
+                assert_eq!(receive[0] + counts[0], receive[2] + counts[2]);
+                assert_eq!(receive[1] + counts[1], receive[3] + counts[3]);
+            });
             server
                 .finish()
                 .expect("script execution")

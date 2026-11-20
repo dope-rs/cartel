@@ -1,6 +1,6 @@
 use cartel_pg::api::traits::Connection as _;
 use cartel_pg::api::traits::{
-    Begin as _, Client as _, Notify as _, Query as _, Status as _, Transaction as _, Unchecked as _,
+    Begin as _, Client as _, Notify as _, Query as _, Status as _, Transaction as _,
 };
 use dope::core::driver::life::recovery;
 use std::{
@@ -53,81 +53,59 @@ fn failed_reconnect_preserves_healthy_connection() {
                 .capacities();
             capacity.connections = 2;
             let config = config::Config::new(capacity).expect("two connection capacity");
-            let prepared = topology::try_new::<_, Env>(
-                port::Port::<Queries>::plan(
-                    Queries::try_config().expect("database config"),
-                    config,
-                ),
-                addr,
-                Duration::from_millis(1),
-                Duration::from_secs(1),
-            )
-            .expect("PostgreSQL topology");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared.with_local(
-                |worker| {
-                    worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
-                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                        let client = runtime.root_client();
-                        fibers::TEST
-                            .try_run(
-                                &mut runtime,
-                                poll_fn(|context| {
-                                    if client.status().live_count() == 1
-                                        && client.status().is_failed()
-                                    {
-                                        Poll::Ready(())
-                                    } else {
-                                        context.wake();
-                                        Poll::Pending
-                                    }
-                                }),
-                            )
-                            .expect("one healthy connection and one refused reconnect");
-                        assert!(matches!(
-                            runtime.block_on(client.status().wait_ready()),
-                            Ok(Err(reply::Error::Open(reply::Open::Transport {
-                                cause: ConnectFault::Transport(event::ConnectError::Connect(errno)),
-                                ..
-                            }))) if errno.is_refused()
-                        ));
-                        assert!(matches!(
-                            runtime.block_on(client.command("SELECT 1")),
-                            Ok(Ok(()))
-                        ));
-                        fibers::TEST
-                            .try_run(
-                                &mut runtime,
-                                poll_fn(|context| {
-                                    if client.status().live_count() == 0 {
-                                        Poll::Ready(())
-                                    } else {
-                                        context.wake();
-                                        Poll::Pending
-                                    }
-                                }),
-                            )
-                            .expect("all connections closed");
-                        assert!(matches!(
-                            runtime.block_on(client.command("SELECT 1")),
-                            Ok(Err(reply::Error::Open(reply::Open::Transport {
-                                cause: ConnectFault::Transport(event::ConnectError::Connect(errno)),
-                                ..
-                            }))) if errno.is_refused()
-                        ));
-                    })
-                        })
-                    })
-                },
-                recovery::Policy::new(|event| reports.push(event), common::recover),
-                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "PostgreSQL scope"),
+            let plan = port::Port::<Queries>::plan(
+                Queries::try_config().expect("database config"),
+                config,
             );
-            assert!(
-                matches!(reports.events(), Ok(events) if events.is_empty()),
-                "unexpected reclamation"
-            );
+            topology::run(plan, addr, (1, 1_000), Throughput, |mut runtime| {
+                let client = runtime.root_client();
+                fibers::TEST
+                    .try_run(
+                        &mut runtime,
+                        poll_fn(|context| {
+                            if client.status().live_count() == 1
+                                && client.status().is_failed()
+                            {
+                                Poll::Ready(())
+                            } else {
+                                context.wake();
+                                Poll::Pending
+                            }
+                        }),
+                    )
+                    .expect("one healthy connection and one refused reconnect");
+                assert!(matches!(
+                    runtime.block_on(client.status().wait_ready()),
+                    Ok(Err(reply::Error::Open(reply::Open::Transport {
+                        cause: ConnectFault::Transport(event::ConnectError::Connect(errno)),
+                        ..
+                    }))) if errno.is_refused()
+                ));
+                assert!(matches!(
+                    runtime.block_on(client.command("SELECT 1")),
+                    Ok(Ok(()))
+                ));
+                fibers::TEST
+                    .try_run(
+                        &mut runtime,
+                        poll_fn(|context| {
+                            if client.status().live_count() == 0 {
+                                Poll::Ready(())
+                            } else {
+                                context.wake();
+                                Poll::Pending
+                            }
+                        }),
+                    )
+                    .expect("all connections closed");
+                assert!(matches!(
+                    runtime.block_on(client.command("SELECT 1")),
+                    Ok(Err(reply::Error::Open(reply::Open::Transport {
+                        cause: ConnectFault::Transport(event::ConnectError::Connect(errno)),
+                        ..
+                    }))) if errno.is_refused()
+                ));
+            });
         })
         .expect("PostgreSQL peer start and join");
     peer.expect("partial pool");
@@ -143,41 +121,16 @@ fn stalled_partial_reconnects_idle_connection() {
             Positive::from_secs::<2>(),
         )
         .expect("PostgreSQL admission deadline");
-        let prepared = topology::try_new::<
-            _,
-            Bundle<Tcp, Identity, Throughput, postgres::retire::ShortIdle>,
-        >(
-            port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config),
-            server.addr(),
-            Duration::from_millis(1),
-            Duration::from_secs(1),
-        )
-        .expect("PostgreSQL topology");
-        let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-        let mut report = Completion::new();
-        prepared.with_local(
-            |worker| {
-                worker.lend(|node, stage| {
-                    node.install(stage, |host, stage| {
-                        stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                            let client = runtime.root_client();
-                            for _ in 0..2 {
-                                assert!(matches!(
-                                    runtime.block_on(client.command("SELECT 1")),
-                                    Ok(Ok(()))
-                                ));
-                            }
-                        })
-                    })
-                })
-            },
-            recovery::Policy::new(|event| reports.push(event), common::recover),
-            |result| assert!(matches!(result, Ok(Ok(Ok(())))), "PostgreSQL scope"),
-        );
-        assert!(
-            matches!(reports.events(), Ok(events) if events.is_empty()),
-            "unexpected reclamation"
-        );
+        let plan = port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config);
+        topology::run(plan, server.addr(), (1, 1_000), postgres::retire::ShortIdle, |mut runtime| {
+            let client = runtime.root_client();
+            for _ in 0..2 {
+                assert!(matches!(
+                    runtime.block_on(client.command("SELECT 1")),
+                    Ok(Ok(()))
+                ));
+            }
+        });
         assert!(
             matches!(server.finish(), Ok(Ok(()))),
             "PostgreSQL peer completion"
@@ -198,61 +151,39 @@ fn unsolicited_partial_cannot_bind_next_request() {
         AcceptScript::with(
             |peer| postgres::retire::unsolicited_partial(peer.accept()?),
             |server| {
-                let prepared = topology::try_new::<_, Env>(
-                    port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config),
-                    server.addr(),
-                    Duration::from_millis(1),
-                    Duration::from_secs(1),
-                )
-                .expect("PostgreSQL topology");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let client = runtime.root_client();
-                                    assert!(matches!(
-                                        runtime.block_on(client.status().wait_ready()),
-                                        Ok(Ok(()))
-                                    ));
-                                    let mut first = pin!(Task::new(client.command("SELECT 1")));
-                                    let mut second = pin!(Task::new(client.command("SELECT 1")));
-                                    runtime.block_on(PollFn::admitted(|admit| {
-                                        let (first, context) = admit.poll(first.as_mut());
-                                        assert!(first.is_pending());
-                                        if throttled {
-                                            assert!(matches!(
-                                                context.try_poll(second.as_mut()),
-                                                dope_fiber::context::PollResult::Polled(Poll::Pending)
-                                            ));
-                                        }
-                                        Poll::Ready(())
-                                    })).expect("both commands polled before responses");
-                                    assert!(matches!(runtime.block_on(first.as_mut()), Ok(Ok(()))));
-                                    fibers::TEST
-                                        .try_pause(&mut runtime, Duration::from_millis(20))
-                                        .expect("process unsolicited partial response");
-                                    assert!(
-                                        matches!(
-                                            runtime.block_on(second.as_mut()),
-                                            Ok(Err(reply::Error::Driver(cartel_pg::Error::RequestTimeout(timeout))))
-                                                if timeout.phase() == cartel_pg::RequestPhase::Admission
-                                        ),
-                                        "an unsolicited partial response must not admit the next request; throttled={throttled}"
-                                    );
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), common::recover),
-                    |result| assert!(matches!(result, Ok(Ok(Ok(())))), "PostgreSQL scope"),
-                );
-                assert!(
-                    matches!(reports.events(), Ok(events) if events.is_empty()),
-                    "unexpected reclamation"
-                );
+                let plan = port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config);
+                topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+                    let client = runtime.root_client();
+                    assert!(matches!(
+                        runtime.block_on(client.status().wait_ready()),
+                        Ok(Ok(()))
+                    ));
+                    let mut first = pin!(Task::new(client.command("SELECT 1")));
+                    let mut second = pin!(Task::new(client.command("SELECT 1")));
+                    runtime.block_on(PollFn::admitted(|admit| {
+                        let (first, context) = admit.poll(first.as_mut());
+                        assert!(first.is_pending());
+                        if throttled {
+                            assert!(matches!(
+                                context.try_poll(second.as_mut()),
+                                dope_fiber::context::PollResult::Polled(Poll::Pending)
+                            ));
+                        }
+                        Poll::Ready(())
+                    })).expect("both commands polled before responses");
+                    assert!(matches!(runtime.block_on(first.as_mut()), Ok(Ok(()))));
+                    fibers::TEST
+                        .try_pause(&mut runtime, Duration::from_millis(20))
+                        .expect("process unsolicited partial response");
+                    assert!(
+                        matches!(
+                            runtime.block_on(second.as_mut()),
+                            Ok(Err(reply::Error::Driver(cartel_pg::Error::RequestTimeout(timeout))))
+                                if timeout.phase() == cartel_pg::RequestPhase::Admission
+                        ),
+                        "an unsolicited partial response must not admit the next request; throttled={throttled}"
+                    );
+                });
                 assert!(
                     matches!(server.finish(), Ok(Ok(()))),
                     "PostgreSQL peer completion"
@@ -424,52 +355,30 @@ fn detached_partial_preserves_pipelined_request() {
     AcceptScript::with(
         |peer| postgres::retire::detached_partial(peer.accept()?),
         |server| {
-            let prepared = topology::try_new::<_, Env>(
-                port::Port::<Queries>::plan(
-                    Queries::try_config().expect("database config"),
-                    Queries::try_reply().expect("PostgreSQL capacity"),
-                ),
-                server.addr(),
-                Duration::from_millis(1),
-                Duration::from_secs(1),
-            )
-            .expect("PostgreSQL topology");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared.with_local(
-                |worker| {
-                    worker.lend(|node, stage| {
-                        node.install(stage, |host, stage| {
-                            stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                let client = runtime.root_client();
-                                assert!(matches!(
-                                    runtime.block_on(client.status().wait_ready()),
-                                    Ok(Ok(()))
-                                ));
-                                assert!(matches!(
-                                    runtime.block_on(
-                                        fibers::TEST.poll_once(client.command("SELECT 1"))
-                                    ),
-                                    Ok(None)
-                                ));
-                                fibers::TEST
-                                    .try_pause(&mut runtime, Duration::from_millis(20))
-                                    .expect("process detached partial response");
-                                assert!(matches!(
-                                    runtime.block_on(client.command("SELECT 2")),
-                                    Ok(Ok(()))
-                                ));
-                            })
-                        })
-                    })
-                },
-                recovery::Policy::new(|event| reports.push(event), common::recover),
-                |result| assert!(matches!(result, Ok(Ok(Ok(())))), "PostgreSQL scope"),
+            let plan = port::Port::<Queries>::plan(
+                Queries::try_config().expect("database config"),
+                Queries::try_reply().expect("PostgreSQL capacity"),
             );
-            assert!(
-                matches!(reports.events(), Ok(events) if events.is_empty()),
-                "unexpected reclamation"
-            );
+            topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+                let client = runtime.root_client();
+                assert!(matches!(
+                    runtime.block_on(client.status().wait_ready()),
+                    Ok(Ok(()))
+                ));
+                assert!(matches!(
+                    runtime.block_on(
+                        fibers::TEST.poll_once(client.command("SELECT 1"))
+                    ),
+                    Ok(None)
+                ));
+                fibers::TEST
+                    .try_pause(&mut runtime, Duration::from_millis(20))
+                    .expect("process detached partial response");
+                assert!(matches!(
+                    runtime.block_on(client.command("SELECT 2")),
+                    Ok(Ok(()))
+                ));
+            });
             assert!(
                 matches!(server.finish(), Ok(Ok(()))),
                 "PostgreSQL peer completion"
@@ -514,90 +423,68 @@ fn pending_ready_settles() {
                 })
             })
             .expect("group configuration");
-            let prepared = topology::try_new::<_, Env>(
-                port::Port::<Database>::plan(Queries::try_config().expect("credentials"), config),
-                address,
-                Duration::from_millis(1),
-                Duration::from_secs(1),
-            )
-            .expect("prepared topology");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared
-                .with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let client = runtime.root_client();
-                                    runtime
-                                        .block_on(client.status().wait_ready())
-                                        .expect("ready driver")
-                                        .ok()
-                                        .expect("ready PostgreSQL");
-                                    let mut tx = Some(
-                                        runtime
-                                            .block_on(client.transaction().begin())
-                                            .expect("begin driver")
-                                            .ok()
-                                            .expect("transaction"),
-                                    );
-                                    let tx_ptr: *mut Option<_> = &mut tx;
-                                    let query = Box::pin(Task::new(
-                                        tx.as_ref()
-                                            .expect("transaction")
-                                            .query()
-                                            .run_group::<TextQuery, COMMANDS>([(); COMMANDS]),
-                                    ));
-                                    runtime
-                                        .drive_for(
-                                            Duration::from_secs(1),
-                                            postgres::Quarantine::new(query, move || {
-                                                // SAFETY: the root destroys the only future borrowing this
-                                                // guard before this callback. The outer Option stays live
-                                                // and is not accessed while the root owns that future.
-                                                drop(unsafe { (*tx_ptr).take() });
-                                            }),
-                                        )
-                                        .expect("quarantine after yielded ReadyForQuery drain")
-                                        .expect("one quarantine continuation");
-                                    assert!(tx.is_none());
-                                    let next = runtime.drive_for(
-                                        Duration::from_secs(1),
-                                        done::Once::new(client.status().wait_ready()),
-                                    );
-                                    if !matches!(&next, Ok(Ok(()))) {
-                                        let peer = server
-                                            .take()
-                                            .expect("settlement peer")
-                                            .finish()
-                                            .expect("settlement peer lifecycle");
-                                        let cause = next.as_ref().map(|ready| {
-                                            ready.as_ref().err().map(reply::Error::kind)
-                                        });
-                                        assert!(
-                                            matches!(&next, Ok(Ok(()))),
-                                            "replacement: {cause:?}; settlement peer: {peer:?}"
-                                        );
-                                    }
-                                    next.expect("replacement driver")
-                                        .ok()
-                                        .expect("replacement connection");
-                                    runtime
-                                        .block_on(client.command("SELECT 1"))
-                                        .expect("replacement command driver")
-                                        .ok()
-                                        .expect("replacement command");
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), common::recover),
-                    |outcome| outcome.map_err(common::entry_error).expect("application entry"),
-                )
-                .expect("installation")
-                .expect("session");
-            assert!(reports.events().expect("native reclamation").is_empty());
+            let plan = port::Port::<Database>::plan(Queries::try_config().expect("credentials"), config);
+            topology::run(plan, address, (1, 1_000), Throughput, |mut runtime| {
+                let client = runtime.root_client();
+                runtime
+                    .block_on(client.status().wait_ready())
+                    .expect("ready driver")
+                    .ok()
+                    .expect("ready PostgreSQL");
+                let mut tx = Some(
+                    runtime
+                        .block_on(client.transaction().begin())
+                        .expect("begin driver")
+                        .ok()
+                        .expect("transaction"),
+                );
+                let tx_ptr: *mut Option<_> = &mut tx;
+                let query = Box::pin(Task::new(
+                    tx.as_ref()
+                        .expect("transaction")
+                        .query()
+                        .run_group::<TextQuery, COMMANDS>([(); COMMANDS]),
+                ));
+                runtime
+                    .drive_for(
+                        Duration::from_secs(1),
+                        postgres::Quarantine::new(query, move || {
+                            // SAFETY: the root destroys the only future borrowing this
+                            // guard before this callback. The outer Option stays live
+                            // and is not accessed while the root owns that future.
+                            drop(unsafe { (*tx_ptr).take() });
+                        }),
+                    )
+                    .expect("quarantine after yielded ReadyForQuery drain")
+                    .expect("one quarantine continuation");
+                assert!(tx.is_none());
+                let next = runtime.drive_for(
+                    Duration::from_secs(1),
+                    done::Once::new(client.status().wait_ready()),
+                );
+                if !matches!(&next, Ok(Ok(()))) {
+                    let peer = server
+                        .take()
+                        .expect("settlement peer")
+                        .finish()
+                        .expect("settlement peer lifecycle");
+                    let cause = next.as_ref().map(|ready| {
+                        ready.as_ref().err().map(reply::Error::kind)
+                    });
+                    assert!(
+                        matches!(&next, Ok(Ok(()))),
+                        "replacement: {cause:?}; settlement peer: {peer:?}"
+                    );
+                }
+                next.expect("replacement driver")
+                    .ok()
+                    .expect("replacement connection");
+                runtime
+                    .block_on(client.command("SELECT 1"))
+                    .expect("replacement command driver")
+                    .ok()
+                    .expect("replacement command");
+            });
             server
                 .take()
                 .expect("settlement peer")
@@ -616,87 +503,63 @@ fn late_error_keeps_batch() {
         |server| {
             let addr = server.addr();
             let config = Queries::try_cancel().expect("pipeline config");
-            let ((), events) = {
-                let prepared = topology::try_new::<_, Env>(
-                    port::Port::<Queries>::plan(
-                        Queries::try_config().expect("database config"),
-                        config,
-                    ),
-                    addr,
-                    Duration::from_millis(1),
-                    Duration::from_millis(1_024),
-                )
-                .expect("topology fixture completed");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                let scoped = prepared.with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let client: api::Client<
-                                        api::Context<'_, '_, '_, '_, '_, '_, '_, _, _>,
-                                    > = runtime.root_client();
-                                    assert!(
-                                        matches!(
-                                            runtime.block_on(client.status().wait_ready()),
-                                            Ok(Ok(()))
-                                        ),
-                                        "PostgreSQL connection ready"
-                                    );
-                                    let mut first = pin!(Task::new(client.command("SELECT 1")));
-                                    assert!(
-                                        matches!(
-                                            runtime
-                                                .block_on(fibers::TEST.poll_once(first.as_mut())),
-                                            Ok(None)
-                                        ),
-                                        "first command admitted"
-                                    );
-                                    let marker = runtime
-                                        .block_on(client.next())
-                                        .expect("notification runtime")
-                                        .ok()
-                                        .expect("CommandComplete marker");
-                                    assert_eq!(marker.channel(), "settlement");
-                                    assert!(
-                                        matches!(
-                                            runtime
-                                                .block_on(fibers::TEST.poll_once(first.as_mut())),
-                                            Ok(None)
-                                        ),
-                                        "CommandComplete remains pending before ReadyForQuery"
-                                    );
-                                    let (first, second) = runtime
-                                        .block_on(Join::new(
-                                            first.as_mut(),
-                                            client.command("SELECT 2"),
-                                        ))
-                                        .expect("pipeline runtime");
-                                    assert!(
-                                        matches!(
-                                            first,
-                                            Err(reply::Error::Server(error))
-                                                if error.fields().code().as_str() == "23505"
-                                                    && error.fields().message() == "late sync"
-                                        ),
-                                        "the first command retains its late Sync error"
-                                    );
-                                    assert!(matches!(second, Ok(())), "second batch completes");
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), common::recover),
-                    |outcome| outcome.map_err(common::entry_error).expect("application entry"),
+            {
+                let plan = port::Port::<Queries>::plan(
+                    Queries::try_config().expect("database config"),
+                    config,
                 );
-                let result = scoped.expect("application installation completed");
-                (result.expect("application session completed"), reports)
-            };
-            assert!(
-                events.events().expect("native reclamation").is_empty(),
-                "unexpected events PostgreSQL operations: {events:?}"
-            );
+                topology::run(plan, addr, (1, 1_024), Throughput, |mut runtime| {
+                    let client: api::Client<
+                        api::Context<'_, '_, '_, '_, '_, '_, '_, _, _>,
+                    > = runtime.root_client();
+                    assert!(
+                        matches!(
+                            runtime.block_on(client.status().wait_ready()),
+                            Ok(Ok(()))
+                        ),
+                        "PostgreSQL connection ready"
+                    );
+                    let mut first = pin!(Task::new(client.command("SELECT 1")));
+                    assert!(
+                        matches!(
+                            runtime
+                                .block_on(fibers::TEST.poll_once(first.as_mut())),
+                            Ok(None)
+                        ),
+                        "first command admitted"
+                    );
+                    let marker = runtime
+                        .block_on(client.next())
+                        .expect("notification runtime")
+                        .ok()
+                        .expect("CommandComplete marker");
+                    assert_eq!(marker.channel(), "settlement");
+                    assert!(
+                        matches!(
+                            runtime
+                                .block_on(fibers::TEST.poll_once(first.as_mut())),
+                            Ok(None)
+                        ),
+                        "CommandComplete remains pending before ReadyForQuery"
+                    );
+                    let (first, second) = runtime
+                        .block_on(Join::new(
+                            first.as_mut(),
+                            client.command("SELECT 2"),
+                        ))
+                        .expect("pipeline runtime");
+                    assert!(
+                        matches!(
+                            first,
+                            Err(reply::Error::Server(error))
+                                if error.fields().code().as_str() == "23505"
+                                    && error.fields().message() == "late sync"
+                        ),
+                        "the first command retains its late Sync error"
+                    );
+                    assert!(matches!(second, Ok(())), "second batch completes");
+                });
+            }
             server
                 .finish()
                 .expect("server")
@@ -737,92 +600,68 @@ fn response_reconnects() {
                     config::Config::with_window(capacity, Positive::from_millis::<50>())
                 };
                 let config = config.expect("valid pg configuration");
-                let ((), events) = {
-                    let prepared = topology::try_new::<_, Env>(
-                        port::Port::<Queries>::plan(
-                            Queries::try_config().expect("database config"),
-                            config,
-                        ),
-                        addr,
-                        Duration::from_millis(1),
-                        Duration::from_millis(1_024),
-                    )
-                    .expect("topology fixture completed");
-                    let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                    let mut report = Completion::new();
-                    let scoped = prepared.with_local(
-                        |worker| {
-                            worker.lend(|node, stage| {
-                                node.install(stage, |host, stage| {
-                                    stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                        let client: api::Client<api::Context<'_, '_, '_, '_, '_, '_, '_, _, _>> =
-                                            runtime.root_client();
-                                        assert!(
-                                            matches!(runtime.block_on(client.status().wait_ready()), Ok(Ok(()))),
-                                            "PostgreSQL connection ready"
-                                        );
-                                        let mut first = pin!(held.then(|| {
-                                            Task::new(client.command("SELECT 1"))
-                                        }));
-                                        if let Some(first) = first.as_mut().as_pin_mut() {
-                                            assert!(
-                                                matches!(runtime.block_on(fibers::TEST.poll_once(first)), Ok(None)),
-                                                "first command admitted"
-                                            );
-                                        }
-                                        if idle || held {
-                                            let notice = fibers::TEST
-                                                .try_run(&mut runtime, client.next())
-                                                .expect("replacement notification driver")
-                                                .ok()
-                                                .expect("replacement notification");
-                                            assert_eq!(
-                                                (notice.pid(), notice.channel(), notice.payload()),
-                                                (2, "replacement", "ready")
-                                            );
-                                        } else {
-                                            assert!(
-                                                matches!(
-                                                    runtime.block_on(client.command("SELECT 1")),
-                                                    Ok(Err(reply::Error::Driver(cartel_pg::Error::RequestTimeout(timeout))))
-                                                        if timeout.phase() == cartel_pg::RequestPhase::Response
-                                                ),
-                                                "response must time out"
-                                            );
-                                            assert!(
-                                                matches!(runtime.block_on(client.status().wait_ready()), Ok(Ok(()))),
-                                                "replacement server must reconnect"
-                                            );
-                                        }
-                                        assert!(
-                                            matches!(runtime.block_on(client.command("SELECT 1")), Ok(Ok(()))),
-                                            "replacement command"
-                                        );
-                                        if let Some(first) = first.as_mut().as_pin_mut() {
-                                            assert!(
-                                                matches!(
-                                                    fibers::TEST.try_run(&mut runtime, first),
-                                                    Ok(Err(reply::Error::Server(error)))
-                                                        if error.fields().code().as_str() == "23505"
-                                                            && error.fields().message() == "held response"
-                                                ),
-                                                "previous generation retains its unconsumed server error"
-                                            );
-                                        }
-                                    })
-                                })
-                            })
-                        },
-                        recovery::Policy::new(|event| reports.push(event), common::recover),
-                        |outcome| outcome.map_err(common::entry_error).expect("application entry"),
+                {
+                    let plan = port::Port::<Queries>::plan(
+                        Queries::try_config().expect("database config"),
+                        config,
                     );
-                    let result = scoped.expect("application installation completed");
-                    (result.expect("application session completed"), reports)
-                };
-                assert!(
-                    events.events().expect("native reclamation").is_empty(),
-                    "unexpected events PostgreSQL operations: {events:?}"
-                );
+                    topology::run(plan, addr, (1, 1_024), Throughput, |mut runtime| {
+                        let client: api::Client<api::Context<'_, '_, '_, '_, '_, '_, '_, _, _>> =
+                            runtime.root_client();
+                        assert!(
+                            matches!(runtime.block_on(client.status().wait_ready()), Ok(Ok(()))),
+                            "PostgreSQL connection ready"
+                        );
+                        let mut first = pin!(held.then(|| {
+                            Task::new(client.command("SELECT 1"))
+                        }));
+                        if let Some(first) = first.as_mut().as_pin_mut() {
+                            assert!(
+                                matches!(runtime.block_on(fibers::TEST.poll_once(first)), Ok(None)),
+                                "first command admitted"
+                            );
+                        }
+                        if idle || held {
+                            let notice = fibers::TEST
+                                .try_run(&mut runtime, client.next())
+                                .expect("replacement notification driver")
+                                .ok()
+                                .expect("replacement notification");
+                            assert_eq!(
+                                (notice.pid(), notice.channel(), notice.payload()),
+                                (2, "replacement", "ready")
+                            );
+                        } else {
+                            assert!(
+                                matches!(
+                                    runtime.block_on(client.command("SELECT 1")),
+                                    Ok(Err(reply::Error::Driver(cartel_pg::Error::RequestTimeout(timeout))))
+                                        if timeout.phase() == cartel_pg::RequestPhase::Response
+                                ),
+                                "response must time out"
+                            );
+                            assert!(
+                                matches!(runtime.block_on(client.status().wait_ready()), Ok(Ok(()))),
+                                "replacement server must reconnect"
+                            );
+                        }
+                        assert!(
+                            matches!(runtime.block_on(client.command("SELECT 1")), Ok(Ok(()))),
+                            "replacement command"
+                        );
+                        if let Some(first) = first.as_mut().as_pin_mut() {
+                            assert!(
+                                matches!(
+                                    fibers::TEST.try_run(&mut runtime, first),
+                                    Ok(Err(reply::Error::Server(error)))
+                                        if error.fields().code().as_str() == "23505"
+                                            && error.fields().message() == "held response"
+                                ),
+                                "previous generation retains its unconsumed server error"
+                            );
+                        }
+                    });
+                }
                 server.finish().expect("server").expect("recovery peer");
             },
         )

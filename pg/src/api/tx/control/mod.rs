@@ -1,3 +1,4 @@
+use super::Guard;
 use crate::port;
 use crate::port::Instance;
 use crate::port::replies;
@@ -12,7 +13,7 @@ use api::{
 use dope::core::driver::{route::KeyTag, schedule::ready};
 use dope::manifold::client::conn;
 use dope_fiber::{abi, context};
-use port::pool::{access, backend};
+use port::pool::backend;
 use std::task;
 
 pub mod error;
@@ -113,22 +114,8 @@ impl<const ID: u8> Drop for Cancel<'_, '_, ID> {
     }
 }
 
-/// A savepoint lease whose operation views cannot outlive the savepoint.
-/// Call [`Self::release`] or [`Self::rollback`] to preserve the transaction.
-/// Dropping an unfinished lease quarantines its connection for full rollback.
-///
-#[must_use = "release or roll back the savepoint to preserve its transaction"]
-pub struct Savepoint<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0>
-where
-    I: Instance<Queries: 'd> + 'd,
-{
-    pub(super) lease:
-        Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, access::Transaction<'d, ID>, Recover, ID>,
-    pub(super) name: crate::Identifier,
-}
-
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
-    Savepoint<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+    Guard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, crate::Identifier>
 {
     fn dispatch(
         &self,
@@ -143,45 +130,16 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + '
     }
 }
 
-impl<B: ?Sized, I: Instance, const ID: u8> sealed::Sealed
-    for Savepoint<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-}
-
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
-    traits::Connection<'d, ID> for Savepoint<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
-{
-    type Schema = I::Queries;
-    type Payload = replies::Payload<'b, 'c, 'd>;
-    type Diagnostics = Ledger<'r, 's>;
-    type CopyChunk = Chunk<'b, 'c, 'd>;
-    type Query<'save>
-        = ops::Query<api::Context<'save, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, api::Target<'d, ID>>
-    where
-        Self: 'save;
-
-    fn query(&self) -> Self::Query<'_> {
-        ops::Query::from_parts(
-            self.lease.reborrow(),
-            api::Target::from_tx(self.lease.target()),
-        )
-    }
-}
-
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
-    traits::Savepoint<'d, ID> for Savepoint<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+    traits::Savepoint<'d, ID> for Guard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, crate::Identifier>
 {
     type Savepoint<'parent>
-        = Savepoint<'parent, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
+        = Guard<'parent, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID, crate::Identifier>
     where
         Self: 'parent;
 
     fn name(&self) -> &str {
         &self.name
-    }
-
-    fn cancel(self) {
-        self.lease.quarantine();
     }
 
     fn release(self) -> impl abi::Fiber<'d, Output = Result<(), reply::Error<'d, ID>>> {
@@ -214,10 +172,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + '
             .stateful(request::Request::savepoint(&name));
         dope_fiber::fiber!('d => async move {
             let lease = opening.await?.retarget(target)?;
-            Ok(Savepoint {
-                lease,
-                name,
-            })
+            Ok(Guard { lease, name })
         })
     }
 }

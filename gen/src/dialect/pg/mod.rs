@@ -65,16 +65,13 @@ impl PgBackend {
         let caller = names.fresh("__CartelClient");
         let route_id = names.fresh("__CARTEL_ROUTE_");
         let driver = names.lifetime("__cartel_driver_");
-        let loan = names.lifetime("__cartel_pool_");
         let input = names.lifetime("__cartel_input_");
         let executor = quote::quote! {
             <#caller as ::cartel_pg::api::traits::IntoQuery<#driver, #route_id>>::Query
         };
         let query_trait = quote::quote! { ::cartel_pg::api::traits::Query<#driver, #route_id> };
         let client = names.fresh("__cartel_client_");
-        let pool = names.fresh("__cartel_pool_");
         let args = names.fresh("__cartel_arguments_");
-        let argument = names.fresh("__cartel_argument_");
 
         if caps.len() > i16::MAX as usize {
             return Err(syn::Error::new(
@@ -130,39 +127,30 @@ impl PgBackend {
             emit::Kind::One(ty) => (
                 Some(ty),
                 quote::quote! { ::cartel_pg::api::results::Row<<#executor as #query_trait>::Payload, #query> },
-                quote::format_ident!("run_one"),
+                quote::quote! { run_one::<#query> },
             ),
-            emit::Kind::First(ty) => (
-                Some(ty),
-                quote::quote! { ::core::option::Option<::cartel_pg::api::results::Row<<#executor as #query_trait>::Payload, #query>> },
-                quote::format_ident!("run_first"),
-            ),
-            emit::Kind::Aggregate(ty) => (
-                Some(ty),
-                quote::quote! { ::core::option::Option<::cartel_pg::api::results::Row<<#executor as #query_trait>::Payload, #query, true>> },
-                quote::format_ident!("run_scalar"),
-            ),
+            emit::Kind::First(ty) | emit::Kind::Aggregate(ty) => {
+                let scalar = matches!(plan.dispatch, emit::Kind::Aggregate(_));
+                (
+                    Some(ty),
+                    quote::quote! { ::core::option::Option<::cartel_pg::api::results::Row<<#executor as #query_trait>::Payload, #query, #scalar>> },
+                    quote::quote! { run_first::<#query, #scalar> },
+                )
+            }
             emit::Kind::All(ty) => (
                 Some(ty),
                 quote::quote! { ::cartel_pg::api::results::Collection<<#executor as #query_trait>::Batch, #query> },
-                quote::format_ident!("run_all"),
+                quote::quote! { run_all::<#query> },
             ),
             emit::Kind::Stream(ty) => (
                 Some(ty),
                 quote::quote! { () },
-                quote::format_ident!("run_stream"),
+                quote::quote! { run_stream::<#query> },
             ),
             emit::Kind::NoRows(required) => (
                 None,
                 quote::quote! { () },
-                quote::format_ident!(
-                    "{}",
-                    if *required {
-                        "run_required"
-                    } else {
-                        "run_no_rows"
-                    }
-                ),
+                quote::quote! { run_command::<#query, #required> },
             ),
         };
         let response = quote::quote! {
@@ -176,7 +164,7 @@ impl PgBackend {
             }
         };
         let call = quote::quote! {
-            ::cartel_pg::api::traits::Query::#run::<#query>(
+            ::cartel_pg::api::traits::Query::#run(
                 ::cartel_pg::api::traits::IntoQuery::into_query(#client), #values
             )
         };
@@ -227,72 +215,6 @@ impl PgBackend {
                 };
             }
         };
-        let batch = if !matches!(plan.dispatch, emit::Kind::Stream(_)) {
-            let count = names.fresh("__CARTEL_GROUP_LEN_");
-            let params = quote::quote! { [<#query as ::cartel_pg::schema::TypedQuery>::Params<'_>; #count] };
-            let grouped = if matches!(plan.dispatch, emit::Kind::One(_)) {
-                let method = group::Group::batch_method(&method, "group");
-                quote::quote! {
-                    #vis fn #method<#driver, #caller, const #route_id: u8, const #count: usize>(
-                        #client: #caller,
-                        #args: #params,
-                    ) -> impl ::cartel_pg::Fiber<
-                        #driver,
-                        Output = ::core::result::Result<
-                            [#value; #count],
-                            ::cartel_pg::api::results::GroupFailure<
-                                #driver,
-                                #value,
-                                <#executor as #query_trait>::Diagnostics,
-                                #count,
-                                #route_id,
-                            >,
-                        >,
-                    > + use<#driver, #caller, #route_id, #count>
-                    where
-                        #caller: ::cartel_pg::api::traits::IntoQuery<#driver, #route_id>,
-                        #executor: #query_trait,
-                    <#executor as #query_trait>::Schema: ::cartel_pg::schema::HasGroup<Self>,
-                    {
-                        ::cartel_pg::api::traits::Query::run_group::<#query, #count>(
-                            ::cartel_pg::api::traits::IntoQuery::into_query(#client),
-                            #args,
-                        )
-                    }
-                }
-            } else {
-                quote::quote! {}
-            };
-            let method = group::Group::batch_method(&method, "each");
-            quote::quote! {
-                #grouped
-
-                #vis fn #method<#loan, #driver, #caller, const #route_id: u8, const #count: usize>(
-                    #client: #caller,
-                    #pool: &#loan mut ::cartel_pg::dope_fiber::task::batch::Pool<#driver, #count>,
-                    #args: #params,
-                ) -> ::cartel_pg::dope_fiber::task::batch::Join<
-                    #loan,
-                    #driver,
-                    impl ::cartel_pg::Fiber<#driver, Output = #response>
-                        + use<#driver, #caller, #route_id, #count>,
-                    #count,
-                >
-                where
-                    #caller: ::cartel_pg::api::traits::IntoQuery<#driver, #route_id> + ::core::marker::Copy,
-                    #executor: #query_trait,
-                    <#executor as #query_trait>::Schema: ::cartel_pg::schema::HasGroup<Self>,
-                {
-                    ::cartel_pg::dope_fiber::task::batch::Join::from_map(
-                        #pool,
-                        #args,
-                        |#argument| ::cartel_pg::api::traits::Query::#run::<#query>(::cartel_pg::api::traits::IntoQuery::into_query(#client), #argument),
-                    )
-                }
-            }
-        } else {
-            quote::quote! {}
-        };
         param::Param::<false>::apply(params.iter_mut().map(|(_, ty)| ty), &input);
         let bound = params.iter().map(|(_, ty)| ty);
         let params = input_shape(quote::quote! { #(#bound),* });
@@ -327,8 +249,6 @@ impl PgBackend {
             }
 
             impl #group {
-                #batch
-
                 #(#attrs)*
                 #vis fn #method<#driver, #caller, const #route_id: u8>(
                     #client: #caller,

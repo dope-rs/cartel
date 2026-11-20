@@ -80,7 +80,7 @@ fn required_update() {
                                 runtime.block_on(client.next()).expect("marker driver").unwrap_or_else(|error| panic!("{:?}", error.kind()));
                             }
                             assert!(runtime.block_on(Item::rename(client, 2, "after cancel")).expect("reused driver").is_ok());
-                            assert!(runtime.block_on(client.run_no_rows::<ItemRename>((1, "optional"))).expect("ordinary driver").is_ok());
+                            assert!(runtime.block_on(client.run_command::<ItemRename, false>((1, "optional"))).expect("ordinary driver").is_ok());
                         } else {
                             let result = runtime.block_on(Item::rename(client, 1, "bad")).expect("failure driver");
                             match case {

@@ -1,7 +1,6 @@
 use crate::backend;
 use crate::dialect::pg;
 use std::collections::BTreeSet;
-use std::iter;
 use syn::parse;
 use syn::punctuated;
 
@@ -16,7 +15,6 @@ impl Group {
         owner: &syn::Ident,
     ) -> syn::Result<Vec<(syn::Ident, proc_macro2::TokenStream)>> {
         let mut names = BTreeSet::new();
-        let mut methods = BTreeSet::new();
         let mut queries = Vec::with_capacity(items.len());
         for item in items {
             let syn::ImplItem::Fn(fun) = item else {
@@ -44,22 +42,6 @@ impl Group {
                 fun.block,
                 &fun.sig.output,
             )?;
-            let each = (!matches!(code.plan.dispatch, crate::emit::Kind::Stream(_)))
-                .then(|| Group::batch_method(&name, "each"));
-            let grouped = matches!(code.plan.dispatch, crate::emit::Kind::One(_))
-                .then(|| Group::batch_method(&name, "group"));
-            for method in iter::once(&name).chain(each.iter()).chain(grouped.iter()) {
-                let text = method.to_string();
-                let text = text.trim_start_matches("r#");
-                if !methods.insert(text.to_owned()) {
-                    return Err(syn::Error::new(
-                        name.span(),
-                        format!(
-                            "query method name `{text}` collides with another query or generated batch method — rename it"
-                        ),
-                    ));
-                }
-            }
             let marker = Group::query_name(owner, &name);
             if !names.insert(marker.to_string()) {
                 return Err(syn::Error::new(
@@ -78,12 +60,6 @@ impl Group {
             queries.push((marker, pg::PgBackend::emit_query(q, &fun.attrs)?));
         }
         Ok(queries)
-    }
-
-    pub(super) fn batch_method(method: &syn::Ident, suffix: &str) -> syn::Ident {
-        let name = method.to_string();
-        let name = name.trim_start_matches("r#");
-        syn::Ident::new(&format!("{name}_{suffix}"), method.span())
     }
 
     fn query_name(owner: &syn::Ident, method: &syn::Ident) -> syn::Ident {

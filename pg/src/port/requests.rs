@@ -196,36 +196,6 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: port::Instance, const ID: u8>
         }
     }
 
-    pub(crate) fn try_reply<'a, J, R>(
-        &self,
-        input: J,
-        reply: &mut impl attach::Attach<
-            'life,
-            'b,
-            'c,
-            'd,
-            replies::Row<'d>,
-            replies::ReplyFailure<'d>,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
-        >,
-        context: ReplyContext<'_, 'a, 'd, ID, I::Policy>,
-        build: impl FnOnce(J, conn::Id<'d, KeyTag<ID>>) -> (Complete<'d>, R),
-    ) -> Result<R, (Rejection, Source<'a, 'd, ID, I::Policy>, J)> {
-        self.try_with(
-            context,
-            input,
-            |token, lane, batch, boundary, input| match reply.try_ordered(
-                token,
-                lane,
-                replies::Tag::new(batch, boundary),
-            ) {
-                Ok(depth) => Ok((depth, input)),
-                Err(cause) => Err((cause, input)),
-            },
-            build,
-        )
-    }
-
     pub(crate) fn try_enqueue(
         &self,
         token: conn::Id<'d, KeyTag<ID>>,

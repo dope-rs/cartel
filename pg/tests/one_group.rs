@@ -48,35 +48,21 @@ fn deadline_keeps_results() {
             config::Config::with_window(config.capacities(), Positive::from_millis::<50>())
                 .and_then(|timed| timed.with_groups(config.groups().expect("group limits")))
                 .expect("bounded group deadline");
-        let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
-            port::Port::<Database>::plan(Queries::try_config().expect("credentials"), config),
-            server.addr(),
-            Duration::from_millis(1),
-            Duration::from_secs(1),
-        )
-        .expect("group topology");
-        let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-        let mut report = Completion::new();
-        prepared.with_local( |worker| worker.lend(|node, stage| {
-            node.install(stage, |host, stage| {
-                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                    let client = runtime.root_client();
-                    runtime.block_on(client.status().wait_ready()).expect("ready driver").ok().expect("ready PostgreSQL");
-                    let mut group = pin!(Task::new(client.run_group::<TextQuery, 3>([(); 3])));
-                    assert!(runtime.block_on(fibers::TEST.poll_once(group.as_mut())).expect("admission driver").is_none());
-                    let marker = runtime.block_on(client.next()).expect("notification driver").ok().expect("Sync marker");
-                    assert_eq!(marker.payload(), "settled");
-                    fibers::TEST.try_pause(&mut runtime, Duration::from_millis(50)).expect("group deadline driver");
-                    let failure = runtime.block_on(group.as_mut()).expect("group driver").err().expect("expired group");
-                    assert_eq!(failure.sync(), Sync::Complete);
-                    assert!(matches!(failure.outcomes(), [Outcome::Completed(row), Outcome::Server, Outcome::Skipped] if row.decode().expect("completed row").lease == 3));
-                    assert_eq!(failure.diagnostic(1).expect("command error").code().as_str(), "23505");
-                    assert!(matches!(failure.cause(), Some(reply::Error::Driver(cartel_pg::Error::RequestTimeout(elapsed))) if elapsed.phase() == cartel_pg::RequestPhase::Response));
-                })
-            })
-        }), recovery::Policy::new(|event| reports.push(event), common::recover),
-|outcome| outcome.map_err(common::entry_error).expect("application entry")).expect("group installation").expect("group session");
-        assert!(reports.events().expect("native reclamation").is_empty());
+        let plan = port::Port::<Database>::plan(Queries::try_config().expect("credentials"), config);
+        topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+            let client = runtime.root_client();
+            runtime.block_on(client.status().wait_ready()).expect("ready driver").ok().expect("ready PostgreSQL");
+            let mut group = pin!(Task::new(client.run_group::<TextQuery, 3>([(); 3])));
+            assert!(runtime.block_on(fibers::TEST.poll_once(group.as_mut())).expect("admission driver").is_none());
+            let marker = runtime.block_on(client.next()).expect("notification driver").ok().expect("Sync marker");
+            assert_eq!(marker.payload(), "settled");
+            fibers::TEST.try_pause(&mut runtime, Duration::from_millis(50)).expect("group deadline driver");
+            let failure = runtime.block_on(group.as_mut()).expect("group driver").err().expect("expired group");
+            assert_eq!(failure.sync(), Sync::Complete);
+            assert!(matches!(failure.outcomes(), [Outcome::Completed(row), Outcome::Server, Outcome::Skipped] if row.decode().expect("completed row").lease == 3));
+            assert_eq!(failure.diagnostic(1).expect("command error").code().as_str(), "23505");
+            assert!(matches!(failure.cause(), Some(reply::Error::Driver(cartel_pg::Error::RequestTimeout(elapsed))) if elapsed.phase() == cartel_pg::RequestPhase::Response));
+        });
         server
             .finish()
             .expect("group peer execution")
@@ -228,47 +214,33 @@ fn rows_outlive_group() {
 #[test]
 fn errors_survive_finish() {
     TcpScript::with(group::transaction, |server| {
-        let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
-            port::Port::<Database>::plan(
-                Queries::try_config().expect("credentials"),
-                Queries::try_groups(
-                    NonZero::new(3).expect("records"),
-                    NonZero::new(256).expect("bytes"),
-                )
-                .expect("bounded group config"),
-            ),
-            server.addr(),
-            Duration::from_millis(1),
-            Duration::from_secs(1),
-        )
-        .expect("group topology");
-        let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-        let mut report = Completion::new();
-        prepared.with_local( |worker| worker.lend(|node, stage| {
-            node.install(stage, |host, stage| {
-                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                    let client = runtime.root_client();
-                    runtime.block_on(client.status().wait_ready()).expect("ready driver").ok().expect("ready PostgreSQL");
-                    let tx = runtime.block_on(client.transaction().begin()).expect("begin driver").ok().expect("transaction");
-                    let outcome = runtime.block_on(tx.query().run_group::<TextQuery, 3>([(); 3])).expect("group driver");
-                    let result = runtime.block_on(tx.finish(outcome)).expect("finish driver");
-                    let error = result.err().expect("group failure");
-                    let failure = match error {
-                        FinishError::Operation(failure) => Ok(failure),
-                        FinishError::Commit(error) | FinishError::Rollback { rollback: error, .. } => Err(error),
-                    };
-                    let failure = failure
-                        .map_err(|error| format!("{:?}", Reply::from(&error)))
-                        .expect("rolled back group failure");
-                    assert_eq!(failure.sync(), Sync::Complete);
-                    assert!(matches!(failure.outcomes(), [Outcome::Completed(row), Outcome::Server, Outcome::Skipped] if row.decode().expect("retained row").name == "retained"));
-                    let details: Vec<_> = failure.diagnostics().iter().map(|entry| (entry.position, entry.fields.code().as_str(), entry.fields.message())).collect();
-                    assert_eq!(details, [(Position::Command(1), "23505", "duplicate"), (Position::Recovery, "XX000", "recovery")]);
-                })
-            })
-        }), recovery::Policy::new(|event| reports.push(event), common::recover),
-|outcome| outcome.map_err(common::entry_error).expect("application entry")).expect("group installation").expect("group session");
-        assert!(reports.events().expect("native reclamation").is_empty());
+        let plan = port::Port::<Database>::plan(
+            Queries::try_config().expect("credentials"),
+            Queries::try_groups(
+                NonZero::new(3).expect("records"),
+                NonZero::new(256).expect("bytes"),
+            )
+            .expect("bounded group config"),
+        );
+        topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+            let client = runtime.root_client();
+            runtime.block_on(client.status().wait_ready()).expect("ready driver").ok().expect("ready PostgreSQL");
+            let tx = runtime.block_on(client.transaction().begin()).expect("begin driver").ok().expect("transaction");
+            let outcome = runtime.block_on(tx.query().run_group::<TextQuery, 3>([(); 3])).expect("group driver");
+            let result = runtime.block_on(tx.finish(outcome)).expect("finish driver");
+            let error = result.err().expect("group failure");
+            let failure = match error {
+                FinishError::Operation(failure) => Ok(failure),
+                FinishError::Commit(error) | FinishError::Rollback { rollback: error, .. } => Err(error),
+            };
+            let failure = failure
+                .map_err(|error| format!("{:?}", Reply::from(&error)))
+                .expect("rolled back group failure");
+            assert_eq!(failure.sync(), Sync::Complete);
+            assert!(matches!(failure.outcomes(), [Outcome::Completed(row), Outcome::Server, Outcome::Skipped] if row.decode().expect("retained row").name == "retained"));
+            let details: Vec<_> = failure.diagnostics().iter().map(|entry| (entry.position, entry.fields.code().as_str(), entry.fields.message())).collect();
+            assert_eq!(details, [(Position::Command(1), "23505", "duplicate"), (Position::Recovery, "XX000", "recovery")]);
+        });
         server
             .finish()
             .expect("group peer execution")
@@ -280,37 +252,23 @@ fn errors_survive_finish() {
 #[test]
 fn sync_keeps_commands() {
     TcpScript::with(group::late_error, |server| {
-        let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
-            port::Port::<Database>::plan(
-                Queries::try_config().expect("credentials"),
-                Queries::try_groups(
-                    NonZero::new(3).expect("records"),
-                    NonZero::new(256).expect("bytes"),
-                )
-                .expect("bounded group config"),
-            ),
-            server.addr(),
-            Duration::from_millis(1),
-            Duration::from_secs(1),
-        )
-        .expect("group topology");
-        let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-        let mut report = Completion::new();
-        prepared.with_local( |worker| worker.lend(|node, stage| {
-            node.install(stage, |host, stage| {
-                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                    let client = runtime.root_client();
-                    runtime.block_on(client.status().wait_ready()).expect("ready driver").ok().expect("ready PostgreSQL");
-                    let failure = runtime.block_on(client.run_group::<TextQuery, 2>([(); 2])).expect("group driver").err().expect("late Sync failure");
-                    assert_eq!(failure.sync(), Sync::Complete);
-                    assert!(matches!(failure.outcomes(), [Outcome::Completed(first), Outcome::Completed(second)] if first.decode().expect("first row").lease == 3 && second.decode().expect("second row").lease == 7));
-                    let detail = failure.diagnostics().iter().next().expect("Sync diagnostic");
-                    assert_eq!((detail.position, detail.fields.code().as_str()), (Position::Sync, "23505"));
-                })
-            })
-        }), recovery::Policy::new(|event| reports.push(event), common::recover),
-|outcome| outcome.map_err(common::entry_error).expect("application entry")).expect("group installation").expect("group session");
-        assert!(reports.events().expect("native reclamation").is_empty());
+        let plan = port::Port::<Database>::plan(
+            Queries::try_config().expect("credentials"),
+            Queries::try_groups(
+                NonZero::new(3).expect("records"),
+                NonZero::new(256).expect("bytes"),
+            )
+            .expect("bounded group config"),
+        );
+        topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+            let client = runtime.root_client();
+            runtime.block_on(client.status().wait_ready()).expect("ready driver").ok().expect("ready PostgreSQL");
+            let failure = runtime.block_on(client.run_group::<TextQuery, 2>([(); 2])).expect("group driver").err().expect("late Sync failure");
+            assert_eq!(failure.sync(), Sync::Complete);
+            assert!(matches!(failure.outcomes(), [Outcome::Completed(first), Outcome::Completed(second)] if first.decode().expect("first row").lease == 3 && second.decode().expect("second row").lease == 7));
+            let detail = failure.diagnostics().iter().next().expect("Sync diagnostic");
+            assert_eq!((detail.position, detail.fields.code().as_str()), (Position::Sync, "23505"));
+        });
         server
             .finish()
             .expect("group peer execution")
@@ -325,69 +283,47 @@ fn classify_error_scope() {
         TcpScript::with(
             |socket| group::classified(socket, detail, ready),
             |server| {
-                let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
-                    port::Port::<Database>::plan(
-                        Queries::try_config().expect("credentials"),
-                        Queries::try_groups(
-                            NonZero::new(3).expect("records"),
-                            NonZero::new(256).expect("bytes"),
-                        )
-                        .expect("bounded group config"),
-                    ),
-                    server.addr(),
-                    Duration::from_millis(1),
-                    Duration::from_secs(1),
-                )
-                .expect("group topology");
-                let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-                let mut report = Completion::new();
-                prepared
-                    .with_local(
-                        |worker| {
-                            worker.lend(|node, stage| {
-                                node.install(stage, |host, stage| {
-                                    stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                        let client = runtime.root_client();
-                                        runtime
-                                            .block_on(client.status().wait_ready())
-                                            .expect("ready driver")
-                                            .ok()
-                                            .expect("ready PostgreSQL");
-                                        let failure = runtime
-                                            .block_on(client.run_group::<TextQuery, 2>([(); 2]))
-                                            .expect("group driver")
-                                            .err()
-                                            .expect("server failure");
-                                        let detail = failure
-                                            .diagnostics()
-                                            .iter()
-                                            .next()
-                                            .expect("retained diagnostic");
-                                        assert_eq!(detail.position, position);
-                                        if ready {
-                                            assert_eq!(failure.sync(), Sync::Complete);
-                                            assert!(matches!(
-                                                failure.outcomes(),
-                                                [Outcome::Server, Outcome::Skipped]
-                                            ));
-                                        } else {
-                                            assert_eq!(failure.sync(), Sync::Unobserved);
-                                            assert!(matches!(
-                                                failure.outcomes(),
-                                                [Outcome::Interrupted(_), Outcome::Interrupted(_)]
-                                            ));
-                                            assert!(failure.sync_error().is_some());
-                                        }
-                                    })
-                                })
-                            })
-                        },
-                        recovery::Policy::new(|event| reports.push(event), common::recover),
-                        |outcome| outcome.map_err(common::entry_error).expect("application entry"),
+                let plan = port::Port::<Database>::plan(
+                    Queries::try_config().expect("credentials"),
+                    Queries::try_groups(
+                        NonZero::new(3).expect("records"),
+                        NonZero::new(256).expect("bytes"),
                     )
-                    .expect("group installation")
-                    .expect("group session");
-                assert!(reports.events().expect("native reclamation").is_empty());
+                    .expect("bounded group config"),
+                );
+                topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+                    let client = runtime.root_client();
+                    runtime
+                        .block_on(client.status().wait_ready())
+                        .expect("ready driver")
+                        .ok()
+                        .expect("ready PostgreSQL");
+                    let failure = runtime
+                        .block_on(client.run_group::<TextQuery, 2>([(); 2]))
+                        .expect("group driver")
+                        .err()
+                        .expect("server failure");
+                    let detail = failure
+                        .diagnostics()
+                        .iter()
+                        .next()
+                        .expect("retained diagnostic");
+                    assert_eq!(detail.position, position);
+                    if ready {
+                        assert_eq!(failure.sync(), Sync::Complete);
+                        assert!(matches!(
+                            failure.outcomes(),
+                            [Outcome::Server, Outcome::Skipped]
+                        ));
+                    } else {
+                        assert_eq!(failure.sync(), Sync::Unobserved);
+                        assert!(matches!(
+                            failure.outcomes(),
+                            [Outcome::Interrupted(_), Outcome::Interrupted(_)]
+                        ));
+                        assert!(failure.sync_error().is_some());
+                    }
+                });
                 server
                     .finish()
                     .expect("group peer execution")
@@ -407,69 +343,47 @@ fn capacity_keeps_error() {
             } else {
                 (3, COMMAND_ERROR.len())
             };
-            let prepared = topology::try_new::<_, Bundle<Tcp, Identity, Throughput>>(
-                port::Port::<Database>::plan(
-                    Queries::try_config().expect("credentials"),
-                    Queries::try_groups(
-                        NonZero::new(count).expect("records"),
-                        NonZero::new(bytes).expect("bytes"),
-                    )
-                    .expect("bounded group config"),
-                ),
-                server.addr(),
-                Duration::from_millis(1),
-                Duration::from_secs(1),
-            )
-            .expect("group topology");
-            let mut reports = Reports::<_>::new(prepared.layout(), [Id::fixed::<0>()]);
-            let mut report = Completion::new();
-            prepared
-                .with_local(
-                    |worker| {
-                        worker.lend(|node, stage| {
-                            node.install(stage, |host, stage| {
-                                stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
-                                    let client = runtime.root_client();
-                                    runtime
-                                        .block_on(client.status().wait_ready())
-                                        .expect("ready driver")
-                                        .ok()
-                                        .expect("ready PostgreSQL");
-                                    let failure = runtime
-                                        .block_on(client.run_group::<TextQuery, 2>([(); 2]))
-                                        .expect("group driver")
-                                        .err()
-                                        .expect("diagnostic capacity failure");
-                                    assert_eq!(failure.diagnostics().len(), 1);
-                                    let first = failure.diagnostic(0).expect("first diagnostic");
-                                    assert_eq!(
-                                        (first.code().as_str(), first.message()),
-                                        ("23505", "duplicate")
-                                    );
-                                    assert_eq!(failure.sync(), Sync::Unobserved);
-                                    assert!(matches!(
-                                        failure.outcomes(),
-                                        [Outcome::Server, Outcome::Interrupted(_)]
-                                    ));
-                                    assert!(match failure.sync_error() {
-                                        Some(reply::Error::Driver(
-                                            cartel_pg::Error::GroupDiagnosticRecords { capacity },
-                                        )) if records => capacity.get() == 1,
-                                        Some(reply::Error::Driver(
-                                            cartel_pg::Error::GroupDiagnosticBytes(_),
-                                        )) if !records => true,
-                                        _ => false,
-                                    });
-                                })
-                            })
-                        })
-                    },
-                    recovery::Policy::new(|event| reports.push(event), common::recover),
-                    |outcome| outcome.map_err(common::entry_error).expect("application entry"),
+            let plan = port::Port::<Database>::plan(
+                Queries::try_config().expect("credentials"),
+                Queries::try_groups(
+                    NonZero::new(count).expect("records"),
+                    NonZero::new(bytes).expect("bytes"),
                 )
-                .expect("group installation")
-                .expect("group session");
-            assert!(reports.events().expect("native reclamation").is_empty());
+                .expect("bounded group config"),
+            );
+            topology::run(plan, server.addr(), (1, 1_000), Throughput, |mut runtime| {
+                let client = runtime.root_client();
+                runtime
+                    .block_on(client.status().wait_ready())
+                    .expect("ready driver")
+                    .ok()
+                    .expect("ready PostgreSQL");
+                let failure = runtime
+                    .block_on(client.run_group::<TextQuery, 2>([(); 2]))
+                    .expect("group driver")
+                    .err()
+                    .expect("diagnostic capacity failure");
+                assert_eq!(failure.diagnostics().len(), 1);
+                let first = failure.diagnostic(0).expect("first diagnostic");
+                assert_eq!(
+                    (first.code().as_str(), first.message()),
+                    ("23505", "duplicate")
+                );
+                assert_eq!(failure.sync(), Sync::Unobserved);
+                assert!(matches!(
+                    failure.outcomes(),
+                    [Outcome::Server, Outcome::Interrupted(_)]
+                ));
+                assert!(match failure.sync_error() {
+                    Some(reply::Error::Driver(
+                        cartel_pg::Error::GroupDiagnosticRecords { capacity },
+                    )) if records => capacity.get() == 1,
+                    Some(reply::Error::Driver(
+                        cartel_pg::Error::GroupDiagnosticBytes(_),
+                    )) if !records => true,
+                    _ => false,
+                });
+            });
             server
                 .finish()
                 .expect("group peer execution")
