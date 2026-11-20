@@ -1,5 +1,5 @@
 use cartel_pg::api::traits::{Client as _, Status as _, Unchecked as _};
-use cartel_pg::{api, port, port::config, protocol::PickPolicy};
+use cartel_pg::{api, port, port::config};
 use common::{
     port::*,
     postgres::accept::Listener,
@@ -130,7 +130,6 @@ fn round_robin_and_shared_admission_progress() {
                                         ),
                                         "all PostgreSQL connections ready"
                                     );
-                                    client.status().set_policy(PickPolicy::RoundRobin);
 
                                     let mut pool = runtime.block_on(batch::Pool::<4>::acquire())
                                         .expect("batch driver").expect("batch slots");

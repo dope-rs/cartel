@@ -1,3 +1,4 @@
+use crate::port::Instance;
 use crate::{api, port, port::replies, reply::Error, schema};
 use api::{ops, request, task, traits, tx};
 use cartel_core::reply::recv;
@@ -7,36 +8,20 @@ use dope_fiber::abi;
 use std::marker::PhantomData;
 use task::lease::{self, Policy, Target};
 
-pub struct Context<
-    'app,
-    'g,
-    'r,
-    's,
-    'b,
-    'c,
-    'd: 'app,
-    B: ?Sized,
-    I: schema::QuerySet,
-    const ID: u8 = 0,
-> {
+pub struct Context<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance, const ID: u8 = 0> {
     pub(crate) port: &'app port::Port<'app, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
     pub(crate) bound: client::Bound<'app, 'd, B>,
 }
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Copy
-    for Context<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-}
+impl<B: ?Sized, I: Instance, const ID: u8> Copy for Context<'_, '_, '_, '_, '_, '_, '_, B, I, ID> {}
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Clone
-    for Context<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
+impl<B: ?Sized, I: Instance, const ID: u8> Clone for Context<'_, '_, '_, '_, '_, '_, '_, B, I, ID> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     pub(super) fn abort<T: Target<'d, ID>>(self, target: T, error: crate::Error) {
@@ -60,7 +45,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     traits::Client<'d, ID> for ops::Query<Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>>
 {
     type Transaction = tx::Guard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>;
@@ -80,8 +65,20 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R, S>
-    ops::Query<Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
+impl<
+    'app,
+    'g,
+    'r,
+    's,
+    'b,
+    'c,
+    'd: 'app,
+    B: ?Sized,
+    I: Instance<Queries: 'd> + 'd,
+    const ID: u8,
+    R,
+    S,
+> ops::Query<Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
 where
     R: Copy + Into<Option<api::Target<'d, ID>>>,
 {
@@ -110,7 +107,7 @@ where
         S: request::Input<'d>,
         Q: schema::TypedQuery,
         X: task::Read<'app, 'b, 'c, 'd, Output = Result<T, Error<'d, ID>>> + api::Sync,
-        I: schema::HasGroup<Q::Group>,
+        I::Queries: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
         let (client, target, frame, clock) = self.into_parts();

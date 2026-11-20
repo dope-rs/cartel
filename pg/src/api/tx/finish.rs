@@ -1,4 +1,5 @@
-use crate::{api, reply::Error, schema};
+use crate::port::Instance;
+use crate::{api, reply::Error};
 use crate::{port::pool::access, protocol::runtime::tx::poll};
 use api::{
     request,
@@ -21,7 +22,7 @@ pub(super) enum End {
 
 enum State<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
 {
     Holding(Held<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>),
     Dispatching(
@@ -56,7 +57,7 @@ where
 #[pin_project::pin_project]
 pub(super) struct Finish<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
 {
     state: State<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     end: End,
@@ -66,7 +67,7 @@ where
     waiter: wait::Waiter<'app, 'd>,
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     Finish<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     pub(super) fn new(lease: Held<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, end: End) -> Self {
@@ -77,30 +78,9 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             waiter: wait::Waiter::new(),
         }
     }
-
-    fn fail(
-        state: &mut State<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-        error: crate::Error,
-    ) -> Error<'d, ID> {
-        match mem::replace(state, State::Done) {
-            State::Holding(lease) => lease.abort(error),
-            State::Dispatching(mut call) => return call.abort(error),
-            State::Settling {
-                finalizing: lease,
-                outcome,
-            } => {
-                lease.abort(error);
-                if let Err(error) = outcome {
-                    return error;
-                }
-            }
-            State::Done => {}
-        }
-        error.into()
-    }
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     abi::Fiber<'d> for Finish<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     type Output = Result<(), Error<'d, ID>>;
@@ -109,137 +89,151 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
         let mut this = this.project();
         let end = *this.end;
         let waiter = this.waiter.as_ref();
-        let mut timer = match this.deadline.as_mut().get_mut() {
-            Ok(timer) => pin::Pin::new(timer),
-            Err(error) => {
-                let error = Self::fail(this.state, crate::Error::Deadline(*error));
-                waiter.unregister();
-                return Poll::Ready(Err(error));
-            }
-        };
-        loop {
-            if timer.as_mut().poll_expired(cx.as_mut()).is_ready() {
-                let time = deadline::Elapsed::new(match &*this.state {
-                    State::Dispatching(call) => call.phase(),
-                    State::Holding(_) | State::Settling { .. } | State::Done => {
-                        deadline::RequestPhase::Settlement
-                    }
-                });
-                let error = Self::fail(this.state, crate::Error::RequestTimeout(time));
-                waiter.unregister();
-                return Poll::Ready(Err(error));
-            }
-            if let State::Dispatching(call) = this.state {
-                match call.poll(
-                    cx.as_mut(),
-                    waiter,
-                    |held, _client, _conn| held.begin(),
-                    Core::complete,
-                ) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(error)) => {
-                        *this.state = State::Done;
-                        waiter.unregister();
-                        timer.as_mut().complete();
-                        return Poll::Ready(Err(error));
-                    }
-                    Poll::Ready(Ok((outcome, committed))) => {
-                        *this.state = State::Settling {
-                            finalizing: committed,
-                            outcome,
-                        };
-                    }
+        let cause = match this.deadline.as_mut().get_mut() {
+            Err(error) => crate::Error::Deadline(*error),
+            Ok(timer) => loop {
+                let mut timer = pin::Pin::new(&mut *timer);
+                if timer.as_mut().poll_expired(cx.as_mut()).is_ready() {
+                    break crate::Error::RequestTimeout(deadline::Elapsed::new(match &*this.state {
+                        State::Dispatching(call) => call.phase(),
+                        State::Holding(_) | State::Settling { .. } | State::Done => {
+                            deadline::RequestPhase::Settlement
+                        }
+                    }));
                 }
-                continue;
-            }
-            match mem::replace(this.state, State::Done) {
-                State::Holding(lease) => {
-                    let owner = lease.client();
-                    let tx = lease.target();
-                    match owner.port.poll_idle(tx, waiter, cx.as_mut()) {
-                        Poll::Ready(Ok(())) => {}
+                if let State::Dispatching(call) = this.state {
+                    match call.poll(
+                        cx.as_mut(),
+                        waiter,
+                        |held, _client, _conn| held.begin(),
+                        Core::complete,
+                    ) {
+                        Poll::Pending => return Poll::Pending,
                         Poll::Ready(Err(error)) => {
+                            *this.state = State::Done;
                             waiter.unregister();
                             timer.as_mut().complete();
                             return Poll::Ready(Err(error));
                         }
-                        Poll::Pending => {
-                            *this.state = State::Holding(lease);
-                            return Poll::Pending;
+                        Poll::Ready(Ok((outcome, committed))) => {
+                            *this.state = State::Settling {
+                                finalizing: committed,
+                                outcome,
+                            };
                         }
                     }
-                    let req = match end {
-                        End::Commit => api::Pending::commit(owner.port),
-                        End::Rollback => api::Pending::raw(
-                            owner.port,
-                            request::Request::raw("ROLLBACK"),
-                            o3::buffer::pool::Pool::acquire,
-                        ),
-                    };
-                    let req = match req {
-                        Ok(req) => req,
-                        Err(error) => {
-                            waiter.unregister();
-                            timer.as_mut().complete();
-                            return Poll::Ready(Err(error.into()));
-                        }
-                    };
-                    let call = Core::new(
-                        owner,
-                        api::Target::from_tx(tx),
-                        (),
-                        Ok(req.map_state(|()| lease)),
-                    );
-                    *this.state = State::Dispatching(call);
+                    continue;
                 }
-                State::Dispatching(_) => unreachable!("dispatching"),
-                State::Settling {
-                    finalizing: lease,
-                    outcome: next,
-                } => {
-                    let owner = lease.client();
-                    let mode = match lease.target() {
-                        access::Finalization::Pending(target) => {
-                            match owner.port.shared.transaction().poll_settled(
-                                target,
-                                waiter,
-                                cx.as_ref(),
-                            ) {
-                                Poll::Ready(Ok(mode)) => mode,
-                                Poll::Ready(Err(error)) => {
-                                    waiter.unregister();
-                                    timer.as_mut().complete();
-                                    let next = next.and(Err(Error::Wait(error)));
-                                    lease.abort(crate::Error::Closed);
-                                    return Poll::Ready(next);
-                                }
-                                Poll::Pending => {
-                                    *this.state = State::Settling {
-                                        finalizing: lease,
-                                        outcome: next,
-                                    };
-                                    return Poll::Pending;
-                                }
+                match mem::replace(this.state, State::Done) {
+                    State::Holding(lease) => {
+                        let owner = lease.client();
+                        let tx = lease.target();
+                        match owner.port.poll_idle(tx, waiter, cx.as_mut()) {
+                            Poll::Ready(Ok(())) => {}
+                            Poll::Ready(Err(error)) => {
+                                waiter.unregister();
+                                timer.as_mut().complete();
+                                return Poll::Ready(Err(error));
+                            }
+                            Poll::Pending => {
+                                *this.state = State::Holding(lease);
+                                return Poll::Pending;
                             }
                         }
-                        access::Finalization::Reusable(_) => poll::Disposition::Reusable,
-                        access::Finalization::Lost(_) => poll::Disposition::Lost,
-                    };
-                    lease.settle();
-                    waiter.unregister();
-                    timer.as_mut().complete();
-                    let next = match mode {
-                        poll::Disposition::Reusable => next,
-                        poll::Disposition::Lost => next.and(Err(crate::Error::Closed.into())),
-                    };
-                    return Poll::Ready(next);
+                        let req = match end {
+                            End::Commit => api::Pending::commit(owner.port),
+                            End::Rollback => api::Pending::raw(
+                                owner.port,
+                                request::Request::raw("ROLLBACK"),
+                                o3::buffer::pool::Pool::acquire,
+                            ),
+                        };
+                        let req = match req {
+                            Ok(req) => req,
+                            Err(error) => {
+                                waiter.unregister();
+                                timer.as_mut().complete();
+                                return Poll::Ready(Err(error.into()));
+                            }
+                        };
+                        let call = Core::new(
+                            owner,
+                            api::Target::from_tx(tx),
+                            (),
+                            Ok(req.map_state(|()| lease)),
+                        );
+                        *this.state = State::Dispatching(call);
+                    }
+                    State::Dispatching(_) => unreachable!("dispatching"),
+                    State::Settling {
+                        finalizing: lease,
+                        outcome: next,
+                    } => {
+                        let owner = lease.client();
+                        let mode = match lease.target() {
+                            access::Finalization::Pending(target) => {
+                                match owner.port.shared.transaction().poll_settled(
+                                    target,
+                                    waiter,
+                                    cx.as_ref(),
+                                ) {
+                                    Poll::Ready(Ok(mode)) => mode,
+                                    Poll::Ready(Err(error)) => {
+                                        waiter.unregister();
+                                        timer.as_mut().complete();
+                                        let next = next.and(Err(Error::Wait(error)));
+                                        lease.abort(crate::Error::Closed);
+                                        return Poll::Ready(next);
+                                    }
+                                    Poll::Pending => {
+                                        *this.state = State::Settling {
+                                            finalizing: lease,
+                                            outcome: next,
+                                        };
+                                        return Poll::Pending;
+                                    }
+                                }
+                            }
+                            access::Finalization::Reusable(_) => poll::Disposition::Reusable,
+                            access::Finalization::Lost(_) => poll::Disposition::Lost,
+                        };
+                        lease.settle();
+                        waiter.unregister();
+                        timer.as_mut().complete();
+                        let next = match mode {
+                            poll::Disposition::Reusable => next,
+                            poll::Disposition::Lost => next.and(Err(crate::Error::Closed.into())),
+                        };
+                        return Poll::Ready(next);
+                    }
+                    State::Done => {
+                        waiter.unregister();
+                        timer.as_mut().complete();
+                        return Poll::Ready(Err(crate::Error::Closed.into()));
+                    }
                 }
-                State::Done => {
-                    waiter.unregister();
-                    timer.as_mut().complete();
-                    return Poll::Ready(Err(crate::Error::Closed.into()));
-                }
+            },
+        };
+        let error = 'cancel: {
+            if let State::Dispatching(call) = this.state {
+                let error = call.abort(cause);
+                *this.state = State::Done;
+                break 'cancel error;
             }
-        }
+            match mem::replace(this.state, State::Done) {
+                State::Holding(lease) => lease.abort(cause),
+                State::Settling { finalizing, outcome } => {
+                    finalizing.abort(cause);
+                    if let Err(error) = outcome {
+                        break 'cancel error;
+                    }
+                }
+                State::Dispatching(_) => unreachable!("dispatching"),
+                State::Done => {}
+            }
+            cause.into()
+        };
+        waiter.unregister();
+        Poll::Ready(Err(error))
     }
 }

@@ -11,15 +11,15 @@ pub struct RowReader<'a> {
     columns: ops::Range<u16>,
 }
 
-#[doc(hidden)]
-pub struct Column<'a> {
+pub(crate) struct Column<'a> {
     buf: Wire<'a>,
     index: u16,
 }
 
-pub(crate) enum Field<'a> {
-    Data(Column<'a>),
-    Null { column: u16 },
+fn width<const N: usize>() -> Result<Length, Reason> {
+    u32::try_from(N)
+        .map(Length::from_u32)
+        .map_err(|_| Reason::RequiredLength { required: N })
 }
 
 impl<'a> RowReader<'a> {
@@ -31,21 +31,19 @@ impl<'a> RowReader<'a> {
             }));
         };
         let count = i16::from_be_bytes(*head);
-        if count < 0 {
-            return Err(crate::Error::Protocol(Reason::NegativeColumnCount {
-                actual: count,
-            }));
-        }
-        let count = count as u16;
-        if count != want {
-            return Err(crate::Error::Protocol(Reason::ColumnCount {
-                actual: count,
-                expected: want,
+        if i32::from(count) != i32::from(want) {
+            return Err(crate::Error::Protocol(if count < 0 {
+                Reason::NegativeColumnCount { actual: count }
+            } else {
+                Reason::ColumnCount {
+                    actual: count as u16,
+                    expected: want,
+                }
             }));
         }
         Ok(Self {
             buf: tail,
-            columns: 0..count,
+            columns: 0..want,
         })
     }
 
@@ -81,148 +79,146 @@ impl<'a> RowReader<'a> {
     }
 
     #[inline]
-    pub(crate) fn take_column(&mut self) -> Result<Field<'a>, crate::Error> {
-        let mut columns = self.columns.clone();
-        let index = columns
-            .next()
-            .ok_or(crate::Error::Protocol(Reason::RowDecoderColumns {
+    fn header(&mut self) -> Result<(u16, i32), Reason> {
+        let index = self.columns.start;
+        if self.columns.is_empty() {
+            return Err(Reason::RowDecoderColumns {
                 declared: self.columns.end,
-            }))?;
+            });
+        }
         let Some((head, tail)) = self.buf.split_array::<4>() else {
-            return Err(crate::Error::Protocol(Reason::ColumnLength {
+            return Err(Reason::ColumnLength {
                 column: index,
                 actual: self.buf.length(),
-            }));
-        };
-        let len = i32::from_be_bytes(*head);
-        self.buf = tail;
-        self.columns = columns;
-        if len == -1 {
-            return Ok(Field::Null { column: index });
-        }
-        if len < 0 {
-            return Err(crate::Error::Protocol(Reason::NegativeColumnLength {
-                column: index,
-                actual: len,
-            }));
-        }
-        let n = len as u32;
-        let Some((head, tail)) = self.buf.split_at(n as usize) else {
-            return Err(crate::Error::Protocol(Reason::ColumnBytes {
-                column: index,
-                actual: self.buf.length(),
-                required: Length::from_u32(n),
-            }));
+            });
         };
         self.buf = tail;
-        Ok(Field::Data(Column { buf: head, index }))
+        self.columns.start += 1;
+        Ok((index, i32::from_be_bytes(*head)))
     }
 
     #[inline]
-    pub(crate) fn require(&mut self) -> Result<Column<'a>, crate::Error> {
-        match self.take_column()? {
-            Field::Data(column) => Ok(column),
-            Field::Null { column } => Err(crate::Error::Protocol(Reason::ColumnNull { column })),
+    fn payload(&mut self, index: u16, length: i32) -> Result<Column<'a>, Reason> {
+        let Ok(n) = u32::try_from(length) else {
+            return Err(if length == -1 {
+                Reason::ColumnNull { column: index }
+            } else {
+                Reason::NegativeColumnLength {
+                    column: index,
+                    actual: length,
+                }
+            });
+        };
+        let Some((buf, tail)) = self.buf.split_at(n as usize) else {
+            return Err(Reason::ColumnBytes {
+                column: index,
+                actual: self.buf.length(),
+                required: Length::from_u32(n),
+            });
+        };
+        self.buf = tail;
+        Ok(Column { buf, index })
+    }
+
+    #[inline]
+    pub(crate) fn column(&mut self) -> Result<Column<'a>, Reason> {
+        let (index, length) = self.header()?;
+        self.payload(index, length)
+    }
+
+    #[inline]
+    pub(crate) fn fixed<const N: usize>(&mut self) -> Result<[u8; N], Reason> {
+        let (index, length) = self.header()?;
+        if usize::try_from(length) == Ok(N)
+            && let Some((bytes, tail)) = self.buf.split_array::<N>()
+        {
+            self.buf = tail;
+            return Ok(*bytes);
+        }
+        let column = self.payload(index, length)?;
+        Err(Reason::ColumnWidth {
+            column: index,
+            actual: column.buf.length(),
+            expected: width::<N>()?,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn read_bool(&mut self) -> Result<bool, Reason> {
+        let column = self.columns.start;
+        match self.fixed::<1>()? {
+            [0] => Ok(false),
+            [1] => Ok(true),
+            [actual] => Err(Reason::Bool { column, actual }),
         }
     }
 }
 
 impl Column<'_> {
-    fn width<const N: usize>() -> Result<Length, crate::Error> {
-        u32::try_from(N)
-            .map(Length::from_u32)
-            .map_err(|_| crate::Error::Protocol(Reason::RequiredLength { required: N }))
-    }
-
-    pub(crate) fn fixed<const N: usize>(&self) -> Result<[u8; N], crate::Error> {
-        match self.buf.as_slice().try_into() {
-            Ok(bytes) => Ok(bytes),
-            Err(_) => Err(crate::Error::Protocol(Reason::ColumnWidth {
-                column: self.index,
-                actual: self.buf.length(),
-                expected: Self::width::<N>()?,
-            })),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn read_bool(&self) -> Result<bool, crate::Error> {
-        match self.fixed::<1>()? {
-            [0] => Ok(false),
-            [1] => Ok(true),
-            [actual] => Err(crate::Error::Protocol(Reason::Bool {
-                column: self.index,
-                actual,
-            })),
-        }
-    }
-
-    fn take_fixed<const N: usize>(&mut self) -> Result<[u8; N], crate::Error> {
+    fn take_fixed<const N: usize>(&mut self) -> Result<[u8; N], Reason> {
         let Some((head, tail)) = self.buf.split_array::<N>() else {
-            return Err(crate::Error::Protocol(Reason::ArrayHeader {
+            return Err(Reason::ArrayHeader {
                 column: self.index,
                 actual: self.buf.length(),
-                required: Self::width::<N>()?,
-            }));
+                required: width::<N>()?,
+            });
         };
         self.buf = tail;
         Ok(*head)
     }
-}
 
-impl Column<'_> {
     #[inline]
-    fn array_header(&mut self, want: ArrayElement) -> Result<usize, crate::Error> {
+    fn array_header(&mut self, want: ArrayElement) -> Result<usize, Reason> {
         let [a, b, c, d, e, f, g, h, i, j, k, l] = self.take_fixed::<12>()?;
         let ndim = i32::from_be_bytes([a, b, c, d]);
         let nulls = i32::from_be_bytes([e, f, g, h]);
         let oid = u32::from_be_bytes([i, j, k, l]);
         match want {
             ArrayElement::Exact(want) if oid != want => {
-                return Err(crate::Error::Protocol(Reason::ArrayOid {
+                return Err(Reason::ArrayOid {
                     column: self.index,
                     actual: oid,
                     expected: want,
-                }));
+                });
             }
             ArrayElement::String if !matches!(oid, 19 | 25 | 1042 | 1043) => {
-                return Err(crate::Error::Protocol(Reason::ArrayTextOid {
+                return Err(Reason::ArrayTextOid {
                     column: self.index,
                     actual: oid,
-                }));
+                });
             }
             ArrayElement::Exact(_) | ArrayElement::String => {}
         }
         if nulls != 0 {
-            return Err(crate::Error::Protocol(Reason::ArrayNulls {
+            return Err(Reason::ArrayNulls {
                 column: self.index,
                 actual: nulls,
-            }));
+            });
         }
         if ndim == 0 {
             return Ok(0);
         }
         if ndim != 1 {
-            return Err(crate::Error::Protocol(Reason::ArrayDimensions {
+            return Err(Reason::ArrayDimensions {
                 column: self.index,
                 actual: ndim,
-            }));
+            });
         }
         let [a, b, c, d, _, _, _, _] = self.take_fixed::<8>()?;
         let dim = i32::from_be_bytes([a, b, c, d]);
         if dim < 0 {
-            return Err(crate::Error::Protocol(Reason::NegativeArrayDimension {
+            return Err(Reason::NegativeArrayDimension {
                 column: self.index,
                 actual: dim,
-            }));
+            });
         }
         let dim = dim as u32;
         if dim as usize > self.buf.len() / 4 {
-            return Err(crate::Error::Protocol(Reason::ArrayPayload {
+            return Err(Reason::ArrayPayload {
                 column: self.index,
                 elements: dim,
                 actual: self.buf.length(),
-            }));
+            });
         }
         Ok(dim as usize)
     }
@@ -238,7 +234,7 @@ impl<'row> Column<'row> {
     pub(crate) fn array<T: array::Element<'row>>(
         mut self,
         want: ArrayElement,
-    ) -> Result<array::Array<'row, T>, crate::Error> {
+    ) -> Result<array::Array<'row, T>, Reason> {
         let len = self.array_header(want)?;
         Ok(array::Array::new(self.buf, len))
     }
@@ -248,38 +244,38 @@ impl<'row> Column<'row> {
     }
 
     #[inline]
-    pub(crate) fn text(self) -> Result<&'row str, crate::Error> {
+    pub(crate) fn text(self) -> Result<&'row str, Reason> {
         match self.buf.try_text() {
             Ok(value) => Ok(value.as_str()),
-            Err(error) => Err(crate::Error::Protocol(Reason::TextUtf8 {
+            Err(error) => Err(Reason::TextUtf8 {
                 column: self.index,
                 valid: error.valid,
                 error: error.error,
-            })),
+            }),
         }
     }
 
     #[inline]
-    pub(crate) fn json(self) -> Result<&'row str, crate::Error> {
+    pub(crate) fn json(self) -> Result<&'row str, Reason> {
         let Some((version, value)) = self.buf.split_first() else {
-            return Err(crate::Error::Protocol(Reason::JsonTruncated {
+            return Err(Reason::JsonTruncated {
                 column: self.index,
                 actual: Length::from_u32(0),
-            }));
+            });
         };
         if version != 0x01 {
-            return Err(crate::Error::Protocol(Reason::JsonVersion {
+            return Err(Reason::JsonVersion {
                 column: self.index,
                 actual: version,
-            }));
+            });
         }
         match value.try_text() {
             Ok(value) => Ok(value.as_str()),
-            Err(error) => Err(crate::Error::Protocol(Reason::JsonUtf8 {
+            Err(error) => Err(Reason::JsonUtf8 {
                 column: self.index,
                 valid: error.valid,
                 error: error.error,
-            })),
+            }),
         }
     }
 }

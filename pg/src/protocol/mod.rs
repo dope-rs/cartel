@@ -327,7 +327,6 @@ pub enum Reason {
     PrepareRetained,
     ReadyBeforeDescription,
     ReadyUnknown,
-    ResponseUnknown,
     RowDecoderColumns {
         declared: u16,
     },
@@ -439,12 +438,3 @@ const _: () = assert!(size_of::<Text<'static>>() == size_of::<&str>());
 const _: () = assert!(std::mem::size_of::<Offset>() == std::mem::size_of::<u32>());
 const _: () = assert!(std::mem::size_of::<Number>() <= std::mem::size_of::<usize>());
 const _: () = assert!(std::mem::size_of::<Reason>() <= 2 * std::mem::size_of::<usize>());
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PickPolicy {
-    #[default]
-    RoundRobin,
-    /// Selects an eligible connection with the fewest reply orders plus
-    /// pending Sync boundaries, including the boundary of an open pipeline.
-    LeastInflight,
-}

@@ -15,7 +15,7 @@ use port::{pool::slot, replies};
 use reply::{order, recv::attach};
 
 use crate::reply::Pressure;
-use crate::{error, port, port::Disposition, protocol::encode, schema};
+use crate::{error, port, port::Disposition, protocol::encode};
 
 pub(crate) enum Rejection {
     Pressure(Pressure),
@@ -41,11 +41,11 @@ const _: () = {
 
 pub(crate) use crate::protocol::runtime::ready::{ReplyContext, Source};
 
-pub(crate) struct Access<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8> {
+pub(crate) struct Access<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: port::Instance, const ID: u8> {
     port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
 }
 
-impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: port::Instance, const ID: u8>
     Access<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
 {
     pub(super) const fn new(port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>) -> Self {
@@ -108,7 +108,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
 
     pub(crate) fn try_with<'a, J, K, R>(
         &self,
-        context: ReplyContext<'_, 'a, 'd, ID>,
+        context: ReplyContext<'_, 'a, 'd, ID, I::Policy>,
         input: J,
         prepare: impl FnOnce(
             &mut region::Token<region::Identity<'d>>,
@@ -121,11 +121,12 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
                 replies::ReplyFailure<'d>,
                 replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
             >,
-            replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
+            replies::Batch,
+            Boundary,
             J,
         ) -> Result<(order::Depth, K), (attach::Error, J)>,
         build: impl FnOnce(K, conn::Id<'d, KeyTag<ID>>) -> (Complete<'d>, R),
-    ) -> Result<R, (Rejection, Source<'a, 'd, ID>, J)> {
+    ) -> Result<R, (Rejection, Source<'a, 'd, ID, I::Policy>, J)> {
         let (ready, source, boundary, region) = context.into_parts();
         let token = ready.connection();
         let permit = match ready.try_reply(boundary) {
@@ -135,26 +136,19 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         let replies = self.port.lane(token.lane());
         let conn = permit.slot();
         let batch = permit.batch();
-        let result = self.port.request_queue.try_with(
-            replies,
-            region,
-            replies::Tag::new(batch, boundary),
-            (source, input),
-            |region, lane, tag, (source, input)| {
-                let (depth, input) = match prepare(region, lane, tag, input) {
-                    Ok(prepared) => prepared,
-                    Err((cause, input)) => return Err((cause, (source, input))),
-                };
-                let (bytes, done) = build(input, token);
-                if !permit.commit() {
-                    self.port.shared.wake_ready();
-                }
-                if let Source::Shared(listed) = source {
-                    listed.reprioritize(depth.get() + conn.barriers());
-                }
-                Ok((bytes, done))
-            },
-        );
+        let lane = self.port.request_queue.lane_for(replies);
+        let result = lane.try_with(region, (source, input), |region, (source, input)| {
+            let (depth, input) = match prepare(region, replies, batch, boundary, input) {
+                Ok(prepared) => prepared,
+                Err((cause, input)) => return Err((queue::Failure::Reply(cause), (source, input))),
+            };
+            let (bytes, done) = build(input, token);
+            if !permit.commit() {
+                self.port.shared.wake_ready();
+            }
+            source.reprioritize(|| depth.get() + conn.barriers());
+            Ok((bytes, done))
+        });
         match result {
             Ok(done) => {
                 conn.wake();
@@ -184,7 +178,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
                 Err((cause, source, input))
             }
             Err((queue::Failure::Queue(cause), (source, input))) => {
-                let queued = self.port.request_queue.lane_for(replies).weight(region);
+                let queued = lane.weight(region);
                 let cause = match cause {
                     queue::Rejection::Capacity(fair::Cause::Exhausted {
                         required,
@@ -214,13 +208,17 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
             replies::ReplyFailure<'d>,
             replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
         >,
-        context: ReplyContext<'_, 'a, 'd, ID>,
+        context: ReplyContext<'_, 'a, 'd, ID, I::Policy>,
         build: impl FnOnce(J, conn::Id<'d, KeyTag<ID>>) -> (Complete<'d>, R),
-    ) -> Result<R, (Rejection, Source<'a, 'd, ID>, J)> {
+    ) -> Result<R, (Rejection, Source<'a, 'd, ID, I::Policy>, J)> {
         self.try_with(
             context,
             input,
-            |token, lane, tag, input| match reply.try_ordered(token, lane, tag) {
+            |token, lane, batch, boundary, input| match reply.try_ordered(
+                token,
+                lane,
+                replies::Tag::new(batch, boundary),
+            ) {
                 Ok(depth) => Ok((depth, input)),
                 Err(cause) => Err((cause, input)),
             },

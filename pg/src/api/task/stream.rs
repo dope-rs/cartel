@@ -1,7 +1,8 @@
 use crate::api::task::{Budget, Core, State, lease};
+use crate::port::Instance;
 use crate::port::{replies, requests};
-use crate::{api, reply::Error, schema};
-use cartel_core::{deadline, reply};
+use crate::{api, reply::Error};
+use cartel_core::reply;
 use dope::core::driver::schedule::clock::timer;
 use dope_fiber::{abi, context, wait};
 use reply::recv::{self, attach::Attach};
@@ -22,7 +23,7 @@ pub(in crate::api) struct Stream<
     R,
     M = requests::Boundary,
 > where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     X: recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>,
 {
     core: Core<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID, R, M>,
@@ -32,7 +33,7 @@ pub(in crate::api) struct Stream<
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, X, const ID: u8, R, M>
     Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID, R, M>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     R: Copy + Into<Option<api::Target<'d, ID>>>,
     M: Copy + Into<requests::Boundary>,
     X: recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>, Context = ()>,
@@ -51,7 +52,7 @@ where
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, X, const ID: u8, R, M>
     Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID, R, M>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     R: Copy + Into<Option<api::Target<'d, ID>>>,
     M: Copy + Into<requests::Boundary>,
     X: recv::Extract<
@@ -72,10 +73,7 @@ where
         F: FnMut(Result<Option<T>, Error<'d, ID>>) -> U + 'a,
     {
         Next {
-            deadline: match self.core.admission {
-                State::Done => Ok(None),
-                _ => self.budget.guard().map(Some),
-            },
+            deadline: self.core.try_alarm::<true>(&self.budget),
             stream: self,
             waiter: wait::Waiter::new(),
             map,
@@ -111,11 +109,10 @@ where
 #[pin_project::pin_project]
 struct Next<'borrow, 'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, X, F, const ID: u8, R, M>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     X: recv::Extract<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>,
 {
     stream: &'borrow mut Stream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID, R, M>,
-    #[pin]
     deadline: Result<Option<timer::Alarm<'d>>, timer::Exhausted>,
     #[pin]
     waiter: wait::Waiter<'borrow, 'd>,
@@ -125,7 +122,7 @@ where
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, X, F, U, const ID: u8, R, M>
     abi::Fiber<'d> for Next<'_, 'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, F, ID, R, M>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     R: Copy + Into<Option<api::Target<'d, ID>>>,
     M: Copy + Into<requests::Boundary>,
     X: recv::Extract<
@@ -143,37 +140,21 @@ where
 
     fn poll(call: context::PollCall<'_, '_, 'd, Self>) -> Poll<Self::Output> {
         let (this, mut cx) = call.into_parts();
-        let mut this = this.project();
+        let this = this.project();
         let waiter = this.waiter.as_ref();
-        let mut guard = match this.deadline.as_mut().get_mut() {
-            Ok(Some(guard)) => Pin::new(guard),
-            Ok(None) => return Poll::Ready((this.map)(Ok(None))),
-            Err(error) => {
-                waiter.unregister();
-                return Poll::Ready((this.map)(Err(this
-                    .stream
-                    .core
-                    .fail(crate::Error::Deadline(*error), cx.as_mut().region_token()))));
-            }
-        };
-        if this
-            .stream
-            .budget
-            .poll_expired(guard.as_mut(), cx.as_mut())
-            .is_ready()
-        {
-            let time = deadline::Elapsed::new(this.stream.core.phase());
-            waiter.unregister();
-            let error = this.stream.core.fail(
-                crate::Error::RequestTimeout(time),
-                cx.as_mut().region_token(),
-            );
-            this.deadline.set(Ok(None));
-            return Poll::Ready((this.map)(Err(error)));
+        match this.stream.core.check_deadline(
+            &mut this.stream.budget,
+            this.deadline,
+            waiter,
+            cx.as_mut(),
+        ) {
+            Ok(true) => {}
+            Ok(false) => return Poll::Ready((this.map)(Ok(None))),
+            Err(error) => return Poll::Ready((this.map)(Err(error))),
         }
-        let next = this.stream.poll_stream(cx.as_mut(), waiter);
+        let next = this.stream.poll_stream(cx, waiter);
         if next.is_ready() {
-            this.deadline.set(Ok(None));
+            *this.deadline = Ok(None);
         }
         next.map(this.map)
     }

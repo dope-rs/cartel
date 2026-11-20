@@ -1,3 +1,4 @@
+use crate::port::Instance;
 use std::{mem, pin::Pin, task::Poll};
 
 use cartel_core::deadline;
@@ -5,7 +6,7 @@ use dope::core::driver::schedule::clock::{self, timer};
 use dope_fiber::{context, wait};
 use o3::base::time::Positive;
 
-use crate::{api, port::requests, reply::Error, schema};
+use crate::{api, port::requests, reply::Error};
 
 use crate::api::task::{State, lease};
 
@@ -18,7 +19,7 @@ impl<
     'c,
     'd: 'app,
     B: ?Sized,
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     const ID: u8,
     R: Copy + Into<Option<api::Target<'d, ID>>>,
     S,
@@ -43,12 +44,12 @@ impl<
         mut prepare: impl FnMut(
             &'this mut Self,
             api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
-            requests::ReplyContext<'_, 'app, 'd, ID>,
+            requests::ReplyContext<'_, 'app, 'd, ID, I::Policy>,
         ) -> Result<
             O,
             (
                 requests::Rejection,
-                requests::Source<'app, 'd, ID>,
+                requests::Source<'app, 'd, ID, I::Policy>,
                 &'this mut Self,
             ),
         >,
@@ -68,9 +69,7 @@ impl<
                     } => (*client, (*target).into(), request),
                     State::Admitted(..) => unreachable!("admitted"),
                     State::Failed(_) | State::Done => {
-                        return Poll::Ready(Err(
-                            this.cancel(crate::Error::Closed, lease::Lease::abort)
-                        ));
+                        return Poll::Ready(Err(this.take_error().unwrap_or(crate::Error::Closed).into()));
                     }
                 };
                 client
@@ -172,18 +171,14 @@ enum BudgetState<'d> {
 }
 
 pub(in crate::api) struct Budget<'d> {
-    timer: timer::Timer<'d>,
+    pub(super) timer: timer::Timer<'d>,
     state: BudgetState<'d>,
 }
 
 impl<'d> Budget<'d> {
-    pub(in crate::api) fn guard(&self) -> Result<timer::Alarm<'d>, timer::Exhausted> {
-        self.timer.try_alarm()
-    }
-
-    pub(in crate::api) fn poll_expired(
+    pub(super) fn poll_expired(
         &mut self,
-        guard: Pin<&mut timer::Alarm<'d>>,
+        alarm: &timer::Alarm<'d>,
         mut ctx: Pin<&mut context::Context<'_, 'd>>,
     ) -> Poll<()> {
         let now = ctx.as_mut().driver().driver_ref().clock().now();
@@ -196,7 +191,6 @@ impl<'d> Budget<'d> {
                 due
             }
         };
-        let alarm = guard.get_mut();
         if now >= due {
             self.state = BudgetState::Elapsed;
             return Poll::Ready(());

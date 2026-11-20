@@ -9,7 +9,6 @@ use crate::{
         logic::{state, turn::Turn},
         runtime::tx::poll,
     },
-    schema,
 };
 
 pub(super) enum Progress {
@@ -23,7 +22,7 @@ enum Action {
     Skip { server: bool },
 }
 
-impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: crate::port::Instance, const ID: u8>
     Turn<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
 {
     pub(super) fn try_settle<A: work::Admission>(
@@ -40,38 +39,36 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         let mut lane = replies::Lane::new(self.port, self.conn, entry, self.region);
         let depth = loop {
             let selected = lane.ordered();
-            let tag = replies::Tag::current(selected.tag(), self.state.batch)?;
-            let action = match (self.state.progress, tag) {
-                (Complete, Some(tag))
-                    if matches!(
-                        tag.kind(),
-                        Kind::Ready | Kind::Required | Kind::Begin | Kind::Commit | Kind::Sync(_)
-                    ) =>
-                {
-                    work.admit(|| Action::Complete)
-                }
-                (Missing, Some(tag)) if matches!(tag.kind(), Kind::Required) => {
-                    work.admit(|| Action::Missing)
-                }
-                (progress @ (Skipping | Unknown), Some(tag)) => match tag.kind() {
-                    Kind::Sync(group) => work.admit(|| {
-                        if matches!(progress, Unknown) {
-                            group.resolve(Position::Sync);
+            let action = match self.state.progress {
+                // Command completion leaves this order at the front, or its paired
+                // Sync after the last group command. Detachment preserves the order.
+                Complete => work.admit(|| Action::Complete),
+                Missing => work.admit(|| Action::Missing),
+                progress @ (Running | Skipping | Unknown) => {
+                    let Some(tag) = replies::Tag::current(selected.tag(), self.state.batch)? else {
+                        break None;
+                    };
+                    match (progress, tag.kind()) {
+                        (Running, _) => {
+                            return Err(crate::Error::Protocol(protocol::Reason::ReadyUnknown));
                         }
-                        Action::Complete
-                    }),
-                    _ if matches!(progress, Unknown) => {
-                        let (group, position) = tag
-                            .diagnostic()
-                            .ok_or(crate::Error::Protocol(protocol::Reason::GroupReply))?;
-                        work.admit(|| Action::Skip {
-                            server: group.resolve(position),
-                        })
+                        (_, Kind::Sync(group)) => work.admit(|| {
+                            if matches!(progress, Unknown) {
+                                group.resolve(Position::Sync);
+                            }
+                            Action::Complete
+                        }),
+                        (Unknown, _) => {
+                            let (group, position) = tag
+                                .diagnostic()
+                                .ok_or(crate::Error::Protocol(protocol::Reason::GroupReply))?;
+                            work.admit(|| Action::Skip {
+                                server: group.resolve(position),
+                            })
+                        }
+                        _ => work.admit(|| Action::Skip { server: false }),
                     }
-                    _ => work.admit(|| Action::Skip { server: false }),
-                },
-                (Running | Skipping | Unknown, None) => break None,
-                _ => return Err(crate::Error::Protocol(protocol::Reason::ReadyUnknown)),
+                }
             };
             let work::Capacity::Available(action) = action else {
                 return Ok(Progress::Blocked);

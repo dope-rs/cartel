@@ -48,7 +48,11 @@ impl Queries {
     }
 
     pub fn try_cancel() -> Result<config::Config, config::Error> {
-        let capacity = config::Capacities {
+        config::Config::new(Self::cancel_capacity())
+    }
+
+    pub fn cancel_capacity() -> config::Capacities {
+        config::Capacities {
             connections: 1,
             inflight: 2,
             admission_waiters: 2,
@@ -65,8 +69,7 @@ impl Queries {
                 items: 1,
                 bytes: 128,
             },
-        };
-        config::Config::new(capacity)
+        }
     }
 
     pub fn try_groups(

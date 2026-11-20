@@ -90,12 +90,13 @@ fn collects_multiple_rows() {
                                         .expect("driver ready")
                                         .ok()
                                         .expect("PostgreSQL ready");
-                                    let (rows, allocations) = Tracker::count(|| app
-                                        .block_on(traits::Query::run_all::<MixedQuery>(
-                                            client,
-                                            (),
-                                        ))
-                                        .expect("driver query"));
+                                    let (rows, allocations) = Tracker::count(|| {
+                                        app.block_on(dope_fiber::fiber!('_ => async move {
+                                            let query = traits::Query::acquire(client).await?;
+                                            traits::Query::run_all::<MixedQuery>(query, ()).await
+                                        }))
+                                        .expect("driver query")
+                                    });
                                     assert_eq!(allocations, 0);
                                     let rows = rows
                                         .map_err(|error| format!("{:?}", Reply::from(&error)))
@@ -106,20 +107,11 @@ fn collects_multiple_rows() {
                                     assert_eq!(usage.bytes().get(), payload_bytes);
                                     let (projected, allocations) = Tracker::count(|| {
                                         let mut values = Vec::new();
-                                        let initial = values
-                                            .try_reserve_exact(count)
-                                            .map(|()| values);
-                                        rows.iter().try_fold(initial, |state, row| {
-                                            let row = row?;
-                                            Ok::<_, cartel_pg::Error>(state.map(|mut values| {
-                                                values.push((row.low, row.tags));
-                                                values
-                                            }))
-                                        })
+                                        values.try_reserve_exact(count).expect("reserved views");
+                                        rows.visit(|row| values.push((row.low, row.tags)))
+                                            .expect("decoded rows");
+                                        values
                                     });
-                                    let projected = projected
-                                        .expect("decoded rows")
-                                        .expect("reserved views");
                                     assert_eq!(allocations, 1);
                                     assert_eq!(projected, [(3, "[]"), (7, "{}")]);
                                     drop(projected);
@@ -271,15 +263,17 @@ fn owned_batch_failure() {
                                         .expect("driver ready")
                                         .ok()
                                         .expect("PostgreSQL ready");
-                                    let rows = app
-                                        .block_on(traits::Query::run_all::<TextQuery>(client, ()))
-                                        .expect("driver query");
+                                    let (rows, receive) = Tracker::measure(|| {
+                                        app.block_on(traits::Query::run_all::<TextQuery>(
+                                            client,
+                                            (),
+                                        ))
+                                        .expect("driver query")
+                                    });
                                     let rows = rows.ok().expect("query rows");
-                                    let failure =
-                                        rows.iter().try_fold(Ok::<_, u8>(()), |state, row| {
-                                            row?;
-                                            Ok::<_, cartel_pg::Error>(state.and(Err(7)))
-                                        });
+                                    let mut name = None;
+                                    let failure = rows.visit(|row| name = Some(row.name));
+                                    assert_eq!(name, Some("first"));
                                     assert!(matches!(
                                         failure,
                                         Err(cartel_pg::Error::Protocol(Reason::RowTrailing {
@@ -294,7 +288,9 @@ fn owned_batch_failure() {
                                         })) if actual.get() == 1
                                     ));
                                     let bytes = 2 * size_of::<TextRow>() + 11;
-                                    assert_eq!(counts, [3, bytes, 5, bytes + 80]);
+                                    assert_eq!(counts[..2], [3, bytes]);
+                                    assert_eq!(receive[0] + counts[0], receive[2] + counts[2]);
+                                    assert_eq!(receive[1] + counts[1], receive[3] + counts[3]);
                                 })
                             })
                         })
@@ -341,6 +337,18 @@ fn rejects_scalar_width() {
                 column: 0,
                 ..
             }))
+        ));
+    });
+}
+
+#[test]
+fn truncated_fixed_field_reports_missing_bytes() {
+    with_row::<TextQuery>(&[0, 2, 0, 0, 0, 7, 0, 0], |row| {
+        assert!(matches!(
+            row.decode(),
+            Err(cartel_pg::Error::Protocol(Reason::ColumnBytes {
+                column: 0, actual, required,
+            })) if actual.get() == 2 && required.get() == 7
         ));
     });
 }

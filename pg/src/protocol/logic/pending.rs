@@ -1,3 +1,4 @@
+use crate::port::Instance;
 use cartel_core::reply::{order, usage};
 use dope::{
     core::driver::route::KeyTag,
@@ -11,7 +12,6 @@ use crate::{
         logic::{Owner, Session, State, drain, turn::Turn},
         runtime::tx::poll,
     },
-    schema,
 };
 
 /// Linear response continuation moved into the connector connection slot.
@@ -32,7 +32,7 @@ impl<'d> Pending<'d> {
         Self(Kind::Ready(pending))
     }
 
-    fn settle_row<'life, I: schema::QuerySet, const ID: u8>(
+    fn settle_row<'life, I: Instance, const ID: u8>(
         port: &'life port::Port<'life, '_, '_, '_, '_, '_, 'd, I, ID>,
         pending: replies::Pending<'d>,
         ctx: &mut turns::Context<
@@ -93,7 +93,7 @@ impl<'d> Pending<'d> {
     }
 }
 
-impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: Instance, const ID: u8>
     response::Action<
         'life,
         'd,

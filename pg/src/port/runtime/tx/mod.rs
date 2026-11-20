@@ -14,11 +14,11 @@ use std::{pin, task::Poll};
 
 pub(crate) mod poll;
 
-pub(crate) struct Access<'a, 'd, const ID: u8> {
-    pub(super) shared: &'a super::Shared<'d, ID>,
+pub(crate) struct Access<'a, 'd, const ID: u8, P: ready::Policy> {
+    pub(super) shared: &'a super::Shared<'d, ID, P>,
 }
 
-impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
+impl<'a, 'd, const ID: u8, P: ready::Policy> Access<'a, 'd, ID, P> {
     fn access(
         &self,
         id: access::Transaction<'d, ID>,
@@ -44,9 +44,9 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
 
     pub(crate) fn reserve(
         &self,
-        listed: ready::Listed<'a, 'd, ID>,
+        listed: ready::Listed<'a, 'd, ID, P>,
         load: impl FnOnce(conn::Id<'d, route::KeyTag<ID>>) -> Option<usize>,
-    ) -> Option<ready::Reservation<'a, 'd, ID>> {
+    ) -> Option<ready::Reservation<'a, 'd, ID, P>> {
         let slot = slot::Ready::listed(&listed).connection();
         let state = listed.reserve();
         if state.is_none() && load(slot) == Some(0) {
@@ -93,7 +93,7 @@ impl<'a, 'd, const ID: u8> Access<'a, 'd, ID> {
     }
 }
 
-impl<'d, I: crate::schema::QuerySet, const ID: u8>
+impl<'d, I: crate::port::Instance, const ID: u8>
     crate::port::Port<'_, '_, '_, '_, '_, '_, 'd, I, ID>
 {
     pub(crate) fn poll_idle<'target>(

@@ -145,7 +145,7 @@ fn finish_with_full_request_pool() {
 }
 
 #[test]
-fn rejected_copy_recovers() {
+fn copy_rejection_and_cancel_reconnect() {
     peer::AcceptScript::with(
         |listener| listener.copy_recover(),
         |server| {
@@ -160,7 +160,7 @@ fn rejected_copy_recovers() {
                 |rt| {
                     let client = rt.client();
                     assert!(rt.runtime.block_on(client.status().wait_ready())?.is_ok());
-                    for finish in [false, true] {
+                    for finish in [Some(false), Some(true), None] {
                         let mut copy = client.copy_stream("COPY missing FROM STDIN");
                         assert!(
                             rt.runtime.block_on(copy.write(&[]))?.is_ok(),
@@ -172,24 +172,23 @@ fn rejected_copy_recovers() {
                             .ok()
                             .expect("server rejection marker");
                         assert_eq!(marker.channel(), "copy");
-                        let rejected = if finish {
-                            rt.runtime.block_on(copy.finish())?
+                        if let Some(finish) = finish {
+                            let rejected = if finish {
+                                rt.runtime.block_on(copy.finish())?
+                            } else {
+                                rt.runtime.block_on(copy.write(&[]))?
+                            };
+                            let error = rejected.expect_err("COPY rejection");
+                            assert_eq!(
+                                error.as_server().expect("server error").fields().code().as_str(),
+                                "42P01",
+                            );
                         } else {
-                            rt.runtime.block_on(copy.write(&[]))?
-                        };
-                        assert_eq!(
-                            rejected
-                                .as_ref()
-                                .err()
-                                .and_then(|error| error.as_server())
-                                .map(|error| error.fields().code().as_str()),
-                            Some("42P01"),
-                            "COPY retains the exact server rejection",
-                        );
-                        drop(rejected);
+                            copy.cancel();
+                        }
                         assert!(
                             rt.runtime.block_on(client.command("SELECT 1"))?.is_ok(),
-                            "a rejected COPY recovers through a replacement connection",
+                            "the replacement connection accepts a new command",
                         );
                     }
                     Ok(())

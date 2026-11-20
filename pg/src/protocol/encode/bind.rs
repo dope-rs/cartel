@@ -15,8 +15,46 @@ use std::{convert::Infallible, mem::MaybeUninit, ptr};
 
 pub(super) struct Prefix<'a> {
     pub(super) name: &'a str,
-    pub(super) formats: &'a [u16],
+    pub(super) formats: Codes<'a>,
     pub(super) params: i16,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Codes<'a>(pub(super) &'a [u16]);
+
+impl Codes<'_> {
+    fn visit<E>(self, mut put: impl FnMut(&[u8]) -> Result<(), E>) -> Result<(), E> {
+        put(&(self.0.len() as i16).to_be_bytes())?;
+        for format in self.0 {
+            put(&format.to_be_bytes())?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn write(self, out: &mut write::Spare<'_>) -> Result<(), Error> {
+        initialize(out, &self).map_err(|room| Error::Capacity {
+            required: std::num::NonZero::<usize>::MIN.saturating_add(1),
+            capacity: room % 2,
+        })
+    }
+}
+
+// SAFETY: the count and each admitted code initialize exactly one wire word.
+unsafe impl Initializer for Codes<'_> {
+    fn len(&self) -> usize {
+        2 + 2 * self.0.len()
+    }
+
+    unsafe fn initialize(&self, target: *mut MaybeUninit<u8>) {
+        let Ok(()) = self.visit(unsafe { destination(target) });
+    }
+}
+
+fn initialize(out: &mut write::Spare<'_>, source: &impl Initializer) -> Result<(), usize> {
+    let mut target = out.bounded();
+    target.try_init(source).map_err(|error| error.into_parts().1)?;
+    target.commit();
+    Ok(())
 }
 
 impl Prefix<'_> {
@@ -24,19 +62,15 @@ impl Prefix<'_> {
         write(&[0])?;
         write(self.name.as_bytes())?;
         write(&[0])?;
-        formats(self.formats, &mut write)?;
+        self.formats.visit(&mut write)?;
         write(&self.params.to_be_bytes())
     }
 
     #[inline]
     pub(super) fn write(&self, out: &mut write::Spare<'_>) -> Result<(), Error> {
-        let mut target = out.bounded();
-        if let Err(error) = target.try_init(self) {
-            return self
-                .visit(remaining(error.into_parts().1))
-                .map_err(Error::capacity);
+        if let Err(room) = initialize(out, self) {
+            return self.visit(remaining(room)).map_err(Error::capacity);
         }
-        target.commit();
         Ok(())
     }
 }
@@ -49,23 +83,12 @@ fn remaining(mut room: usize) -> impl FnMut(&[u8]) -> Result<(), consume::Error>
     }
 }
 
-pub(super) fn formats<E>(
-    formats: &[u16],
-    mut write: impl FnMut(&[u8]) -> Result<(), E>,
-) -> Result<(), E> {
-    write(&(formats.len() as i16).to_be_bytes())?;
-    for format in formats {
-        write(&format.to_be_bytes())?;
-    }
-    Ok(())
-}
-
 // SAFETY: immutable sources retain the exact fragment sum. Callers retain query
 // admission or use the unnamed singleton, so the format count fits i16.
 unsafe impl Initializer for Prefix<'_> {
     #[inline]
     fn len(&self) -> usize {
-        self.name.len() + 6 + self.formats.len() * 2
+        self.name.len() + 4 + self.formats.len()
     }
 
     #[inline]
@@ -101,7 +124,7 @@ impl<Q: TypedQuery> Admission<Q> {
             prefix.visit(&mut put)?;
             let _ = value::bind::<Q>(&params);
             drop(params);
-            formats(Q::RESULT_FORMAT_CODES, &mut put)?;
+            Codes(Q::RESULT_FORMAT_CODES).visit(&mut put)?;
             put(EXECUTE)?;
         }
         if CLOSE {
@@ -118,12 +141,12 @@ impl<Q: TypedQuery> Admission<Q> {
     ) -> Result<(), Error> {
         let prefix = Prefix {
             name: Q::STATEMENT_NAME,
-            formats: Q::PARAM_FORMAT_CODES,
+            formats: Codes(Q::PARAM_FORMAT_CODES),
             params: Q::N_PARAMS,
         };
-        let results = Q::RESULT_FORMAT_CODES;
+        let results = Codes(Q::RESULT_FORMAT_CODES);
         if prefix.params == 0
-            && let Ok(length) = i32::try_from(4 + prefix.len() + 2 + 2 * results.len())
+            && let Ok(length) = i32::try_from(4 + prefix.len() + results.len())
         {
             let record = 1 + length as usize + EXECUTE.len();
             let total = record

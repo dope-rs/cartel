@@ -1,3 +1,4 @@
+use crate::port::Instance;
 use std::{array, marker::PhantomData, mem, ops::ControlFlow, pin::Pin, task::Poll};
 
 use cartel_core::{deadline, reply};
@@ -116,7 +117,7 @@ pub(in crate::api) struct Group<
     'c: 'b,
     'd: 'c + 'app,
     B: ?Sized,
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     Q: schema::TypedQuery<Result = schema::result::Rows>,
     const ID: u8,
     const N: usize,
@@ -140,7 +141,7 @@ impl<
     'c: 'b,
     'd: 'c + 'app,
     B: ?Sized,
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     Q: schema::TypedQuery<Result = schema::result::Rows>,
     const ID: u8,
     const N: usize,
@@ -177,7 +178,7 @@ impl<
     'c: 'b,
     'd: 'c + 'app,
     B: ?Sized,
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     Q: schema::TypedQuery<Result = schema::result::Rows>,
     const ID: u8,
     const N: usize,
@@ -212,7 +213,7 @@ where
                         client.port.request().try_with(
                             context,
                             admit,
-                            |token, lane, tag, admit| {
+                            |token, lane, batch, _, admit| {
                                 let State::Connecting { request, .. } = &*admit else {
                                     unreachable!("connecting");
                                 };
@@ -227,7 +228,7 @@ where
                                     lane,
                                     this.commands,
                                     this.sync,
-                                    tag.batch(),
+                                    batch,
                                     admit,
                                     move |admit| match mem::replace(admit, State::Done) {
                                         State::Connecting { request, .. } => {
@@ -306,9 +307,9 @@ where
         };
         this.sync.detach();
         let cause = match stop {
-            Stop::Deadline(error) => Some(this.admission.cancel(error, lease::Lease::abort)),
+            Stop::Deadline(error) => Some(this.admission.cancel(error, |_| true, lease::Lease::abort)),
             stop => {
-                this.admission.take();
+                *this.admission = State::Done;
                 if let Ok(guard) = this.deadline.get_mut() {
                     guard.complete();
                 }

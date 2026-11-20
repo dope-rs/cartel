@@ -7,7 +7,7 @@ use dope::core::driver::route::KeyTag;
 use dope_fiber::reply::Batch;
 
 use crate::port::{pool::access, replies, replies::Response};
-use crate::protocol::{self, runtime::tx::Access};
+use crate::protocol::runtime::tx::Access;
 use crate::reply::{self, Pressure};
 use crate::schema;
 use cartel_core::reply::recv::outcome::Terminal;
@@ -66,7 +66,10 @@ impl<'d, const ID: u8> lease::Target<'d, ID> for Target<'d, ID> {
         self.conn
     }
 
-    fn current(self, tx: &Access<'_, 'd, ID>) -> Option<conn::Id<'d, KeyTag<ID>>> {
+    fn current<P: crate::port::ready::Policy>(
+        self,
+        tx: &Access<'_, 'd, ID, P>,
+    ) -> Option<conn::Id<'d, KeyTag<ID>>> {
         match self.transaction() {
             Some(target) => lease::Target::current(target, tx),
             None => Some(self.conn),
@@ -87,7 +90,18 @@ pub mod tx;
 pub use client::Context;
 pub use ops::Query as Client;
 
-fn check_open<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet, const ID: u8>(
+fn check_open<
+    'app,
+    'g,
+    'r,
+    's,
+    'b,
+    'c,
+    'd: 'app,
+    B: ?Sized,
+    I: crate::port::Instance,
+    const ID: u8,
+>(
     client: Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
 ) -> Result<(), reply::Error<'d, ID>> {
     client.port.shared.failure().map_or(Ok(()), Err)
@@ -120,7 +134,7 @@ impl<'app, 'b: 'app, 'c: 'b, 'd: 'c, Q: schema::TypedQuery, const ID: u8>
     }
 }
 
-pub struct ExtractUnit<const ID: u8 = 0, const REQUIRED: bool = false>;
+struct ExtractUnit<const ID: u8 = 0, const REQUIRED: bool = false>;
 
 impl<'app, 'b, 'c, 'd, const ID: u8, const REQUIRED: bool>
     recv::Spec<'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>
@@ -141,15 +155,10 @@ impl<'app, 'b, 'c, 'd, const ID: u8, const REQUIRED: bool>
         _: &Self::Context,
         slot: &mut Slot<'_, 'app, 'b, 'c, 'd, replies::Row<'d>, replies::ReplyFailure<'d>>,
     ) -> Option<Self::Output> {
-        match slot.terminal()? {
-            Terminal::Failed(failure) => Some(Err(failure.into_error().into_error())),
-            Terminal::Complete(mut done) => match done.pop() {
-                Some(_) => Some(Err(
-                    crate::Error::Protocol(protocol::Reason::CommandData).into()
-                )),
-                None => Some(Ok(())),
-            },
-        }
+        Some(match slot.terminal()? {
+            Terminal::Complete(_) => Ok(()),
+            Terminal::Failed(failure) => Err(failure.into_error().into_error()),
+        })
     }
 }
 

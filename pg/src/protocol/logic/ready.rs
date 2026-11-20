@@ -1,4 +1,4 @@
-use cartel_core::reply::{order::Front, usage};
+use cartel_core::reply::{input::Target, order::Front, usage};
 use o3::buffer::{self, hold};
 
 use crate::{
@@ -12,10 +12,10 @@ use crate::{
         messages,
         runtime::{ready::Entry, tx::poll},
     },
-    reply, schema,
+    reply,
 };
 
-impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: crate::port::Instance, const ID: u8>
     Turn<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
 {
     /// Command completion retains Ready replies until Sync resolves the transaction.
@@ -23,7 +23,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         &mut self,
         typ: u8,
         data: frame::Payload<'input, 'd, R>,
-        entry: Entry<'life, 'd, ID>,
+        entry: Entry<'life, 'd, ID, I::Policy>,
     ) -> Result<Option<logic::Pending<'d>>, crate::Error>
     where
         'd: 'input,
@@ -152,18 +152,6 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 }
                 Ok(None)
             }
-            messages::Be::COPY_DATA => {
-                if !matches!(self.state.phase, state::Phase::CopyOutActive(_)) {
-                    return Err(crate::Error::UnexpectedReadyMessage(typ));
-                }
-                self.push(data, entry)
-            }
-            messages::Be::DATA_ROW => {
-                if copy {
-                    return Err(crate::Error::UnexpectedReadyMessage(typ));
-                }
-                self.push(data, entry)
-            }
             messages::Be::NOTIFICATION_RESPONSE => {
                 payloads::notification(data, &self.port.shared.notifications, self.region)?;
                 Ok(None)
@@ -204,11 +192,11 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         }
     }
 
-    fn push<'input, R: buffer::Cursor + hold::raw::Retain<'d>>(
+    pub(super) fn push<'id, 'input, R: buffer::Cursor + hold::raw::Retain<'d>>(
         &mut self,
-        data: frame::Payload<'input, 'd, R>,
-        entry: Entry<'life, 'd, ID>,
-    ) -> Result<Option<logic::Pending<'d>>, crate::Error>
+        frame: frame::Complete<'id, 'input, 'd, R>,
+        entry: Entry<'life, 'd, ID, I::Policy>,
+    ) -> frame::Item<'id, Result<Option<logic::Pending<'d>>, crate::Error>>
     where
         'd: 'input,
     {
@@ -216,18 +204,19 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
 
         let mut queue = replies::Lane::new(self.port, self.conn, entry, self.region);
         let selected = queue.ordered();
-        match Tag::current(selected.tag(), self.state.batch)?.map(Tag::kind) {
-            None => {
-                return Err(crate::Error::Protocol(Reason::RowEmpty));
+        match Tag::current(selected.tag(), self.state.batch).map(|tag| tag.map(Tag::kind)) {
+            Err(error) => return frame.message(|_| Err(error)),
+            Ok(None) => {
+                return frame.message(|_| Err(crate::Error::Protocol(Reason::RowEmpty)));
             }
-            Some(Kind::Sync(_)) => {
-                return match selected.into_push().front() {
+            Ok(Some(Kind::Sync(_))) => {
+                return frame.message(|_| match selected.into_push().front() {
                     Front::Detached => Ok(None),
                     Front::Open | Front::Denied => Err(crate::Error::Protocol(Reason::CommandData)),
                     Front::Empty => Err(crate::Error::Protocol(Reason::ReadyUnknown)),
-                };
+                });
             }
-            Some(
+            Ok(Some(
                 Kind::Command
                 | Kind::Group(..)
                 | Kind::Last(..)
@@ -235,28 +224,59 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 | Kind::Required
                 | Kind::Begin
                 | Kind::Commit,
-            ) => {}
+            )) => {}
         }
-        match selected.into_push().try_build(replies::RowPlan::row(
-            data,
-            self.port.shared.config.retention_headroom(),
-        )) {
+        let headroom = self.port.shared.config.retention_headroom();
+        match selected.into_push().input() {
+            Ok(Target::Collected(target)) => frame.collected(|data, rows| {
+                Self::row_result(
+                    target.try_build(replies::Run::new(data, rows, headroom)),
+                    |_, cause| {
+                        Err(crate::Error::ReplyCapacity(usage::Capacity::Unavailable(
+                            cause,
+                        )))
+                    },
+                )
+            }),
+            Ok(Target::Single(target)) => frame.message(|message| {
+                Self::row_result(
+                    target.try_build(replies::RowPlan::row(message.payload, headroom)),
+                    |build, _| {
+                        build
+                            .into_pending()
+                            .map(|row| Some(logic::Pending::row(row)))
+                            .map_err(|(_, error)| crate::Error::ResponseRetention(error))
+                    },
+                )
+            }),
+            Ok(Target::Discard) => frame.message(|_| Ok(None)),
+            Err(front) => frame.message(|_| Self::row_front(front)),
+        }
+    }
+
+    fn row_front(front: Front) -> Result<Option<logic::Pending<'d>>, crate::Error> {
+        match front {
+            Front::Detached => Ok(None),
+            Front::Denied => Err(crate::Error::Protocol(Reason::CommandData)),
+            Front::Empty => Err(crate::Error::Protocol(Reason::ReadyUnknown)),
+            Front::Open => Err(crate::Error::ReplyFront(front)),
+        }
+    }
+
+    fn row_result<B, V>(
+        result: Result<(), usage::PushError<B, hold::Error, V>>,
+        pressure: impl FnOnce(
+            B,
+            usage::Backpressure,
+        ) -> Result<Option<logic::Pending<'d>>, crate::Error>,
+    ) -> Result<Option<logic::Pending<'d>>, crate::Error> {
+        match result {
             Ok(()) => Ok(None),
-            Err(usage::PushError::Backpressure { builder: build, .. }) => {
-                match build.into_pending() {
-                    Ok(next) => Ok(Some(logic::Pending::row(next))),
-                    Err((_, error)) => Err(crate::Error::ResponseRetention(error)),
-                }
-            }
+            Err(usage::PushError::Backpressure { builder, cause }) => pressure(builder, cause),
             Err(usage::PushError::Capacity { cause, .. }) => {
                 Err(crate::Error::ReplyCapacity(cause))
             }
-            Err(usage::PushError::Front { front, .. }) => match front {
-                Front::Detached => Ok(None),
-                Front::Denied => Err(crate::Error::Protocol(Reason::CommandData)),
-                Front::Empty => Err(crate::Error::Protocol(Reason::ReadyUnknown)),
-                Front::Open => Err(crate::Error::ReplyFront(front)),
-            },
+            Err(usage::PushError::Front { front, .. }) => Self::row_front(front),
             Err(usage::PushError::Build { error, .. }) => {
                 Err(crate::Error::ResponseRetention(error))
             }
@@ -274,7 +294,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
     pub(super) fn reply_error<'input, R: buffer::Cursor + hold::raw::Retain<'d>>(
         &mut self,
         plan: reply::Plan<'input, 'd, R>,
-        entry: Entry<'life, 'd, ID>,
+        entry: Entry<'life, 'd, ID, I::Policy>,
     ) -> Result<Option<logic::Pending<'d>>, crate::Error>
     where
         'd: 'input,

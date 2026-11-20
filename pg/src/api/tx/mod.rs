@@ -1,15 +1,15 @@
+use crate::port::Instance;
 use crate::{
     api,
     port::replies,
     reply::{Error, group::Ledger},
-    schema,
 };
 use api::task::tx::{Begin, Held};
 use api::{
     ops, request,
     results::copy::Chunk,
     sql,
-    traits::{self, sealed},
+    traits::{self, Connection as _, sealed},
 };
 use dope_fiber::abi;
 use finish::{End, Finish};
@@ -45,7 +45,7 @@ pub(super) enum Deferral {
 
 pub struct Builder<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
 {
     pub(super) client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     pub(super) isolation: Isolation,
@@ -54,12 +54,12 @@ where
     pub(super) timeout: Option<sql::Timeout>,
 }
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> sealed::Sealed
+impl<B: ?Sized, I: Instance, const ID: u8> sealed::Sealed
     for Builder<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
 {
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     traits::Begin<'d, ID> for Builder<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     type Guard = Guard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>;
@@ -90,19 +90,15 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 
     fn begin(self) -> impl abi::Fiber<'d, Output = Result<Self::Guard, Error<'d, ID>>> {
-        let limit = self.timeout;
         let client = self.client;
-        let level = self.isolation;
-        let access = self.access_mode;
-        let deferral = self.deferral;
+        let begin = request::Begin::new(self.isolation, self.access_mode, self.deferral);
+        let timeout = self.timeout;
         dope_fiber::fiber!('d => async move {
-            let lease = Begin::new(client, request::Begin::new(level, access, deferral)).await?;
-            let target = lease.target();
-            if let Some(time) = limit {
-                let setting = ops::Query::from_parts(client, api::Target::from_tx(target)).raw(request::Request::timeout(time));
-                setting.await?;
+            let guard = Guard { lease: Begin::new(client, begin).await? };
+            if let Some(time) = timeout {
+                guard.query().raw(request::Request::timeout(time)).await?;
             }
-            Ok(Guard { lease })
+            Ok(guard)
         })
     }
 }
@@ -111,7 +107,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
 /// so a pinned query cannot survive commit, rollback, or guard drop.
 pub struct Guard<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
 {
     lease: Held<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
 }
@@ -128,15 +124,15 @@ pub enum FinishError<E, F> {
 const _: () = assert!(mem::size_of::<Deferral>() == mem::size_of::<bool>());
 const _: () = assert!(mem::align_of::<Deferral>() == mem::align_of::<bool>());
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> sealed::Sealed
+impl<B: ?Sized, I: Instance, const ID: u8> sealed::Sealed
     for Guard<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
 {
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     traits::Connection<'d, ID> for Guard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
-    type Schema = I;
+    type Schema = I::Queries;
     type Payload = replies::Payload<'b, 'c, 'd>;
     type Diagnostics = Ledger<'r, 's>;
     type CopyChunk = Chunk<'b, 'c, 'd>;
@@ -153,7 +149,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     traits::Transaction<'d, ID> for Guard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     type Savepoint<'tx>

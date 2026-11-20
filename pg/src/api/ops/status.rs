@@ -1,4 +1,4 @@
-use crate::{api, protocol, reply::Error, schema};
+use crate::{api, port::Instance, reply::Error};
 use api::traits;
 use dope_fiber::{abi, context, wait};
 use std::task;
@@ -8,16 +8,27 @@ pub struct Status<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8
     pub(in crate::api) api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
 )
 where
-    I: schema::QuerySet + 'd;
+    I: Instance<Queries: 'd> + 'd;
 
 #[pin_project::pin_project]
-struct Wait<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8> {
+struct Wait<
+    'app,
+    'g,
+    'r,
+    's,
+    'b,
+    'c,
+    'd: 'app,
+    B: ?Sized,
+    I: Instance<Queries: 'd> + 'd,
+    const ID: u8,
+> {
     client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     #[pin]
     waiter: wait::Waiter<'app, 'd>,
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     abi::Fiber<'d> for Wait<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     type Output = Result<(), crate::reply::Error<'d, ID>>;
@@ -45,25 +56,17 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 }
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Copy
-    for Status<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-}
+impl<B: ?Sized, I: Instance, const ID: u8> Copy for Status<'_, '_, '_, '_, '_, '_, '_, B, I, ID> {}
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Clone
-    for Status<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
+impl<B: ?Sized, I: Instance, const ID: u8> Clone for Status<'_, '_, '_, '_, '_, '_, '_, B, I, ID> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> Sealed
-    for Status<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
-{
-}
+impl<B: ?Sized, I: Instance, const ID: u8> Sealed for Status<'_, '_, '_, '_, '_, '_, '_, B, I, ID> {}
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     traits::Status<'d, ID> for Status<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     fn is_failed(self) -> bool {
@@ -83,9 +86,5 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
             client: self.0,
             waiter: wait::Waiter::new(),
         }
-    }
-
-    fn set_policy(self, policy: protocol::PickPolicy) {
-        self.0.port.shared.set_policy(policy);
     }
 }

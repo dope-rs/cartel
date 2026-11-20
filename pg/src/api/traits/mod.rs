@@ -1,6 +1,6 @@
 //! Statically dispatched operations retaining their exact client and reply owners.
 
-use crate::{api, protocol, reply, reply::Error, schema};
+use crate::{api, reply, reply::Error, schema};
 use api::tx::control;
 use api::{results, sql, tx};
 use dope_fiber::abi::Fiber;
@@ -274,5 +274,4 @@ pub trait Status<'d, const ID: u8 = 0>: Sealed + Copy {
     fn is_ready(self) -> bool;
     fn live_count(self) -> usize;
     fn wait_ready(self) -> impl Fiber<'d, Output = Result<(), Error<'d, ID>>>;
-    fn set_policy(self, policy: protocol::PickPolicy);
 }

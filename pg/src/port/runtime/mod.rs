@@ -4,7 +4,7 @@ use crate::port::{
     pool::{access, slot},
     replies,
 };
-use crate::protocol::{self, scram};
+use crate::protocol::scram;
 use dope::core::driver::{self, route};
 use dope::manifold::client::{close, conn};
 use dope_fiber::wait;
@@ -18,11 +18,10 @@ mod states;
 pub(crate) mod tx;
 mod waiters;
 
-pub(crate) struct Shared<'d, const ID: u8> {
+pub(crate) struct Shared<'d, const ID: u8, P: ready::Policy> {
     pub(crate) database: crate::Config,
-    pub(crate) config: config::Config,
-    index: ready::Index<'d, ID>,
-    policy: cell::Cell<protocol::PickPolicy>,
+    pub(crate) config: config::Configuration<P>,
+    index: ready::Index<'d, ID, P>,
     next: cell::Cell<waiters::Step>,
     ready_waiters: wait::Notifier<'d>,
     pub(crate) frame_waiters: wait::Notifier<'d>,
@@ -32,10 +31,10 @@ pub(crate) struct Shared<'d, const ID: u8> {
     pub(crate) scram: scram::Runtime<'d, ID>,
 }
 
-impl<'d, const ID: u8> Shared<'d, ID> {
+impl<'d, const ID: u8, P: ready::Policy> Shared<'d, ID, P> {
     pub(crate) fn try_new(
         db: crate::Config,
-        config: config::Config,
+        config: config::Configuration<P>,
         driver: driver::Reference<'d>,
         proof: region::Identity<'d>,
     ) -> Result<Self, alloc::Error> {
@@ -49,7 +48,6 @@ impl<'d, const ID: u8> Shared<'d, ID> {
             database: db,
             config,
             index: ready::Index::try_new(ready)?,
-            policy: cell::Cell::new(protocol::PickPolicy::default()),
             next: cell::Cell::new(waiters::Step::Retire),
             ready_waiters: wait::Notifier::new(driver, wait),
             frame_waiters: wait::Notifier::new(driver, wait),
@@ -64,7 +62,7 @@ impl<'d, const ID: u8> Shared<'d, ID> {
         })
     }
 
-    pub(crate) fn transaction(&self) -> tx::Access<'_, 'd, ID> {
+    pub(crate) fn transaction(&self) -> tx::Access<'_, 'd, ID, P> {
         tx::Access { shared: self }
     }
 
@@ -80,7 +78,7 @@ impl<'d, const ID: u8> Shared<'d, ID> {
     }
 }
 
-impl<'d, const ID: u8> Shared<'d, ID> {
+impl<'d, const ID: u8, P: ready::Policy> Shared<'d, ID, P> {
     /// Operations can use prepared peers while another connection is opening.
     pub(crate) fn failure(&self) -> Option<crate::reply::Error<'d, ID>> {
         match self.signals.failure() {

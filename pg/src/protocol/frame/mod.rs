@@ -3,11 +3,10 @@ use o3::buffer::{self, bytes::bounded, hold, hold::scope};
 use crate::protocol::Wire;
 
 mod codec;
-pub use codec::Codec;
+pub use codec::{Codec, Complete, Item, Parsed};
 
-pub enum Head<'input, 'd, R: buffer::Cursor> {
-    Message(Message<'input, 'd, R>),
-    Fatal(crate::Error),
+pub(crate) fn declared(header: &[u8; 5]) -> u32 {
+    u32::from_be_bytes([header[1], header[2], header[3], header[4]])
 }
 
 /// A decoded message retaining its exact input projection.

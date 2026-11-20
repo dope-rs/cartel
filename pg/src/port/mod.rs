@@ -1,4 +1,4 @@
-use std::{marker, num};
+use std::num;
 
 use cartel_core::{deadline, queue, reply};
 use dope::{
@@ -43,6 +43,19 @@ pub(crate) use backend::Storage;
 pub use node::Node;
 pub use plan::Plan;
 
+pub trait Instance {
+    type Queries: schema::QuerySet;
+    type Policy: ready::Policy;
+}
+impl<Q: schema::QuerySet> Instance for Q {
+    type Queries = Q;
+    type Policy = ready::RoundRobin;
+}
+impl<Q: schema::QuerySet, P: ready::Policy> Instance for (Q, P) {
+    type Queries = Q;
+    type Policy = P;
+}
+
 pub(super) const CONNECTOR_CONNECTION_LIMIT: usize = u32::MAX as usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,8 +79,8 @@ pub(super) struct Lifecycle<'d, const ID: u8> {
     pub(super) buffer: backend::Storage,
 }
 
-pub struct Port<'e, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8 = 0> {
-    pub(super) shared: runtime::Shared<'d, ID>,
+pub struct Port<'e, 'g, 'r, 's, 'b, 'c, 'd, I: Instance, const ID: u8 = 0> {
+    pub(super) shared: runtime::Shared<'d, ID, I::Policy>,
     pub(super) lifecycle: Lifecycle<'d, ID>,
     request_queue: queue::Scoped<'b, 'd, egress::NonEmpty<requests::Frame<'d>>>,
     pub(crate) requests: Pool,
@@ -81,7 +94,6 @@ pub struct Port<'e, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8 = 
         replies::Tag<'g, 'r, 's, 'b, 'c, 'd>,
     >,
     pub(crate) diagnostics: Option<groups::Access<'g, 'r, 's, 'b, 'c, 'd>>,
-    queries: marker::PhantomData<fn() -> I>,
 }
 
 impl<
@@ -93,7 +105,7 @@ impl<
     'b: 'life,
     'c,
     'd: 'life,
-    I: schema::QuerySet + 'life,
+    I: Instance + 'life,
     const ID: u8,
 > endpoint::Provider<'life, 'd, KeyTag<ID>, { CONNECTOR_CONNECTION_LIMIT }>
     for Port<'e, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
@@ -116,10 +128,10 @@ impl<
     }
 }
 
-impl<'e, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8>
+impl<'e, 'g, 'r, 's, 'b, 'c, 'd, I: Instance, const ID: u8>
     Port<'e, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
 {
-    pub fn plan(database: crate::Config, config: config::Config) -> Plan<I, ID> {
+    pub fn plan(database: crate::Config, config: config::Configuration<I::Policy>) -> Plan<I, ID> {
         Plan::new(database, config)
     }
 
@@ -127,7 +139,7 @@ impl<'e, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8>
         self.shared.config.capacities().connections
     }
 
-    pub fn config(&self) -> &config::Config {
+    pub fn config(&self) -> &config::Configuration<I::Policy> {
         &self.shared.config
     }
 
@@ -161,7 +173,7 @@ impl<'e, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8>
         &'turn self,
         token: conn::Id<'d, KeyTag<ID>>,
         region: &'turn mut region::Token<region::Identity<'d>>,
-    ) -> Option<replies::Lane<'turn, 'g, 'r, 's, 'b, 'c, 'd, ID>> {
+    ) -> Option<replies::Lane<'turn, 'g, 'r, 's, 'b, 'c, 'd, ID, I::Policy>> {
         replies::Lane::try_new(self, token, region)
     }
 

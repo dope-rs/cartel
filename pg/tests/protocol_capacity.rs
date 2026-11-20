@@ -4,7 +4,7 @@ use cartel_pg::{
         traits::{Client as _, Query as _, Status as _},
     },
     port,
-    protocol::{Codec, encode, frame::Head},
+    protocol::{self, Codec, encode},
     reply,
 };
 use common::{
@@ -42,50 +42,85 @@ fn request_capacity(failure: &reply::Error<'_>) -> (usize, usize) {
 
 #[test]
 fn row_borrows_ingress() {
-    let config = capacity::try_frame(32);
-    let config = config.expect("valid test capacity");
+    let config = capacity::try_frame(32).expect("valid test capacity");
     let codec = Codec::new(&config);
     let ingress =
         (Frame::new(b'D', b"payload").try_ingress(4096)).expect("fixture ingress allocation");
-    capacity::try_parse(&codec, &ingress, |parsed| {
-        let (head, consumed) = match parsed {
-            Parse::Item { head, consumed } => Some((head, consumed)),
-            Parse::More(_) | Parse::Blocked | Parse::CapacityExhausted => None,
-        }
-        .expect("complete frame must parse");
-        let message = match head {
-            Head::Message(message) => Ok(message),
-            Head::Fatal(error) => Err(error),
-        }
-        .expect("valid row must remain a message");
-        assert_eq!(consumed.count().get() as usize, 12);
-        assert_eq!(message.payload.as_slice(), b"payload");
-        assert_eq!(
-            message.payload.as_slice().as_ptr(),
-            ingress.as_slice().as_ptr().wrapping_add(5),
-            "the codec must not retain or copy a complete frame"
-        );
-    })
-    .expect("PostgreSQL source proof");
+    capacity::parse(
+        &codec,
+        &ingress,
+        |frame| {
+            frame.message(|message| {
+                assert_eq!(message.payload.as_slice(), b"payload");
+                assert_eq!(
+                    message.payload.as_slice().as_ptr(),
+                    ingress.as_slice()[5..].as_ptr()
+                );
+            })
+        },
+        |parsed| {
+            assert!(
+                matches!(parsed, Ok(Parse::Item { head: Ok(()), consumed }) if consumed.count().get() == 12)
+            )
+        },
+    );
 }
 
 #[test]
 fn header_rejects_oversize() {
-    let config = capacity::try_frame(12);
-    let config = config.expect("valid test capacity");
+    let config = capacity::try_frame(12).expect("valid test capacity");
     let codec = Codec::new(&config);
     let ingress =
         (Frame::new(b'D', b"12345678").try_ingress(4096)).expect("fixture ingress allocation");
-    capacity::try_parse(&codec, &ingress, |parsed| {
-        let (head, consumed) = match parsed {
-            Parse::Item { head, consumed } => Some((head, consumed)),
-            Parse::More(_) | Parse::Blocked | Parse::CapacityExhausted => None,
-        }
-        .expect("complete frame must parse");
-        assert!(matches!(head, Head::Fatal(_)));
-        assert_eq!(consumed.count().get() as usize, 5);
-    })
-    .expect("PostgreSQL source proof");
+    capacity::parse(
+        &codec,
+        &ingress,
+        |frame| frame.message(|_| ()),
+        |parsed| {
+            assert!(matches!(
+                parsed,
+                Ok(Parse::Item {
+                    head: Err(cartel_pg::Error::Protocol(protocol::Reason::FrameCapacity {
+                        declared: 12, capacity,
+                    })),
+                    consumed,
+                }) if capacity.get() == 12 && consumed.count().get() == 5
+            ));
+        },
+    );
+}
+
+#[test]
+fn collected_rows_stop_before_control_partial_or_invalid_frame() {
+    let codec = Codec::new(&capacity::try_frame(12).expect("frame capacity"));
+    let first = Frame::new(b'D', &[0, 1, 0xff, 0xff, 0xff, 0xff]).encode();
+    let second = Frame::new(b'D', &[0, 1, 0, 0, 0, 0]).encode();
+    for suffix in [
+        &b"Z\0\0\0\x05I"[..],
+        b"D\0",
+        b"D\0\0\0\x0a\0",
+        b"D\0\0\0\x03",
+        b"D\0\0\0\x0c",
+    ] {
+        let wire = [first.as_slice(), second.as_slice(), suffix].concat();
+        let ingress = o3::buffer::storage::Shared::try_copy(&wire).expect("row ingress");
+        capacity::parse(
+            &codec,
+            &ingress,
+            |frame| {
+                frame.collected(|payload, rows| {
+                    assert_eq!(payload.as_slice(), &wire[..22]);
+                    assert_eq!(payload.as_slice().as_ptr(), ingress.as_slice().as_ptr());
+                    rows.get()
+                })
+            },
+            |parsed| {
+                assert!(
+                    matches!(parsed, Ok(Parse::Item { head: Ok(2), consumed }) if consumed.count().get() == 22)
+                )
+            },
+        );
+    }
 }
 
 #[test]
@@ -214,15 +249,17 @@ fn bind_failures_recover() {
                                 order.map(Cell::into_inner),
                                 [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 0]
                             );
-                            for (text, array, capacity) in [
-                                (OVERSIZED, &["x"][..], 483),
-                                ("ok", &["kept", OVERSIZED][..], 445),
+                            for (text, array, expected) in [
+                                (OVERSIZED, &["x"][..], (512, 483)),
+                                ("ok", &["kept", OVERSIZED][..], (512, 445)),
+                                // Three bytes remain for the result count and its two-byte code.
+                                (&OVERSIZED[..456], &[][..], (2, 1)),
                             ] {
                                 let failure = runtime
                                     .block_on(client.run_no_rows::<Bind>((7, text, array)))
                                     .expect("bind driver")
-                                    .expect_err("oversized parameter");
-                                assert_eq!(request_capacity(&failure), (512, capacity));
+                                    .expect_err("short request frame");
+                                assert_eq!(request_capacity(&failure), expected);
                             }
                             runtime
                                 .block_on(client.run_no_rows::<Bind>((7, "ok", &["x"])))

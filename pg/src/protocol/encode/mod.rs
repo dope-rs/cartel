@@ -3,6 +3,53 @@ mod error;
 
 pub use error::Error;
 
+#[doc(hidden)]
+pub const fn format_codes<const PARAMETERS: bool>(values: &'static [u16]) -> &'static [u16] {
+    let [first, ..] = values else {
+        return if PARAMETERS { &[] } else { &[1] };
+    };
+    let mut index = 1;
+    while index < values.len() {
+        if values[index] != *first {
+            return values;
+        }
+        index += 1;
+    }
+    match *first {
+        1 => &[1],
+        0 if PARAMETERS => &[],
+        _ => values,
+    }
+}
+
+#[doc(hidden)]
+pub const fn result_formats<const N: usize>(shape: &crate::schema::desc::Formats) -> [u16; N] {
+    use crate::schema::desc::Formats;
+
+    const fn write(shape: &Formats, out: &mut [u16], at: &mut usize) {
+        match shape {
+            Formats::Value(code) => {
+                if *at < out.len() {
+                    out[*at] = *code;
+                    *at += 1;
+                }
+            }
+            Formats::Row(fields) => {
+                let mut index = 0;
+                while index < fields.len() {
+                    write(&fields[index], out, at);
+                    index += 1;
+                }
+            }
+        }
+    }
+    // Query admission reports a custom declaration with too many or too few fields.
+    let mut codes = [1; N];
+    let mut at = 0;
+    write(shape, &mut codes, &mut at);
+    codes
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Scope {
     Frame,
@@ -192,7 +239,22 @@ impl Writer<'_> {
         self.patch::<true, _>(write)
     }
 
-    pub(crate) fn parse_with(
+    fn run(
+        &mut self,
+        prefix: &bind::Prefix<'_>,
+        results: bind::Codes<'_>,
+        write: impl FnOnce(&mut Writer<'_>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.write_byte(messages::Fe::BIND)?;
+        self.patch::<true, _>(|out| {
+            prefix.write(&mut out.0)?;
+            write(out)?;
+            results.write(&mut out.0)
+        })?;
+        self.write_slice(EXECUTE)
+    }
+
+    pub(crate) fn unnamed(
         &mut self,
         write: impl FnOnce(&mut Writer<'_>) -> Result<(), Error>,
     ) -> Result<(), Error> {
@@ -202,28 +264,10 @@ impl Writer<'_> {
             write(out)?;
             out.write_byte(0)?;
             out.write_slice(&0i16.to_be_bytes())
-        })
-    }
-
-    fn run(
-        &mut self,
-        prefix: &bind::Prefix<'_>,
-        results: &[u16],
-        write: impl FnOnce(&mut Writer<'_>) -> Result<(), Error>,
-    ) -> Result<(), Error> {
-        self.write_byte(messages::Fe::BIND)?;
-        self.patch::<true, _>(|out| {
-            prefix.write(&mut out.0)?;
-            write(out)?;
-            bind::formats(results, |bytes| out.write_slice(bytes))
         })?;
-        self.write_slice(EXECUTE)
-    }
-
-    pub(crate) fn unnamed(&mut self) -> Result<(), Error> {
         self.run(
-            &bind::Prefix { name: "", formats: &[1], params: 0 },
-            &[1],
+            &bind::Prefix { name: "", formats: bind::Codes(&[1]), params: 0 },
+            bind::Codes(&[1]),
             |_| Ok(()),
         )
     }

@@ -1,6 +1,15 @@
-use cartel_pg::port::config;
-use o3::buffer::resident::staging;
-use o3::{base::cell::region, buffer::resident};
+use cartel_pg::{
+    port::config,
+    protocol::{
+        Codec,
+        frame::{Complete, Item, Parsed},
+    },
+};
+use dope::manifold::client::session::codec::{self, Codec as _, Input, staging::Policy};
+use o3::{
+    base::cell::region,
+    buffer::{resident, storage::Shared},
+};
 use std::pin::Pin;
 
 pub fn try_frame(frame: usize) -> Result<config::Config, config::Error> {
@@ -24,40 +33,31 @@ pub fn try_frame(frame: usize) -> Result<config::Config, config::Error> {
     })
 }
 
-use cartel_pg::protocol::{Codec, frame::Head};
-use dope::{
-    manifold::client::session::codec, manifold::client::session::codec::Codec as _,
-    manifold::client::session::codec::Input, manifold::client::session::codec::Parse,
-    manifold::client::session::codec::Stateless as _,
-    manifold::client::session::codec::staging::Policy,
-};
-use o3::{buffer::storage::Shared, buffer::write::consume::scope};
-
-pub fn try_parse(
+pub fn parse<T>(
     codec: &Codec,
     ingress: &Shared,
-    inspect: impl for<'id, 'input, 'd> FnOnce(Parse<'id, Head<'input, 'd, Shared>>),
-) -> Result<(), Error> {
+    project: impl for<'id, 'input, 'd> FnOnce(Complete<'id, 'input, 'd, Shared>) -> Item<'id, T>,
+    inspect: impl for<'id> FnOnce(Parsed<'id, Result<T, cartel_pg::Error>>),
+) {
     let mut domain = resident::Domain::new();
     region::Token::scope_pinned(Pin::new(&mut domain), |token, domain| {
         let budget = domain
             .get_mut()
             .try_budget(0, token.proof())
-            .map_err(Error::Budget)?;
+            .expect("fixture budget");
         let plan = (<<Codec as codec::Codec>::Staging as Policy>::plan(codec.staging()))
-            .map_err(Error::Staging)?;
+            .expect("fixture staging");
         let limit = <<Codec as codec::Codec>::Staging as Policy>::limit(plan);
         Input::with(ingress, &budget, limit, |input| {
-            let parsed = (codec.parse(input)).map_err(Error::Source)?;
-            inspect(parsed);
-            Ok(())
+            inspect(codec.parse(
+                input,
+                project,
+                |_, error| Err(error),
+                |project, frame| {
+                    let (value, end) = project(frame)?;
+                    Ok((Ok(value), end))
+                },
+            ))
         })
     })
-}
-
-#[derive(Debug)]
-pub enum Error {
-    Budget(resident::Reuse),
-    Staging(staging::Error),
-    Source(scope::Error),
 }

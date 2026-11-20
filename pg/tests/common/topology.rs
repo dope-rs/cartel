@@ -59,7 +59,7 @@ pub enum Error {
     Claim(Claim),
 }
 
-pub fn try_new<I: schema::QuerySet, E>(
+pub fn try_new<I: port::Instance, E>(
     plan: port::Plan<I>,
     address: <E::Transport as Transport>::Addr,
     base: Duration,

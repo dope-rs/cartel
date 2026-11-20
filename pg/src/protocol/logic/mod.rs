@@ -1,3 +1,4 @@
+use crate::port::Instance;
 use bindings::endpoint;
 use cartel_core::reply;
 use codec::mode;
@@ -19,17 +20,12 @@ use dope::{
 use driver::schedule::{self, app::Work, clock};
 use o3::{
     base::{Call, cell::region, time::Positive},
-    buffer::{self, hold, write::consume::scope},
+    buffer::{self, hold, resident},
 };
 use policy::admit;
 use port::{CONNECTOR_CONNECTION_LIMIT, Port, replies, requests};
 
-use crate::{
-    port,
-    port::Disposition,
-    protocol::{Codec, frame::Head},
-    schema,
-};
+use crate::{port, port::Disposition, protocol::Codec};
 
 mod drain;
 mod failure;
@@ -58,7 +54,7 @@ type Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, const ID: u8> = endpoint::State<
 type Context<'turn, 'e, 'life, 'd, I, const ID: u8> =
     turns::Context<'turn, 'e, 'd, State<'life, 'd, I, ID>, requests::Frame<'d>, KeyTag<ID>>;
 
-impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: Instance, const ID: u8>
     protocol::Spec<
         'life,
         'd,
@@ -71,7 +67,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
     type Connect = Full;
     type ConnState = State<'life, 'd, I, ID>;
     type Failure = Observed;
-    type Mode = mode::Plain;
+    type Mode = mode::Stored;
     type Requests = request::Enabled;
     type Response = response::Resume<Pending<'d>, Pending<'d>>;
     type Receipt = ();
@@ -82,8 +78,8 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         &owner.logic().0
     }
 }
-impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
-    protocol::Plain<
+impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: Instance, const ID: u8>
+    protocol::Stored<
         'life,
         'd,
         Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
@@ -91,30 +87,57 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         CONNECTOR_CONNECTION_LIMIT,
     > for Session
 {
-    fn reject<'e>(
-        owner: &mut Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
-        cause: scope::Error,
-        ctx: &mut Context<'_, 'e, 'life, 'd, I, ID>,
-    ) -> response::Delivery<Pending<'d>> {
-        turn::Turn::new(owner.root(), ctx).fail(crate::Error::Input(cause));
-        response::Delivery::Committed
+    fn blocked(
+        _: &Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
+        _: conn::Id<'d, KeyTag<ID>>,
+        _: &mut (),
+    ) -> session::Blocking {
+        session::Blocking::Unsupported
     }
 
-    fn deliver<'input, R: buffer::Cursor + hold::raw::Retain<'d>>(
+    fn decode<S>(
         owner: &mut Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
-        head: Head<'input, 'd, R>,
+        _: conn::Id<'d, KeyTag<ID>>,
+        storage: &mut S,
+        _: &mut (),
+        budget: &resident::Budget<'d>,
+        limit: codec::staging::Limit,
         ctx: &mut Context<'_, '_, 'life, 'd, I, ID>,
-    ) -> response::Delivery<Pending<'d>>
+    ) -> codec::Step<response::Delivery<Pending<'d>>>
     where
-        'd: 'input,
+        S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
     {
-        match head {
-            Head::Message(message) => turn::Turn::new(owner.root(), ctx).response(message),
-            Head::Fatal(error) => {
-                turn::Turn::new(owner.root(), ctx).fail(error);
-                response::Delivery::Committed
-            }
-        }
+        let port = owner.root();
+        let codec = &owner.logic().0;
+        codec::Input::commit(storage, budget, limit, |input| {
+            codec
+                .parse(
+                    input,
+                    &mut *ctx,
+                    |ctx, error| turn::Turn::new(port, ctx).reject(error),
+                    |ctx, frame| turn::Turn::new(port, ctx).frame(frame),
+                )
+                .map_err(|error| turn::Turn::new(port, ctx).reject(crate::Error::Input(error)))
+        })
+    }
+
+    fn finish<'slot, 'id, S>(
+        owner: &mut Owner<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
+        mut input: codec::storage::Owner<'slot, 'id, S, ()>,
+        _: &resident::Budget<'d>,
+        _: codec::staging::Limit,
+        ctx: &mut Context<'_, '_, 'life, 'd, I, ID>,
+    ) -> codec::Finished<codec::storage::Owner<'slot, 'id, S, ()>, response::Delivery<Pending<'d>>>
+    where
+        S: buffer::Cursor + hold::raw::Retain<'d> + buffer::raw::Consume,
+    {
+        let result = owner
+            .logic()
+            .0
+            .finish_with(input.parts().0.as_ref(), |error| {
+                turn::Turn::new(owner.root(), ctx).reject(error)
+            });
+        (input, Ok(result))
     }
 }
 impl<
@@ -125,7 +148,7 @@ impl<
     'b: 'life,
     'c: 'life,
     'd: 'life,
-    I: schema::QuerySet + 'life,
+    I: Instance + 'life,
     const ID: u8,
 >
     policy::Output<
@@ -158,7 +181,7 @@ impl<
         )
     }
 }
-impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: Instance, const ID: u8>
     policy::Requests<
         'life,
         'd,
@@ -175,7 +198,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         owner.root().request().drain(reqs);
     }
 }
-impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: Instance, const ID: u8>
     admit::Register<
         'life,
         'd,
@@ -195,7 +218,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
     }
 }
 
-impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: Instance, const ID: u8>
     policy::Connected<
         'life,
         'd,
@@ -215,7 +238,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         turn::Turn::from_startup(owner.root(), ctx).connect();
     }
 }
-impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: Instance, const ID: u8>
     policy::Failed<
         'life,
         'd,
@@ -235,7 +258,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         shared.waiters().wake_all();
     }
 }
-impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: Instance, const ID: u8>
     policy::Exhausted<
         'life,
         'd,
@@ -255,7 +278,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         shared.waiters().wake_all();
     }
 }
-impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: Instance, const ID: u8>
     policy::Lifecycle<
         'life,
         'd,
@@ -371,7 +394,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         }
     }
 }
-impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: Instance, const ID: u8>
     policy::Quiescence<
         'life,
         'd,
@@ -388,7 +411,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
         barrier.ready()
     }
 }
-impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: Instance, const ID: u8>
     policy::Scheduling<
         'life,
         'd,

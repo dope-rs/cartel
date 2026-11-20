@@ -7,7 +7,15 @@ use dope::core::driver::life::recovery;
 use dope_test::harness::peer;
 use std::{pin::pin, task::Poll, time::Duration};
 
-use cartel_pg::{api::tx::FinishError, port, port::config, protocol::PickPolicy, reply};
+use cartel_pg::{
+    api::tx::FinishError,
+    port,
+    port::{
+        config,
+        ready::{LeastInflight, Policy, RoundRobin},
+    },
+    reply,
+};
 use common::{
     port::*,
     postgres::{accept::Listener, retire, startup::Stream},
@@ -30,12 +38,12 @@ pub mod common;
 
 #[test]
 fn transaction_does_not_join_open_stream() {
-    for policy in [PickPolicy::RoundRobin, PickPolicy::LeastInflight] {
+    fn run<P: Policy>() {
         peer::AcceptScript::with(common::transaction::streamed, |server| {
             let prepared = topology::try_new::<_, Env>(
-                port::Port::<Database>::plan(
+                port::Port::<(Database, P)>::plan(
                     Queries::try_config().expect("database config"),
-                    Queries::try_cancel().expect("two in-flight replies"),
+                    config::Configuration::new(Queries::cancel_capacity()).expect("two in-flight replies"),
                 ),
                 server.addr(),
                 Duration::from_millis(1),
@@ -50,7 +58,6 @@ fn transaction_does_not_join_open_stream() {
                         node.install(stage, |host, stage| {
                             stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
                                 let client = runtime.root_client();
-                                client.status().set_policy(policy);
                                 assert!(matches!(
                                     runtime.block_on(client.status().wait_ready()),
                                     Ok(Ok(()))
@@ -80,6 +87,8 @@ fn transaction_does_not_join_open_stream() {
         })
         .expect("spawn transaction peer");
     }
+    run::<RoundRobin>();
+    run::<LeastInflight>();
 }
 
 #[test]
@@ -703,7 +712,7 @@ fn transaction_frees_slot() {
     for failed in [false, true] {
         let bound = socket::Listener::bind(([127, 0, 0, 1], 0).into()).expect("peer listener");
         let addr = bound.local_addr();
-        let config = config::Config::with_window(
+        let config = config::Configuration::with_window(
             config::Capacities {
                 connections: 2,
                 inflight: 2,
@@ -729,15 +738,17 @@ fn transaction_frees_slot() {
             service::Revision::new(1),
             service::Endpoint::new(addr, addr),
         );
-        let (_, node) =
-            port::Port::<Queries>::plan(Queries::try_config().expect("database config"), config)
-                .assemble::<Env>(
-                    snapshot,
-                    Duration::from_millis(1),
-                    Duration::from_millis(1_024),
-                )
-                .expect("PostgreSQL plan")
-                .into_parts();
+        let (_, node) = port::Port::<(Queries, LeastInflight)>::plan(
+            Queries::try_config().expect("database config"),
+            config,
+        )
+        .assemble::<Env>(
+            snapshot,
+            Duration::from_millis(1),
+            Duration::from_millis(1_024),
+        )
+        .expect("PostgreSQL plan")
+        .into_parts();
         let peer = server::Plan::<Identity, KeyTag<1>>::new(Capacity::fixed::<2>(), Identity);
         let layout =
             listener::topology::Layout::<KeyTag<1>, receive::Owned>::new(Capacity::fixed::<2>());
@@ -835,7 +846,6 @@ fn transaction_frees_slot() {
                                             .try_run(&mut runtime, Join::new(waiting.as_mut(), exchange))
                                             .expect("new peer admission driver");
                                         assert!(result.is_ok(), "new peer must wake and admit the waiting query");
-                                        client.status().set_policy(PickPolicy::LeastInflight);
                                         let mut held = pin!(Task::new(client.command("SELECT 3")));
                                         assert!(matches!(
                                             runtime.block_on(fibers::TEST.poll_once(held.as_mut())),

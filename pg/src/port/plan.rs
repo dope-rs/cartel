@@ -1,4 +1,4 @@
-use std::{marker, time};
+use std::time;
 
 use dope::{
     manifold::{app::env, network::client::topology::plan, service::health},
@@ -6,32 +6,22 @@ use dope::{
     runtime::topology,
 };
 
-use crate::{
-    port::{self, Node, config},
-    schema,
-};
+use crate::port::{self, Node, config};
 
-pub struct Plan<I, const ID: u8 = 0> {
+pub struct Plan<I: port::Instance, const ID: u8 = 0> {
     pub(super) database: crate::Config,
-    pub(super) config: config::Config,
-    pub(super) queries: marker::PhantomData<fn() -> I>,
+    pub(super) config: config::Configuration<I::Policy>,
 }
 
-impl<I, const ID: u8> Plan<I, ID> {
-    pub(super) fn new(database: crate::Config, config: config::Config) -> Self {
-        Self {
-            database,
-            config,
-            queries: marker::PhantomData,
-        }
+impl<I: port::Instance, const ID: u8> Plan<I, ID> {
+    pub(super) fn new(database: crate::Config, config: config::Configuration<I::Policy>) -> Self {
+        Self { database, config }
     }
 
-    pub fn config(&self) -> &config::Config {
+    pub fn config(&self) -> &config::Configuration<I::Policy> {
         &self.config
     }
-}
 
-impl<I: schema::QuerySet, const ID: u8> Plan<I, ID> {
     pub fn assemble<E>(
         self,
         set: port::Snapshot<E>,

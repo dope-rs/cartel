@@ -1,5 +1,3 @@
-use std::marker;
-
 use cartel_core::{deadline, queue, reply};
 use client::topology::plan;
 use dope::{
@@ -29,7 +27,6 @@ use o3::{buffer::pool, depot::arena::pool::shared};
 use crate::{
     port::{self, backend::Storage, replies::groups::Access, requests},
     protocol::{self, logic},
-    schema,
 };
 
 type Host<'q, 'h, 'a, 'g, 'r, 's, 'b, 'c, 'e, 'd, I, const ID: u8, E> = app::Host<
@@ -58,7 +55,7 @@ type Host<'q, 'h, 'a, 'g, 'r, 's, 'b, 'c, 'e, 'd, I, const ID: u8, E> = app::Hos
 >;
 
 /// Owns the protocol configuration through its complete installation scope.
-pub struct Node<I, const ID: u8, E>
+pub struct Node<I: port::Instance, const ID: u8, E>
 where
     E: env::Spec,
 {
@@ -67,7 +64,7 @@ where
     plan: plan::Plan<KeyTag<ID>, { port::CONNECTOR_CONNECTION_LIMIT }, plan::Side>,
 }
 
-impl<I, const ID: u8, E> Node<I, ID, E>
+impl<I: port::Instance, const ID: u8, E> Node<I, ID, E>
 where
     E: env::Spec,
 {
@@ -84,7 +81,7 @@ where
     }
 }
 
-impl<I, const ID: u8, E> settings::Resource for Node<I, ID, E>
+impl<I: port::Instance, const ID: u8, E> settings::Resource for Node<I, ID, E>
 where
     E: env::Spec,
 {
@@ -93,7 +90,7 @@ where
     }
 }
 
-impl<I, const ID: u8, E> Node<I, ID, E>
+impl<I: port::Instance, const ID: u8, E> Node<I, ID, E>
 where
     E: env::Spec<Wire = Identity>,
     <E::Transport as net::Transport>::Addr: Eq,
@@ -107,7 +104,6 @@ where
     ) -> topology::Plan<S, (Self, lending::Composition<T, F>)>
     where
         S: storage::Plan,
-        I: schema::QuerySet,
         F: for<'stage, 'scope, 'life, 'p, 'd, 'q, 'h, 'a, 'g, 'r, 's, 'b, 'c, 'e> FnOnce(
             T,
             Host<'q, 'h, 'a, 'g, 'r, 's, 'b, 'c, 'e, 'd, I, ID, E>,
@@ -130,7 +126,6 @@ where
     where
         S: storage::Plan + 'd,
         Q: executor::Startup,
-        I: schema::QuerySet,
         E: 'd,
     {
         use net::link::egress;
@@ -142,11 +137,7 @@ where
             set,
             plan,
         } = self;
-        let port::Plan {
-            database,
-            config,
-            queries: _,
-        } = settings;
+        let port::Plan { database, config } = settings;
         let run = *config.runtime();
         let cap = config.side().primary();
         let window = config.operation_window;
@@ -235,7 +226,7 @@ where
                         .try_bind(replies.domain())
                         .map_err(port::Build::QueueDomain)
                         .map_err(manifold::BuildError::Factory)?;
-                    let port = port::Port {
+                    let port = port::Port::<I, ID> {
                         shared,
                         lifecycle: port::Lifecycle {
                             deadline,
@@ -247,7 +238,6 @@ where
                         controls,
                         responses: replies,
                         diagnostics: access,
-                        queries: marker::PhantomData,
                     };
                     let memory = port.config().memory_bound();
                     let ingress = ingress::Plan::local(
@@ -286,7 +276,7 @@ impl<'stage, 'scope, 'life, 'p, 'd, S, Q, N, O, I, const ID: u8, E>
 where
     S: storage::Plan,
     Q: executor::Startup,
-    I: schema::QuerySet,
+    I: port::Instance,
     E: env::Spec<Wire = Identity> + 'd,
     <E::Transport as net::Transport>::Addr: Eq,
     N: for<'q, 'h, 'a, 'g, 'r, 's, 'b, 'c, 'e> lending::Next<
@@ -312,7 +302,7 @@ impl<S, T, Q, F, R, I, const ID: u8, E> lending::ComposeFrom<S, lending::Composi
 where
     S: storage::Plan,
     Q: executor::Startup,
-    I: schema::QuerySet,
+    I: port::Instance,
     E: env::Spec<Wire = Identity>,
     <E::Transport as net::Transport>::Addr: Eq,
     F: for<'stage, 'scope, 'life, 'p, 'd, 'q, 'h, 'a, 'g, 'r, 's, 'b, 'c, 'e> FnOnce(

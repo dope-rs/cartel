@@ -1,3 +1,4 @@
+use crate::port::Instance;
 use crate::{api, port::replies, reply, reply::Error, schema};
 use dope_fiber::{abi, wait};
 use schema::result;
@@ -43,8 +44,20 @@ impl<'d, C, R, S, const ID: u8> traits::IntoQuery<'d, ID> for Query<C, R, S> {
     }
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R, S>
-    traits::Query<'d, ID> for Query<api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
+impl<
+    'app,
+    'g,
+    'r,
+    's,
+    'b,
+    'c,
+    'd: 'app,
+    B: ?Sized,
+    I: Instance<Queries: 'd> + 'd,
+    const ID: u8,
+    R,
+    S,
+> traits::Query<'d, ID> for Query<api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
 where
     R: Copy + Into<Option<api::Target<'d, ID>>>,
     S: request::Input<'d>,
@@ -100,7 +113,7 @@ where
         })
     }
 
-    type Schema = I;
+    type Schema = I::Queries;
     type Payload = replies::Payload<'b, 'c, 'd>;
     type Batch = Batch<'app, 'b, 'c, 'd, replies::Row<'d>>;
     type Diagnostics = group::Ledger<'r, 's>;
@@ -116,7 +129,7 @@ where
     + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
-        I: schema::HasGroup<Q::Group>,
+        I::Queries: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
         self.typed::<Q, api::ExtractFirst<_, ID>, _>(params, results::Row::<_, Q>::required)
@@ -131,7 +144,7 @@ where
     > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, N, R, S>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
-        I: schema::HasGroup<Q::Group>,
+        I::Queries: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
         let (client, target, frame, clock) = self.into_parts();
@@ -146,7 +159,7 @@ where
     + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
-        I: schema::HasGroup<Q::Group>,
+        I::Queries: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
         self.typed::<Q, api::ExtractFirst<_, ID>, _>(params, results::Row::<_, Q>::optional)
@@ -161,7 +174,7 @@ where
     > + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
     where
         Q: schema::TypedQuery<Result = result::Rows<true>>,
-        I: schema::HasGroup<Q::Group>,
+        I::Queries: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
         self.typed::<Q, api::ExtractFirst<_, ID>, _>(params, results::Row::<_, Q, true>::optional)
@@ -174,7 +187,7 @@ where
     + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
-        I: schema::HasGroup<Q::Group>,
+        I::Queries: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
         self.typed::<Q, api::ExtractAll<Q, ID>, _>(params, ())
@@ -187,7 +200,7 @@ where
     + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
     where
         Q: schema::TypedQuery<Row = (), Result = result::Command>,
-        I: schema::HasGroup<Q::Group>,
+        I::Queries: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
         self.typed::<Q, api::ExtractUnit<ID>, _>(params, ())
@@ -200,7 +213,7 @@ where
     + use<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R, S>
     where
         Q: schema::TypedQuery<Row = (), Result = result::Command>,
-        I: schema::HasGroup<Q::Group>,
+        I::Queries: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
         self.typed::<Q, api::ExtractUnit<ID, true>, _>(params, ())
@@ -209,7 +222,7 @@ where
     fn run_stream<Q>(self, params: Q::Params<'_>) -> <Self as traits::Query<'d, ID>>::Stream<Q>
     where
         Q: schema::TypedQuery<Result = result::Rows>,
-        I: schema::HasGroup<Q::Group>,
+        I::Queries: schema::HasGroup<Q::Group>,
         Q::Group: schema::QueryGroup,
     {
         let (client, target, frame, clock) = self.into_parts();
@@ -224,8 +237,20 @@ where
     }
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R, S>
-    traits::Unchecked<'d, ID> for Query<api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
+impl<
+    'app,
+    'g,
+    'r,
+    's,
+    'b,
+    'c,
+    'd: 'app,
+    B: ?Sized,
+    I: Instance<Queries: 'd> + 'd,
+    const ID: u8,
+    R,
+    S,
+> traits::Unchecked<'d, ID> for Query<api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
 where
     R: Copy + Into<Option<api::Target<'d, ID>>>,
     S: request::Input<'d>,
@@ -239,8 +264,20 @@ where
     }
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R, S>
-    copy::Transfer<'d, ID> for Query<api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
+impl<
+    'app,
+    'g,
+    'r,
+    's,
+    'b,
+    'c,
+    'd: 'app,
+    B: ?Sized,
+    I: Instance<Queries: 'd> + 'd,
+    const ID: u8,
+    R,
+    S,
+> copy::Transfer<'d, ID> for Query<api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R, S>
 where
     R: Copy + Into<Option<api::Target<'d, ID>>>,
     S: request::Input<'d>,
@@ -278,7 +315,7 @@ where
     }
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8, R>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8, R>
     traits::Notify<'d, ID> for Query<api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>, R>
 where
     R: Copy + Into<Option<api::Target<'d, ID>>>,

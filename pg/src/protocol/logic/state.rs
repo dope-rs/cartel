@@ -1,3 +1,4 @@
+use crate::port::Instance;
 use dope::{
     core::driver::route::KeyTag,
     manifold::client::{app, conn},
@@ -12,13 +13,13 @@ use crate::{
     schema::{self, desc},
 };
 
-pub struct State<'a, 'd, I, const ID: u8> {
+pub struct State<'a, 'd, I: Instance, const ID: u8> {
     pub(super) phase: Phase<'a, 'd, I, ID>,
     pub(super) progress: Progress,
     pub(super) batch: replies::Batch,
 }
 
-impl<I, const ID: u8> Default for State<'_, '_, I, ID> {
+impl<I: Instance, const ID: u8> Default for State<'_, '_, I, ID> {
     fn default() -> Self {
         Self {
             phase: Phase::NeedsStartup,
@@ -99,8 +100,8 @@ impl<I: schema::QuerySet> Prepare<I> {
 const _: () = assert!(std::mem::size_of::<Progress>() == std::mem::size_of::<bool>());
 const _: () = assert!(std::mem::align_of::<Progress>() == std::mem::align_of::<bool>());
 
-impl<'a, 'd, I, const ID: u8> State<'a, 'd, I, ID> {
-    pub(super) fn entry(&self) -> Option<ready::Entry<'a, 'd, ID>> {
+impl<'a, 'd, I: Instance, const ID: u8> State<'a, 'd, I, ID> {
+    pub(super) fn entry(&self) -> Option<ready::Entry<'a, 'd, ID, I::Policy>> {
         match self.phase {
             Phase::Ready(entry)
             | Phase::CopyInActive(entry)
@@ -152,16 +153,16 @@ impl<'a, 'd, I, const ID: u8> State<'a, 'd, I, ID> {
     }
 }
 
-pub(super) enum Phase<'a, 'd, I, const ID: u8> {
+pub(super) enum Phase<'a, 'd, I: Instance, const ID: u8> {
     NeedsStartup,
     StartupSent,
     Sasl { scram: scram::Scram<'a, 'd, ID> },
     AwaitingReady,
-    Preparing { remaining: Prepare<I> },
-    Ready(ready::Entry<'a, 'd, ID>),
-    CopyInActive(ready::Entry<'a, 'd, ID>),
-    CopyOutActive(ready::Entry<'a, 'd, ID>),
-    Retiring(ready::Entry<'a, 'd, ID>),
+    Preparing { remaining: Prepare<I::Queries> },
+    Ready(ready::Entry<'a, 'd, ID, I::Policy>),
+    CopyInActive(ready::Entry<'a, 'd, ID, I::Policy>),
+    CopyOutActive(ready::Entry<'a, 'd, ID, I::Policy>),
+    Retiring(ready::Entry<'a, 'd, ID, I::Policy>),
     Failed,
 }
 

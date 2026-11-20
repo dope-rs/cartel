@@ -13,14 +13,13 @@ use crate::{
         replies,
     },
     protocol::{self, logic},
-    schema,
 };
 
-pub(crate) struct Control<'p, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8> {
+pub(crate) struct Control<'p, 'g, 'r, 's, 'b, 'c, 'd, I: port::Instance, const ID: u8> {
     port: &'p port::Port<'p, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
 }
 
-impl<'p, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8>
+impl<'p, 'g, 'r, 's, 'b, 'c, 'd, I: port::Instance, const ID: u8>
     Control<'p, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
 {
     pub(in crate::port) const fn new(
@@ -73,7 +72,7 @@ impl<'p, 'g, 'r, 's, 'b, 'c, 'd, I: schema::QuerySet, const ID: u8>
     pub(crate) fn try_ready(
         &self,
         token: conn::Id<'d, KeyTag<ID>>,
-    ) -> Result<protocol::runtime::ready::Entry<'p, 'd, ID>, protocol::Reason> {
+    ) -> Result<protocol::runtime::ready::Entry<'p, 'd, ID, I::Policy>, protocol::Reason> {
         let entry = self.port.shared.try_ready(token)?;
         if self.port.shared.count() == self.port.capacity() {
             self.port.shared.signals.clear_open();

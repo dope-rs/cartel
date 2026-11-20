@@ -7,16 +7,15 @@ use std::pin;
 
 use crate::port::pool::slot;
 use crate::port::requests::Boundary;
-use crate::protocol;
 use crate::protocol::runtime::{Shared, ready};
-use ready::storage;
+use ready::{Policy, storage, storage::Order};
 
-pub(crate) enum Source<'a, 'd, const ID: u8> {
-    Shared(storage::Listed<'a, 'd, ID>),
+pub(crate) enum Source<'a, 'd, const ID: u8, P: Policy> {
+    Shared(storage::Listed<'a, 'd, ID, P>),
     Exclusive(slot::Ready<'a, 'd, ID>),
 }
 
-impl<'a, 'd, const ID: u8> Source<'a, 'd, ID> {
+impl<'a, 'd, const ID: u8, P: Policy> Source<'a, 'd, ID, P> {
     fn ready(&self) -> slot::Ready<'a, 'd, ID> {
         match self {
             Self::Shared(listed) => slot::Ready::listed(listed),
@@ -32,7 +31,7 @@ impl<'a, 'd, const ID: u8> Source<'a, 'd, ID> {
         self,
         boundary: Boundary,
         region: &'turn mut region::Token<region::Identity<'d>>,
-    ) -> ReplyContext<'turn, 'a, 'd, ID> {
+    ) -> ReplyContext<'turn, 'a, 'd, ID, P> {
         ReplyContext {
             source: self,
             boundary,
@@ -40,7 +39,15 @@ impl<'a, 'd, const ID: u8> Source<'a, 'd, ID> {
         }
     }
 
-    pub(crate) fn into_listed(self) -> Option<storage::Listed<'a, 'd, ID>> {
+    pub(crate) fn reprioritize(self, depth: impl FnOnce() -> usize) {
+        if P::Order::RANKED
+            && let Self::Shared(listed) = self
+        {
+            listed.reprioritize(depth);
+        }
+    }
+
+    pub(crate) fn into_listed(self) -> Option<storage::Listed<'a, 'd, ID, P>> {
         match self {
             Self::Shared(listed) => Some(listed),
             Self::Exclusive(_) => None,
@@ -48,15 +55,15 @@ impl<'a, 'd, const ID: u8> Source<'a, 'd, ID> {
     }
 }
 
-pub(crate) struct ReplyContext<'turn, 'a, 'd, const ID: u8> {
-    source: Source<'a, 'd, ID>,
+pub(crate) struct ReplyContext<'turn, 'a, 'd, const ID: u8, P: Policy> {
+    source: Source<'a, 'd, ID, P>,
     boundary: Boundary,
     region: &'turn mut region::Token<region::Identity<'d>>,
 }
 
-impl<'turn, 'a: 'turn, 'd, const ID: u8> ReplyContext<'turn, 'a, 'd, ID> {
+impl<'turn, 'a: 'turn, 'd, const ID: u8, P: Policy> ReplyContext<'turn, 'a, 'd, ID, P> {
     pub(crate) fn reserved(
-        proof: &ready::Reservation<'a, 'd, ID>,
+        proof: &ready::Reservation<'a, 'd, ID, P>,
         boundary: Boundary,
         region: &'turn mut region::Token<region::Identity<'d>>,
     ) -> Self {
@@ -71,7 +78,7 @@ impl<'turn, 'a: 'turn, 'd, const ID: u8> ReplyContext<'turn, 'a, 'd, ID> {
         self,
     ) -> (
         slot::Ready<'a, 'd, ID>,
-        Source<'a, 'd, ID>,
+        Source<'a, 'd, ID, P>,
         Boundary,
         &'turn mut region::Token<region::Identity<'d>>,
     ) {
@@ -85,7 +92,7 @@ pub(crate) enum Bind {
     Rejected,
 }
 
-impl<'d, const ID: u8> Shared<'d, ID> {
+impl<'d, const ID: u8, P: Policy> Shared<'d, ID, P> {
     pub(crate) fn try_register<'target, 'poll>(
         &'target self,
         waiter: pin::Pin<&wait::Waiter<'target, 'd>>,
@@ -104,7 +111,7 @@ impl<'d, const ID: u8> Shared<'d, ID> {
     pub(crate) fn connection_entry(
         &self,
         id: conn::Id<'d, route::KeyTag<ID>>,
-    ) -> Option<storage::Entry<'_, 'd, ID>> {
+    ) -> Option<storage::Entry<'_, 'd, ID, P>> {
         let entry = self.entry(id.index().into_usize())?;
         entry.slot().matches(id).then_some(entry)
     }
@@ -122,7 +129,7 @@ impl<'d, const ID: u8> Shared<'d, ID> {
     pub(crate) fn select(
         &self,
         target: &api::Target<'d, ID>,
-    ) -> Result<Option<Source<'_, 'd, ID>>, api::Target<'d, ID>> {
+    ) -> Result<Option<Source<'_, 'd, ID, P>>, api::Target<'d, ID>> {
         let target = *target;
         let token = target.connection();
         let generation = target.transaction().map(|tx| tx.generation);
@@ -141,16 +148,5 @@ impl<'d, const ID: u8> Shared<'d, ID> {
             Source::Shared(listed)
         };
         Ok(Some(source))
-    }
-
-    pub(crate) fn pick(&self) -> Option<storage::Listed<'_, 'd, ID>> {
-        match self.policy.get() {
-            protocol::PickPolicy::RoundRobin => self.next(),
-            protocol::PickPolicy::LeastInflight => self.minimum(),
-        }
-    }
-
-    pub(crate) fn set_policy(&self, policy: protocol::PickPolicy) {
-        self.policy.set(policy);
     }
 }

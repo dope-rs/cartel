@@ -1,9 +1,7 @@
+use crate::api::{self, task};
+use crate::port::Instance;
 use crate::port::{replies, requests};
 use crate::reply::Error;
-use crate::{
-    api::{self, task},
-    schema,
-};
 use cartel_core::{deadline, reply};
 use dope::{
     core::driver::{route::KeyTag, schedule::clock::timer},
@@ -107,7 +105,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, U, X, const ID: u8, R,
         F,
     >
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     R: Copy + Into<Option<api::Target<'d, ID>>>,
     M: Copy + Into<requests::Boundary>,
     P: task::lease::Policy,

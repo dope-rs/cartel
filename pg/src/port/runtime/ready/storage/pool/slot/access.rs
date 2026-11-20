@@ -76,7 +76,7 @@ impl<'a, 'd, const ID: u8> Reservation<'a, 'd, ID> {
         self.id
     }
 
-    pub(crate) fn reserve(listed: &ready::Listed<'a, 'd, ID>) -> Option<Self> {
+    pub(crate) fn reserve<P: ready::Policy>(listed: &ready::Listed<'a, 'd, ID, P>) -> Option<Self> {
         let slot = listed.slot();
         let Some((
             bound,
@@ -122,7 +122,7 @@ impl<'d, const ID: u8> slot::Slot<'d, ID> {
     }
 }
 
-impl<'d, const ID: u8> ready::Entry<'_, 'd, ID> {
+impl<'d, const ID: u8, P: ready::Policy> ready::Entry<'_, 'd, ID, P> {
     pub(crate) fn set_receiving(&mut self, receiving: bool, depth: impl FnOnce() -> Depth) {
         let slot = self.slot();
         let Some(Lifecycle::Ready {
@@ -147,7 +147,7 @@ impl<'d, const ID: u8> ready::Entry<'_, 'd, ID> {
             return;
         }
         if matches!(access, State::Shared(_)) {
-            entry.insert(depth().get() + slot.barriers());
+            entry.insert(|| depth().get() + slot.barriers());
         }
         self.core.wake_ready();
     }
@@ -226,7 +226,7 @@ impl<'d, const ID: u8> ready::Entry<'_, 'd, ID> {
                         core: self.core,
                         index: self.index,
                     }
-                    .insert(depth.get() + slot.barriers());
+                    .insert(|| depth.get() + slot.barriers());
                 }
                 generation
             }

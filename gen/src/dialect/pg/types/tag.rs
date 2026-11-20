@@ -1,15 +1,11 @@
-#[derive(Clone, Copy)]
 pub(super) enum Tag {
     Scalar(Scalar),
     Bytes,
     RowOnly,
-    OptionalLtree,
     Borrowed,
-    Named,
     Unsupported,
 }
 
-#[derive(Clone, Copy)]
 pub(super) enum Scalar {
     Bool,
     I16,
@@ -78,11 +74,7 @@ impl Tag {
     }
 
     pub(super) fn plain(ident: &syn::Ident) -> Self {
-        match Scalar::from_ident(ident) {
-            Some(scalar) => Self::Scalar(scalar),
-            None if ident == "u8" || ident == "u32" || ident == "str" => Self::Unsupported,
-            None => Self::Named,
-        }
+        Scalar::from_ident(ident).map_or(Self::Unsupported, Self::Scalar)
     }
 
     pub(super) fn vector(ident: &syn::Ident) -> Self {
@@ -97,7 +89,6 @@ impl Tag {
 
     pub(super) fn optional(ident: &syn::Ident) -> Self {
         match Scalar::from_ident(ident) {
-            Some(Scalar::Ltree) => Self::OptionalLtree,
             Some(_) => Self::RowOnly,
             None => Self::Unsupported,
         }
@@ -123,13 +114,6 @@ impl Tag {
         }
     }
 
-    pub(super) fn format(self) -> u16 {
-        u16::from(!matches!(
-            self,
-            Self::Scalar(Scalar::Ltree) | Self::OptionalLtree
-        ))
-    }
-
     pub(super) fn slice_type(self) -> Option<proc_macro2::TokenStream> {
         match self {
             Self::Scalar(Scalar::Bool) => Some(quote::quote! { &'data [bool] }),
@@ -148,20 +132,8 @@ impl Tag {
             Self::Bytes => Some(quote::quote! { &'data [&'data [u8]] }),
             Self::Scalar(Scalar::Text | Scalar::Jsonb)
             | Self::RowOnly
-            | Self::OptionalLtree
             | Self::Borrowed
-            | Self::Named
             | Self::Unsupported => None,
-        }
-    }
-
-    pub(super) fn formats(self, syntax: &syn::Type) -> Option<proc_macro2::TokenStream> {
-        if matches!(self, Self::Named) {
-            Some(quote::quote! { <#syntax>::__CARTEL_RESULT_FORMAT_CODES })
-        } else if self.format() == 0 {
-            Some(quote::quote! { &[0u16] })
-        } else {
-            None
         }
     }
 }

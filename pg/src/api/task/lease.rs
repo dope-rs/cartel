@@ -1,11 +1,15 @@
-use crate::{api, port::pool::access, protocol::runtime::tx, schema};
+use crate::port::Instance;
+use crate::{api, port::pool::access, protocol::runtime::tx};
 use dope::{core::driver::route::KeyTag, manifold::client::conn};
 use o3::mem::{self, lease};
 use std::marker;
 
 pub(crate) trait Target<'d, const ID: u8>: Copy {
     fn connection(self) -> conn::Id<'d, KeyTag<ID>>;
-    fn current(self, tx: &tx::Access<'_, 'd, ID>) -> Option<conn::Id<'d, KeyTag<ID>>>;
+    fn current<P: crate::port::ready::Policy>(
+        self,
+        tx: &tx::Access<'_, 'd, ID, P>,
+    ) -> Option<conn::Id<'d, KeyTag<ID>>>;
 }
 
 impl<'d, const ID: u8> Target<'d, ID> for conn::Id<'d, KeyTag<ID>> {
@@ -13,7 +17,10 @@ impl<'d, const ID: u8> Target<'d, ID> for conn::Id<'d, KeyTag<ID>> {
         self
     }
 
-    fn current(self, _: &tx::Access<'_, 'd, ID>) -> Option<conn::Id<'d, KeyTag<ID>>> {
+    fn current<P: crate::port::ready::Policy>(
+        self,
+        _: &tx::Access<'_, 'd, ID, P>,
+    ) -> Option<conn::Id<'d, KeyTag<ID>>> {
         Some(self)
     }
 }
@@ -23,7 +30,10 @@ impl<'d, const ID: u8> Target<'d, ID> for access::Transaction<'d, ID> {
         self.conn
     }
 
-    fn current(self, tx: &tx::Access<'_, 'd, ID>) -> Option<conn::Id<'d, KeyTag<ID>>> {
+    fn current<P: crate::port::ready::Policy>(
+        self,
+        tx: &tx::Access<'_, 'd, ID, P>,
+    ) -> Option<conn::Id<'d, KeyTag<ID>>> {
         tx.is_current::<false>(self).then_some(self.conn)
     }
 }
@@ -33,7 +43,10 @@ impl<'d, const ID: u8> Target<'d, ID> for access::Finalization<'d, ID> {
         self.id().conn
     }
 
-    fn current(self, tx: &tx::Access<'_, 'd, ID>) -> Option<conn::Id<'d, KeyTag<ID>>> {
+    fn current<P: crate::port::ready::Policy>(
+        self,
+        tx: &tx::Access<'_, 'd, ID, P>,
+    ) -> Option<conn::Id<'d, KeyTag<ID>>> {
         match self {
             Self::Pending(id) => tx.is_current::<true>(id).then_some(id.conn),
             Self::Reusable(_) | Self::Lost(_) => None,
@@ -71,7 +84,7 @@ pub(in crate::api) struct Lease<
     P,
     const ID: u8 = 0,
 > where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     T: Target<'d, ID>,
     P: Policy,
 {
@@ -80,7 +93,7 @@ pub(in crate::api) struct Lease<
 
 struct Owner<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, P, const ID: u8>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
 {
     client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     policy: marker::PhantomData<(T, P)>,
@@ -89,7 +102,7 @@ where
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, P, const ID: u8>
     Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, T, P, ID>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     T: Target<'d, ID>,
     P: Policy,
 {
@@ -160,7 +173,7 @@ where
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, const ID: u8>
     Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, T, Recover, ID>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     T: Target<'d, ID>,
 {
     pub(in crate::api) fn quarantine(self) {
@@ -171,7 +184,7 @@ where
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, P, const ID: u8> mem::Return
     for Owner<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, T, P, ID>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     T: Target<'d, ID>,
     P: Policy,
 {

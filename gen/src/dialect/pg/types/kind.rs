@@ -1,7 +1,7 @@
 use crate::dialect::pg::types::tag::Tag;
 
 pub(super) struct Kind<'a> {
-    pub(super) syntax: &'a syn::Type,
+    syntax: &'a syn::Type,
     cause: &'a syn::Type,
     pub(super) tag: Tag,
 }
@@ -89,30 +89,28 @@ impl<'a> Kind<'a> {
         }
     }
 
-    pub(super) fn param(self) -> syn::Result<(&'a syn::Type, u16)> {
+    pub(super) fn param(self) -> syn::Result<&'a syn::Type> {
         match self.tag {
-            Tag::Scalar(_) | Tag::Bytes | Tag::Borrowed => {
-                let ty = match self.syntax {
-                    syn::Type::Reference(value) => value.elem.as_ref(),
-                    value => value,
-                };
-                Ok((ty, self.tag.format()))
-            }
-            Tag::RowOnly | Tag::OptionalLtree | Tag::Named | Tag::Unsupported => Err(
-                syn::Error::new_spanned(self.cause, "#[query] cannot bind this parameter type"),
-            ),
+            Tag::Scalar(_) | Tag::Bytes | Tag::Borrowed => Ok(match self.syntax {
+                syn::Type::Reference(value) => value.elem.as_ref(),
+                value => value,
+            }),
+            Tag::RowOnly | Tag::Unsupported => Err(syn::Error::new_spanned(
+                self.cause,
+                "#[query] cannot bind this parameter type",
+            )),
         }
     }
 
     pub(super) fn row_read(self) -> syn::Result<proc_macro2::TokenStream> {
         match self.tag {
-            Tag::Scalar(_) | Tag::Bytes | Tag::RowOnly | Tag::OptionalLtree => {
+            Tag::Scalar(_) | Tag::Bytes | Tag::RowOnly => {
                 let syntax = self.syntax;
                 Ok(quote::quote! {
                     <#syntax as ::cartel_pg::schema::Row>::decode_owned(row)?
                 })
             }
-            Tag::Borrowed | Tag::Named | Tag::Unsupported => Err(syn::Error::new_spanned(
+            Tag::Borrowed | Tag::Unsupported => Err(syn::Error::new_spanned(
                 self.cause,
                 "#[derive(PgRow)] cannot decode this field type",
             )),

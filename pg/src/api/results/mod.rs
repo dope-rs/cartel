@@ -1,3 +1,4 @@
+use crate::port::Instance;
 use crate::protocol::value::decode;
 use crate::protocol::value::decode::checked;
 use crate::reply::{Error, server};
@@ -6,7 +7,7 @@ use cartel_core::reply::usage;
 use dope_fiber::abi;
 use dope_fiber::context;
 use dope_fiber::wait;
-use std::{marker, task::Poll};
+use std::{convert::identity, marker, task::Poll};
 
 use crate::api::{
     task,
@@ -20,16 +21,16 @@ pub mod source;
 
 use group::{Diagnostics, Outcome, Position, Sync};
 
-use source::Payload as _;
-
 #[inline(always)]
-fn read<'row, Q: schema::TypedQuery>(
+fn read<'row, Q: schema::TypedQuery, T, E>(
     bytes: crate::protocol::Wire<'row>,
-) -> Result<<Q::Row as schema::Row>::View<'row>, crate::Error> {
-    let mut reader = decode::RowReader::new(bytes, Q::N_RESULT_COLS)?;
-    let row = <Q::Row as schema::Row>::decode(&mut reader)?;
-    reader.finish()?;
-    Ok(row)
+    project: impl FnOnce(<Q::Row as schema::Row>::View<'row>) -> T,
+    mut reject: impl FnMut(crate::Error) -> E,
+) -> Result<T, E> {
+    let mut reader = decode::RowReader::new(bytes, Q::N_RESULT_COLS).map_err(&mut reject)?;
+    let row = <Q::Row as schema::Row>::decode(&mut reader).map_err(&mut reject)?;
+    reader.finish().map_err(reject)?;
+    Ok(project(row))
 }
 
 pub(in crate::api) type FirstResult<'d, P, Q, const ID: u8, const SCALAR: bool = false> =
@@ -81,7 +82,7 @@ where
     }
 
     pub fn decode(&self) -> Result<<Q::Row as schema::Row>::View<'_>, crate::Error> {
-        read::<Q>(self.payload.wire())
+        read::<Q, _, _>(self.payload.wire(), identity, identity)
     }
 
     pub fn into_owned(self) -> Result<Q::Row, crate::Error> {
@@ -157,7 +158,20 @@ where
     pub fn iter<'rows>(
         &'rows self,
     ) -> impl Iterator<Item = Result<<Q::Row as schema::Row>::View<'rows>, crate::Error>> {
-        self.batch.iter().map(|row| read::<Q>(row.wire()))
+        self.batch
+            .iter()
+            .map(|wire| read::<Q, _, _>(wire, identity, identity))
+    }
+
+    pub fn visit<'rows>(
+        &'rows self,
+        mut visit: impl FnMut(<Q::Row as schema::Row>::View<'rows>),
+    ) -> Result<(), crate::Error> {
+        let mut result = Ok(());
+        let _ = self.batch.iter().find_map(|wire| {
+            read::<Q, _, _>(wire, &mut visit, |error| result = Err(error)).err()
+        });
+        result
     }
 
     pub fn usage(&self) -> usage::Usage {
@@ -175,8 +189,20 @@ where
         }
     }
 
-    pub fn into_owned(self) -> Result<Vec<Q::Row>, crate::Error> {
-        self.batch.into_owned::<Q>()
+    pub fn into_owned(mut self) -> Result<Vec<Q::Row>, crate::Error> {
+        use o3::alloc::VecExt as _;
+        use schema::Row as _;
+        let mut rows = Vec::try_new(self.len().get()).map_err(crate::Error::Allocation)?;
+        self.batch.try_drain(|row| {
+            let mut reader = decode::RowReader::new(row, Q::N_RESULT_COLS)?;
+            let value = Q::Row::decode_owned(&mut reader)?;
+            // SAFETY: Collection owns only a completed PG batch. Its value credits
+            // count every admitted frame once and its immutable runs drain in order.
+            let insert = unsafe { o3::alloc::raw::VecExt::vacancy(&mut rows) };
+            insert(value);
+            reader.finish()
+        })?;
+        Ok(rows)
     }
 
     pub fn validate(self) -> Result<Validated<Self>, crate::Error>
@@ -185,7 +211,7 @@ where
         <Q::Row as schema::Project>::Fields: checked::Fields,
     {
         for row in self.batch.iter() {
-            checked::validate::<<Q::Row as schema::Project>::Fields>(row.wire(), Q::N_RESULT_COLS)?;
+            checked::validate::<<Q::Row as schema::Project>::Fields>(row, Q::N_RESULT_COLS)?;
         }
         Ok(Validated(self))
     }
@@ -249,7 +275,7 @@ pub struct RunStream<
     const ID: u8 = 0,
     R = api::Pooled,
 > where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     Q: schema::TypedQuery,
 {
     pub(super) state: stream::Stream<
@@ -270,7 +296,7 @@ pub struct RunStream<
     pub(super) marker: marker::PhantomData<Q>,
 }
 
-impl<B: ?Sized, I: schema::QuerySet, Q: schema::TypedQuery, const ID: u8, R> Sealed
+impl<B: ?Sized, I: Instance, Q: schema::TypedQuery, const ID: u8, R> Sealed
     for RunStream<'_, '_, '_, '_, '_, '_, '_, B, I, Q, ID, R>
 {
 }
@@ -278,7 +304,7 @@ impl<B: ?Sized, I: schema::QuerySet, Q: schema::TypedQuery, const ID: u8, R> Sea
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, Q, const ID: u8, R> traits::Stream<'d, Q, ID>
     for RunStream<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, Q, ID, R>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
     R: Copy + Into<Option<api::Target<'d, ID>>>,
     Q: schema::TypedQuery<Result = schema::result::Rows>,
 {
@@ -295,14 +321,14 @@ where
 #[pin_project::pin_project]
 pub struct Next<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
 {
     pub(super) client: api::Context<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>,
     #[pin]
     pub(super) waiter: wait::Waiter<'app, 'd>,
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     abi::Fiber<'d> for Next<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     type Output = Result<crate::reply::Notice<'d>, Error<'d, ID>>;

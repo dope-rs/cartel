@@ -20,13 +20,18 @@ use o3::{
 };
 use reply::{layout, usage};
 
-use crate::{port::replies::groups, protocol::runtime::ready::plan};
+use crate::{
+    port::replies::groups,
+    protocol::runtime::ready::{self, plan},
+};
 
 pub(crate) const FRAME_HEADER_BYTES: usize = 5;
 pub const DEFAULT_OPERATION_WINDOW: Positive = Positive::from_secs::<30>();
 
+pub type Config = Configuration<ready::RoundRobin>;
+
 #[derive(Clone)]
-pub struct Config {
+pub struct Configuration<P: ready::Policy> {
     connections: side::Capacity,
     inflight: usize,
     admission_waiters: usize,
@@ -36,17 +41,17 @@ pub struct Config {
         bounded::NonZeroU32<{ FRAME_HEADER_BYTES as u32 }, { transfer::MAX_BYTES as u32 }>,
     pub(super) operation_window: Positive,
     memory_bound: Memory,
-    runtime: Runtime,
+    runtime: Runtime<P>,
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct Runtime {
+pub(super) struct Runtime<P: ready::Policy> {
     request_pool: pool::Layout,
     control_pool: pool::Layout,
     request_queue: fair::Plan,
     response_arena: layout::Layout,
     retention_headroom: usize,
-    ready: plan::Plan,
+    ready: plan::Plan<P>,
     notifications: NonZero<u32>,
     groups: Option<groups::Layout>,
 }
@@ -104,7 +109,7 @@ pub struct Memory {
     pub total_bytes: limits::Bound,
 }
 
-impl Config {
+impl<P: ready::Policy> Configuration<P> {
     pub fn new(caps: Capacities) -> Result<Self, Error> {
         Self::with_window(caps, DEFAULT_OPERATION_WINDOW)
     }
@@ -202,7 +207,7 @@ impl Config {
             usage::Values::new(items),
         );
         let arena = layout::Layout::bounded(capacity).map_err(Error::Arena)?;
-        let ready = plan::Plan::new(sides.primary(), arena).map_err(Error::Ready)?;
+        let ready = plan::Plan::<P>::new(sides.primary(), arena).map_err(Error::Ready)?;
         let limit = arena.limit().bytes().get();
         if payload > limit {
             return Err(Error::ResponseFrameExceedsLaneCapacity {
@@ -235,6 +240,13 @@ impl Config {
             retained.admitted().bytes()
         };
         let mut ingress = retained.ingress(owners);
+        let headers = limits::Bound::new(items)
+            .try_mul(FRAME_HEADER_BYTES)
+            .map_err(Error::ResponseHeaders)?;
+        ingress.retained = ingress
+            .retained
+            .try_add(headers.bytes())
+            .map_err(Error::ResponseHeaders)?;
         ingress.retained = ingress
             .retained
             .try_add(retention_headroom)
@@ -354,7 +366,7 @@ impl Config {
         self.response_wire.get()
     }
 
-    pub(crate) const fn ready_layout(&self) -> plan::Plan {
+    pub(crate) const fn ready_layout(&self) -> plan::Plan<P> {
         self.runtime.ready
     }
 
@@ -376,12 +388,12 @@ impl Config {
         self.connections
     }
 
-    pub(super) const fn runtime(&self) -> &Runtime {
+    pub(super) const fn runtime(&self) -> &Runtime<P> {
         &self.runtime
     }
 }
 
-impl Runtime {
+impl<P: ready::Policy> Runtime<P> {
     pub(crate) const fn groups(&self) -> Option<groups::Layout> {
         self.groups
     }

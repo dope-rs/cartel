@@ -1,3 +1,4 @@
+use cartel_pg::api::traits::copy::{Sink as _, Stream as _, Transfer as _};
 use cartel_pg::api::traits::{
     Begin as _, Client as _, Notify as _, Query as _, Status as _, Stream as _, Unchecked as _,
 };
@@ -75,8 +76,9 @@ fn timer_capacity_is_exact() {
                                 }
                             };
                             assert!(matches!(failure, Exhausted::Slots));
+                            let invalid_sql = "COPY\0";
                             let invalid = runtime
-                                .block_on(client.command("SELECT\0"))
+                                .block_on(client.command(invalid_sql))
                                 .expect("invalid query driver");
                             let group = runtime
                                 .block_on(client.run_group::<TextQuery, 1>([()]))
@@ -88,11 +90,33 @@ fn timer_capacity_is_exact() {
                                 .block_on(client.transaction().begin())
                                 .expect("begin driver");
                             drop(pending);
-                            assert!(matches!(
+                            drop(alarms.pop().expect("last timer"));
+                            let mut input = client.copy_stream(invalid_sql);
+                            let mut output = client.copy_out(invalid_sql);
+                            let write = input.write(b"x");
+                            let read = output.next_chunk();
+                            let finish = client.copy_stream(invalid_sql).finish();
+                            alarms.push(timer.try_alarm().expect("rejected COPY leaves timer free"));
+                            drop((write, read));
+                            for rejected in [
                                 invalid,
-                                Err(reply::Error::Driver(cartel_pg::Error::Request(
-                                    encode::Error::StatementSqlNul { position: 6 }
-                                )))
+                                runtime.block_on(input.write(b"x")).expect("write driver"),
+                                runtime.block_on(output.next_chunk()).expect("read driver").map(drop),
+                                runtime.block_on(finish).expect("finish driver"),
+                            ] {
+                                assert!(matches!(
+                                    rejected,
+                                    Err(reply::Error::Driver(cartel_pg::Error::Request(
+                                        encode::Error::StatementSqlNul { position: 4 }
+                                    )))
+                                ));
+                            }
+                            assert!(matches!(runtime.block_on(output.next_chunk()), Ok(Ok(None))));
+                            assert!(matches!(
+                                runtime.block_on(input.write(b"x")),
+                                Ok(Err(reply::Error::Driver(cartel_pg::Error::Deadline(
+                                    Exhausted::Slots
+                                ))))
                             ));
                             assert!(matches!(
                                 group.cause(),
@@ -200,7 +224,12 @@ fn typed_queries_free_timer() {
                                         ));
                                     }
 
-                                    let mut one = pin!(client.run_one::<TextQuery>(()));
+                                    let acquired = runtime
+                                        .block_on(client.acquire())
+                                        .expect("frame drive")
+                                        .ok()
+                                        .expect("request frame");
+                                    let mut one = pin!(acquired.run_one::<TextQuery>(()));
                                     assert!(matches!(timer.try_alarm(), Err(Exhausted::Slots)));
                                     let row = runtime
                                         .block_on(poll_fn(|context| {

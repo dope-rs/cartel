@@ -7,10 +7,6 @@ use cartel_pg::{
 
 pub struct Reject;
 
-impl Reject {
-    pub const __CARTEL_RESULT_FORMAT_CODES: &'static [u16] = &[0];
-}
-
 impl desc::Validate for Reject {
     const FORMAT: u16 = 0;
 

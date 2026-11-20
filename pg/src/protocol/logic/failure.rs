@@ -6,10 +6,10 @@ use crate::{
     port::{Disposition, replies},
     protocol::logic::{state, turn::Turn},
     reply::{self, server},
-    schema, scram,
+    scram,
 };
 
-impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: crate::port::Instance, const ID: u8>
     Turn<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
 {
     pub(super) fn fail(&mut self, error: crate::Error) {

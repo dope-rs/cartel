@@ -1,5 +1,8 @@
 use cartel_pg::api::traits::{Client as _, Status as _, Unchecked as _};
-use cartel_pg::{port, port::config, protocol::PickPolicy};
+use cartel_pg::{
+    port,
+    port::{config, ready::LeastInflight},
+};
 use common::{
     port::*,
     postgres::{Error, accept::Listener as _, startup::Stream as _},
@@ -61,11 +64,11 @@ fn least_inflight_selects() {
                         bytes: 128,
                     },
                 };
-                let config = config::Config::new(capacity);
+                let config = config::Configuration::new(capacity);
                 let config = config.expect("valid pg configuration");
                 let ((), events) = {
                     let prepared = topology::try_new::<_, Env>(
-                        port::Port::<Queries>::plan(
+                        port::Port::<(Queries, LeastInflight)>::plan(
                             Queries::try_config().expect("database config"),
                             config,
                         ),
@@ -83,7 +86,6 @@ fn least_inflight_selects() {
                                     node.install(stage, |host, stage| {
                                         stage.with_quiesce(&mut report, host, GUARD, |mut runtime| {
                                 let client = runtime.root_client();
-                                client.status().set_policy(PickPolicy::LeastInflight);
 
                                 let deadline = Instant::now() + Duration::from_secs(1);
                                 runtime

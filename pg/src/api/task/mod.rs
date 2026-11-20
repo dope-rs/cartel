@@ -1,7 +1,7 @@
 use crate::{
     api::{self, Response},
+    port::replies,
     reply::Error,
-    schema,
 };
 use cartel_core::{deadline, reply};
 use dope::{
@@ -34,50 +34,76 @@ enum State<C, R, Q, L, H> {
     Done,
 }
 
-impl<C, R, Q, L, H> State<C, R, Q, L, H> {
-    fn new(client: C, target: R, next: Result<Q, crate::Error>) -> Self {
-        match next {
-            Ok(request) => Self::Connecting {
-                client,
-                target,
-                request,
-            },
-            Err(error) => Self::Failed(error),
-        }
-    }
+mod raw {
+    use super::{Error, State, deadline};
+    use std::{mem, ptr};
 
-    fn phase(&self) -> deadline::RequestPhase {
-        match self {
-            Self::Admitted(..) => deadline::RequestPhase::Response,
-            _ => deadline::RequestPhase::Admission,
+    impl<C, R, Q, L, H> State<C, R, Q, L, H> {
+        pub(super) fn new(client: C, target: R, next: Result<Q, crate::Error>) -> Self {
+            match next {
+                Ok(request) => Self::Connecting {
+                    client,
+                    target,
+                    request,
+                },
+                Err(error) => Self::Failed(error),
+            }
         }
-    }
 
-    fn admitted(&self) -> Option<&L> {
-        match self {
-            Self::Admitted(lease, _) => Some(lease),
-            _ => None,
+        pub(super) fn phase(&self) -> deadline::RequestPhase {
+            match self {
+                Self::Admitted(..) => deadline::RequestPhase::Response,
+                _ => deadline::RequestPhase::Admission,
+            }
         }
-    }
 
-    fn take(&mut self) -> Option<L> {
-        match mem::replace(self, Self::Done) {
-            Self::Admitted(lease, _) => Some(lease),
-            _ => None,
+        pub(super) fn take(&mut self) -> Option<L> {
+            match mem::replace(self, Self::Done) {
+                Self::Admitted(lease, _) => Some(lease),
+                _ => None,
+            }
         }
-    }
 
-    fn cancel<'d, const ID: u8>(
-        &mut self,
-        error: crate::Error,
-        abort: impl FnOnce(L, crate::Error),
-    ) -> Error<'d, ID> {
-        match mem::replace(self, Self::Done) {
-            Self::Failed(error) => return error.into(),
-            Self::Admitted(lease, _) => abort(lease, error),
-            _ => {}
+        pub(super) fn take_error(&mut self) -> Option<crate::Error> {
+            let Self::Failed(error) = *self else {
+                return None;
+            };
+            // Failed owns only this Copy error.
+            mem::forget(mem::replace(self, Self::Done));
+            Some(error)
         }
-        error.into()
+
+        pub(super) fn cancel<'d, const ID: u8>(
+            &mut self,
+            error: crate::Error,
+            linked: impl FnOnce(&mut H) -> bool,
+            abort: impl FnOnce(L, crate::Error),
+        ) -> Error<'d, ID> {
+            let slot = ptr::from_mut(self);
+            // SAFETY: the slot is exclusive. Retire the reply in place and consume
+            // the disjoint lease once before overwriting the empty variant.
+            unsafe {
+                match &mut *slot {
+                    Self::Admitted(lease, reply) => {
+                        let aborting = linked(reply);
+                        ptr::drop_in_place(reply);
+                        let lease = ptr::read(lease);
+                        if aborting {
+                            abort(lease, error);
+                        }
+                        slot.write(Self::Done);
+                    }
+                    state @ Self::Connecting { .. } => *state = Self::Done,
+                    Self::Failed(first) => {
+                        let failure = Error::from(*first);
+                        slot.write(Self::Done);
+                        return failure;
+                    }
+                    Self::Done => return error.into(),
+                }
+            }
+            error.into()
+        }
     }
 }
 
@@ -99,7 +125,7 @@ pub(super) struct Core<
     A = conn::Id<'d, KeyTag<ID>>,
     P = lease::Detached,
 > where
-    I: schema::QuerySet + 'd,
+    I: crate::port::Instance<Queries: 'd> + 'd,
     X: Read<'app, 'b, 'c, 'd>,
     A: lease::Target<'d, ID>,
     P: lease::Policy,
@@ -121,7 +147,7 @@ const _: () = assert!(
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, X, const ID: u8, R, M, S, A, P>
     Core<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID, R, M, S, A, P>
 where
-    I: schema::QuerySet + 'd,
+    I: crate::port::Instance<Queries: 'd> + 'd,
     X: Read<'app, 'b, 'c, 'd>,
     A: lease::Target<'d, ID>,
     P: lease::Policy,
@@ -141,6 +167,41 @@ where
                 next.map(|request| request.map_state(|state| (state, context))),
             ),
         }
+    }
+
+    pub(in crate::api) fn try_alarm<const EOF: bool>(
+        &self,
+        budget: &Budget<'d>,
+    ) -> Result<Option<timer::Alarm<'d>>, timer::Exhausted> {
+        match &self.admission {
+            State::Failed(_) => Ok(None),
+            State::Done if EOF => Ok(None),
+            _ => budget.timer.try_alarm().map(Some),
+        }
+    }
+
+    #[inline(always)]
+    pub(in crate::api) fn check_deadline(
+        &mut self,
+        budget: &mut Budget<'d>,
+        alarm: &mut Result<Option<timer::Alarm<'d>>, timer::Exhausted>,
+        waiter: Pin<&wait::Waiter<'_, 'd>>,
+        mut cx: Pin<&mut context::Context<'_, 'd>>,
+    ) -> Result<bool, Error<'d, ID>> {
+        let cause = match alarm {
+            Ok(Some(timer)) => {
+                if budget.poll_expired(timer, cx.as_mut()).is_pending() {
+                    return Ok(true);
+                }
+                crate::Error::RequestTimeout(deadline::Elapsed::new(self.phase()))
+            }
+            Err(error) => crate::Error::Deadline(*error),
+            Ok(None) => return self.admission.take_error().map_or(Ok(false), |error| Err(error.into())),
+        };
+        waiter.unregister();
+        let error = self.fail(cause, cx.as_mut().region_token());
+        *alarm = Ok(None);
+        Err(error)
     }
 
     pub(super) fn poll_admit<'target>(
@@ -166,7 +227,8 @@ where
                 client.port.request().try_with(
                     context,
                     this,
-                    |region, lane, tag, this| {
+                    |region, lane, batch, boundary, this| {
+                        let tag = replies::Tag::new(batch, boundary);
                         Response::<X::Spec>::try_with(region, lane, tag, this, |this| {
                             match mem::replace(this, State::Done) {
                                 State::Connecting { request, .. } => {
@@ -203,7 +265,10 @@ where
     pub(super) fn admitted(
         &self,
     ) -> Option<&lease::Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, A, P, ID>> {
-        self.admission.admitted()
+        match &self.admission {
+            State::Admitted(lease, _) => Some(lease),
+            _ => None,
+        }
     }
 
     pub(super) fn fail(
@@ -211,27 +276,22 @@ where
         error: crate::Error,
         token: &region::Token<region::Identity<'d>>,
     ) -> Error<'d, ID> {
-        if !P::RECOVER
-            && let State::Admitted(_, reply) = &mut self.admission
-            && reply.detach_order(token) == reply::order::State::Detached
-        {
-            self.admission = State::Done;
-        }
-        self.abort(error)
+        self.admission.cancel(
+            error,
+            |reply| P::RECOVER || reply.detach_order(token) == reply::order::State::Linked,
+            lease::Lease::abort,
+        )
     }
 
     pub(super) fn abort(&mut self, error: crate::Error) -> Error<'d, ID> {
-        if let State::Admitted(_, reply) = &mut self.admission {
-            reply.detach();
-        }
-        self.admission.cancel(error, lease::Lease::abort)
+        self.admission.cancel(error, |_| true, lease::Lease::abort)
     }
 }
 
 impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, T, X, const ID: u8, R, M, S, A, P>
     Core<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, X, ID, R, M, S, A, P>
 where
-    I: schema::QuerySet + 'd,
+    I: crate::port::Instance<Queries: 'd> + 'd,
     X: Read<'app, 'b, 'c, 'd, Output = Result<T, Error<'d, ID>>>,
     A: lease::Target<'d, ID>,
     P: lease::Policy,

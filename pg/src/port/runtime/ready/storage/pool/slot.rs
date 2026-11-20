@@ -173,7 +173,9 @@ impl<'a, 'd, const ID: u8> Ready<'a, 'd, ID> {
         Self { slot: self.slot }
     }
 
-    pub(crate) fn listed(listed: &protocol::runtime::ready::Listed<'a, 'd, ID>) -> Self {
+    pub(crate) fn listed<P: protocol::runtime::ready::Policy>(
+        listed: &protocol::runtime::ready::Listed<'a, 'd, ID, P>,
+    ) -> Self {
         Self {
             slot: listed.slot(),
         }
@@ -440,7 +442,9 @@ impl<'d, const ID: u8> Slot<'d, ID> {
     }
 }
 
-impl<'d, const ID: u8> protocol::runtime::ready::Entry<'_, 'd, ID> {
+impl<'d, const ID: u8, P: protocol::runtime::ready::Policy>
+    protocol::runtime::ready::Entry<'_, 'd, ID, P>
+{
     pub(crate) fn try_flush<E>(
         self,
         requests: queue::Lane<'_, 'd, egress::NonEmpty<requests::Frame<'d>>>,

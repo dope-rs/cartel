@@ -95,17 +95,15 @@ impl PgBackend {
         let mut oids = Vec::new();
         let mut arguments = Vec::new();
         let mut fmts = Vec::new();
-        let mut text = false;
         for &(fn_idx, _) in caps {
             let (_, ty) = &params[fn_idx];
-            let (meta, format) = ty.param()?;
+            let meta = ty.param()?;
             oids.push(
                 quote::quote! { <#meta as ::cartel_pg::protocol::value::encode::Param>::OID },
             );
             fmts.push(
                 quote::quote! { <#meta as ::cartel_pg::protocol::value::encode::Param>::FORMAT },
             );
-            text |= format == 0;
             let idx = syn::Index::from(fn_idx);
             let arg = match (single, ty) {
                 (true, syn::Type::Reference(_)) => quote::quote! { &**#args },
@@ -122,14 +120,6 @@ impl PgBackend {
             .fold(quote::quote! { () }, |tail, head| {
                 quote::quote! { (#head, #tail) }
             });
-
-        let decl = if text {
-            quote::quote! {
-                const PARAM_FORMAT_CODES: &[u16] = &[ #( #fmts, )* ];
-            }
-        } else {
-            quote::quote! {}
-        };
 
         let ids = params.iter().map(|(id, _)| id);
         let values = input_shape(quote::quote! { #(#ids),* });
@@ -190,30 +180,20 @@ impl PgBackend {
                 ::cartel_pg::api::traits::IntoQuery::into_query(#client), #values
             )
         };
-        let (row_ty, shape, codes) = match row {
-            Some(ty) => {
-                let codes = match ty.formats() {
-                    Some(path) => {
-                        quote::quote! { const RESULT_FORMAT_CODES: &[u16] = #path; }
-                    }
-                    None => quote::quote! {},
-                };
-                let (row, shape) = match (&plan.dispatch, plan.output.as_ref()) {
-                    (emit::Kind::Aggregate(_), syn::ReturnType::Type(_, declared)) => (
-                        quote::quote! { <#declared as ::core::iter::IntoIterator>::Item },
-                        quote::quote! { ::cartel_pg::schema::result::Rows<true> },
-                    ),
-                    _ => (
-                        quote::quote! { #ty },
-                        quote::quote! { ::cartel_pg::schema::result::Rows },
-                    ),
-                };
-                (row, shape, codes)
-            }
+        let (row_ty, shape) = match row {
+            Some(ty) => match (&plan.dispatch, plan.output.as_ref()) {
+                (emit::Kind::Aggregate(_), syn::ReturnType::Type(_, declared)) => (
+                    quote::quote! { <#declared as ::core::iter::IntoIterator>::Item },
+                    quote::quote! { ::cartel_pg::schema::result::Rows<true> },
+                ),
+                _ => (
+                    quote::quote! { #ty },
+                    quote::quote! { ::cartel_pg::schema::result::Rows },
+                ),
+            },
             None => (
                 quote::quote! { () },
                 quote::quote! { ::cartel_pg::schema::result::Command },
-                quote::quote! {},
             ),
         };
 
@@ -330,8 +310,13 @@ impl PgBackend {
                 const PARAM_OIDS: &[u32] = &[ #( #oids, )* ];
                 const N_PARAMS: i16 = #count;
                 const N_RESULT_COLS: u16 = #cols;
-                #decl
-                #codes
+                const PARAM_FORMAT_CODES: &[u16] =
+                    ::cartel_pg::protocol::encode::format_codes::<true>(&[#(#fmts,)*]);
+                const RESULT_FORMAT_CODES: &[u16] = {
+                    const CODES: [u16; <#query as ::cartel_pg::schema::TypedQuery>::N_RESULT_COLS as usize] =
+                        ::cartel_pg::protocol::encode::result_formats(&<#row_ty as ::cartel_pg::schema::desc::Validate>::FORMATS);
+                    ::cartel_pg::protocol::encode::format_codes::<false>(&CODES)
+                };
 
                 #[inline(always)]
                 fn bind(

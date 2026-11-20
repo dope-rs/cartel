@@ -338,7 +338,7 @@ impl<'a> Listener<'a> for peer::TcpAcceptor<'a> {
     fn copy_recover(&self) -> Result<(), Error> {
         let mut stream = self.accept_within(Duration::from_secs(1))?;
         stream.try_start(None)?;
-        for _ in 0..2 {
+        for _ in 0..3 {
             read_empty(&stream, b'd')?;
             let rejected = [
                 Frame::new(b'E', b"SERROR\0C42P01\0Mmissing copy relation\0\0").encode(),

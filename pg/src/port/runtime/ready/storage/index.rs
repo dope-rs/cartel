@@ -1,4 +1,10 @@
-use std::{cell, marker, mem, num::NonZero};
+use std::{
+    alloc::Layout,
+    cell, marker, mem,
+    num::NonZero,
+    ptr::{self, NonNull},
+    slice,
+};
 
 use dope::core::driver::route;
 use dope::manifold::client::conn;
@@ -20,90 +26,57 @@ use crate::{
     },
 };
 
-pub(in crate::port::runtime) struct Index<'d, const ID: u8> {
-    pub(super) allocation: storage::Block<'d, ID>,
-    pub(super) ring: links::Cycle,
-    pub(super) minimum: cell::Cell<Option<storage::Rank>>,
+use o3::alloc::raw::LayoutExt as _;
+use storage::{Order, Policy};
+
+pub(in crate::port::runtime) struct Index<'d, const ID: u8, P: Policy> {
+    slots: NonNull<slot::Slot<'d, ID>>,
+    layout: Layout,
+    capacity: route::table::conn::Capacity,
+    pub(super) order: P::Order,
     live: cell::Cell<bounded::U32<0, { route::SLOT_MASK as u32 }>>,
     blockers: cell::Cell<bounded::U32<0, { route::SLOT_MASK as u32 }>>,
     thread: marker::PhantomData<ThreadBound>,
 }
 
-pub(crate) struct Reservation<'a, 'd, const ID: u8> {
-    listed: storage::Listed<'a, 'd, ID>,
+pub(crate) struct Reservation<'a, 'd, const ID: u8, P: Policy> {
+    listed: storage::Listed<'a, 'd, ID, P>,
     phase: access::Reservation<'a, 'd, ID>,
 }
 
-pub(crate) struct Remaining<'a, 'd, const ID: u8> {
-    next: Option<storage::Listed<'a, 'd, ID>>,
-    end: Option<links::Index>,
+pub(crate) struct Remaining<'a, 'd, const ID: u8, P: Policy> {
+    core: &'a Shared<'d, ID, P>,
+    next: Option<(links::Index, <P::Order as Order>::Rank)>,
+    end: <P::Order as Order>::End,
 }
 
-impl<'a, 'd, const ID: u8> Iterator for Remaining<'a, 'd, ID> {
-    type Item = storage::Listed<'a, 'd, ID>;
+impl<'a, 'd, const ID: u8, P: Policy> Iterator for Remaining<'a, 'd, ID, P> {
+    type Item = storage::Listed<'a, 'd, ID, P>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let listed = self.next.take()?;
-        self.next = match self.end {
-            Some(end) => {
-                let (next, _) = listed.core.step(links::Index::from(listed.index));
-                (next != end)
-                    .then(|| storage::Entry {
-                        core: listed.core,
-                        index: next.position(),
-                    })
-                    .and_then(storage::Entry::listed)
-            }
-            None => listed.following(),
-        };
-        Some(listed)
+        let (index, rank) = self.next?;
+        // SAFETY: this cursor is consumed within the same exclusive admission turn.
+        self.next = unsafe { self.core.index.order.following(index, rank, &self.end) };
+        Some(storage::Listed {
+            core: self.core,
+            index,
+            rank,
+        })
     }
 }
 
-impl<'a, 'd, const ID: u8> storage::Listed<'a, 'd, ID> {
-    pub(crate) fn remaining(self) -> Remaining<'a, 'd, ID> {
-        match self.core.policy.get() {
-            protocol::PickPolicy::RoundRobin => {
-                let end = links::Index::from(self.index);
-                let next = self.core.index.ring.first().filter(|index| *index != end);
-                Remaining {
-                    next: next.and_then(|index| {
-                        storage::Entry {
-                            core: self.core,
-                            index: index.position(),
-                        }
-                        .listed()
-                    }),
-                    end: Some(end),
-                }
-            }
-            protocol::PickPolicy::LeastInflight => Remaining {
-                next: self.following(),
-                end: None,
-            },
-        }
-    }
-
-    fn following(&self) -> Option<Self> {
-        use o3::depot::index::bitmap::Access as _;
-
-        let entry = storage::Entry {
+impl<'a, 'd, const ID: u8, P: Policy> storage::Listed<'a, 'd, ID, P> {
+    pub(crate) fn remaining(self) -> Remaining<'a, 'd, ID, P> {
+        // SAFETY: this is the originally selected candidate of this admission turn.
+        let (next, end) = unsafe { self.core.index.order.remaining(self.index, self.rank) };
+        Remaining {
             core: self.core,
-            index: self.index,
-        };
-        if let Some(next) = entry.node().bucket.next_index() {
-            return Some(Self {
-                core: self.core,
-                index: next.position(),
-                rank: self.rank,
-            });
+            next,
+            end,
         }
-        let row = self.rank.row(&self.core.index.allocation);
-        let next = (&self.core.index.allocation).find((), row.index() + 1)?;
-        Some(self.core.first_rank(storage::Rank::new(next)))
     }
 
-    pub(crate) fn reserve(self) -> Option<Reservation<'a, 'd, ID>> {
+    pub(crate) fn reserve(self) -> Option<Reservation<'a, 'd, ID, P>> {
         let Some(phase) = access::Reservation::reserve(&self) else {
             self.remove();
             return None;
@@ -115,14 +88,14 @@ impl<'a, 'd, const ID: u8> storage::Listed<'a, 'd, ID> {
     }
 }
 
-impl<'a, 'd, const ID: u8> Reservation<'a, 'd, ID> {
+impl<'a, 'd, const ID: u8, P: Policy> Reservation<'a, 'd, ID, P> {
     pub(crate) fn ready(&self) -> slot::Ready<'a, 'd, ID> {
         slot::Ready::reserved(&self.phase)
     }
 
     pub(crate) fn commit(self) -> access::Transaction<'d, ID> {
         let id = self.phase.commit();
-        let (entry, _) = self.listed.remove();
+        let entry = self.listed.remove();
         // SAFETY: this Shared -> Reserved transition adds one previously uncounted blocker.
         entry
             .core
@@ -132,82 +105,79 @@ impl<'a, 'd, const ID: u8> Reservation<'a, 'd, ID> {
         id
     }
 
-    pub(crate) fn into_listed(self) -> storage::Listed<'a, 'd, ID> {
+    pub(crate) fn into_listed(self) -> storage::Listed<'a, 'd, ID, P> {
         self.listed
     }
 }
 
-impl<'d, const ID: u8> Index<'d, ID> {
-    pub(in crate::port::runtime) fn try_new(plan: plan::Plan) -> Result<Self, Error> {
+impl<'d, const ID: u8, P: Policy> Index<'d, ID, P> {
+    pub(in crate::port::runtime) fn try_new(plan: plan::Plan<P>) -> Result<Self, Error> {
+        let ptr = plan.allocation.try_allocate::<u8>()?;
+        let count = plan.capacity.entries().get();
+        let slots = ptr.cast::<slot::Slot<'d, ID>>();
+        // SAFETY: values start at offset zero, followed by this policy's admitted arrays.
+        // Slot and schedule initialization do not exit early or re-enter the owner.
+        for index in 0..count {
+            unsafe { slots.add(index).write(slot::Slot::new()) };
+        }
+        let order = unsafe { P::Order::install(ptr, count, plan.offsets) };
         Ok(Self {
-            allocation: storage::Block::try_new(plan)?,
-            ring: links::Cycle::new(),
-            minimum: cell::Cell::new(None),
+            slots,
+            layout: plan.allocation,
+            capacity: plan.capacity,
+            order,
             live: cell::Cell::new(bounded::U32::exact::<0>()),
             blockers: cell::Cell::new(bounded::U32::exact::<0>()),
             thread: marker::PhantomData,
         })
     }
+
+    pub(super) fn values(&self) -> &[slot::Slot<'d, ID>] {
+        unsafe { slice::from_raw_parts(self.slots.as_ptr(), self.capacity.entries().get()) }
+    }
 }
 
-impl<'d, const ID: u8> Shared<'d, ID> {
+impl<const ID: u8, P: Policy> Drop for Index<'_, ID, P> {
+    fn drop(&mut self) {
+        if mem::needs_drop::<slot::Slot<'_, ID>>() {
+            let values =
+                ptr::slice_from_raw_parts_mut(self.slots.as_ptr(), self.capacity.entries().get());
+            unsafe { values.drop_in_place() };
+        }
+        // The sealed order contains only pointer/bitmap/hook metadata with no drop effect.
+        unsafe { self.layout.deallocate(self.slots) };
+    }
+}
+
+impl<'d, const ID: u8, P: Policy> Shared<'d, ID, P> {
     pub(in crate::port::runtime) fn entry(
         &self,
         index: usize,
-    ) -> Option<storage::Entry<'_, 'd, ID>> {
-        self.index.allocation.values().get(index)?;
-        let index = unsafe { NonZero::new_unchecked(index as u32 + 1) };
+    ) -> Option<storage::Entry<'_, 'd, ID, P>> {
+        self.index.values().get(index)?;
+        // SAFETY: the route slot capacity excludes the compact sentinel.
+        let index = unsafe { <links::Index as depot::raw::Word>::from_offset(index) };
         Some(storage::Entry { core: self, index })
     }
 
-    pub(in crate::port::runtime::ready) fn next(&self) -> Option<storage::Listed<'_, 'd, ID>> {
-        let index = self.index.ring.first()?;
-        self.step(index).1.listed()
-    }
-
-    /// The private ring contains only this allocation's admitted entries;
-    /// advancing its head preserves the same indexed owner.
-    fn step(&self, index: links::Index) -> (links::Index, storage::Entry<'_, 'd, ID>) {
-        // SAFETY: this Index owns the exact reciprocal ring and its resident domain.
-        let next = unsafe {
-            depot::raw::Hooks::cycle_step(
-                &storage::Round(&self.index.allocation),
-                &self.index.ring,
-                index,
-            )
-        };
-        let entry = storage::Entry {
+    pub(crate) fn pick(&self) -> Option<storage::Listed<'_, 'd, ID, P>> {
+        let (index, rank) = self.index.order.pick()?;
+        Some(storage::Listed {
             core: self,
-            index: index.position(),
-        };
-        (next, entry)
-    }
-
-    pub(in crate::port::runtime::ready) fn minimum(&self) -> Option<storage::Listed<'_, 'd, ID>> {
-        Some(self.first_rank(self.index.minimum.get()?))
-    }
-
-    fn first_rank(&self, rank: storage::Rank) -> storage::Listed<'_, 'd, ID> {
-        let row = rank.row(&self.index.allocation);
-        // SAFETY: minimum and bitmap hits name this owner's occupied buckets.
-        let head = unsafe { self.index.allocation.heads().get_unchecked(row.index()) };
-        let index = links::List::front_from(unsafe { depot::raw::Proof::new(head) });
-        storage::Listed {
-            core: self,
-            index: index.position(),
+            index,
             rank,
-        }
+        })
     }
 
     pub(crate) fn try_ready(
         &self,
         id: conn::Id<'d, route::KeyTag<ID>>,
-    ) -> Result<storage::Entry<'_, 'd, ID>, protocol::Reason> {
+    ) -> Result<storage::Entry<'_, 'd, ID, P>, protocol::Reason> {
         let entry = self
             .entry(id.index().into_usize())
             .ok_or(protocol::Reason::PrepareReady)?;
         entry.slot().try_ready(id)?;
-        entry.insert(0);
+        entry.insert(|| 0);
         // SAFETY: only Handshaking -> Ready succeeds above. That uncounted
         // resident makes live strictly smaller than this fixed connection domain.
         self.index
@@ -239,7 +209,7 @@ impl<'d, const ID: u8> Shared<'d, ID> {
     }
 }
 
-impl<'d, const ID: u8> storage::Entry<'_, 'd, ID> {
+impl<'d, const ID: u8, P: Policy> storage::Entry<'_, 'd, ID, P> {
     pub(in crate::port::runtime) fn close(
         self,
         id: conn::Id<'d, route::KeyTag<ID>>,
@@ -271,7 +241,3 @@ impl<'d, const ID: u8> storage::Entry<'_, 'd, ID> {
         Some(core.apply_close(close))
     }
 }
-
-const _: () = assert!(
-    mem::size_of::<Index<'static, 0>>() == 6 * mem::size_of::<usize>() + 6 * mem::size_of::<u32>()
-);

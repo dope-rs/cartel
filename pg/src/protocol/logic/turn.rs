@@ -1,3 +1,4 @@
+use crate::port::Instance;
 use cartel_core::reply::order;
 use dope::{
     core::driver::route,
@@ -26,19 +27,7 @@ use crate::{
     schema::{self, desc, result},
 };
 
-pub(super) struct Turn<
-    'turn,
-    'life,
-    'e,
-    'g,
-    'r,
-    's,
-    'b,
-    'c,
-    'd: 'life,
-    I: schema::QuerySet,
-    const ID: u8,
-> {
+pub(super) struct Turn<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: Instance, const ID: u8> {
     pub(super) port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
     pub(super) conn: conn::Id<'d, route::KeyTag<ID>>,
     pub(super) state: &'turn mut State<'life, 'd, I, ID>,
@@ -46,7 +35,7 @@ pub(super) struct Turn<
     pub(super) region: &'turn mut region::Token<region::Identity<'d>>,
 }
 
-impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const ID: u8>
+impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: Instance, const ID: u8>
     Turn<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd, I, ID>
 {
     pub(super) fn new(
@@ -139,7 +128,42 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         Ok(())
     }
 
-    pub(super) fn response<'input, R: buffer::Cursor + hold::raw::Retain<'d>>(
+    pub(super) fn reject(&mut self, error: crate::Error) -> Delivery<Pending<'d>> {
+        self.fail(error);
+        Delivery::Committed
+    }
+
+    pub(super) fn frame<'id, 'input, R: buffer::Cursor + hold::raw::Retain<'d>>(
+        mut self,
+        frame: frame::Complete<'id, 'input, 'd, R>,
+    ) -> frame::Item<'id, Delivery<Pending<'d>>>
+    where
+        'd: 'input,
+    {
+        let entry = match (&self.state.progress, &self.state.phase, frame.typ) {
+            (state::Progress::Running, state::Phase::Ready(entry), messages::Be::DATA_ROW)
+            | (
+                state::Progress::Running,
+                state::Phase::CopyOutActive(entry),
+                messages::Be::COPY_DATA,
+            ) => *entry,
+            _ => return frame.message(|message| self.response(message)),
+        };
+        let (result, consumed) = self.push(frame, entry)?;
+        Ok((self.delivered(result), consumed))
+    }
+
+    fn delivered(
+        &mut self,
+        result: Result<Option<Pending<'d>>, crate::Error>,
+    ) -> Delivery<Pending<'d>> {
+        match result {
+            Ok(next) => next.map_or(Delivery::Committed, Delivery::Prepared),
+            Err(error) => self.reject(error),
+        }
+    }
+
+    fn response<'input, R: buffer::Cursor + hold::raw::Retain<'d>>(
         mut self,
         message: frame::Message<'input, 'd, R>,
     ) -> Delivery<Pending<'d>>
@@ -179,13 +203,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 Ok(None)
             }
         };
-        match result {
-            Ok(next) => next.map_or(Delivery::Committed, Delivery::Prepared),
-            Err(error) => {
-                self.fail(error);
-                Delivery::Committed
-            }
-        }
+        self.delivered(result)
     }
 
     fn error<'input, R: buffer::Cursor + hold::raw::Retain<'d>>(
@@ -297,8 +315,8 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
                 {
                     return Err(crate::Error::Protocol(Reason::ReadyUnknown));
                 }
-                let catalog = schema::Catalog::<I>::try_new()?;
-                let set = I::PREPARE;
+                let catalog = schema::Catalog::<I::Queries>::try_new()?;
+                let set = <I::Queries as schema::QuerySet>::PREPARE;
                 let frame = egress::NonEmpty::try_new(Frame::from(set.wire()))
                     .map_err(crate::Error::RequestLoad)?;
                 Self::enqueue(&self.sink, self.region, frame)?;
@@ -366,7 +384,7 @@ impl<'turn, 'life, 'e, 'g, 'r, 's, 'b, 'c, 'd: 'life, I: schema::QuerySet, const
         &mut self,
         typ: u8,
         data: Wire<'_>,
-        prep: state::Prepare<I>,
+        prep: state::Prepare<I::Queries>,
     ) -> Result<(), crate::Error> {
         use state::Prepare;
 

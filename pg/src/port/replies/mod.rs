@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, ptr::NonNull};
+use std::{cmp::Ordering, num::NonZero, ptr::NonNull};
 
 use cartel_core::reply::{self, order, retain, usage};
 use dope::{
@@ -23,7 +23,6 @@ use crate::{
         runtime::{ready, tx::poll},
     },
     reply::{Error, server},
-    schema,
 };
 
 mod batch;
@@ -71,10 +70,6 @@ impl<'g, 'r, 's, 'b, 'c, 'd> Tag<'g, 'r, 's, 'b, 'c, 'd> {
                 Boundary::Commit => Kind::Commit,
             },
         }
-    }
-
-    pub(crate) const fn batch(&self) -> Batch {
-        self.batch
     }
 
     pub(crate) fn current(
@@ -281,6 +276,18 @@ pub(crate) struct RowPlan<'input, 'd, R: buffer::Cursor> {
     headroom: usize,
 }
 
+pub struct Run<T> {
+    value: T,
+    bytes: u32,
+    rows: NonZero<u32>,
+}
+
+impl<T> Run<T> {
+    fn amount(&self) -> usage::Counted {
+        usage::Counted::new(self.bytes, self.rows)
+    }
+}
+
 pub(crate) enum Pending<'d> {
     Row(Row<'d>),
     Failure(ReplyFailure<'d>),
@@ -300,26 +307,21 @@ impl<'input, 'd, R: buffer::Cursor> RowPlan<'input, 'd, R> {
     {
         self.try_build().map(Pending::Row)
     }
-}
-
-impl<'d, R: buffer::Cursor + hold::raw::Retain<'d>> usage::Build<Row<'d>> for RowPlan<'_, 'd, R> {
-    type Error = hold::Error;
-
-    fn usage(&self) -> usage::Bytes {
-        usage::Bytes::new(self.payload.as_slice().len())
-    }
-
     #[inline(always)]
-    fn try_build(self) -> Result<Row<'d>, (Self, Self::Error)> {
+    fn try_retain(self, logical: usize) -> Result<Row<'d>, (Self, hold::Error)>
+    where
+        R: hold::raw::Retain<'d>,
+    {
         let mut payload = self.payload.bind(hold::Policy::share());
-        let len = payload.len();
-        if let hold::Choice::Copy = cartel_core::memory::RETENTION.choose(len, || payload.ceiling())
-        {
-            // Optional sharing spends only extra headroom; ordinary retention stays reserved.
-            if let Ok(Some(owner)) = payload.try_retain_with(self.headroom) {
-                return Ok(Row(owner));
+        match cartel_core::memory::RETENTION.choose(logical, || payload.ceiling()) {
+            hold::Choice::Copy => {
+                if let Ok(Some(owner)) = payload.try_retain_with(self.headroom) {
+                    return Ok(Row(owner));
+                }
+                payload = payload.defer().bind(hold::Policy::compact());
             }
-            payload = payload.defer().bind(hold::Policy::compact());
+            hold::Choice::Empty => payload = payload.defer().bind(hold::Policy::compact()),
+            hold::Choice::Share => {}
         }
         match payload.try_retain() {
             Ok(owner) => Ok(Row(owner)),
@@ -331,6 +333,72 @@ impl<'d, R: buffer::Cursor + hold::raw::Retain<'d>> usage::Build<Row<'d>> for Ro
                 error,
             )),
         }
+    }
+}
+
+impl<'d, R: buffer::Cursor + hold::raw::Retain<'d>> usage::Build<Row<'d>> for RowPlan<'_, 'd, R> {
+    type Error = hold::Error;
+
+    fn usage(&self) -> usage::Counted {
+        usage::Counted::new(self.payload.as_slice().len() as u32, NonZero::<u32>::MIN)
+    }
+
+    fn try_build(self) -> Result<Row<'d>, (Self, Self::Error)> {
+        let len = self.payload.as_slice().len();
+        self.try_retain(len)
+    }
+}
+
+impl<'input, 'd, R: buffer::Cursor> Run<RowPlan<'input, 'd, R>> {
+    pub(crate) fn new(
+        payload: frame::Payload<'input, 'd, R>,
+        rows: NonZero<u32>,
+        headroom: usize,
+    ) -> Self {
+        // The codec counted complete frames, and retention preserves their exact byte range.
+        let bytes =
+            payload.as_slice().len() - rows.get() as usize * port::config::FRAME_HEADER_BYTES;
+        Self {
+            value: RowPlan::row(payload, headroom),
+            bytes: bytes as u32,
+            rows,
+        }
+    }
+}
+
+impl<'d, R: buffer::Cursor + hold::raw::Retain<'d>> usage::Build<Run<Row<'d>>>
+    for Run<RowPlan<'_, 'd, R>>
+{
+    type Error = hold::Error;
+
+    fn usage(&self) -> usage::Counted {
+        self.amount()
+    }
+
+    fn try_build(self) -> Result<Run<Row<'d>>, (Self, Self::Error)> {
+        let Self { value, bytes, rows } = self;
+        value
+            .try_retain(bytes as usize)
+            .map(|value| Run { value, bytes, rows })
+            .map_err(|(value, error)| (Run { value, bytes, rows }, error))
+    }
+}
+
+impl<'d> usage::Grouped for Row<'d> {
+    type Group = Run<Self>;
+}
+
+impl usage::Footprint for Run<Row<'_>> {
+    type Amount = usage::Counted;
+
+    fn footprint(&self) -> Self::Amount {
+        self.amount()
+    }
+}
+
+impl<'d> From<Run<Row<'d>>> for Row<'d> {
+    fn from(run: Run<Row<'d>>) -> Self {
+        run.value
     }
 }
 
@@ -372,10 +440,10 @@ impl<'d> ReplyFailure<'d> {
 }
 
 impl usage::Footprint for Row<'_> {
-    type Amount = usage::Bytes;
+    type Amount = usage::Counted;
 
-    fn footprint(&self) -> usage::Bytes {
-        usage::Bytes::new(self.0.as_slice().len())
+    fn footprint(&self) -> Self::Amount {
+        usage::Counted::new(self.0.as_slice().len() as u32, NonZero::<u32>::MIN)
     }
 }
 
@@ -405,14 +473,16 @@ impl From<&GroupServer> for ReplyFailure<'_> {
     }
 }
 
-pub(crate) struct Lane<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, const ID: u8> {
-    entry: ready::Entry<'life, 'd, ID>,
+pub(crate) struct Lane<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, const ID: u8, P: ready::Policy> {
+    entry: ready::Entry<'life, 'd, ID, P>,
     lane: reply::Lane<'life, 'b, 'c, 'd, Row<'d>, ReplyFailure<'d>, Tag<'g, 'r, 's, 'b, 'c, 'd>>,
     region: &'life mut region::Token<region::Identity<'d>>,
 }
 
-impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, const ID: u8> Lane<'life, 'g, 'r, 's, 'b, 'c, 'd, ID> {
-    pub(super) fn try_new<I: schema::QuerySet>(
+impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, const ID: u8, P: ready::Policy>
+    Lane<'life, 'g, 'r, 's, 'b, 'c, 'd, ID, P>
+{
+    pub(super) fn try_new<I: port::Instance<Policy = P>>(
         port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
         conn: conn::Id<'d, KeyTag<ID>>,
         region: &'life mut region::Token<region::Identity<'d>>,
@@ -421,10 +491,10 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, const ID: u8> Lane<'life, 'g, 'r, 's,
         Some(Self::new(port, conn, entry, region))
     }
 
-    pub(crate) fn new<I: schema::QuerySet>(
+    pub(crate) fn new<I: port::Instance<Policy = P>>(
         port: &'life port::Port<'life, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
         conn: conn::Id<'d, KeyTag<ID>>,
-        entry: ready::Entry<'life, 'd, ID>,
+        entry: ready::Entry<'life, 'd, ID, P>,
         region: &'life mut region::Token<region::Identity<'d>>,
     ) -> Self {
         Self {
@@ -443,7 +513,7 @@ impl<'life, 'g, 'r, 's, 'b, 'c, 'd: 'life, const ID: u8> Lane<'life, 'g, 'r, 's,
         self.lane.depth(self.region)
     }
 
-    pub(crate) fn try_flush<E, I: schema::QuerySet>(
+    pub(crate) fn try_flush<E, I: port::Instance<Policy = P>>(
         self,
         port: &port::Port<'_, 'g, 'r, 's, 'b, 'c, 'd, I, ID>,
         send: impl FnOnce(&mut region::Token<region::Identity<'d>>) -> Result<(), E>,

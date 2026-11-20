@@ -1,55 +1,40 @@
-use std::{mem, num};
-
-use crate::port::ready;
-use crate::protocol::runtime::ready::storage;
+use super::{Policy, RoundRobin, storage};
+use crate::port::{
+    pool::slot,
+    ready::{Error, Part},
+};
 use cartel_core::reply::layout;
 use dope::core::driver::route::table::conn;
+use std::alloc::Layout;
+use storage::Order;
 
-#[derive(Clone, Copy)]
-pub(crate) struct Plan {
-    capacity: conn::Capacity,
-    buckets: num::NonZero<u32>,
-    block: storage::Layout,
+pub(crate) struct Plan<P: Policy = RoundRobin> {
+    pub(super) capacity: conn::Capacity,
+    pub(super) allocation: Layout,
+    pub(super) offsets: <P::Order as Order>::Layout,
 }
 
-impl Plan {
-    /// With K shared credits, M eligible lanes carry at most 2K + 3M load: one reserved order
-    /// per lane and only its current Sync may outlive all orders. Clipping at K + 3 keeps the minimum.
-    /// The validated reply layout bounds the K + 1 order limit by u32::MAX / 2.
-    pub(crate) fn new(
-        capacity: conn::Capacity,
-        replies: layout::Layout,
-    ) -> Result<Self, ready::Error> {
-        let buckets = if capacity.entries().get() == 1 {
-            num::NonZero::<u32>::MIN
-        } else {
-            // SAFETY: Layout admission bounds order_limit by u32::MAX / 2.
-            unsafe { num::NonZero::new_unchecked(replies.order_limit().get() + 3) }
-        };
-        let block = storage::Layout::try_new(capacity, buckets)?;
+impl<P: Policy> Copy for Plan<P> {}
+
+impl<P: Policy> Clone for Plan<P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: Policy> Plan<P> {
+    pub(crate) fn new(capacity: conn::Capacity, replies: layout::Layout) -> Result<Self, Error> {
+        let slots = capacity.entries().get();
+        let values = storage::layout::array::<slot::Slot<'_, 0>>(slots, Part::Values)?;
+        let (allocation, offsets) = P::Order::layout(values, slots, replies)?;
         Ok(Self {
             capacity,
-            buckets,
-            block,
+            allocation: allocation.pad_to_align(),
+            offsets,
         })
     }
 
-    pub(super) const fn capacity(self) -> conn::Capacity {
-        self.capacity
-    }
-
-    pub(super) const fn buckets(self) -> num::NonZero<u32> {
-        self.buckets
-    }
-
     pub(crate) const fn bytes(self) -> usize {
-        self.block.allocation.size()
-    }
-
-    pub(super) const fn block(self) -> storage::Layout {
-        self.block
+        self.allocation.size()
     }
 }
-
-const _: () =
-    assert!(mem::size_of::<Plan>() == 5 * mem::size_of::<usize>() + 4 * mem::size_of::<u32>());

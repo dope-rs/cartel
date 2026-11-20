@@ -1,4 +1,5 @@
 use crate::api::{sql, tx};
+use crate::port::Instance;
 use crate::{api, port, protocol, schema};
 use cartel_core::deadline;
 use dope::core::driver::schedule::clock::timer;
@@ -26,6 +27,38 @@ impl Begin {
             deferral,
         }
     }
+
+    pub(super) fn encode(self, frame: &mut pool::Span) -> Result<(), encode::Error> {
+        let sql = move |out: &mut encode::Writer<'_>| {
+            out.write_slice(b"BEGIN")?;
+            match self.isolation {
+                tx::Isolation::Default => {}
+                tx::Isolation::ReadCommitted => {
+                    out.write_slice(b" ISOLATION LEVEL READ COMMITTED")?;
+                }
+                tx::Isolation::RepeatableRead => {
+                    out.write_slice(b" ISOLATION LEVEL REPEATABLE READ")?;
+                }
+                tx::Isolation::Serializable => {
+                    out.write_slice(b" ISOLATION LEVEL SERIALIZABLE")?;
+                }
+            }
+            match self.access {
+                tx::AccessMode::Default => {}
+                tx::AccessMode::ReadWrite => out.write_slice(b" READ WRITE")?,
+                tx::AccessMode::ReadOnly => out.write_slice(b" READ ONLY")?,
+            }
+            match self.deferral {
+                tx::Deferral::Default => {}
+                tx::Deferral::Deferred => out.write_slice(b" DEFERRABLE")?,
+            }
+            Ok(())
+        };
+        encode::Writer::with(frame, move |out| {
+            out.unnamed(sql)?;
+            out.sync()
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -40,7 +73,6 @@ enum Quoted {
 #[derive(Clone, Copy)]
 enum Sql<'a> {
     Raw(&'a str),
-    Begin(Begin),
     StatementTimeout(sql::Timeout),
     Quoted(Quoted, &'a str),
 }
@@ -53,30 +85,6 @@ impl Sql<'_> {
                     return Err(encode::Error::StatementSqlNul { position });
                 }
                 out.write_slice(sql.as_bytes())?;
-            }
-            Self::Begin(begin) => {
-                out.write_slice(b"BEGIN")?;
-                match begin.isolation {
-                    tx::Isolation::Default => {}
-                    tx::Isolation::ReadCommitted => {
-                        out.write_slice(b" ISOLATION LEVEL READ COMMITTED")?;
-                    }
-                    tx::Isolation::RepeatableRead => {
-                        out.write_slice(b" ISOLATION LEVEL REPEATABLE READ")?;
-                    }
-                    tx::Isolation::Serializable => {
-                        out.write_slice(b" ISOLATION LEVEL SERIALIZABLE")?;
-                    }
-                }
-                match begin.access {
-                    tx::AccessMode::Default => {}
-                    tx::AccessMode::ReadWrite => out.write_slice(b" READ WRITE")?,
-                    tx::AccessMode::ReadOnly => out.write_slice(b" READ ONLY")?,
-                }
-                match begin.deferral {
-                    tx::Deferral::Default => {}
-                    tx::Deferral::Deferred => out.write_slice(b" DEFERRABLE")?,
-                }
             }
             Self::StatementTimeout(timeout) => {
                 out.write_slice(b"SET LOCAL statement_timeout TO ")?;
@@ -127,13 +135,6 @@ impl<'a> Request<'a> {
         }
     }
 
-    pub(super) fn begin(begin: Begin) -> Self {
-        Self {
-            sql: Sql::Begin(begin),
-            extra: Extra::Plain,
-        }
-    }
-
     pub(super) fn timeout(timeout: sql::Timeout) -> Self {
         Self {
             sql: Sql::StatementTimeout(timeout),
@@ -169,16 +170,16 @@ impl<'a> Request<'a> {
     }
 
     fn write(self, out: &mut encode::Writer<'_>) -> Result<(), encode::Error> {
-        out.parse_with(|out| self.sql.write(out))?;
-        out.unnamed()?;
-        if let Extra::CopyIn { data } = self.extra {
-            out.copy_data(data)?;
-            out.copy_done()?;
+        out.unnamed(move |out| self.sql.write(out))?;
+        match self.extra {
+            Extra::Plain => {}
+            Extra::CopyIn { data } => {
+                out.copy_data(data)?;
+                out.copy_done()?;
+            }
+            Extra::CopyInOpen => return Ok(()),
         }
-        if !matches!(self.extra, Extra::CopyInOpen) {
-            out.sync()?;
-        }
-        Ok(())
+        out.sync()
     }
 }
 
@@ -207,17 +208,12 @@ impl<'d, S, M> Pending<'d, S, M> {
 }
 
 impl<'d> Pending<'d> {
-    pub(in crate::api) fn typed<
-        Q: schema::TypedQuery,
-        I: schema::QuerySet,
-        X: api::Sync,
-        const ID: u8,
-    >(
+    pub(in crate::api) fn typed<Q: schema::TypedQuery, I: Instance, X: api::Sync, const ID: u8>(
         port: &port::Port<'_, '_, '_, '_, '_, '_, 'd, I, ID>,
         params: Q::Params<'_>,
         frame: impl FnOnce(&pool::Pool) -> Option<pool::Span>,
     ) -> Result<Pending<'d, (), PhantomData<X>>, crate::Error> {
-        if !schema::contains::<I, Q>() {
+        if !schema::contains::<I::Queries, Q>() {
             return Err(crate::Error::QueryMetadata);
         }
         let frame = port.request().encode(frame(&port.requests), |frame| {
@@ -245,10 +241,10 @@ impl<'d> Pending<'d> {
     >
     where
         Q: schema::TypedQuery,
-        I: schema::QuerySet,
+        I: Instance,
         'd: 'app,
     {
-        if !schema::contains::<I, Q>() {
+        if !schema::contains::<I::Queries, Q>() {
             return Err(crate::Error::QueryMetadata);
         }
         let access = port
@@ -266,15 +262,14 @@ impl<'d> Pending<'d> {
         })
     }
 
-    pub(in crate::api) fn raw<I: schema::QuerySet, const ID: u8>(
+    pub(in crate::api) fn raw<I: Instance, const ID: u8>(
         port: &port::Port<'_, '_, '_, '_, '_, '_, 'd, I, ID>,
         req: Request<'_>,
         frame: impl FnOnce(&pool::Pool) -> Option<pool::Span>,
     ) -> Result<Self, crate::Error> {
-        let boundary = match (req.sql, req.extra) {
-            (Sql::Begin(_), _) => requests::Boundary::Begin,
-            (_, Extra::Plain | Extra::CopyIn { .. }) => requests::Boundary::Close,
-            (_, Extra::CopyInOpen) => requests::Boundary::External,
+        let boundary = match req.extra {
+            Extra::Plain | Extra::CopyIn { .. } => requests::Boundary::Close,
+            Extra::CopyInOpen => requests::Boundary::External,
         };
         let frame = port.request().encode(frame(&port.requests), |frame| {
             encode::Writer::with(frame, |out| req.write(out))
@@ -286,7 +281,7 @@ impl<'d> Pending<'d> {
         })
     }
 
-    pub(in crate::api) fn commit<I: schema::QuerySet, const ID: u8>(
+    pub(in crate::api) fn commit<I: Instance, const ID: u8>(
         port: &port::Port<'_, '_, '_, '_, '_, '_, 'd, I, ID>,
     ) -> Result<Self, crate::Error> {
         let mut request = Self::raw(port, Request::raw("COMMIT"), pool::Pool::acquire)?;

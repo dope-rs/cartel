@@ -74,26 +74,6 @@ impl backend::TableBackend for super::PgBackend {
                 }
             });
         }
-        let mut fmts: Vec<u16> = Vec::new();
-        let mut text = false;
-        for f in &fields {
-            let fmt = f.ty.format();
-            if fmt == 0 {
-                text = true;
-            }
-            fmts.push(fmt);
-        }
-        let codes = if text {
-            quote::quote! {
-                #[doc(hidden)]
-                pub const __CARTEL_RESULT_FORMAT_CODES: &'static [u16] = &[ #( #fmts, )* ];
-            }
-        } else {
-            quote::quote! {
-                #[doc(hidden)]
-                pub const __CARTEL_RESULT_FORMAT_CODES: &'static [u16] = &[1u16];
-            }
-        };
         let emit = if batch {
             let slices = quote::format_ident!("{name}Slices");
             let vis = &input.vis;
@@ -130,7 +110,6 @@ impl backend::TableBackend for super::PgBackend {
 
                 #[doc(hidden)]
                 pub const __CARTEL_TABLE: &'static str = #sql;
-                #codes
             }
 
             impl #name {

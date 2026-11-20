@@ -1,42 +1,80 @@
-use block::Block;
-use buckets::Buckets;
-pub(crate) use entry::Entry;
-pub(crate) use entry::Listed;
-use header::Header;
+use o3::depot::queue::links;
+use std::{alloc::Layout, ptr::NonNull};
+
+pub(crate) use entry::{Entry, Listed};
 pub(in crate::port::runtime) use index::Index;
 pub(crate) use index::{Remaining, Reservation};
-pub(super) use layout::Layout;
-use node::Node;
-use o3::depot::{self, index::bitmap::entry::Row};
-use round::Round;
-use std::num::NonZero;
 
-mod layout;
-
-mod block;
 mod buckets;
 mod entry;
-mod header;
 mod index;
-mod node;
+pub(super) mod layout;
 pub(crate) mod pool;
 mod round;
 
-/// An admitted row kept only in the allocation which issued it.
-#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-#[repr(transparent)]
-struct Rank(NonZero<u32>);
+#[derive(Clone, Copy, Debug)]
+pub struct RoundRobin;
+/// Selects an eligible connection with the fewest reply orders plus
+/// pending Sync boundaries, including the boundary of an open pipeline.
+#[derive(Clone, Copy, Debug)]
+pub struct LeastInflight;
 
-impl Rank {
-    fn new<const ID: u8>(row: Row<&Block<'_, ID>>) -> Self {
-        Self(row.position())
-    }
-
-    fn row<'a, 'd, const ID: u8>(self, source: &'a Block<'d, ID>) -> Row<&'a Block<'d, ID>> {
-        // SAFETY: ranks are issued only by this allocation's admitted rows and
-        // are retained privately in its node priorities and index minimum.
-        Row::from_source(unsafe { depot::raw::Proof::new((source, self.0)) })
-    }
+pub trait Policy: sealed::Seal + Copy + 'static {
+    #[doc(hidden)]
+    type Order: Order;
 }
 
-const _: () = assert!(std::mem::size_of::<Option<Rank>>() == std::mem::size_of::<u32>());
+mod sealed {
+    pub trait Seal {}
+    impl Seal for super::RoundRobin {}
+    impl Seal for super::LeastInflight {}
+}
+
+impl Policy for RoundRobin {
+    type Order = round::Round;
+}
+
+impl Policy for LeastInflight {
+    type Order = buckets::Buckets;
+}
+
+/// Storage and transitions belonging to one installed policy.
+#[doc(hidden)]
+pub trait Order: Sized {
+    const RANKED: bool;
+    type Layout: Copy;
+    type Rank: Copy;
+    type End;
+
+    fn layout(
+        values: Layout,
+        slots: usize,
+        replies: cartel_core::reply::layout::Layout,
+    ) -> Result<(Layout, Self::Layout), crate::port::ready::Error>;
+
+    // The original allocation was admitted with this exact plan and slot count.
+    unsafe fn install(ptr: NonNull<u8>, slots: usize, layout: Self::Layout) -> Self;
+
+    fn pick(&self) -> Option<(links::Index, Self::Rank)>;
+    // The index and rank are retained by the caller's exclusive eligibility transition.
+    unsafe fn rank(&self, index: links::Index) -> Option<Self::Rank>;
+    unsafe fn insert(&self, index: links::Index, depth: impl FnOnce() -> usize);
+    unsafe fn remove(&self, index: links::Index, rank: Self::Rank);
+    unsafe fn reprioritize(
+        &self,
+        index: links::Index,
+        rank: Self::Rank,
+        depth: impl FnOnce() -> usize,
+    );
+    unsafe fn remaining(
+        &self,
+        index: links::Index,
+        rank: Self::Rank,
+    ) -> (Option<(links::Index, Self::Rank)>, Self::End);
+    unsafe fn following(
+        &self,
+        index: links::Index,
+        rank: Self::Rank,
+        end: &Self::End,
+    ) -> Option<(links::Index, Self::Rank)>;
+}

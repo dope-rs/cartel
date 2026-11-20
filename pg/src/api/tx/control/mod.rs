@@ -1,7 +1,8 @@
 use crate::port;
+use crate::port::Instance;
 use crate::port::replies;
 use crate::reply::group::Ledger;
-use crate::{api, reply, schema};
+use crate::{api, reply};
 use api::task::lease::{Lease, Recover};
 use api::{
     ops, request,
@@ -119,14 +120,14 @@ impl<const ID: u8> Drop for Cancel<'_, '_, ID> {
 #[must_use = "release or roll back the savepoint to preserve its transaction"]
 pub struct Savepoint<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
 {
     pub(super) lease:
         Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, access::Transaction<'d, ID>, Recover, ID>,
     pub(super) name: crate::Identifier,
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     Savepoint<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     fn dispatch(
@@ -142,15 +143,15 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 }
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> sealed::Sealed
+impl<B: ?Sized, I: Instance, const ID: u8> sealed::Sealed
     for Savepoint<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
 {
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     traits::Connection<'d, ID> for Savepoint<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
-    type Schema = I;
+    type Schema = I::Queries;
     type Payload = replies::Payload<'b, 'c, 'd>;
     type Diagnostics = Ledger<'r, 's>;
     type CopyChunk = Chunk<'b, 'c, 'd>;
@@ -167,7 +168,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     traits::Savepoint<'d, ID> for Savepoint<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     type Savepoint<'parent>
@@ -225,13 +226,13 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
 ///
 pub struct ListenGuard<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I, const ID: u8 = 0>
 where
-    I: schema::QuerySet + 'd,
+    I: Instance<Queries: 'd> + 'd,
 {
     lease: Lease<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, api::Target<'d, ID>, Recover, ID>,
     channel: crate::Identifier,
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     ListenGuard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     pub(in crate::api) fn from_parts(
@@ -250,15 +251,15 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 }
 
-impl<B: ?Sized, I: schema::QuerySet, const ID: u8> sealed::Sealed
+impl<B: ?Sized, I: Instance, const ID: u8> sealed::Sealed
     for ListenGuard<'_, '_, '_, '_, '_, '_, '_, B, I, ID>
 {
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     traits::Connection<'d, ID> for ListenGuard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
-    type Schema = I;
+    type Schema = I::Queries;
     type Payload = replies::Payload<'b, 'c, 'd>;
     type Diagnostics = Ledger<'r, 's>;
     type CopyChunk = Chunk<'b, 'c, 'd>;
@@ -272,7 +273,7 @@ impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, co
     }
 }
 
-impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: schema::QuerySet + 'd, const ID: u8>
+impl<'app, 'g, 'r, 's, 'b, 'c, 'd: 'app, B: ?Sized, I: Instance<Queries: 'd> + 'd, const ID: u8>
     traits::Listener<'d, ID> for ListenGuard<'app, 'g, 'r, 's, 'b, 'c, 'd, B, I, ID>
 {
     fn channel(&self) -> &str {

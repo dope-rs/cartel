@@ -149,6 +149,15 @@ fn admission_uses_window() {
                     ),
                     "request admission must time out"
                 );
+                let acquired = runtime.block_on(client.acquire())
+                    .expect("frame drive").ok().expect("request frame");
+                fibers::TEST.try_pause(&mut runtime, Duration::from_millis(10))
+                    .expect("failed request deadline fires");
+                assert!(matches!(runtime.block_on(acquired.command("SELECT\0")),
+                    Ok(Err(reply::Error::Driver(cartel_pg::Error::Request(
+                        cartel_pg::protocol::encode::Error::StatementSqlNul { position: 6 }
+                    ))))
+                ));
 
                             })
                         })
